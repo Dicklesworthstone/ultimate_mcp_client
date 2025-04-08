@@ -166,3 +166,7 @@ cython_debug/
 *.sqlite-journal
 *.gguf
 claude_desktop_config.json
+.mcpclient_config/
+*.pyc
+__pycache__/
+.env

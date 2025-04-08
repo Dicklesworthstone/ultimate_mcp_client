@@ -350,7 +350,7 @@ def force_exit_handler(is_force=False):
                 # Terminate all processes immediately
                 for name, process in app.mcp_client.server_manager.processes.items():
                     try:
-                        if process.poll() is None:  # If process is still running
+                        if process.returncode is None: # If process is still running
                             print(f"Force killing process {name} (PID {process.pid})")
                             process.kill()
                     except Exception:
@@ -654,7 +654,8 @@ STATUS_EMOJI = {
 }
 
 # Constants
-CONFIG_DIR = Path.home() / ".config" / "mcpclient"
+PROJECT_ROOT = Path(__file__).parent.resolve()
+CONFIG_DIR = PROJECT_ROOT / ".mcpclient_config" # Store in a hidden subfolder in project root
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 HISTORY_FILE = CONFIG_DIR / "history.json"
 SERVER_DIR = CONFIG_DIR / "servers"
@@ -2327,7 +2328,10 @@ class ServerManager:
             safe_console.print("[yellow]Server discovery is disabled in configuration.[/]")
     
     async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
-        """Connect to a single MCP server with retry logic and health monitoring"""
+        """
+        Connect to a single MCP server with retry logic, health monitoring,
+        and AUTOMATIC stderr redirection for STDIO servers to config dir.
+        """
         server_name = server_config.name
         retry_count = 0
         max_retries = server_config.retry_count
@@ -2341,6 +2345,9 @@ class ServerManager:
                 # Track metrics for this connection attempt
                 start_time = time.time()
                 session: Optional[ClientSession] = None # Initialize session for clarity
+                # Keep track of tasks/process created in *this* attempt for cleanup on error
+                process_this_attempt: Optional[asyncio.subprocess.Process] = None
+                stderr_reader_task_this_attempt: Optional[asyncio.Task] = None
 
                 try:
                     # Start span for observability if available
@@ -2366,13 +2373,13 @@ class ServerManager:
                     if server_config.type == ServerType.STDIO:
                         # Check if we need to start the server process
                         if server_config.auto_start and server_config.path:
-                            # Check if a process is already running for this server
+                            # Check if a process managed by us is already running for this server
                             existing_process = self.processes.get(server_config.name)
                             restart_process = False
 
                             if existing_process:
                                 # Check if the process is still alive
-                                if existing_process.poll() is None:
+                                if existing_process.returncode is None:
                                     # Process is running, but if we've hit an error before, we might want to restart
                                     if retry_count > 0:
                                         log.warning(f"Restarting process for {server_name} on retry {retry_count}")
@@ -2382,10 +2389,12 @@ class ServerManager:
 
                                         # Try to terminate gracefully
                                         try:
+                                            log.info(f"Terminating existing process {server_name} (PID {existing_process.pid}) before restart.")
                                             existing_process.terminate()
                                             try:
                                                 # Wait with timeout for termination
                                                 await asyncio.wait_for(existing_process.wait(), timeout=2.0)
+                                                log.info(f"Existing process {server_name} terminated gracefully.")
                                             except asyncio.TimeoutError:
                                                 # Force kill if necessary
                                                 log.warning(f"Process for {server_name} not responding to terminate, killing")
@@ -2393,209 +2402,339 @@ class ServerManager:
                                                 self._safe_printer(f"[red]Process for {server_name} not responding, forcing kill[/]")
                                                 existing_process.kill()
                                                 await existing_process.wait() # Wait for kill to complete
+                                                log.info(f"Existing process {server_name} killed.")
+                                        except ProcessLookupError: # Process already exited
+                                            log.info(f"Existing process {server_name} already exited before termination attempt.")
                                         except Exception as e:
-                                            log.error(f"Error terminating process for {server_name}: {e}")
+                                            log.error(f"Error terminating existing process for {server_name}: {e}")
                                             # Use safe printer
-                                            self._safe_printer(f"[red]Error terminating process: {e}[/]")
+                                            self._safe_printer(f"[red]Error terminating existing process: {e}[/]")
+                                    else: # Process is running, first attempt - don't restart yet
+                                        log.debug(f"Found existing process for {server_name} (PID {existing_process.pid}), will attempt connection.")
+                                        process_this_attempt = existing_process # Use existing process for this attempt
                                 else:
-                                    # Process has exited
+                                    # Process existed but has terminated
                                     exit_code = existing_process.returncode
-                                    log.warning(f"Process for {server_name} has exited with code {exit_code}")
+                                    log.warning(f"Previously managed process for {server_name} has exited with code {exit_code}. Cleaning up entry.")
                                     # Use safe printer
-                                    self._safe_printer(f"[yellow]Process for {server_name} has exited with code {exit_code}[/]")
-
-                                    # Try to get stderr output for diagnostics if process has terminated
-                                    try:
-                                        if existing_process.stderr:
-                                            stderr_data = await existing_process.stderr.read()
-                                            if stderr_data:
-                                                stderr_output = stderr_data.decode('utf-8', errors='replace').strip()
-                                                if stderr_output: # Only log if there's actual stderr content
-                                                     log.error(f"Process stderr for {server_name}: {stderr_output}")
-                                    except Exception as e:
-                                        log.warning(f"Couldn't read stderr for {server_name}: {e}")
-
+                                    self._safe_printer(f"[yellow]Previous process for {server_name} exited (code {exit_code}). Starting new one.[/]")
                                     restart_process = True
+                                    del self.processes[server_name] # Remove dead process entry
                             else:
-                                # No existing process
+                                # No existing process entry
                                 restart_process = True
 
                             # Start or restart the process if needed
                             if restart_process:
-                                # Start the process
-                                cmd = [server_config.path] + server_config.args
+                                # Get the original command + args from config
+                                original_cmd_list = [server_config.path] + server_config.args
+                                # Copy it to potentially modify for execution
+                                final_cmd_list = original_cmd_list[:]
 
-                                # Detect if it's a Python file
-                                if server_config.path.endswith('.py'):
-                                    python_cmd = sys.executable
-                                    cmd = [python_cmd] + cmd
-                                # Detect if it's a JS file
-                                elif server_config.path.endswith('.js'):
-                                    node_cmd = 'node' # Assumes node is in PATH
-                                    # Check if npx is being used explicitly
-                                    if server_config.path == 'npx':
-                                        # Keep cmd as is if 'npx' is the command
-                                        pass
-                                    else:
-                                         cmd = [node_cmd] + cmd
+                                # --- Automatic Stderr Redirection Logic ---
+                                # Determine the desired log file path (ensure CONFIG_DIR is defined earlier)
+                                log_file_path = (CONFIG_DIR / f"{server_name}_stderr.log").resolve()
+                                log_file_path.parent.mkdir(parents=True, exist_ok=True) # Ensure dir exists
 
-                                log.info(f"Starting server process: {' '.join(cmd)}")
-                                # Use safe printer
-                                self._safe_printer(f"[cyan]Starting server process: {' '.join(cmd)}[/]")
-
-                                # Create process with pipes and set resource limits
-                                # Add a unique identifier to each process to prevent interference
-                                env = os.environ.copy()
-                                # These environment variables are critical for preventing interference between
-                                # multiple stdio MCP servers running on the same machine:
-                                # - MCP_SERVER_ID: Unique name for each server to distinguish protocol messages
-                                # - MCP_CLIENT_ID: Unique ID for this client instance to prevent cross-talk
-                                env["MCP_SERVER_ID"] = server_name
-                                env["MCP_CLIENT_ID"] = str(uuid.uuid4())
-
-                                process = await asyncio.create_subprocess_exec(
-                                    *cmd,
-                                    stdin=asyncio.subprocess.PIPE,
-                                    stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.PIPE, # Keep stderr piped
-                                    env=env
+                                # Check if the command looks like it's using bash -c via wsl.exe
+                                # This targets the specific pattern from the claude desktop config
+                                is_wsl_bash_c = (
+                                    len(original_cmd_list) >= 4 and
+                                    isinstance(original_cmd_list[0], str) and original_cmd_list[0].lower().endswith("wsl.exe") and
+                                    isinstance(original_cmd_list[1], str) and original_cmd_list[1].lower() == "bash" and
+                                    isinstance(original_cmd_list[2], str) and original_cmd_list[2].lower() == "-c" and
+                                    isinstance(original_cmd_list[3], str) # Ensure the command string exists
                                 )
 
-                                self.processes[server_config.name] = process
+                                stderr_needs_piping = True # Default to piping stderr in Python
 
-                                # Register the server with zeroconf if local discovery is enabled
+                                if is_wsl_bash_c:
+                                    original_bash_command = original_cmd_list[3]
+                                    # Wrap the original command in a subshell `( ... )` and redirect stderr
+                                    # This forcefully redirects stderr for the *entire* original command string.
+                                    wrapped_bash_command = f'( {original_bash_command} ) 2> "{log_file_path!s}"'
+                                    final_cmd_list[3] = wrapped_bash_command # Replace the command string in the execution list
+                                    log.info(f"Wrapping WSL bash command for {server_name} to redirect stderr to {log_file_path}")
+                                    stderr_needs_piping = False # Shell is handling redirection
+                                else:
+                                    # For other commands (python, npx, node, etc.), we will pipe stderr
+                                    log.info(f"Stderr for {server_name} (non-WSL bash) will be handled via pipe reader -> {log_file_path}")
+                                    # final_cmd_list remains unchanged from original_cmd_list
+
+                                # Detect if it's a Python file being run directly (needs interpreter)
+                                # This check needs to happen *before* wrapping, using original_cmd_list
+                                if isinstance(original_cmd_list[0], str) and original_cmd_list[0].endswith('.py'):
+                                    python_cmd = sys.executable
+                                    final_cmd_list = [python_cmd] + final_cmd_list # Prepend interpreter
+                                # Detect if it's a JS file being run directly (needs interpreter)
+                                elif isinstance(original_cmd_list[0], str) and original_cmd_list[0].endswith('.js'):
+                                    # Avoid prepending 'node' if command is already 'node' or 'npx'
+                                    if original_cmd_list[0].lower() not in ['node', 'npx']:
+                                        node_cmd = 'node' # Assumes node is in PATH
+                                        final_cmd_list = [node_cmd] + final_cmd_list # Prepend interpreter
+
+                                log.info(f"Executing final command: {' '.join(map(str, final_cmd_list))}")
+                                # Use safe printer
+                                self._safe_printer(f"[cyan]Starting server process: {' '.join(map(str, final_cmd_list))}[/]")
+
+                                # --- Environment Setup ---
+                                env = os.environ.copy()
+                                # Set essential MCP vars if needed by servers
+                                env["MCP_SERVER_ID"] = server_name
+                                env["MCP_CLIENT_ID"] = str(uuid.uuid4())
+                                # No need to pass MCP_STDERR_LOG_PATH if using shell wrapping
+
+                                # --- Execute Process ---
+                                process = await asyncio.create_subprocess_exec(
+                                    *final_cmd_list,
+                                    stdin=asyncio.subprocess.PIPE,
+                                    stdout=asyncio.subprocess.PIPE,
+                                    # Always pipe stderr from Python's perspective.
+                                    # If shell wrapping was used, this pipe likely won't receive much data.
+                                    # If shell wrapping wasn't used, our reader task will use this pipe.
+                                    stderr=asyncio.subprocess.PIPE,
+                                    env=env
+                                )
+                                process_this_attempt = process # Store process created in this attempt
+                                self.processes[server_config.name] = process # Update the main process store
+                                log.info(f"Started process for {server_name} with PID {process.pid}")
+
+                                # --- Start stderr reader task ONLY if shell wrapping wasn't used ---
+                                if stderr_needs_piping:
+                                    log_file_path_str = str(log_file_path) # Need string for file open
+                                    log.info(f"Starting stderr pipe reader task for {server_name} -> {log_file_path_str}")
+                                    async def read_stderr_to_file(proc_stderr, log_path_str, server_id):
+                                        try:
+                                            # Use aiofiles for async file writing
+                                            async with aiofiles.open(log_path_str, "ab") as log_f: # Append binary
+                                                while True:
+                                                    line_bytes = await proc_stderr.readline()
+                                                    if not line_bytes: # EOF
+                                                        log.debug(f"Stderr pipe EOF reached for {server_id}")
+                                                        break
+                                                    await log_f.write(line_bytes)
+                                                    # Optional: log to client log too (can be very verbose)
+                                                    # log.debug(f"[{server_id} stderr] {line_bytes.decode(errors='replace').strip()}")
+                                            log.info(f"Stderr reader task finished normally for {server_id}")
+                                        except asyncio.CancelledError:
+                                            log.info(f"Stderr reader task cancelled for {server_id}")
+                                            raise # Re-raise cancellation
+                                        except Exception as e:
+                                            log.error(f"Error in stderr reader task for {server_id}: {e}", exc_info=True)
+                                        finally:
+                                            log.debug(f"Exiting stderr reader task for {server_id}")
+
+                                    stderr_reader_task_this_attempt = asyncio.create_task(
+                                        read_stderr_to_file(process.stderr, log_file_path_str, server_name)
+                                    )
+                                    # Give the task a moment to start up
+                                    await asyncio.sleep(0.01)
+                                # --- End stderr reader task start ---
+
+                                # Allow brief moment for process to potentially fail immediately after start
+                                await asyncio.sleep(0.2) # Slightly longer pause
+                                if process.returncode is not None:
+                                    # Process exited very quickly
+                                    log.error(f"Process for {server_name} failed immediately after start (code {process.returncode}).")
+                                    # Cancel reader task if started and not done
+                                    if stderr_reader_task_this_attempt and not stderr_reader_task_this_attempt.done():
+                                        log.debug(f"Cancelling stderr reader for {server_name} due to immediate exit.")
+                                        stderr_reader_task_this_attempt.cancel()
+                                        try: await stderr_reader_task_this_attempt
+                                        except asyncio.CancelledError: pass
+                                    # Try reading stderr directly from pipe (might have early errors)
+                                    stderr_output = "<stderr already closed or empty>"
+                                    try:
+                                        # Read remaining data quickly
+                                        if process.stderr and not process.stderr.at_eof():
+                                            stderr_data = await asyncio.wait_for(process.stderr.read(), timeout=0.5)
+                                            stderr_output = stderr_data.decode(errors='replace').strip()
+                                            if stderr_output:
+                                                log.error(f"Immediate exit stderr for {server_name}: {stderr_output}")
+                                    except asyncio.TimeoutError:
+                                        log.warning(f"Timeout reading stderr after immediate exit for {server_name}")
+                                    except Exception as e:
+                                        log.warning(f"Error reading stderr after immediate exit for {server_name}: {e}")
+                                    raise RuntimeError(f"Process for {server_name} failed immediately after start "
+                                                    f"(code {process.returncode}). Check log file '{log_file_path}' or see client logs for stderr.")
+
+                                # Register with Zeroconf if needed (after confirming process is alive)
                                 if self.config.enable_local_discovery and self.registry:
-                                    await self.register_local_server(server_config)
+                                    try:
+                                        await self.register_local_server(server_config)
+                                    except Exception as zc_err:
+                                        log.error(f"Failed to register {server_name} with Zeroconf: {zc_err}", exc_info=True)
+                                        # Log but continue connection attempt
 
-                        # Set up parameters with timeout - include existing process if available
-                        current_process = self.processes.get(server_name) # Get potentially newly created process
-                        params = StdioServerParameters(
-                            command=server_config.path, # Command/path used for logging/config, not necessarily for execution if process exists
-                            args=server_config.args,
-                            timeout=server_config.timeout,
-                            process=current_process # Pass potentially existing/new process
-                        )
+                            # --- Connect via MCP stdio_client ---
+                            current_process = self.processes.get(server_name) # Get current live process object
+                            if not current_process or current_process.returncode is not None:
+                                # This could happen if the existing process was reused but died just before this check
+                                raise RuntimeError(f"Process for STDIO server {server_name} not running or not found before MCP connection attempt.")
 
-                        # Check if process exists before trying to connect via stdio
-                        if not current_process:
-                            raise McpError(f"Process for STDIO server {server_name} not found or failed to start.")
-
-                        # Create client with context manager to ensure proper cleanup
-                        # FIX: Removed extra await before stdio_client
-                        session = await self.exit_stack.enter_async_context(stdio_client(params))
-
-                        # --- FIX: Add explicit session validation ---
-                        if not session or not hasattr(session, 'list_tools') or not callable(session.list_tools):
-                             log.error(f"Failed to obtain a valid session object for {server_name} after connection attempt.")
-                             self._safe_printer(f"[red]Failed to initialize session for {server_name}. Check server logs/startup.[/]")
-                             # Attempt to clean up the potentially running process
-                             if current_process and current_process.poll() is None:
-                                  try:
-                                      log.warning(f"Terminating process for {server_name} due to invalid session.")
-                                      current_process.terminate()
-                                      await asyncio.wait_for(current_process.wait(), timeout=1.0)
-                                  except Exception:
-                                      log.error(f"Failed to terminate process for {server_name} after invalid session.")
-                                      try: current_process.kill() # Force kill as last resort
-                                      except Exception: pass
-                             # Raise error to trigger retry or final failure
-                             raise McpError(f"Invalid session object obtained for {server_name}")
-                        # --- End FIX ---
-
-                    elif server_config.type == ServerType.SSE:
-                        # Connect to SSE server using direct parameters
-                        # FIX: Removed extra await before sse_client
-                        session = await self.exit_stack.enter_async_context(
-                            sse_client(
-                                url=server_config.path,
+                            params = StdioServerParameters(
+                                # Pass command/args for info, process object for communication
+                                command=server_config.path,
+                                args=server_config.args,
                                 timeout=server_config.timeout,
-                                sse_read_timeout=server_config.timeout * 12 # Set longer timeout for events
+                                process=current_process # MUST pass the live asyncio process object
                             )
-                        )
-                        # --- FIX: Add explicit session validation ---
-                        if not session or not hasattr(session, 'list_tools') or not callable(session.list_tools):
-                             log.error(f"Failed to obtain a valid SSE session object for {server_name}.")
-                             self._safe_printer(f"[red]Failed to initialize SSE session for {server_name}.[/]")
-                             # Raise error to trigger retry or final failure
-                             raise McpError(f"Invalid SSE session object obtained for {server_name}")
-                        # --- End FIX ---
 
-                    else:
-                        # This part remains the same, but use safe_printer
+                            # Create client with context manager to ensure proper cleanup
+                            session = await self.exit_stack.enter_async_context(stdio_client(params))
+
+                            # --- Validate Session ---
+                            if not session or not hasattr(session, 'list_tools') or not callable(session.list_tools):
+                                log.error(f"Failed to obtain a valid session object for {server_name} after stdio_client context.")
+                                self._safe_printer(f"[red]Failed to initialize session for {server_name}. Check server logs/startup.[/]")
+                                # Attempt cleanup (terminate process, cancel stderr reader)
+                                if current_process and current_process.returncode is None:
+                                    try:
+                                        log.warning(f"Terminating process {server_name} (PID {current_process.pid}) due to invalid session.")
+                                        current_process.terminate()
+                                        await asyncio.wait_for(current_process.wait(), timeout=1.0)
+                                    except asyncio.TimeoutError:
+                                        log.warning(f"Timeout terminating process {server_name} on invalid session, killing.")
+                                        try: current_process.kill()
+                                        except ProcessLookupError: pass # Already gone
+                                        except Exception as kill_err_inner: log.error(f"Error killing process on invalid session: {kill_err_inner}")
+                                    except ProcessLookupError: pass # Already exited
+                                    except Exception as term_err_inner:
+                                        log.error(f"Error terminating process {server_name} on invalid session: {term_err_inner}")
+                                        try: # Try kill as fallback
+                                            if current_process.returncode is None: current_process.kill()
+                                        except ProcessLookupError: pass
+                                        except Exception: pass # Ignore kill errors
+                                # Cancel reader task if it was created in this attempt
+                                if stderr_reader_task_this_attempt and not stderr_reader_task_this_attempt.done():
+                                    log.debug(f"Cancelling stderr reader for {server_name} due to invalid session.")
+                                    stderr_reader_task_this_attempt.cancel()
+                                    try: await stderr_reader_task_this_attempt
+                                    except asyncio.CancelledError: pass
+                                # Raise specific error to trigger retry
+                                raise RuntimeError(f"Invalid session object obtained for {server_name}")
+                            # --- End Session Validation ---
+
+                            # --- STDIO Success ---
+                            log.info(f"Successfully established MCP session for STDIO server {server_name}")
+
+
+                        elif server_config.type == ServerType.SSE:
+                            # --- SSE Server Logic (remains mostly the same) ---
+                            log.info(f"Connecting to SSE server {server_name} at {server_config.path}")
+                            session = await self.exit_stack.enter_async_context(
+                                sse_client(
+                                    url=server_config.path,
+                                    timeout=server_config.timeout,
+                                    sse_read_timeout=server_config.timeout * 12 # Set longer timeout for events
+                                )
+                            )
+                            # --- Validate SSE Session ---
+                            if not session or not hasattr(session, 'list_tools') or not callable(session.list_tools):
+                                log.error(f"Failed to obtain a valid SSE session object for {server_name}.")
+                                self._safe_printer(f"[red]Failed to initialize SSE session for {server_name}.[/]")
+                                # Use RuntimeError for consistency with STDIO validation failure
+                                raise RuntimeError(f"Invalid SSE session object obtained for {server_name}")
+                            # --- SSE Success ---
+                            log.info(f"Successfully established MCP session for SSE server {server_name}")
+
+                        else:
+                            # --- Unknown Server Type ---
+                            # This part remains the same, but use safe_printer
+                            if span_ctx and hasattr(span_ctx, 'set_status'):
+                                span_ctx.set_status(trace.StatusCode.ERROR, f"Unknown server type: {server_config.type}")
+                            log.error(f"Unknown server type: {server_config.type}")
+                            # Use safe printer
+                            self._safe_printer(f"[red]Unknown server type: {server_config.type}[/]")
+                            # No valid session possible, return None after cleanup (handled by exit_stack)
+                            return None # Explicitly return None here
+
+                        # --- Success Path (Common for STDIO/SSE) ---
+                        # If we reached here, session is considered valid
+                        connection_time = (time.time() - start_time) * 1000 # ms
+
+                        # Update metrics
+                        server_config.metrics.request_count += 1
+                        server_config.metrics.update_response_time(connection_time)
+                        server_config.metrics.update_status()
+
+                        # Record metrics if available
+                        if latency_histogram:
+                            try:
+                                latency_histogram.record(
+                                    connection_time,
+                                    {
+                                        "operation": "connect",
+                                        "server": server_name,
+                                        "server_type": server_config.type.value
+                                    }
+                                )
+                            except Exception as metric_error:
+                                log.warning(f"Failed to record latency metric: {metric_error}")
+
+                        # Mark span as successful
                         if span_ctx and hasattr(span_ctx, 'set_status'):
-                            span_ctx.set_status(trace.StatusCode.ERROR, f"Unknown server type: {server_config.type}")
-                        log.error(f"Unknown server type: {server_config.type}")
+                            try:
+                                span_ctx.set_status(trace.StatusCode.OK)
+                                if hasattr(span_ctx, 'end'):
+                                    span_ctx.end() # End span on success
+                            except Exception as e:
+                                log.warning(f"Error updating span status: {e}")
+
+                        log.info(f"Connected to server {server_name} in {connection_time:.2f}ms")
                         # Use safe printer
-                        self._safe_printer(f"[red]Unknown server type: {server_config.type}[/]")
-                        # No valid session possible, return None after cleanup (handled by exit_stack)
-                        return None # Explicitly return None here
+                        self._safe_printer(f"[green]Connected to server {server_name} in {connection_time:.2f}ms[/]")
 
-                    # --- Success Path ---
-                    # If we reached here, session is considered valid
-                    connection_time = (time.time() - start_time) * 1000 # ms
+                        # Keep stderr reader task running if it exists (for non-WSL STDIO)
+                        if stderr_reader_task_this_attempt:
+                            log.debug(f"Keeping stderr reader task active for {server_name}")
+                            # We need a way to manage this task long-term, perhaps store it with the session or process info
+                            # For now, it will run until the process exits or it's cancelled on disconnect/shutdown.
+                            pass
 
-                    # Update metrics
-                    server_config.metrics.request_count += 1
-                    server_config.metrics.update_response_time(connection_time)
-                    server_config.metrics.update_status()
-
-                    # Record metrics if available
-                    if latency_histogram:
-                        try:
-                            latency_histogram.record(
-                                connection_time,
-                                {
-                                    "operation": "connect",
-                                    "server": server_name,
-                                    "server_type": server_config.type.value
-                                }
-                            )
-                        except Exception as metric_error:
-                            log.warning(f"Failed to record latency metric: {metric_error}")
-
-                    # Mark span as successful
-                    if span_ctx and hasattr(span_ctx, 'set_status'):
-                        try:
-                            span_ctx.set_status(trace.StatusCode.OK)
-                            if hasattr(span_ctx, 'end'):
-                                span_ctx.end() # End span on success
-                        except Exception as e:
-                            log.warning(f"Error updating span status: {e}")
-
-                    log.info(f"Connected to server {server_name} in {connection_time:.2f}ms")
-                    # Use safe printer
-                    self._safe_printer(f"[green]Connected to server {server_name} in {connection_time:.2f}ms[/]")
-                    return session # Return the valid session object
+                        return session # Return the valid session object
 
                 # --- Exception Handling Block ---
                 # (This block catches errors during the connection attempt within the 'try')
-                except McpError as e: # Catch MCP client errors (including our raised validation error)
+                except (McpError, RuntimeError) as e: # Catch MCP client errors and our custom runtime errors
                     connection_error = e
+                    log.warning(f"Connection attempt failed for {server_name} (MCP/Runtime Error): {e}")
                 except httpx.RequestError as e: # Network errors for SSE
                     connection_error = e
+                    log.warning(f"Connection attempt failed for {server_name} (Network Error): {e}")
                 except subprocess.SubprocessError as e: # Errors starting/communicating with STDIO process
                     connection_error = e
-                    # Check if the process terminated unexpectedly
-                    if server_config.name in self.processes:
-                        proc = self.processes[server_config.name]
-                        if proc and proc.poll() is not None: # Check if proc exists and exited
+                    log.warning(f"Connection attempt failed for {server_name} (Subprocess Error): {e}")
+                    # Check if the process terminated unexpectedly *during* this attempt
+                    if process_this_attempt and process_this_attempt.returncode is not None:
                             try:
-                                stderr_data = await proc.stderr.read() if proc.stderr else b""
-                                stderr_output = stderr_data.decode('utf-8', errors='replace').strip()
-                                log.error(f"STDIO server process for '{server_config.name}' exited with code {proc.returncode}. Stderr: {stderr_output if stderr_output else '<no stderr>'}")
-                                # Use safe printer
-                                self._safe_printer(f"[red]STDIO server process for '{server_config.name}' exited unexpectedly (code {proc.returncode}).[/]")
+                                # Attempt to read any final stderr output
+                                stderr_output = "<stderr not read>"
+                                if process_this_attempt.stderr and not process_this_attempt.stderr.at_eof():
+                                    stderr_data = await asyncio.wait_for(process_this_attempt.stderr.read(), timeout=0.5)
+                                    stderr_output = stderr_data.decode('utf-8', errors='replace').strip()
+                                log.error(f"STDIO server process for '{server_name}' exited during connection attempt with code {process_this_attempt.returncode}. Stderr: {stderr_output if stderr_output else '<no stderr>'}")
+                                self._safe_printer(f"[red]STDIO server process for '{server_name}' exited unexpectedly during connect (code {process_this_attempt.returncode}). Check logs.[/]")
+                            except asyncio.TimeoutError:
+                                log.warning(f"Timeout reading stderr after process exit during connect for {server_name}")
                             except Exception as err:
-                                log.error(f"Error reading stderr after process exit for {server_name}: {err}")
-                except OSError as e: # OS level errors (e.g., command not found)
+                                log.error(f"Error reading stderr after process exit during connect for {server_name}: {err}")
+                except OSError as e: # OS level errors (e.g., command not found, permissions)
                     connection_error = e
-                # Keep broad exception for truly unexpected connection issues
-                except Exception as e:
+                    log.warning(f"Connection attempt failed for {server_name} (OS Error): {e}")
+                except Exception as e: # Catch any other unexpected errors
                     log.exception(f"Unexpected error during connection attempt for {server_name}") # Log with traceback
                     connection_error = e
 
                 # --- Shared Error Handling & Retry Logic ---
-                # (This code runs if any exception occurred in the 'try' block above)
+                # Ensure cleanup for tasks/process started *in this failed attempt*
+                if stderr_reader_task_this_attempt and not stderr_reader_task_this_attempt.done():
+                    log.debug(f"Cancelling stderr reader task for {server_name} due to connection error before retry.")
+                    stderr_reader_task_this_attempt.cancel()
+                    try: await stderr_reader_task_this_attempt # Allow cancellation to process
+                    except asyncio.CancelledError: pass
+                # Note: Process termination for retries is handled by the check at the start of the loop
+
                 retry_count += 1
                 server_config.metrics.error_count += 1 # Increment error count for this server
                 server_config.metrics.update_status() # Update status based on new error count
@@ -2638,7 +2777,7 @@ class ServerManager:
                     span_ctx.end()
                 except Exception as e:
                     log.warning(f"Error ending span outside loop: {e}")
-            return None # Return None if loop completes without success
+            return None # Return None if loop completes without success    
 
 
     async def register_local_server(self, server_config: ServerConfig):
@@ -2709,8 +2848,8 @@ class ServerManager:
                 if not hasattr(self, 'registered_services'):
                     self.registered_services = {}
                 self.registered_services[server_config.name] = service_info
-            except Exception as e:
-                log.error(f"Error registering service with zeroconf: {e}")
+            except Exception:
+                log.error(f"Error registering service with zeroconf:", exc_info=True)
             
         except ImportError:
             log.warning("Zeroconf not available, cannot register local server")
@@ -2921,7 +3060,7 @@ class ServerManager:
                     # Force kill any remaining processes
                     for name, process in self.server_manager.processes.items():
                         try:
-                            if process and process.poll() is None:
+                            if process and process.returncode is None:
                                 log.warning(f"Force killing process {name} that didn't terminate properly")
                                 process.kill()
                         except Exception as kill_error:
@@ -3394,7 +3533,7 @@ class MCPClient:
                     log.error(f"Exception connecting to {name}", exc_info=True)
                     self.safe_print(f"  [red]✗ Error connecting to {name}: {e}[/]") # Uses self.safe_print
                     connection_results[name] = False
-                    
+
         # Start server monitoring
         # This Status widget is fine as it doesn't overlap with Progress calls
         try:
@@ -4164,7 +4303,7 @@ class MCPClient:
                     # Terminate any active processes immediately
                     for name, process in self.server_manager.processes.items():
                         try:
-                            if process and process.poll() is None:
+                            if process and process.returncode is None:
                                 self.safe_print(f"[yellow]Force killing process: {name}[/]")
                                 process.kill()
                         except Exception as e:
@@ -4597,7 +4736,7 @@ class MCPClient:
         # Terminate process if applicable
         if name in self.server_manager.processes:
             process = self.server_manager.processes[name]
-            if process.poll() is None:  # If process is still running
+            if process.returncode is None:  # If process is still running
                 try:
                     process.terminate()
                     process.wait(timeout=2)
@@ -4678,7 +4817,7 @@ class MCPClient:
             # Process info if applicable
             if name in self.server_manager.processes:
                 process = self.server_manager.processes[name]
-                if process.poll() is None:  # If process is still running
+                if process.returncode is None: # If process is still running
                     pid = process.pid
                     try:
                         p = psutil.Process(pid)
@@ -6199,7 +6338,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 # Force kill any stubborn processes
                 if hasattr(client, 'server_manager'):
                     for name, process in client.server_manager.processes.items():
-                        if process and process.poll() is None:
+                        if process and process.returncode is None:
                             try:
                                 safe_console.print(f"[yellow]Force killing process: {name}[/]")
                                 process.kill()
@@ -6240,7 +6379,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 # Force kill processes that didn't shut down cleanly
                 if hasattr(client, 'server_manager') and hasattr(client.server_manager, 'processes'):
                     for name, process in client.server_manager.processes.items():
-                        if process and process.poll() is None:
+                        if process and process.returncode is None:
                             try:
                                 safe_console.print(f"[yellow]Force killing process: {name}[/]")
                                 process.kill()
