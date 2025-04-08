@@ -211,18 +211,21 @@ app = typer.Typer(help="🔌 Ultimate MCP Client for Anthropic API")
 def main_callback(ctx: typer.Context):
     """Ultimate MCP Client for connecting Claude and other AI models with MCP servers."""
     if ctx.invoked_subcommand is None:
+        # Use get_safe_console() to prevent stdout pollution
+        safe_console = get_safe_console()
+        
         # Display helpful information when no command is provided
-        console.print("\n[bold green]Ultimate MCP Client[/]")
-        console.print("A comprehensive client for the Model Context Protocol (MCP)")
-        console.print("\n[bold]Common Commands:[/]")
-        console.print("  [cyan]run --interactive[/]  Start an interactive chat session")
-        console.print("  [cyan]run --query TEXT[/]   Run a single query")
-        console.print("  [cyan]run --dashboard[/]    Show the monitoring dashboard")
-        console.print("  [cyan]servers --list[/]     List configured servers")
-        console.print("  [cyan]config --show[/]      Display current configuration")
-        console.print("\n[bold]For more information:[/]")
-        console.print("  [cyan]--help[/]             Show detailed help for all commands")
-        console.print("  [cyan]COMMAND --help[/]     Show help for a specific command\n")
+        safe_console.print("\n[bold green]Ultimate MCP Client[/]")
+        safe_console.print("A comprehensive client for the Model Context Protocol (MCP)")
+        safe_console.print("\n[bold]Common Commands:[/]")
+        safe_console.print("  [cyan]run --interactive[/]  Start an interactive chat session")
+        safe_console.print("  [cyan]run --query TEXT[/]   Run a single query")
+        safe_console.print("  [cyan]run --dashboard[/]    Show the monitoring dashboard")
+        safe_console.print("  [cyan]servers --list[/]     List configured servers")
+        safe_console.print("  [cyan]config --show[/]      Display current configuration")
+        safe_console.print("\n[bold]For more information:[/]")
+        safe_console.print("  [cyan]--help[/]             Show detailed help for all commands")
+        safe_console.print("  [cyan]COMMAND --help[/]     Show help for a specific command\n")
 
 # Configure Rich theme
 from rich.theme import Theme
@@ -260,9 +263,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("mcpclient")
 
-# Add a helper function to determine if we should use stderr
+# =============================================================================
+# CRITICAL STDIO SAFETY MECHANISM
+# =============================================================================
+# MCP servers that use stdio for communication rely on a clean stdio channel.
+# Any output sent to stdout will corrupt the protocol communication and can 
+# cause MCP servers to crash or behave unpredictably.
+#
+# The get_safe_console() function is a critical safety mechanism that ensures:
+# 1. All user-facing output goes to stderr when ANY stdio server is active
+# 2. Multiple stdio servers can safely coexist without protocol corruption
+# 3. User output remains visible while keeping the stdio channel clean
+#
+# IMPORTANT: Never use console.print() directly. Always use:
+#   - get_safe_console().print() for direct access
+#   - self.safe_print() for class instance methods
+#   - safe_console = get_safe_console() for local variables
+# =============================================================================
 def get_safe_console():
     """Get the appropriate console based on whether we're using stdio servers.
+    
+    CRITICAL: This function ensures all user output goes to stderr when any stdout-based
+    MCP server is active, preventing protocol corruption and server crashes.
     
     Returns stderr_console if there are any active stdio servers to prevent
     interfering with stdio communication channels.
@@ -2052,6 +2074,10 @@ class ServerManager:
                             # Create process with pipes and set resource limits
                             # Add a unique identifier to each process to prevent interference
                             env = os.environ.copy()
+                            # These environment variables are critical for preventing interference between
+                            # multiple stdio MCP servers running on the same machine:
+                            # - MCP_SERVER_ID: Unique name for each server to distinguish protocol messages
+                            # - MCP_CLIENT_ID: Unique ID for this client instance to prevent cross-talk
                             env["MCP_SERVER_ID"] = server_name
                             env["MCP_CLIENT_ID"] = str(uuid.uuid4())
                             
@@ -2542,9 +2568,6 @@ class MCPClient:
             log.warning("Loaded current node ID not found in graph, resetting to root.")
             self.conversation_graph.set_current_node("root")
 
-        # For storing conversation context (Now managed by ConversationGraph)
-        # self.conversation_messages = [] 
-
         # Command handlers
         self.commands = {
             'exit': self.cmd_exit,
@@ -2575,6 +2598,20 @@ class MCPClient:
         readline.set_completer(self.completer)
         readline.parse_and_bind("tab: complete")
     
+    @staticmethod
+    def safe_print(message, **kwargs):
+        """Print using the appropriate console based on active stdio servers.
+        
+        This helps prevent stdout pollution when stdio servers are connected.
+        Use this method for all user-facing output instead of direct console.print() calls.
+        
+        Args:
+            message: The message to print
+            **kwargs: Additional arguments to pass to print
+        """
+        safe_console = get_safe_console()
+        safe_console.print(message, **kwargs)
+
     @staticmethod
     def with_tool_error_handling(func):
         """Decorator for consistent tool error handling"""
@@ -2829,7 +2866,8 @@ class MCPClient:
           auto on|off - Enable/disable automatic local discovery
         """
         if not self.server_manager.registry:
-            console.print("[yellow]Registry not available, local discovery is disabled.[/]")
+            safe_console = get_safe_console()
+            safe_console.print("[yellow]Registry not available, local discovery is disabled.[/]")
             return
             
         parts = args.split(maxsplit=1)
@@ -2839,13 +2877,14 @@ class MCPClient:
         if subcmd == "list":
             # List all discovered servers
             discovered_servers = self.server_manager.registry.discovered_servers
+            safe_console = get_safe_console()
             
             if not discovered_servers:
-                console.print("[yellow]No MCP servers discovered on local network.[/]")
-                console.print("Try running [bold blue]/discover refresh[/] to scan again.")
+                safe_console.print("[yellow]No MCP servers discovered on local network.[/]")
+                safe_console.print("Try running [bold blue]/discover refresh[/] to scan again.")
                 return
                 
-            console.print(f"\n[bold cyan]{STATUS_EMOJI['search']} Discovered Local Network Servers:[/]")
+            safe_console.print(f"\n[bold cyan]{STATUS_EMOJI['search']} Discovered Local Network Servers:[/]")
             
             # Create a table to display servers
             server_table = Table(title="Local MCP Servers")
@@ -2864,22 +2903,29 @@ class MCPClient:
                 in_config = any(s.path == url for s in self.config.servers.values())
                 status = "[green]In config[/]" if in_config else "[yellow]Not in config[/]"
                 
-                server_table.add_row(name, url, server_type, description, status)
+                server_table.add_row(
+                    name,
+                    url,
+                    server_type,
+                    description,
+                    status
+                )
             
-            console.print(server_table)
-            console.print("\nUse [bold blue]/discover connect NAME[/] to connect to a server.")
+            safe_console.print(server_table)
+            safe_console.print("\nUse [bold blue]/discover connect NAME[/] to connect to a server.")
             
         elif subcmd == "connect":
+            safe_console = get_safe_console()
             if not subargs:
-                console.print("[yellow]Usage: /discover connect SERVER_NAME[/]")
+                safe_console.print("[yellow]Usage: /discover connect SERVER_NAME[/]")
                 return
                 
             server_name = subargs
             
             # Check if server exists in discovered servers
             if server_name not in self.server_manager.registry.discovered_servers:
-                console.print(f"[red]Server '{server_name}' not found in discovered servers.[/]")
-                console.print("Use [bold blue]/discover list[/] to see available servers.")
+                safe_console.print(f"[red]Server '{server_name}' not found in discovered servers.[/]")
+                safe_console.print("Use [bold blue]/discover list[/] to see available servers.")
                 return
                 
             # Get server info
@@ -2896,12 +2942,12 @@ class MCPClient:
                     break
             
             if existing_server:
-                console.print(f"[yellow]Server with URL '{url}' already exists as '{existing_server}'.[/]")
+                safe_console.print(f"[yellow]Server with URL '{url}' already exists as '{existing_server}'.[/]")
                 if existing_server not in self.server_manager.active_sessions:
                     if Confirm.ask(f"Connect to existing server '{existing_server}'?"):
                         await self.connect_server(existing_server)
                 else:
-                    console.print(f"[yellow]Server '{existing_server}' is already connected.[/]")
+                    safe_console.print(f"[yellow]Server '{existing_server}' is already connected.[/]")
                 return
                 
             # Add server to config
@@ -2919,13 +2965,14 @@ class MCPClient:
             
             # Save the configuration
             self.config.save()
-            console.print(f"[green]Added server '{server_name}' to configuration.[/]")
+            safe_console.print(f"[green]Added server '{server_name}' to configuration.[/]")
             
             # Offer to connect
             if Confirm.ask(f"Connect to server '{server_name}' now?"):
                 await self.connect_server(server_name)
                 
         elif subcmd == "refresh":
+            safe_console = get_safe_console()
             # Force a refresh of the discovery
             with Status(f"{STATUS_EMOJI['search']} Refreshing local MCP server discovery...", spinner="dots") as status:
                 # Restart the discovery to refresh
@@ -2945,17 +2992,18 @@ class MCPClient:
                 # Trigger a check for newly discovered servers
                 current_servers = set(self.server_manager.registry.discovered_servers.keys())
                 if current_servers:
-                    console.print(f"\n[bold cyan]Found {len(current_servers)} servers on the local network[/]")
-                    console.print("Use [bold blue]/discover list[/] to see details.")
+                    safe_console.print(f"\n[bold cyan]Found {len(current_servers)} servers on the local network[/]")
+                    safe_console.print("Use [bold blue]/discover list[/] to see details.")
                 else:
-                    console.print("[yellow]No servers found on the local network.[/]")
+                    safe_console.print("[yellow]No servers found on the local network.[/]")
                     
         elif subcmd == "auto":
+            safe_console = get_safe_console()
             # Enable/disable automatic discovery
             if subargs.lower() in ("on", "yes", "true", "1"):
                 self.config.enable_local_discovery = True
                 self.config.save()
-                console.print("[green]Automatic local discovery enabled.[/]")
+                safe_console.print("[green]Automatic local discovery enabled.[/]")
                 
                 # Start discovery if not already running
                 if not self.local_discovery_task:
@@ -2964,7 +3012,7 @@ class MCPClient:
             elif subargs.lower() in ("off", "no", "false", "0"):
                 self.config.enable_local_discovery = False
                 self.config.save()
-                console.print("[yellow]Automatic local discovery disabled.[/]")
+                safe_console.print("[yellow]Automatic local discovery disabled.[/]")
                 
                 # Stop discovery if running
                 await self.stop_local_discovery_monitoring()
@@ -2972,11 +3020,12 @@ class MCPClient:
             else:
                 # Show current status
                 status = "enabled" if self.config.enable_local_discovery else "disabled"
-                console.print(f"[cyan]Automatic local discovery is currently {status}.[/]")
-                console.print("Usage: [bold blue]/discover auto [on|off][/]")
+                safe_console.print(f"[cyan]Automatic local discovery is currently {status}.[/]")
+                safe_console.print("Usage: [bold blue]/discover auto [on|off][/]")
                 
         else:
-            console.print("[yellow]Unknown discover command. Available: list, connect, refresh, auto[/]")
+            safe_console = get_safe_console()
+            safe_console.print("[yellow]Unknown discover command. Available: list, connect, refresh, auto[/]")
 
     async def close(self):
         """Clean up resources before exit"""
@@ -3395,7 +3444,8 @@ class MCPClient:
                 }
             )
         
-        with Status(f"{STATUS_EMOJI['speech_balloon']} Claude is thinking...", spinner="dots") as status:
+        safe_console = get_safe_console()
+        with Status(f"{STATUS_EMOJI['speech_balloon']} Claude is thinking...", spinner="dots", console=safe_console) as status:
             try:
                 # Make initial API call
                 status.update(f"{STATUS_EMOJI['speech_balloon']} Sending query to Claude ({model})...")
@@ -3502,8 +3552,6 @@ class MCPClient:
                                 assistant_message.append(content)
                 
                 # Update conversation messages for future continuations
-                # self.conversation_messages = messages + [{"role": "assistant", "content": assistant_message}]
-                # Update the current node in the graph instead
                 self.conversation_graph.current_node.messages = messages # Store full history leading to this response
                 self.conversation_graph.current_node.add_message({"role": "assistant", "content": assistant_message}) # Add final assistant response
                 self.conversation_graph.current_node.model = model # Store model used for this node
@@ -3558,8 +3606,8 @@ class MCPClient:
         # Always use stderr console for interactive mode to avoid interference with stdio servers
         interactive_console = stderr_console
         
-        interactive_console.print("\n[bold green]MCP Client Interactive Mode[/]")
-        interactive_console.print("Type your query to Claude, or a command (type 'help' for available commands)")
+        self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
+        self.safe_print("Type your query to Claude, or a command (type 'help' for available commands)")
         
         while True:
             try:
@@ -3592,18 +3640,18 @@ class MCPClient:
                     ))
                     
             except KeyboardInterrupt:
-                console.print("\n[yellow]Interrupted[/]")
+                self.safe_print("\n[yellow]Interrupted[/]")
                 break
             # Catch specific errors related to command execution or query processing
             except (anthropic.APIError, McpError, httpx.RequestError) as e: 
-                console.print(f"[bold red]Error ({type(e).__name__}):[/] {str(e)}")
+                self.safe_print(f"[bold red]Error ({type(e).__name__}):[/] {str(e)}")
             # Keep broad exception for unexpected loop issues
             except Exception as e: 
-                console.print(f"[bold red]Unexpected Error:[/] {str(e)}")
+                self.safe_print(f"[bold red]Unexpected Error:[/] {str(e)}")
     
     async def cmd_exit(self, args):
         """Exit the client"""
-        console.print("[yellow]Exiting...[/]")
+        self.safe_print("[yellow]Exiting...[/]")
         sys.exit(0)
         
     async def cmd_help(self, args):
@@ -3645,33 +3693,33 @@ class MCPClient:
         ]
         
         # Display commands in organized groups
-        console.print("\n[bold]Available Commands:[/]")
+        self.safe_print("\n[bold]Available Commands:[/]")
         
-        console.print(Panel(
+        self.safe_print(Panel(
             Group(*general_commands),
             title="General Commands",
             border_style="blue"
         ))
         
-        console.print(Panel(
+        self.safe_print(Panel(
             Group(*config_commands),
             title="Configuration Commands",
             border_style="cyan"
         ))
         
-        console.print(Panel(
+        self.safe_print(Panel(
             Group(*server_commands),
             title="Server & Tools Commands",
             border_style="magenta"
         ))
         
-        console.print(Panel(
+        self.safe_print(Panel(
             Group(*conversation_commands),
             title="Conversation Commands",
             border_style="green"
         ))
         
-        console.print(Panel(
+        self.safe_print(Panel(
             Group(*monitoring_commands),
             title="Monitoring Commands",
             border_style="yellow"
@@ -3817,14 +3865,14 @@ class MCPClient:
             await self.server_status(subargs)
             
         else:
-            console.print("[yellow]Unknown servers command. Available: list, add, remove, connect, disconnect, enable, disable, status[/]")
+            self.safe_print("[yellow]Unknown servers command. Available: list, add, remove, connect, disconnect, enable, disable, status[/]")
     
     async def list_servers(self):
         """List all configured servers"""
         safe_console = get_safe_console()
         
         if not self.config.servers:
-            safe_console.print(f"{STATUS_EMOJI['warning']} [yellow]No servers configured[/]")
+            self.safe_print(f"{STATUS_EMOJI['warning']} [yellow]No servers configured[/]")
             return
             
         server_table = Table(title=f"{STATUS_EMOJI['server']} Configured Servers")
@@ -3850,16 +3898,16 @@ class MCPClient:
                 auto_start
             )
             
-        safe_console.print(server_table)
+        self.safe_print(server_table)
     
     async def add_server(self, args):
         """Add a new server to configuration"""
         safe_console = get_safe_console()
         parts = args.split(maxsplit=3)
         if len(parts) < 3:
-            safe_console.print("[yellow]Usage: /servers add NAME TYPE PATH [ARGS...][/]")
-            safe_console.print("Example: /servers add github stdio /path/to/github-server.js")
-            safe_console.print("Example: /servers add github sse https://github-mcp-server.example.com")
+            self.safe_print("[yellow]Usage: /servers add NAME TYPE PATH [ARGS...][/]")
+            self.safe_print("Example: /servers add github stdio /path/to/github-server.js")
+            self.safe_print("Example: /servers add github sse https://github-mcp-server.example.com")
             return
             
         name, type_str, path = parts[0], parts[1], parts[2]
@@ -3867,7 +3915,7 @@ class MCPClient:
         
         # Validate inputs
         if name in self.config.servers:
-            safe_console.print(f"[red]Server with name '{name}' already exists[/]")
+            self.safe_print(f"[red]Server with name '{name}' already exists[/]")
             return
             
         try:
@@ -3897,11 +3945,11 @@ class MCPClient:
     async def remove_server(self, name):
         """Remove a server from configuration"""
         if not name:
-            console.print("[yellow]Usage: /servers remove SERVER_NAME[/]")
+            self.safe_print("[yellow]Usage: /servers remove SERVER_NAME[/]")
             return
             
         if name not in self.config.servers:
-            console.print(f"[red]Server '{name}' not found[/]")
+            self.safe_print(f"[red]Server '{name}' not found[/]")
             return
             
         # Disconnect if connected
@@ -3912,28 +3960,28 @@ class MCPClient:
         del self.config.servers[name]
         self.config.save()
         
-        console.print(f"[green]Server '{name}' removed from configuration[/]")
+        self.safe_print(f"[green]Server '{name}' removed from configuration[/]")
     
     async def connect_server(self, name):
         """Connect to a specific server"""
         safe_console = get_safe_console()
         if not name:
-            safe_console.print("[yellow]Usage: /servers connect SERVER_NAME[/]")
+            self.safe_print("[yellow]Usage: /servers connect SERVER_NAME[/]")
             return
             
         if name not in self.config.servers:
-            safe_console.print(f"[red]Server '{name}' not found[/]")
+            self.safe_print(f"[red]Server '{name}' not found[/]")
             return
             
         if name in self.server_manager.active_sessions:
-            safe_console.print(f"[yellow]Server '{name}' is already connected[/]")
+            self.safe_print(f"[yellow]Server '{name}' is already connected[/]")
             return
             
         # Connect to server using the context manager
         server_config = self.config.servers[name]
         
         try:
-            with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots") as status:
+            with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots", console=safe_console) as status:
                 try:
                     async with self.server_manager.connect_server_session(server_config) as session:
                         if session:
@@ -3945,35 +3993,35 @@ class MCPClient:
                                 await self.server_manager.load_server_capabilities(name, session)
                                 status.update(f"{STATUS_EMOJI['success']} Loaded capabilities from server: {name}")
                                 
-                                console.print(f"[green]Connected to server: {name}[/]")
+                                self.safe_print(f"[green]Connected to server: {name}[/]")
                             except Exception as e:
-                                console.print(f"[red]Error loading capabilities from server {name}: {e}[/]")
+                                self.safe_print(f"[red]Error loading capabilities from server {name}: {e}[/]")
                         else:
-                            console.print(f"[red]Failed to connect to server: {name}[/]")
+                            self.safe_print(f"[red]Failed to connect to server: {name}[/]")
                 except Exception as e:
-                    console.print(f"[red]Error connecting to server {name}: {e}[/]")
+                    self.safe_print(f"[red]Error connecting to server {name}: {e}[/]")
         except Exception as e:
             # This captures any exceptions from the Status widget itself
-            console.print(f"[red]Error in status display: {e}[/]")
+            self.safe_print(f"[red]Error in status display: {e}[/]")
             # Still try to connect without the status widget
             try:
                 async with self.server_manager.connect_server_session(server_config) as session:
                     if session:
                         await self.server_manager.load_server_capabilities(name, session)
-                        console.print(f"[green]Connected to server: {name}[/]")
+                        self.safe_print(f"[green]Connected to server: {name}[/]")
                     else:
-                        console.print(f"[red]Failed to connect to server: {name}[/]")
+                        self.safe_print(f"[red]Failed to connect to server: {name}[/]")
             except Exception as inner_e:
-                console.print(f"[red]Failed to connect to server {name}: {inner_e}[/]")
+                self.safe_print(f"[red]Failed to connect to server {name}: {inner_e}[/]")
     
     async def disconnect_server(self, name):
         """Disconnect from a specific server"""
         if not name:
-            console.print("[yellow]Usage: /servers disconnect SERVER_NAME[/]")
+            self.safe_print("[yellow]Usage: /servers disconnect SERVER_NAME[/]")
             return
             
         if name not in self.server_manager.active_sessions:
-            console.print(f"[yellow]Server '{name}' is not connected[/]")
+            self.safe_print(f"[yellow]Server '{name}' is not connected[/]")
             return
             
         # Remove tools, resources, and prompts from this server
@@ -4025,17 +4073,17 @@ class MCPClient:
                     
             del self.server_manager.processes[name]
             
-        console.print(f"[green]Disconnected from server: {name}[/]")
+        self.safe_print(f"[green]Disconnected from server: {name}[/]")
     
     async def enable_server(self, name, enable=True):
         """Enable or disable a server"""
         if not name:
             action = "enable" if enable else "disable"
-            console.print(f"[yellow]Usage: /servers {action} SERVER_NAME[/]")
+            self.safe_print(f"[yellow]Usage: /servers {action} SERVER_NAME[/]")
             return
             
         if name not in self.config.servers:
-            console.print(f"[red]Server '{name}' not found[/]")
+            self.safe_print(f"[red]Server '{name}' not found[/]")
             return
             
         # Update config
@@ -4043,24 +4091,25 @@ class MCPClient:
         self.config.save()
         
         action = "enabled" if enable else "disabled"
-        console.print(f"[green]Server '{name}' {action}[/]")
+        self.safe_print(f"[green]Server '{name}' {action}[/]")
         
         # Connect or disconnect if needed
         if enable and name not in self.server_manager.active_sessions:
-            if Confirm.ask(f"Connect to server '{name}' now?"):
+            if Confirm.ask(f"Connect to server '{name}' now?", console=get_safe_console()):
                 await self.connect_server(name)
         elif not enable and name in self.server_manager.active_sessions:
-            if Confirm.ask(f"Disconnect from server '{name}' now?"):
+            if Confirm.ask(f"Disconnect from server '{name}' now?", console=get_safe_console()):
                 await self.disconnect_server(name)
     
     async def server_status(self, name):
         """Show detailed status for a server"""
+        safe_console = get_safe_console()
         if not name:
-            console.print("[yellow]Usage: /servers status SERVER_NAME[/]")
+            self.safe_print("[yellow]Usage: /servers status SERVER_NAME[/]")
             return
             
         if name not in self.config.servers:
-            console.print(f"[red]Server '{name}' not found[/]")
+            self.safe_print(f"[red]Server '{name}' not found[/]")
             return
             
         server_config = self.config.servers[name]
@@ -4078,7 +4127,7 @@ class MCPClient:
                 style="green" if connected else "red")
         )
         
-        console.print(Panel(basic_info, title=f"Server Status: {name}", border_style="blue"))
+        self.safe_print(Panel(basic_info, title=f"Server Status: {name}", border_style="blue"))
         
         if connected:
             # Count capabilities
@@ -4092,7 +4141,7 @@ class MCPClient:
                 Text(f"Prompts: {prompts_count}", style="yellow")
             )
             
-            console.print(Panel(capability_info, title="Capabilities", border_style="green"))
+            self.safe_print(Panel(capability_info, title="Capabilities", border_style="green"))
             
             # Process info if applicable
             if name in self.server_manager.processes:
@@ -4110,16 +4159,16 @@ class MCPClient:
                             Text(f"Memory Usage: {memory_info.rss / (1024 * 1024):.1f} MB")
                         )
                         
-                        console.print(Panel(process_info, title="Process Information", border_style="yellow"))
+                        self.safe_print(Panel(process_info, title="Process Information", border_style="yellow"))
                     except Exception:
-                        console.print(Panel(f"Process ID: {pid} (stats unavailable)", 
+                        self.safe_print(Panel(f"Process ID: {pid} (stats unavailable)", 
                                            title="Process Information", 
                                            border_style="yellow"))
     
     async def cmd_tools(self, args):
         """List available tools"""
         if not self.server_manager.tools:
-            console.print(f"{STATUS_EMOJI['warning']} [yellow]No tools available from connected servers[/]")
+            self.safe_print(f"{STATUS_EMOJI['warning']} [yellow]No tools available from connected servers[/]")
             return
             
         # Parse args for filtering
@@ -4142,11 +4191,11 @@ class MCPClient:
                 tool.description
             )
             
-        console.print(tool_table)
+        self.safe_print(tool_table)
         
         # Offer to show schema for a specific tool
         if not args:
-            tool_name = Prompt.ask("Enter tool name to see schema (or press Enter to skip)")
+            tool_name = Prompt.ask("Enter tool name to see schema (or press Enter to skip)", console=get_safe_console())
             if tool_name in self.server_manager.tools:
                 tool = self.server_manager.tools[tool_name]
                 
@@ -4156,7 +4205,7 @@ class MCPClient:
                     Syntax(json.dumps(tool.input_schema, indent=2), "json", theme="monokai")
                 )
                 
-                console.print(Panel(
+                self.safe_print(Panel(
                     schema_display, 
                     title=f"Tool: {tool_name}", 
                     border_style="magenta"
@@ -4165,7 +4214,7 @@ class MCPClient:
     async def cmd_resources(self, args):
         """List available resources"""
         if not self.server_manager.resources:
-            console.print(f"{STATUS_EMOJI['warning']} [yellow]No resources available from connected servers[/]")
+            self.safe_print(f"{STATUS_EMOJI['warning']} [yellow]No resources available from connected servers[/]")
             return
             
         # Parse args for filtering
@@ -4190,12 +4239,12 @@ class MCPClient:
                 resource.template
             )
             
-        console.print(resource_table)
+        self.safe_print(resource_table)
     
     async def cmd_prompts(self, args):
         """List available prompts"""
         if not self.server_manager.prompts:
-            console.print(f"{STATUS_EMOJI['warning']} [yellow]No prompts available from connected servers[/]")
+            self.safe_print(f"{STATUS_EMOJI['warning']} [yellow]No prompts available from connected servers[/]")
             return
             
         # Parse args for filtering
@@ -4218,15 +4267,15 @@ class MCPClient:
                 prompt.description
             )
             
-        console.print(prompt_table)
+        self.safe_print(prompt_table)
         
         # Offer to show template for a specific prompt
         if not args:
-            prompt_name = Prompt.ask("Enter prompt name to see template (or press Enter to skip)")
+            prompt_name = Prompt.ask("Enter prompt name to see template (or press Enter to skip)", console=get_safe_console())
             if prompt_name in self.server_manager.prompts:
                 prompt = self.server_manager.prompts[prompt_name]
-                console.print(f"\n[bold]Template for {prompt_name}:[/]")
-                console.print(prompt.template)
+                self.safe_print(f"\n[bold]Template for {prompt_name}:[/]")
+                self.safe_print(prompt.template)
     
     async def cmd_history(self, args):
         """View conversation history"""
@@ -4700,15 +4749,22 @@ class MCPClient:
     async def cmd_dashboard(self, args):
         """Show the live monitoring dashboard."""
         try:
-            with Live(self.generate_dashboard_renderable(), refresh_per_second=1.0/self.config.dashboard_refresh_rate, screen=True, transient=True) as live:
+            # Use get_safe_console() for the dashboard to avoid interfering with stdio
+            safe_console = get_safe_console()
+            
+            with Live(self.generate_dashboard_renderable(), 
+                      refresh_per_second=1.0/self.config.dashboard_refresh_rate, 
+                      screen=True, 
+                      transient=True,
+                      console=safe_console) as live:
                 while True:
                     await asyncio.sleep(self.config.dashboard_refresh_rate)
                     live.update(self.generate_dashboard_renderable())
         except KeyboardInterrupt:
-            console.print("\n[yellow]Dashboard stopped.[/]")
+            self.safe_print("\n[yellow]Dashboard stopped.[/]")
         except Exception as e:
             log.error(f"Dashboard error: {e}")
-            console.print(f"\n[red]Dashboard encountered an error: {e}[/]")
+            self.safe_print(f"\n[red]Dashboard encountered an error: {e}[/]")
 
     # Helper method to process a content block delta event
     def _process_text_delta(self, delta_event: ContentBlockDeltaEvent, current_text: str) -> Tuple[str, str]:
@@ -4894,8 +4950,9 @@ class MCPClient:
 
     async def cmd_tool(self, args):
         """Directly execute a tool with parameters"""
+        safe_console = get_safe_console()
         if not args:
-            console.print("[yellow]Usage: /tool NAME {JSON_PARAMS}[/yellow]")
+            safe_console.print("[yellow]Usage: /tool NAME {JSON_PARAMS}[/yellow]")
             return
             
         # Split into tool name and params
@@ -4905,15 +4962,15 @@ class MCPClient:
             params_str = parts[1] if len(parts) > 1 else "{}"
             params = json.loads(params_str)
         except json.JSONDecodeError:
-            console.print("[red]Invalid JSON parameters. Use valid JSON format.[/red]")
+            safe_console.print("[red]Invalid JSON parameters. Use valid JSON format.[/red]")
             return
         except Exception as e:
-            console.print(f"[red]Error parsing command: {e}[/red]")
+            safe_console.print(f"[red]Error parsing command: {e}[/red]")
             return
 
         # Check if tool exists
         if tool_name not in self.server_manager.tools:
-            console.print(f"[red]Tool not found: {tool_name}[/red]")
+            safe_console.print(f"[red]Tool not found: {tool_name}[/red]")
             return
         
         # Get the tool and its server
@@ -4929,14 +4986,14 @@ class MCPClient:
                 status.update(f"{STATUS_EMOJI['success']} Tool execution completed in {latency:.2f}s")
                 
                 # Show result
-                console.print(Panel.fit(
+                safe_console.print(Panel.fit(
                     Syntax(json.dumps(result, indent=2), "json", theme="monokai"),
                     title=f"Tool Result: {tool_name} (executed in {latency:.2f}s)",
                     border_style="magenta"
                 ))
             except Exception as e:
                 status.update(f"{STATUS_EMOJI['failure']} Tool execution failed: {e}")
-                console.print(f"[red]Error executing tool: {e}[/red]")
+                safe_console.print(f"[red]Error executing tool: {e}[/red]")
 
     # After the cmd_tool method (around line 4295)
     async def cmd_prompt(self, args):
@@ -5347,6 +5404,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
     """Main async entry point"""
     # Initialize client
     client = MCPClient()
+    safe_console = get_safe_console()
     
     try:
         # Set up client with error handling for each step
@@ -5498,16 +5556,18 @@ async def config_async(show, edit, reset):
     # client = MCPClient() # Instantiation might be better outside if used elsewhere
     # For simplicity here, assuming it's needed within this command scope
     client = None # Initialize to None
+    safe_console = get_safe_console()
+    
     try:
         client = MCPClient() # Instantiate client within the main try
 
         if reset:
-            if Confirm.ask("[yellow]Are you sure you want to reset the configuration?[/]"):
+            if Confirm.ask("[yellow]Are you sure you want to reset the configuration?[/]", console=safe_console):
                 # Create a new default config
                 new_config = Config()
                 # Save it
                 new_config.save()
-                console.print("[green]Configuration reset to defaults[/]")
+                safe_console.print("[green]Configuration reset to defaults[/]")
 
         elif edit:
             # Open config file in editor
@@ -5526,22 +5586,22 @@ async def config_async(show, edit, reset):
                 stdout, stderr = await process.communicate()
                 
                 if process.returncode != 0:
-                     console.print(f"[yellow]Editor exited with code {process.returncode}[/]")
+                     safe_console.print(f"[yellow]Editor exited with code {process.returncode}[/]")
                 else:
-                    console.print(f"[green]Configuration file potentially edited: {CONFIG_FILE}[/]")
+                    safe_console.print(f"[green]Configuration file potentially edited: {CONFIG_FILE}[/]")
             except FileNotFoundError:
-                 console.print(f"[red]Editor command not found: '{editor}'. Set EDITOR environment variable.[/]")
+                 safe_console.print(f"[red]Editor command not found: '{editor}'. Set EDITOR environment variable.[/]")
             except OSError as e:
-                 console.print(f"[red]Error running editor '{editor}': {e}[/]")
+                 safe_console.print(f"[red]Error running editor '{editor}': {e}[/]")
             # Keep broad exception for unexpected editor issues
             except Exception as e:
-                 console.print(f"[red]Unexpected error trying to edit config: {e}")
+                 safe_console.print(f"[red]Unexpected error trying to edit config: {e}")
             # --- End inner try for editor ---
 
             # Reload config (Needs client object)
             if client:
                  client.config.load()
-                 console.print("[green]Configuration reloaded[/]")
+                 safe_console.print("[green]Configuration reloaded[/]")
             else:
                  log.warning("Client not initialized, cannot reload config.")
 
@@ -5568,7 +5628,7 @@ async def config_async(show, edit, reset):
                         for name, server in value.items()
                     }
 
-            console.print(Panel(
+            safe_console.print(Panel(
                 Syntax(yaml.safe_dump(config_data, default_flow_style=False), "yaml", theme="monokai"),
                 title="Current Configuration",
                 border_style="blue"
@@ -5578,10 +5638,10 @@ async def config_async(show, edit, reset):
     # These should catch errors during MCPClient() init or file operations if needed,
     # NOT the misplaced blocks from before.
     except (IOError, yaml.YAMLError, json.JSONDecodeError) as e:
-         console.print(f"[bold red]Configuration/File Error during config command:[/] {str(str(e))}")
+         safe_console.print(f"[bold red]Configuration/File Error during config command:[/] {str(str(e))}")
          # Decide if sys.exit is appropriate here or just log
     except Exception as e:
-        console.print(f"[bold red]Unexpected Error during config command:[/] {str(e)}")
+        safe_console.print(f"[bold red]Unexpected Error during config command:[/] {str(e)}")
         # Log detailed error if needed
 
     finally:
@@ -5598,24 +5658,20 @@ async def main():
     try:
         app()
     except McpError as e:
-        # Correct indentation (aligned with try)
-        console.print(f"[bold red]MCP Error:[/] {str(e)}")
+        # Use get_safe_console() to prevent pollution
+        get_safe_console().print(f"[bold red]MCP Error:[/] {str(e)}")
         sys.exit(1)
     except httpx.RequestError as e:
-        # Correct indentation
-        console.print(f"[bold red]Network Error:[/] {str(e)}")
+        get_safe_console().print(f"[bold red]Network Error:[/] {str(e)}")
         sys.exit(1)
     except anthropic.APIError as e:
-        # Correct indentation
-        console.print(f"[bold red]Anthropic API Error:[/] {str(e)}")
+        get_safe_console().print(f"[bold red]Anthropic API Error:[/] {str(e)}")
         sys.exit(1)
     except (OSError, yaml.YAMLError, json.JSONDecodeError) as e:
-        # Correct indentation
-        console.print(f"[bold red]Configuration/File Error:[/] {str(e)}")
+        get_safe_console().print(f"[bold red]Configuration/File Error:[/] {str(e)}")
         sys.exit(1)
     except Exception as e: # Keep broad exception for top-level unexpected errors
-        # Correct indentation
-        console.print(f"[bold red]Unexpected Error:[/] {str(e)}")
+        get_safe_console().print(f"[bold red]Unexpected Error:[/] {str(e)}")
         if os.environ.get("MCP_CLIENT_DEBUG"): # Show traceback if debug env var is set
              import traceback
              traceback.print_exc()
