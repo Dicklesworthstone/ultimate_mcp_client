@@ -17,7 +17,8 @@
 #     "opentelemetry-api>=1.19.0",
 #     "opentelemetry-sdk>=1.19.0",
 #     "opentelemetry-instrumentation>=0.41b0",
-#     "asyncio>=3.4.3"
+#     "asyncio>=3.4.3",
+#     "aiofiles>=23.2.0"
 # ]
 # ///
 
@@ -94,7 +95,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -105,15 +106,13 @@ from typing import (
     AsyncIterator,
     Callable,
     Dict,
-    Iterator,
     List,
     Optional,
-    Set,
     Tuple,
-    Union,
 )
 
-# Anthropic API
+# Third-party imports
+import aiofiles  # For async file operations
 import anthropic
 
 # Typer CLI
@@ -168,9 +167,6 @@ try:
     )
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-    from opentelemetry.trace.propagation.tracecontext import (
-        TraceContextTextMapPropagator,
-    )
     HAS_OPENTELEMETRY = True
 except ImportError:
     HAS_OPENTELEMETRY = False
@@ -181,7 +177,6 @@ import httpx
 import psutil
 import yaml
 from dotenv import load_dotenv
-from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf
 
 # Cache libraries
 try:
@@ -409,14 +404,12 @@ class MCPTool:
     original_tool: Tool
     call_count: int = 0
     avg_execution_time: float = 0.0
-    execution_times: List[float] = field(default_factory=list)
+    execution_times: deque = field(default_factory=lambda: deque(maxlen=100))
     last_used: datetime = field(default_factory=datetime.now)
     
     def update_execution_time(self, time_ms: float) -> None:
         """Update execution time metrics"""
         self.execution_times.append(time_ms)
-        if len(self.execution_times) > 100:
-            self.execution_times = self.execution_times[-100:]
         self.avg_execution_time = sum(self.execution_times) / len(self.execution_times)
         self.call_count += 1
         self.last_used = datetime.now()
@@ -600,18 +593,56 @@ class ServerRegistry:
                     host = socket.inet_ntoa(info.addresses[0]) if info.addresses else "localhost"
                     port = info.port
                     
+                    # Extract and parse properties from TXT records
+                    properties = {}
+                    if info.properties:
+                        for k, v in info.properties.items():
+                            try:
+                                key = k.decode('utf-8')
+                                value = v.decode('utf-8')
+                                properties[key] = value
+                            except UnicodeDecodeError:
+                                # Skip binary properties that can't be decoded as UTF-8
+                                continue
+
+                    # Determine server type from properties or default to SSE
+                    server_type = "sse"
+                    if "type" in properties:
+                        server_type = properties["type"]
+                        
+                    # Extract version information if available
+                    version = None
+                    if "version" in properties:
+                        try:
+                            version = properties["version"]
+                        except Exception:
+                            pass
+                            
+                    # Extract categories information if available
+                    categories = []
+                    if "categories" in properties:
+                        try:
+                            categories = properties["categories"].split(",")
+                        except Exception:
+                            pass
+                            
+                    # Get description if available
+                    description = properties.get("description", f"mDNS discovered server at {host}:{port}")
+                    
                     self.registry.discovered_servers[server_name] = {
                         "name": server_name,
                         "host": host,
                         "port": port,
-                        "type": "sse",
+                        "type": server_type,
                         "url": f"http://{host}:{port}",
-                        "properties": {
-                            k.decode('utf-8'): v.decode('utf-8') for k, v in info.properties.items()
-                        }
+                        "properties": properties,
+                        "version": version,
+                        "categories": categories,
+                        "description": description,
+                        "discovered_via": "mdns"
                     }
                     
-                    log.info(f"Discovered local MCP server: {server_name} at {host}:{port}")
+                    log.info(f"Discovered local MCP server: {server_name} at {host}:{port} ({description})")
                 
                 def remove_service(self, zeroconf, service_type, name):
                     server_name = name.replace("._mcp._tcp.local.", "")
@@ -944,6 +975,8 @@ class ConversationGraph:
 
 class Config:
     def __init__(self):
+        # Load environment variables from .env file
+        load_dotenv()
         self.api_key: Optional[str] = os.environ.get("ANTHROPIC_API_KEY")
         self.default_model: str = DEFAULT_MODEL
         self.servers: Dict[str, ServerConfig] = {}
@@ -1107,18 +1140,13 @@ class Config:
 
 class History:
     def __init__(self, max_entries=MAX_HISTORY_ENTRIES):
-        self.entries: List[ChatHistory] = []
+        self.entries = deque(maxlen=max_entries)
         self.max_entries = max_entries
         self.load()
     
     def add(self, entry: ChatHistory):
         """Add a new entry to history"""
         self.entries.append(entry)
-        
-        # Trim if needed
-        if len(self.entries) > self.max_entries:
-            self.entries = self.entries[-self.max_entries:]
-        
         self.save()
     
     def load(self):
@@ -1130,7 +1158,7 @@ class History:
             with open(HISTORY_FILE, 'r') as f:
                 history_data = json.load(f)
             
-            self.entries = []
+            self.entries.clear()
             for entry_data in history_data:
                 self.entries.append(ChatHistory(
                     query=entry_data.get('query', ''),
@@ -1146,9 +1174,6 @@ class History:
                     streamed=entry_data.get('streamed', False)
                 ))
                 
-            # Respect max_entries
-            self.entries = self.entries[-self.max_entries:]
-            
         except FileNotFoundError:
             # Expected if no history yet
             return
@@ -1339,6 +1364,42 @@ class ServerManager:
         # Connect to registry if enabled
         self.registry = ServerRegistry() if config.enable_registry else None
     
+    @asynccontextmanager
+    async def connect_server_session(self, server_config: ServerConfig):
+        """Context manager for connecting to a server with proper cleanup.
+        
+        This handles connecting to the server, tracking the session, and proper cleanup
+        when the context is exited, whether normally or due to an exception.
+        
+        Args:
+            server_config: The server configuration
+            
+        Yields:
+            The connected session or None if connection failed
+        """
+        server_name = server_config.name
+        session = None
+        connected = False
+        
+        try:
+            # Use existing connection logic
+            session = await self.connect_to_server(server_config)
+            if session:
+                self.active_sessions[server_name] = session
+                connected = True
+                yield session
+            else:
+                yield None
+        finally:
+            # Clean up if we connected successfully
+            if connected and server_name in self.active_sessions:
+                # Note: We're not removing from self.active_sessions here
+                # as that should be managed by higher-level disconnect method
+                # This just ensures session cleanup resources are released
+                log.debug(f"Cleaning up server session for {server_name}")
+                # Close could be added if a specific per-session close is implemented
+                # For now we rely on the exit_stack in close() method
+
     async def discover_servers(self):
         """Auto-discover MCP servers in configured paths and from registry"""
         # Keep track of all discoveries
@@ -1413,13 +1474,18 @@ class ServerManager:
             # Process discovered servers
             for name, server in self.registry.discovered_servers.items():
                 url = server.get("url", "")
-                server_type = "sse"
+                server_type = server.get("type", "sse")
                 
                 # Skip if already in config
                 if any(s.path == url for s in self.config.servers.values()):
                     continue
-                    
-                discovered_mdns.append((name, url, server_type))
+                
+                # Get additional information
+                version = server.get("version")
+                categories = server.get("categories", [])
+                description = server.get("description", "")
+                
+                discovered_mdns.append((name, url, server_type, version, categories, description))
         
         # Show discoveries to user with clear categorization
         total_discovered = len(discovered_local) + len(discovered_remote) + len(discovered_mdns)
@@ -1440,8 +1506,11 @@ class ServerManager:
             
             if discovered_mdns:
                 console.print("\n[bold cyan]Local Network (mDNS):[/]")
-                for i, (name, url, server_type) in enumerate(discovered_mdns, 1):
-                    console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url}")
+                for i, (name, url, server_type, version, categories, description) in enumerate(discovered_mdns, 1):
+                    version_str = f"v{version}" if version else "unknown version"
+                    categories_str = ", ".join(categories) if categories else "no categories"
+                    desc_str = f" - {description}" if description else ""
+                    console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - {categories_str}{desc_str}")
             
             # Ask user which ones to add
             if Confirm.ask("\nAdd discovered servers to configuration?"):
@@ -1462,7 +1531,7 @@ class ServerManager:
                 
                 if discovered_mdns:
                     console.print("\n[bold cyan]Local Network Servers:[/]")
-                    for i, (name, url, server_type) in enumerate(discovered_mdns, 1):
+                    for i, (name, url, server_type, version, categories, description) in enumerate(discovered_mdns, 1):
                         if Confirm.ask(f"Add {name} ({url})?"):
                             selections.append(("mdns", i-1))
                 
@@ -1495,14 +1564,16 @@ class ServerManager:
                         )
                     
                     elif source == "mdns":
-                        name, url, server_type = discovered_mdns[idx]
+                        name, url, server_type, version, categories, description = discovered_mdns[idx]
                         self.config.servers[name] = ServerConfig(
                             name=name,
                             type=ServerType(server_type),
                             path=url,
                             enabled=True,
                             auto_start=False,
-                            description="Discovered on local network"
+                            description=description or "Discovered on local network",
+                            categories=categories,
+                            version=version if version else None
                         )
                 
                 self.config.save()
@@ -1550,19 +1621,21 @@ class ServerManager:
                         log.info(f"Starting server process: {' '.join(cmd)}")
                         
                         # Create process with pipes and set resource limits
-                        process = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            bufsize=0
+                        process = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
                         )
                         
                         # Read stderr in a separate thread/task to prevent blocking? (More complex change)
                         # For now, just capture it. Check poll() status after connect attempt fails.
                         
                         self.processes[server_config.name] = process
+                        
+                        # Register the server with zeroconf if local discovery is enabled
+                        if self.config.enable_local_discovery and self.registry:
+                            await self.register_local_server(server_config)
                     
                     # Set up parameters with timeout
                     params = StdioServerParameters(
@@ -1659,6 +1732,80 @@ class ServerManager:
         if span_ctx: span_ctx.end() # End span if loop finishes unexpectedly
         return None
 
+    async def register_local_server(self, server_config: ServerConfig):
+        """Register a locally started MCP server with zeroconf so other clients can discover it"""
+        if not self.registry or not self.registry.zeroconf:
+            # Start zeroconf if not already running
+            if self.registry and not self.registry.zeroconf:
+                self.registry.start_local_discovery()
+            else:
+                return
+        
+        try:
+            import ipaddress
+            import socket
+
+            from zeroconf import ServiceInfo
+            
+            # Get local IP address
+            # This method attempts to determine the local IP that would be used for external connections
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Doesn't actually connect but helps determine the interface
+                s.connect(('8.8.8.8', 80))
+                local_ip = s.getsockname()[0]
+            except Exception:
+                # Fallback if the above doesn't work
+                local_ip = socket.gethostbyname(socket.gethostname())
+            finally:
+                s.close()
+            
+            # Default to port 8080 for STDIO servers, but allow overriding
+            # In a real implementation, we'd need to determine the actual port
+            # the server is listening on, which might require modification of the server
+            port = 8080
+            
+            # Check if the server specifies a port in its args
+            for i, arg in enumerate(server_config.args):
+                if arg == '--port' or arg == '-p' and i < len(server_config.args) - 1:
+                    try:
+                        port = int(server_config.args[i+1])
+                        break
+                    except (ValueError, IndexError):
+                        pass
+            
+            # Prepare properties as bytes dict
+            props = {
+                b'name': server_config.name.encode('utf-8'),
+                b'type': server_config.type.value.encode('utf-8'),
+                b'description': server_config.description.encode('utf-8'),
+                b'version': str(server_config.version or '1.0.0').encode('utf-8'),
+                b'host': 'localhost'.encode('utf-8')
+            }
+            
+            # Create service info
+            service_info = ServiceInfo(
+                "_mcp._tcp.local.",
+                f"{server_config.name}._mcp._tcp.local.",
+                addresses=[ipaddress.IPv4Address(local_ip).packed],
+                port=port,
+                properties=props
+            )
+            
+            # Register the service
+            self.registry.zeroconf.register_service(service_info)
+            log.info(f"Registered local MCP server {server_config.name} with zeroconf on {local_ip}:{port}")
+            
+            # Store service info for later unregistering
+            if not hasattr(self, 'registered_services'):
+                self.registered_services = {}
+            self.registered_services[server_config.name] = service_info
+            
+        except ImportError:
+            log.warning("Zeroconf not available, cannot register local server")
+        except Exception as e:
+            log.error(f"Error registering server with zeroconf: {e}")
+
     async def connect_to_servers(self):
         """Connect to all enabled MCP servers"""
         if not self.config.servers:
@@ -1744,6 +1891,15 @@ class ServerManager:
     
     async def close(self):
         """Close all server connections and processes"""
+        # Unregister zeroconf services if any
+        if hasattr(self, 'registered_services') and self.registry and self.registry.zeroconf:
+            for name, service_info in self.registered_services.items():
+                try:
+                    self.registry.zeroconf.unregister_service(service_info)
+                    log.info(f"Unregistered zeroconf service for {name}")
+                except Exception as e:
+                    log.error(f"Error unregistering zeroconf service for {name}: {e}")
+        
         # Close all sessions
         await self.exit_stack.aclose()
         
@@ -1953,6 +2109,87 @@ class MCPClient:
         else:
             console.print("\n[yellow]No tools available. Connect to MCP servers to access tools.[/]")
     
+    @asynccontextmanager
+    async def tool_execution_context(self, tool_name: str, tool_args: dict, server_name: str):
+        """Context manager for tool execution with metrics and tracing.
+        
+        This centralizes all the tool execution boilerplate like tracing,
+        metrics collection, and error handling.
+        
+        Args:
+            tool_name: Name of the tool being executed
+            tool_args: Arguments for the tool
+            server_name: Name of the server running the tool
+            
+        Yields:
+            None (just provides the context)
+            
+        Returns:
+            The execution time in milliseconds on successful completion
+        """
+        tool_start_time = time.time()
+        tool_span = None
+        
+        if tracer:
+            tool_span = tracer.start_as_current_span(
+                f"tool.{tool_name}",
+                attributes={
+                    "tool.name": tool_name,
+                    "server.name": server_name,
+                    "params": str(tool_args)
+                }
+            )
+        
+        try:
+            yield
+            
+            # Calculate execution time
+            tool_execution_time = (time.time() - tool_start_time) * 1000  # ms
+            
+            # Update tool metrics in tool collection
+            tool = self.server_manager.tools.get(tool_name)
+            if tool:
+                tool.update_execution_time(tool_execution_time)
+            
+            # Record metrics if available
+            if tool_execution_counter:
+                tool_execution_counter.add(
+                    1, 
+                    {"tool": tool_name, "server": server_name, "success": "true"}
+                )
+            
+            if latency_histogram:
+                latency_histogram.record(
+                    tool_execution_time,
+                    {"operation": "tool_execution", "tool": tool_name, "server": server_name}
+                )
+            
+            # End span if tracking with success status
+            if tool_span:
+                tool_span.set_status(trace.StatusCode.OK)
+            
+            return tool_execution_time
+            
+        except Exception as e:
+            # Record error metrics
+            if tool_execution_counter:
+                tool_execution_counter.add(
+                    1, 
+                    {"tool": tool_name, "server": server_name, "success": "false"}
+                )
+            
+            # End span with error status
+            if tool_span:
+                tool_span.set_status(trace.StatusCode.ERROR, str(e))
+                
+            # Re-raise the exception
+            raise
+            
+        finally:
+            # Always end the span if it exists
+            if tool_span:
+                tool_span.end()
+    
     async def process_streaming_query(self, query: str, model: Optional[str] = None, 
                                max_tokens: Optional[int] = None) -> AsyncIterator[str]:
         """Process a query using Claude and available tools with streaming"""
@@ -2080,68 +2317,21 @@ class MCPClient:
                             if not cache_used:
                                 yield f"\n[{STATUS_EMOJI['tool']}] Executing {tool_name}..."
                                 
-                                # Track tool execution time
-                                tool_start_time = time.time()
-                                
+                                # Use the new context manager for tool execution
                                 try:
-                                    # Execute with tracing if available
-                                    tool_span = None
-                                    if tracer:
-                                        tool_span = tracer.start_as_current_span(
-                                            f"tool.{tool_name}",
-                                            attributes={
-                                                "tool.name": tool_name,
-                                                "server.name": tool.server_name,
-                                                "params": str(tool_args)
-                                            }
-                                        )
-                                    
-                                    # Call the tool
-                                    result = await session.call_tool(tool.original_tool.name, tool_args)
-                                    tool_result = result.result
-                                    
-                                    # Update tool metrics
-                                    tool_execution_time = (time.time() - tool_start_time) * 1000  # ms
-                                    tool.update_execution_time(tool_execution_time)
-                                    
-                                    # Record metrics if available
-                                    if tool_execution_counter:
-                                        tool_execution_counter.add(
-                                            1, 
-                                            {"tool": tool_name, "server": tool.server_name, "success": "true"}
-                                        )
-                                    
-                                    if latency_histogram:
-                                        latency_histogram.record(
-                                            tool_execution_time,
-                                            {"operation": "tool_execution", "tool": tool_name, "server": tool.server_name}
-                                        )
-                                    
-                                    # Cache the result if enabled
-                                    if self.tool_cache:
-                                        self.tool_cache.set(tool_name, tool_args, tool_result)
-                                    
-                                    # End span if tracking
-                                    if tool_span:
-                                        tool_span.set_status(trace.StatusCode.OK)
-                                        tool_span.end()
+                                    async with self.tool_execution_context(tool_name, tool_args, tool.server_name):
+                                        # Call the tool
+                                        result = await session.call_tool(tool.original_tool.name, tool_args)
+                                        tool_result = result.result
+                                        
+                                        # Cache the result if enabled
+                                        if self.tool_cache:
+                                            self.tool_cache.set(tool_name, tool_args, tool_result)
                                         
                                 except Exception as e:
                                     log.error(f"Error executing tool {tool_name}: {e}")
                                     yield f"\n[{STATUS_EMOJI['failure']}] Tool Execution Error: {str(e)}"
                                     
-                                    # Record error metrics
-                                    if tool_execution_counter:
-                                        tool_execution_counter.add(
-                                            1, 
-                                            {"tool": tool_name, "server": tool.server_name, "success": "false"}
-                                        )
-                                    
-                                    # End span with error if tracking
-                                    if tool_span:
-                                        tool_span.set_status(trace.StatusCode.ERROR, str(e))
-                                        tool_span.end()
-                                        
                                     # Skip this tool call
                                     continue
                             
@@ -2340,72 +2530,25 @@ class MCPClient:
                             # Execute the tool
                             status.update(f"{STATUS_EMOJI['tool']} Executing tool: {tool_name}...")
                             
-                            # Track tool execution time
-                            tool_start_time = time.time()
-                            
                             try:
-                                # Execute with tracing if available
-                                tool_span = None
-                                if tracer:
-                                    tool_span = tracer.start_as_current_span(
-                                        f"tool.{tool_name}",
-                                        attributes={
-                                            "tool.name": tool_name,
-                                            "server.name": tool.server_name,
-                                            "params": str(tool_args)
-                                        }
-                                    )
-                                
-                                # Call the tool
-                                result = await session.call_tool(tool.original_tool.name, tool_args)
-                                tool_result = result.result
-                                
-                                # Update progress
-                                status.update(f"{STATUS_EMOJI['success']} Tool {tool_name} execution complete")
-                                
-                                # Update tool metrics
-                                tool_execution_time = (time.time() - tool_start_time) * 1000  # ms
-                                tool.update_execution_time(tool_execution_time)
-                                
-                                # Record metrics if available
-                                if tool_execution_counter:
-                                    tool_execution_counter.add(
-                                        1, 
-                                        {"tool": tool_name, "server": tool.server_name, "success": "true"}
-                                    )
-                                
-                                if latency_histogram:
-                                    latency_histogram.record(
-                                        tool_execution_time,
-                                        {"operation": "tool_execution", "tool": tool_name, "server": tool.server_name}
-                                    )
-                                
-                                # Cache the result if enabled
-                                if self.tool_cache:
-                                    self.tool_cache.set(tool_name, tool_args, tool_result)
-                                
-                                # End span if tracking
-                                if tool_span:
-                                    tool_span.set_status(trace.StatusCode.OK)
-                                    tool_span.end()
+                                # Use the new context manager for tool execution
+                                async with self.tool_execution_context(tool_name, tool_args, tool.server_name):
+                                    # Call the tool
+                                    result = await session.call_tool(tool.original_tool.name, tool_args)
+                                    tool_result = result.result
+                                    
+                                    # Update progress
+                                    status.update(f"{STATUS_EMOJI['success']} Tool {tool_name} execution complete")
+                                    
+                                    # Cache the result if enabled
+                                    if self.tool_cache:
+                                        self.tool_cache.set(tool_name, tool_args, tool_result)
                                     
                             except Exception as e:
                                 log.error(f"Error executing tool {tool_name}: {e}")
                                 status.update(f"{STATUS_EMOJI['failure']} Tool {tool_name} execution failed: {e}")
                                 final_text.append(f"\n[Tool Execution Error: {str(e)}]")
                                 
-                                # Record error metrics
-                                if tool_execution_counter:
-                                    tool_execution_counter.add(
-                                        1, 
-                                        {"tool": tool_name, "server": tool.server_name, "success": "false"}
-                                    )
-                                
-                                # End span with error if tracking
-                                if tool_span:
-                                    tool_span.set_status(trace.StatusCode.ERROR, str(e))
-                                    tool_span.end()
-                                    
                                 # Skip this tool call
                                 continue
                         
@@ -2850,25 +2993,23 @@ class MCPClient:
             console.print(f"[yellow]Server '{name}' is already connected[/]")
             return
             
-        # Connect to server
+        # Connect to server using the context manager
         server_config = self.config.servers[name]
         
         with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots") as status:
-            session = await self.server_manager.connect_to_server(server_config)
-            
-            if session:
-                self.server_manager.active_sessions[name] = session
-                status.update(f"{STATUS_EMOJI['connected']} Connected to server: {name}")
-                
-                # Load capabilities
-                status.update(f"{STATUS_EMOJI['tool']} Loading capabilities from {name}...")
-                await self.server_manager.load_server_capabilities(name, session)
-                status.update(f"{STATUS_EMOJI['success']} Loaded capabilities from server: {name}")
-                
-                console.print(f"[green]Connected to server: {name}[/]")
-            else:
-                status.update(f"{STATUS_EMOJI['error']} Failed to connect to server: {name}")
-                console.print(f"[red]Failed to connect to server: {name}[/]")
+            async with self.server_manager.connect_server_session(server_config) as session:
+                if session:
+                    status.update(f"{STATUS_EMOJI['connected']} Connected to server: {name}")
+                    
+                    # Load capabilities
+                    status.update(f"{STATUS_EMOJI['tool']} Loading capabilities from {name}...")
+                    await self.server_manager.load_server_capabilities(name, session)
+                    status.update(f"{STATUS_EMOJI['success']} Loaded capabilities from server: {name}")
+                    
+                    console.print(f"[green]Connected to server: {name}[/]")
+                else:
+                    status.update(f"{STATUS_EMOJI['error']} Failed to connect to server: {name}")
+                    console.print(f"[red]Failed to connect to server: {name}[/]")
     
     async def disconnect_server(self, name):
         """Disconnect from a specific server"""
@@ -2898,8 +3039,22 @@ class MCPClient:
         
         # Close session
         session = self.server_manager.active_sessions[name]
-        # TODO: Properly close individual session
-        
+        try:
+            # Check if the session has a close or aclose method and call it
+            if hasattr(session, 'aclose') and callable(session.aclose):
+                await session.aclose()
+            elif hasattr(session, 'close') and callable(session.close):
+                if asyncio.iscoroutinefunction(session.close):
+                    await session.close()
+                else:
+                    session.close()
+            
+            # Note: This doesn't remove it from the exit_stack, but that will be cleaned up
+            # when the server_manager is closed. For a more complete solution, we would need
+            # to refactor how sessions are managed in the exit stack.
+        except Exception as e:
+            log.error(f"Error closing session for server {name}: {e}")
+            
         # Remove from active sessions
         del self.server_manager.active_sessions[name]
         
@@ -3661,8 +3816,8 @@ class MCPClient:
             try:
                 progress.update(export_task, description=f"{STATUS_EMOJI['scroll']} Writing to file...")
                 
-                with open(file_path, 'w') as f:
-                    json.dump(export_data, f, indent=2)
+                async with aiofiles.open(file_path, 'w') as f:
+                    await f.write(json.dumps(export_data, indent=2))
                 
                 progress.update(export_task, description=f"{STATUS_EMOJI['success']} Export complete")
                 return True
@@ -3707,7 +3862,7 @@ class MCPClient:
         with Progress(*progress_columns, console=console) as progress:
             task = progress.add_task(title, total=len(steps))
             
-            for i, (step, description) in enumerate(zip(steps, step_descriptions)):
+            for i, (step, description) in enumerate(zip(steps, step_descriptions, strict=False)):
                 try:
                     progress.update(task, description=description)
                     await step()
@@ -3876,7 +4031,14 @@ async def config_async(show, edit, reset):
                 CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
                 CONFIG_FILE.touch() # Create if doesn't exist
 
-                process = subprocess.run([editor, str(CONFIG_FILE)]) # Use run instead of call
+                process = await asyncio.create_subprocess_exec(
+                    editor, str(CONFIG_FILE),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                # Wait for the process to complete
+                stdout, stderr = await process.communicate()
+                
                 if process.returncode != 0:
                      console.print(f"[yellow]Editor exited with code {process.returncode}[/]")
                 else:
