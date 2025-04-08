@@ -104,6 +104,7 @@ Version: 1.0.0
 """
 
 import asyncio
+import atexit
 import functools
 import hashlib
 import inspect
@@ -113,6 +114,7 @@ import os
 import platform
 import random
 import readline
+import signal
 import socket
 import subprocess
 import sys
@@ -331,6 +333,147 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True, markup=True, console=stderr_console)]
 )
 log = logging.getLogger("mcpclient")
+
+# Create a global exit handler
+def force_exit_handler(is_force=False):
+    """Force exit handler to ensure all processes are terminated."""
+    print("\nForcing exit and cleaning up resources...")
+    
+    # Use os._exit in emergency situations which bypasses normal exit handlers
+    # but only as a last resort
+    if is_force:
+        print("Emergency shutdown initiated!")
+        # Try to kill any child processes before force exiting
+        if 'app' in globals() and hasattr(app, 'mcp_client'):
+            if hasattr(app.mcp_client, 'server_manager'):
+                # Terminate all processes immediately
+                for name, process in app.mcp_client.server_manager.processes.items():
+                    try:
+                        if process.poll() is None:  # If process is still running
+                            print(f"Force killing process {name} (PID {process.pid})")
+                            process.kill()
+                    except Exception:
+                        pass
+        
+        # This is a hard exit that bypasses normal Python cleanup
+        os._exit(1)
+    
+    # Normal exit via sys.exit
+    sys.exit(1)
+
+# Add a signal handler for SIGINT (Ctrl+C)
+def sigint_handler(signum, frame):
+    """Handle SIGINT (Ctrl+C) by initiating clean shutdown."""
+    print("\nCtrl+C detected. Shutting down...")
+    
+    # Keep track of how many times Ctrl+C has been pressed
+    sigint_handler.counter += 1
+    
+    # If pressed multiple times, force exit
+    if sigint_handler.counter >= 2:
+        print("Multiple interrupts detected. Forcing immediate exit!")
+        force_exit_handler(is_force=True)
+    
+    # Try clean shutdown first
+    try:
+        force_exit_handler(is_force=False)
+    except Exception as e:
+        print(f"Error during clean shutdown: {e}. Forcing exit!")
+        force_exit_handler(is_force=True)
+
+# Initialize the counter
+sigint_handler.counter = 0
+
+# Register the signal handler
+signal.signal(signal.SIGINT, sigint_handler)
+
+# Register with atexit to ensure cleanup on normal exit
+atexit.register(lambda: force_exit_handler(is_force=False))
+
+# Helper function to adapt paths for different platforms, used for processing Claude Desktop JSON config file 
+def adapt_path_for_platform(command, args):
+    is_windows = platform.system() == "Windows"
+    is_wsl = "WSL" in platform.platform().upper() or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
+    
+    # Improved Windows path to WSL path conversion
+    def convert_to_wsl_path(win_path):
+        if not win_path or not isinstance(win_path, str):
+            return win_path
+        
+        # Handle C:\ style paths for WSL - convert to /mnt/c/...
+        if len(win_path) > 2 and win_path[1] == ":" and win_path[2] in ["\\", "/"]:
+            drive_letter = win_path[0].lower()
+            # Remove the drive letter and colon, then replace backslashes with forward slashes
+            rest_of_path = win_path[2:].replace("\\", "/")
+            
+            # Ensure there's only one leading slash and no trailing slashes
+            if rest_of_path.startswith("/"):
+                rest_of_path = rest_of_path[1:]
+            rest_of_path = rest_of_path.rstrip("/")
+                
+            wsl_path = f"/mnt/{drive_letter}/{rest_of_path}"
+            log.info(f"Converted Windows path '{win_path}' to WSL path '{wsl_path}'")
+            return wsl_path
+        return win_path
+    
+    # If we're running on Windows, no need to adapt paths
+    if is_windows and not is_wsl:
+        return command, args
+    
+    # If we're on Linux/WSL and command contains Windows paths
+    if not is_windows or is_wsl:
+        # For filesystem server specifically
+        if "npx" in command and "@modelcontextprotocol/server-filesystem" in str(args):
+            new_args = []
+            for arg in args:
+                if isinstance(arg, str) and ":" in arg:
+                    # Convert Windows path to WSL path
+                    new_args.append(convert_to_wsl_path(arg))
+                else:
+                    new_args.append(arg)
+            
+            log.info(f"Adapted filesystem server args: {args} -> {new_args}")
+            return command, new_args
+        
+        # For wsl.exe commands running in Linux (extract the bash command)
+        elif "wsl.exe" in command:
+            if isinstance(args, list) and len(args) >= 3:
+                try:
+                    bash_c_index = args.index("-c")
+                    if bash_c_index + 1 < len(args):
+                        actual_command = args[bash_c_index + 1]
+                        log.info(f"Converting wsl.exe command to direct bash command")
+                        return "bash", ["-c", actual_command]
+                except ValueError:
+                    # If we can't parse it, just return as is
+                    log.warning(f"Could not extract bash command from wsl.exe args: {args}")
+                    # Still try to convert any Windows paths in args
+                    new_args = []
+                    for arg in args:
+                        if isinstance(arg, str) and ":" in arg and len(arg) > 2 and arg[1] == ":":
+                            new_args.append(convert_to_wsl_path(arg))
+                        else:
+                            new_args.append(arg)
+                    return command, new_args
+        
+        # For any command with Windows paths
+        else:
+            new_args = []
+            windows_path_found = False
+            
+            for arg in args:
+                if isinstance(arg, str) and ":" in arg and len(arg) > 2 and arg[1] == ":":
+                    windows_path_found = True
+                    new_args.append(convert_to_wsl_path(arg))
+                else:
+                    new_args.append(arg)
+            
+            if windows_path_found:
+                log.info(f"Converted Windows paths in command args: {args} -> {new_args}")
+                return command, new_args
+    
+    # Default case - return unchanged
+    return command, args
 
 # =============================================================================
 # CRITICAL STDIO SAFETY MECHANISM
@@ -2525,115 +2668,182 @@ class ServerManager:
         await self.print_status()
     
     async def load_server_capabilities(self, server_name: str, session: ClientSession):
-        """Load tools, resources, and prompts from a server"""
+        """Load tools, resources, and prompts from a server with better validation"""
         # Use safe_stdout to prevent protocol corruption when interacting with servers
         with safe_stdout():
             try:
-                # Load tools
-                tool_response = await session.list_tools()
-                for tool in tool_response.tools:
-                    tool_name = f"{server_name}:{tool.name}" if ":" not in tool.name else tool.name
-                    self.tools[tool_name] = MCPTool(
-                        name=tool_name,
-                        description=tool.description,
-                        server_name=server_name,
-                        input_schema=tool.input_schema,
-                        original_tool=tool
-                    )
+                # First verify the session has required methods
+                if not session or not hasattr(session, 'list_tools') or not callable(session.list_tools):
+                    log.error(f"Server {server_name} session object is invalid or incomplete")
+                    return
+                
+                # Load tools with proper validation
+                try:
+                    tool_response = await session.list_tools()
                     
-                    # Register tool dependencies if present
-                    if hasattr(tool, 'dependencies') and isinstance(tool.dependencies, list):
-                        for dependency in tool.dependencies:
-                            # Make sure dependency has the server prefix if needed
-                            dependency_name = f"{server_name}:{dependency}" if ":" not in dependency else dependency
-                            # Add the dependency to the cache dependency graph
-                            if hasattr(self, 'tool_cache') and self.tool_cache:
-                                self.tool_cache.add_dependency(tool_name, dependency_name)
-                                log.debug(f"Registered dependency: {tool_name} depends on {dependency_name}")
-                
-                # Load resources
-                try:
-                    resource_response = await session.list_resources()
-                    for resource in resource_response.resources:
-                        resource_name = f"{server_name}:{resource.name}" if ":" not in resource.name else resource.name
-                        self.resources[resource_name] = MCPResource(
-                            name=resource_name,
-                            description=resource.description,
+                    # Validate tool response
+                    if not tool_response or not hasattr(tool_response, 'tools') or not isinstance(tool_response.tools, list):
+                        log.error(f"Server {server_name} returned invalid tool response format")
+                        return
+                    
+                    # Process tools
+                    for tool in tool_response.tools:
+                        if not hasattr(tool, 'name') or not hasattr(tool, 'description') or not hasattr(tool, 'input_schema'):
+                            log.warning(f"Server {server_name} returned a tool with missing required attributes, skipping")
+                            continue
+                            
+                        tool_name = f"{server_name}:{tool.name}" if ":" not in tool.name else tool.name
+                        self.tools[tool_name] = MCPTool(
+                            name=tool_name,
+                            description=tool.description,
                             server_name=server_name,
-                            template=resource.template,
-                            original_resource=resource
+                            input_schema=tool.input_schema,
+                            original_tool=tool
                         )
+                        
+                        # Register tool dependencies if present
+                        if hasattr(tool, 'dependencies') and isinstance(tool.dependencies, list):
+                            for dependency in tool.dependencies:
+                                # Make sure dependency has the server prefix if needed
+                                dependency_name = f"{server_name}:{dependency}" if ":" not in dependency else dependency
+                                # Add the dependency to the cache dependency graph
+                                if hasattr(self, 'tool_cache') and self.tool_cache:
+                                    self.tool_cache.add_dependency(tool_name, dependency_name)
+                                    log.debug(f"Registered dependency: {tool_name} depends on {dependency_name}")
                 except McpError as e:
-                    log.debug(f"Server {server_name} doesn't support resources: {e}")
-                # Keep broad exception for unexpected issues listing resources
-                except Exception as e: 
-                     log.error(f"Unexpected error listing resources from {server_name}: {e}")
+                    log.error(f"MCP error loading tools from server {server_name}: {e}")
+                except Exception as e:
+                    log.error(f"Unexpected error loading tools from server {server_name}: {e}")
                 
-                # Load prompts
-                try:
-                    prompt_response = await session.list_prompts()
-                    for prompt in prompt_response.prompts:
-                        prompt_name = f"{server_name}:{prompt.name}" if ":" not in prompt.name else prompt.name
-                        self.prompts[prompt_name] = MCPPrompt(
-                            name=prompt_name,
-                            description=prompt.description,
-                            server_name=server_name,
-                            template=prompt.template,
-                            original_prompt=prompt
-                        )
-                except McpError as e:
-                    log.debug(f"Server {server_name} doesn't support prompts: {e}")
-                # Keep broad exception for unexpected issues listing prompts
-                except Exception as e: 
-                     log.error(f"Unexpected error listing prompts from {server_name}: {e}")
+                # Load resources if available
+                if hasattr(session, 'list_resources') and callable(session.list_resources):
+                    try:
+                        resource_response = await session.list_resources()
+                        # Validate resource response
+                        if not resource_response or not hasattr(resource_response, 'resources') or not isinstance(resource_response.resources, list):
+                            log.warning(f"Server {server_name} returned invalid resource response format")
+                        else:
+                            for resource in resource_response.resources:
+                                if not hasattr(resource, 'name') or not hasattr(resource, 'description') or not hasattr(resource, 'template'):
+                                    log.warning(f"Server {server_name} returned a resource with missing required attributes, skipping")
+                                    continue
+                                    
+                                resource_name = f"{server_name}:{resource.name}" if ":" not in resource.name else resource.name
+                                self.resources[resource_name] = MCPResource(
+                                    name=resource_name,
+                                    description=resource.description,
+                                    server_name=server_name,
+                                    template=resource.template,
+                                    original_resource=resource
+                                )
+                    except McpError as e:
+                        log.debug(f"Server {server_name} doesn't support resources: {e}")
+                    except Exception as e: 
+                        log.error(f"Unexpected error listing resources from {server_name}: {e}")
+                
+                # Load prompts if available
+                if hasattr(session, 'list_prompts') and callable(session.list_prompts):
+                    try:
+                        prompt_response = await session.list_prompts()
+                        # Validate prompt response
+                        if not prompt_response or not hasattr(prompt_response, 'prompts') or not isinstance(prompt_response.prompts, list):
+                            log.warning(f"Server {server_name} returned invalid prompt response format")
+                        else:
+                            for prompt in prompt_response.prompts:
+                                if not hasattr(prompt, 'name') or not hasattr(prompt, 'description') or not hasattr(prompt, 'template'):
+                                    log.warning(f"Server {server_name} returned a prompt with missing required attributes, skipping")
+                                    continue
+                                    
+                                prompt_name = f"{server_name}:{prompt.name}" if ":" not in prompt.name else prompt.name
+                                self.prompts[prompt_name] = MCPPrompt(
+                                    name=prompt_name,
+                                    description=prompt.description,
+                                    server_name=server_name,
+                                    template=prompt.template,
+                                    original_prompt=prompt
+                                )
+                    except McpError as e:
+                        log.debug(f"Server {server_name} doesn't support prompts: {e}")
+                    except Exception as e: 
+                        log.error(f"Unexpected error listing prompts from {server_name}: {e}")
                     
             except McpError as e: # Catch specific MCP errors first
-                 log.error(f"MCP error loading capabilities from server {server_name}: {e}")
+                log.error(f"MCP error loading capabilities from server {server_name}: {e}")
             except httpx.RequestError as e: # Catch network errors if using SSE
-                 log.error(f"Network error loading capabilities from server {server_name}: {e}")
+                log.error(f"Network error loading capabilities from server {server_name}: {e}")
             # Keep broad exception for other unexpected issues
             except Exception as e: 
                 log.error(f"Unexpected error loading capabilities from server {server_name}: {e}")
+                import traceback
+                log.debug(f"Stack trace for error loading capabilities from {server_name}: {traceback.format_exc()}")
+                
+            # Mark the server as loaded capabilities, even if there were errors
+            # This prevents repeated attempts that would just fail again
+            if server_name in self.config.servers:
+                self.config.servers[server_name].loaded_capabilities = True
     
     async def close(self):
-        """Close all server connections and processes"""
-        # Unregister zeroconf services if any
-        if hasattr(self, 'registered_services') and self.registry and self.registry.zeroconf:
-            for name, service_info in self.registered_services.items():
+        """Clean up resources before exit"""
+        try:
+            # Add a timeout to all cleanup operations
+            cleanup_timeout = 5  # seconds
+            
+            # Stop local discovery monitoring if running
+            if self.local_discovery_task:
                 try:
-                    # Use async version of unregister_service
-                    await self.registry.zeroconf.async_unregister_service(service_info)
-                    log.info(f"Unregistered zeroconf service for {name}")
+                    await asyncio.wait_for(self.stop_local_discovery_monitoring(), timeout=cleanup_timeout)
+                except asyncio.TimeoutError:
+                    log.warning("Timeout stopping local discovery monitoring")
                 except Exception as e:
-                    log.error(f"Error unregistering zeroconf service for {name}: {e}")
-        
-        # Close all sessions
-        await self.exit_stack.aclose()
-        
-        # Terminate all processes
-        for name, process in self.processes.items():
+                    log.error(f"Error stopping local discovery: {e}")
+                    
+            # Save conversation graph
             try:
-                if process.poll() is None:  # If process is still running
-                    log.info(f"Terminating server process: {name}")
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                         log.warning(f"Process {name} did not terminate gracefully, killing.")
-                         process.kill()
-                         process.wait() # Wait for kill
-            except OSError as e:
-                log.error(f"OS error terminating process {name} (PID {process.pid if process else 'unknown'}): {e}")
-            # Keep broad exception for other unexpected termination issues
-            except Exception as e: 
-                log.error(f"Unexpected error terminating process {name}: {e}")
-                
-                # Force kill as a last resort
+                await asyncio.wait_for(
+                    self.conversation_graph.save(str(self.conversation_graph_file)),
+                    timeout=cleanup_timeout
+                )
+                log.info(f"Saved conversation graph to {self.conversation_graph_file}")
+            except (asyncio.TimeoutError, Exception) as e:
+                log.error(f"Failed to save conversation graph: {e}")
+
+            # Stop server monitor with timeout
+            if hasattr(self, 'server_monitor'):
                 try:
-                    if process.poll() is None:
-                        process.kill()
-                except Exception:
-                    pass
+                    await asyncio.wait_for(self.server_monitor.stop_monitoring(), timeout=cleanup_timeout)
+                except (asyncio.TimeoutError, Exception) as e:
+                    log.error(f"Error stopping server monitor: {e}")
+                    
+            # Close server connections and processes
+            if hasattr(self, 'server_manager'):
+                try:
+                    # Use a more aggressive timeout for server connections
+                    await asyncio.wait_for(self.server_manager.close(), timeout=cleanup_timeout)
+                except (asyncio.TimeoutError, Exception) as e:
+                    log.error(f"Error closing server manager: {e}")
+                    
+                    # Force kill any remaining processes
+                    for name, process in self.server_manager.processes.items():
+                        try:
+                            if process and process.poll() is None:
+                                log.warning(f"Force killing process {name} that didn't terminate properly")
+                                process.kill()
+                        except Exception as kill_error:
+                            log.error(f"Error killing process {name}: {kill_error}")
+                            
+            # Close cache
+            if self.tool_cache:
+                try:
+                    self.tool_cache.close()
+                except Exception as e:
+                    log.error(f"Error closing tool cache: {e}")
+                    
+        except Exception as e:
+            log.error(f"Unexpected error during cleanup: {e}")
+            
+        finally:
+            # Let user know we're done
+            self.safe_print("[yellow]Shutdown complete[/]")
 
     def format_tools_for_anthropic(self) -> List[ToolParam]:
         """Format MCP tools for Anthropic API"""
@@ -2835,6 +3045,37 @@ class MCPClient:
         """
         safe_console = get_safe_console()
         safe_console.print(message, **kwargs)
+    
+    @staticmethod
+    def ensure_safe_console(func):
+        """Decorator to ensure methods use safe console consistently
+        
+        This decorator:
+        1. Gets a safe console once at the beginning of the method
+        2. Stores it temporarily on the instance to prevent multiple calls
+        3. Restores the previous value after method completes
+        
+        Args:
+            func: The method to decorate
+            
+        Returns:
+            Wrapped method that uses safe console consistently
+        """
+        @functools.wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            # Get safe console once at the beginning
+            safe_console = get_safe_console()
+            # Store temporarily on the instance to prevent multiple calls
+            old_console = getattr(self, '_current_safe_console', None)
+            self._current_safe_console = safe_console
+            try:
+                return await func(self, *args, **kwargs)
+            finally:
+                # Restore previous value if it existed
+                if old_console is not None:
+                    self._current_safe_console = old_console
+                else:
+                    delattr(self, '_current_safe_console')
 
     @staticmethod
     def with_tool_error_handling(func):
@@ -2947,6 +3188,57 @@ class MCPClient:
             return options[state]
         return None
         
+    async def print_simple_status(self):
+        """Print a simplified status without using Progress widgets"""
+        safe_console = get_safe_console()
+        
+        # Count connected servers, available tools/resources
+        connected_servers = len(self.server_manager.active_sessions)
+        total_servers = len(self.config.servers)
+        total_tools = len(self.server_manager.tools)
+        total_resources = len(self.server_manager.resources)
+        total_prompts = len(self.server_manager.prompts)
+        
+        # Print basic info table
+        status_table = Table(title="MCP Client Status")
+        status_table.add_column("Item")
+        status_table.add_column("Status", justify="right")
+        
+        status_table.add_row(
+            f"{STATUS_EMOJI['model']} Model",
+            self.current_model
+        )
+        status_table.add_row(
+            f"{STATUS_EMOJI['server']} Servers",
+            f"{connected_servers}/{total_servers} connected"
+        )
+        status_table.add_row(
+            f"{STATUS_EMOJI['tool']} Tools",
+            str(total_tools)
+        )
+        status_table.add_row(
+            f"{STATUS_EMOJI['resource']} Resources",
+            str(total_resources)
+        )
+        status_table.add_row(
+            f"{STATUS_EMOJI['prompt']} Prompts",
+            str(total_prompts)
+        )
+        
+        safe_console.print(status_table)
+        
+        # Show connected server info
+        if connected_servers > 0:
+            self.safe_print("\n[bold]Connected Servers:[/]")
+            for name, server in self.config.servers.items():
+                if name in self.server_manager.active_sessions:
+                    # Get number of tools for this server
+                    server_tools = sum(1 for t in self.server_manager.tools.values() 
+                                if t.server_name == name)
+                    self.safe_print(f"[green]✓[/] {name} ({server.type.value}) - {server_tools} tools")
+        
+        self.safe_print("[green]Ready to process queries![/green]")
+                
     async def setup(self, interactive_mode=False):
         """Set up the client, connect to servers, and load capabilities"""
         # Ensure API key is set
@@ -2988,9 +3280,10 @@ class MCPClient:
                 log.info("Verifying no stdout pollution before connecting to servers...")
                 verify_no_stdout_pollution()
         
-        # Discover servers if enabled
+        # Discover servers if enabled - use a simple status instead of Progress
         if self.config.auto_discover:
-            with Status(f"{STATUS_EMOJI['search']} Discovering MCP servers...", spinner="dots", console=safe_console) as status:
+            with Status(f"{STATUS_EMOJI['search']} Discovering MCP servers...", 
+                    spinner="dots", console=safe_console) as status:
                 await self.server_manager.discover_servers()
                 status.update(f"{STATUS_EMOJI['success']} Server discovery complete")
         
@@ -2998,42 +3291,35 @@ class MCPClient:
         if self.config.enable_local_discovery and self.server_manager.registry:
             await self.start_local_discovery_monitoring()
         
-        # Connect to all enabled servers - Use Progress with our helper to avoid Live display conflicts
+        # Connect to all enabled servers without using Progress widget
         enabled_servers = [s for s in self.config.servers.values() if s.enabled]
         if enabled_servers:
-            # Wrap server connection in safe_stdout to prevent any potential stdout pollution
-            with safe_stdout():
-                # Prepare connection tasks
-                server_tasks = []
-                for name, server_config in self.config.servers.items():
-                    if not server_config.enabled:
-                        continue
-                        
-                    connect_desc = f"{STATUS_EMOJI['server']} Connecting to server {name}..."
-                    server_tasks.append((
-                        self._connect_and_load_server,
-                        connect_desc,
-                        (name, server_config)
-                    ))
-                
-                # Run all connection tasks with a single progress bar
+            # Don't use _run_with_progress here to avoid potential display nesting
+            self.safe_print(f"[bold blue]Connecting to {len(enabled_servers)} servers...[/]")
+            
+            for name, server_config in self.config.servers.items():
+                if not server_config.enabled:
+                    continue
+                    
                 try:
-                    await self._run_with_progress(
-                        server_tasks,
-                        f"{STATUS_EMOJI['server']} Connecting to servers...",
-                        transient=True
-                    )
+                    self.safe_print(f"[cyan]Connecting to server {name}...[/]")
+                    # Connect and load server
+                    result = await self._connect_and_load_server(name, server_config)
+                    if result:
+                        self.safe_print(f"[green]Connected to server {name}[/]")
+                    else:
+                        self.safe_print(f"[yellow]Failed to connect to server {name}[/]")
                 except Exception as e:
-                    log.error(f"Error connecting to servers: {e}")
-                    # Continue with setup even if some servers fail to connect
+                    self.safe_print(f"[red]Error connecting to server {name}: {e}[/]")
         
         # Start server monitoring
-        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots", console=safe_console) as status:
+        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", 
+                spinner="dots", console=safe_console) as status:
             await self.server_monitor.start_monitoring()
             status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
         
-        # Display status
-        await self.print_status()
+        # Display status without Progress widgets
+        await self.print_simple_status()
         
     async def _connect_and_load_server(self, server_name, server_config):
         """Connect to a server and load its capabilities (for use with _run_with_progress)"""
@@ -3731,7 +4017,6 @@ class MCPClient:
                 
                 return f"[Error: {error_msg}]"
         
-    
     async def interactive_loop(self):
         """Run interactive command loop"""
         # Always use get_safe_console for interactive mode to avoid interference with stdio servers
@@ -3739,10 +4024,18 @@ class MCPClient:
         
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print("Type your query to Claude, or a command (type 'help' for available commands)")
+        self.safe_print("[italic]Press Ctrl+C twice in quick succession to force exit if unresponsive[/italic]")
+        
+        # Track Ctrl+C attempts for force exit
+        ctrl_c_count = 0
+        last_ctrl_c_time = 0
         
         while True:
             try:
                 user_input = Prompt.ask("\n[bold blue]>>[/]", console=interactive_console)
+                
+                # Reset Ctrl+C counter on successful input
+                ctrl_c_count = 0
                 
                 # Check if it's a command
                 if user_input.startswith('/'):
@@ -3771,15 +4064,35 @@ class MCPClient:
                     ))
                     
             except KeyboardInterrupt:
-                self.safe_print("\n[yellow]Interrupted[/]")
-                break
+                # Track Ctrl+C for double-press detection
+                current_time = time.time()
+                if current_time - last_ctrl_c_time < 2:  # Within 2 seconds
+                    ctrl_c_count += 1
+                else:
+                    ctrl_c_count = 1
+                last_ctrl_c_time = current_time
+                
+                if ctrl_c_count >= 2:
+                    self.safe_print("\n[bold red]Force exiting...[/]")
+                    # Terminate any active processes immediately
+                    for name, process in self.server_manager.processes.items():
+                        try:
+                            if process and process.poll() is None:
+                                self.safe_print(f"[yellow]Force killing process: {name}[/]")
+                                process.kill()
+                        except Exception as e:
+                            self.safe_print(f"[red]Error killing process {name}: {e}[/]")
+                    break
+                
+                self.safe_print("\n[yellow]Interrupted. Press Ctrl+C again to force exit.[/]")
+                continue
             # Catch specific errors related to command execution or query processing
             except (anthropic.APIError, McpError, httpx.RequestError) as e: 
                 self.safe_print(f"[bold red]Error ({type(e).__name__}):[/] {str(e)}")
             # Keep broad exception for unexpected loop issues
             except Exception as e: 
                 self.safe_print(f"[bold red]Unexpected Error:[/] {str(e)}")
-    
+        
     async def cmd_exit(self, args):
         """Exit the client"""
         self.safe_print("[yellow]Exiting...[/]")
@@ -4886,17 +5199,23 @@ class MCPClient:
     async def cmd_dashboard(self, args):
         """Show the live monitoring dashboard."""
         try:
-            # Use get_safe_console() for the dashboard to avoid interfering with stdio
+            # Check if we already have an active display
+            if hasattr(self, '_active_progress') and self._active_progress:
+                self.safe_print("[yellow]Cannot start dashboard while another live display is active.[/]")
+                return
+                
+            # Set the flag to prevent other live displays
+            self._active_progress = True
+            
+            # Use get_safe_console() for the dashboard
             safe_console = get_safe_console()
             
             # Use a single Live display context for the dashboard
-            # This is a different pattern since we want continuous updates
-            # rather than a one-time progress display
             with Live(self.generate_dashboard_renderable(), 
-                      refresh_per_second=1.0/self.config.dashboard_refresh_rate, 
-                      screen=True, 
-                      transient=False,  # Important: set to False for a continuous display
-                      console=safe_console) as live:
+                    refresh_per_second=1.0/self.config.dashboard_refresh_rate, 
+                    screen=True, 
+                    transient=False,
+                    console=safe_console) as live:
                 while True:
                     await asyncio.sleep(self.config.dashboard_refresh_rate)
                     # Generate a new renderable and update the display
@@ -4906,6 +5225,9 @@ class MCPClient:
         except Exception as e:
             log.error(f"Dashboard error: {e}")
             self.safe_print(f"\n[red]Dashboard encountered an error: {e}[/]")
+        finally:
+            # Always clear the flag when exiting
+            self._active_progress = False
 
     # Helper method to process a content block delta event
     def _process_text_delta(self, delta_event: ContentBlockDeltaEvent, current_text: str) -> Tuple[str, str]:
@@ -5173,8 +5495,8 @@ class MCPClient:
                 desktop_config = json.loads(content)
                 # Log the structure
                 log.debug(f"Claude desktop config keys: {list(desktop_config.keys())}")
-            except json.JSONDecodeError as e:
-                self.safe_print(f"[red]Invalid JSON in Claude desktop config: {e}[/]")
+            except json.JSONDecodeError as json_error:
+                self.safe_print(f"[red]Invalid JSON in Claude desktop config: {json_error}[/]")
                 return
             
             # The primary key is 'mcpServers', but check alternatives if needed
@@ -5200,74 +5522,7 @@ class MCPClient:
             # Track successful imports and skipped servers
             imported_servers = []
             skipped_servers = []
-            
-            # Helper function to adjust paths based on platform
-            def adapt_path_for_platform(command, args):
-                is_windows = platform.system() == "Windows"
-                is_wsl = "WSL" in platform.platform().upper() or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
-                
-                # Convert Windows path to WSL path
-                def convert_to_wsl_path(win_path):
-                    if not win_path or not isinstance(win_path, str):
-                        return win_path
-                    
-                    # Handle C:\ style paths for WSL
-                    if len(win_path) > 2 and win_path[1] == ":" and win_path[2] in ["\\", "/"]:
-                        drive_letter = win_path[0].lower()
-                        rest_of_path = win_path[2:].replace("\\", "/")
-                        return f"/mnt/{drive_letter}{rest_of_path}"
-                    return win_path
-                
-                # Handle npx commands for the filesystem server
-                if "npx" in command and "@modelcontextprotocol/server-filesystem" in str(args):
-                    if is_windows and not is_wsl:
-                        # Keep Windows format for Windows
-                        return command, args
-                    else:
-                        # Adjust for Linux/WSL
-                        new_args = []
-                        for arg in args:
-                            # If it's a Windows path in a WSL environment, convert it
-                            if is_wsl and isinstance(arg, str) and ":" in arg:
-                                new_args.append(convert_to_wsl_path(arg))
-                            # If it's a regular Windows path with OneDrive or Downloads, map to common folders
-                            elif isinstance(arg, str) and ("\\Users\\" in arg or "/Users/" in arg):
-                                home_dir = str(Path.home())
-                                if "OneDrive\\Desktop" in arg or "OneDrive/Desktop" in arg:
-                                    new_args.append(os.path.join(home_dir, "Desktop"))
-                                elif "\\Downloads" in arg or "/Downloads" in arg:
-                                    new_args.append(os.path.join(home_dir, "Downloads"))
-                                else:
-                                    # For other Windows paths in WSL, try to convert them
-                                    new_args.append(convert_to_wsl_path(arg))
-                            else:
-                                new_args.append(arg)
                         
-                        return command, new_args
-                        
-                # Handle WSL commands
-                elif "wsl.exe" in command:
-                    if is_windows and not is_wsl:
-                        # Keep Windows format for Windows
-                        return command, args
-                    else:
-                        # If running in Linux/WSL, just run the command directly without wsl.exe
-                        if isinstance(args, list) and len(args) >= 3:
-                            # Extract the actual command from the wsl.exe bash -c "actual command"
-                            # Find the index of the actual command
-                            try:
-                                bash_c_index = args.index("-c")
-                                if bash_c_index + 1 < len(args):
-                                    actual_command = args[bash_c_index + 1]
-                                    # Create a shell command to run it
-                                    return "bash", ["-c", actual_command]
-                            except ValueError:
-                                # If we can't parse it, just return as is
-                                pass
-                
-                # Default case - return unchanged
-                return command, args
-            
             # Process each server
             for server_name, server_data in mcp_servers.items():
                 try:
@@ -5290,7 +5545,14 @@ class MCPClient:
                     args = server_data.get('args', [])
                     
                     # Adapt paths for the current platform
-                    adapted_command, adapted_args = adapt_path_for_platform(command, args)
+                    try:
+                        adapted_command, adapted_args = adapt_path_for_platform(command, args)
+                        log.info(f"Server '{server_name}': Adapted command from '{command}' to '{adapted_command}'")
+                        log.debug(f"Server '{server_name}': Adapted args from '{args}' to '{adapted_args}'")
+                    except Exception as adapt_error:
+                        log.error(f"Error adapting paths for server '{server_name}': {adapt_error}")
+                        # Use original command and args as fallback
+                        adapted_command, adapted_args = command, args
                     
                     # Create new server config
                     server_config = ServerConfig(
@@ -5309,45 +5571,50 @@ class MCPClient:
                     imported_servers.append(server_name)
                     log.info(f"Imported server '{server_name}' from Claude desktop config")
                 except Exception as server_error:
-                    log.error(f"Error processing server '{server_name}': {server_error}")
-                    skipped_servers.append((server_name, f"processing error: {str(server_error)}"))
+                    server_error_str = str(server_error)
+                    log.error(f"Error processing server '{server_name}': {server_error_str}")
+                    skipped_servers.append((server_name, f"processing error: {server_error_str}"))
             
             # Save config
             if imported_servers:
-                await self.config.save_async()
-                self.safe_print(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config")
-                
-                # Create a nice report
-                if imported_servers:
-                    server_table = Table(title="Imported Servers")
-                    server_table.add_column("Name")
-                    server_table.add_column("Command")
-                    server_table.add_column("Arguments")
+                try:
+                    await self.config.save_async()
+                    self.safe_print(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config")
                     
-                    for name in imported_servers:
-                        server = self.config.servers[name]
-                        server_table.add_row(
-                            name,
-                            server.path,
-                            " ".join(str(arg) for arg in server.args) if server.args else ""
-                        )
+                    # Create a nice report
+                    if imported_servers:
+                        server_table = Table(title="Imported Servers")
+                        server_table.add_column("Name")
+                        server_table.add_column("Command")
+                        server_table.add_column("Arguments")
+                        
+                        for name in imported_servers:
+                            server = self.config.servers[name]
+                            server_table.add_row(
+                                name,
+                                server.path,
+                                " ".join(str(arg) for arg in server.args) if server.args else ""
+                            )
+                        
+                        self.safe_print(server_table)
                     
-                    self.safe_print(server_table)
-                
-                if skipped_servers:
-                    skipped_table = Table(title="Skipped Servers")
-                    skipped_table.add_column("Name")
-                    skipped_table.add_column("Reason")
-                    
-                    for name, reason in skipped_servers:
-                        skipped_table.add_row(name, reason)
-                    
-                    self.safe_print(skipped_table)
+                    if skipped_servers:
+                        skipped_table = Table(title="Skipped Servers")
+                        skipped_table.add_column("Name")
+                        skipped_table.add_column("Reason")
+                        
+                        for name, reason in skipped_servers:
+                            skipped_table.add_row(name, reason)
+                        
+                        self.safe_print(skipped_table)
+                except Exception as save_error:
+                    log.error(f"Error saving config after importing servers: {save_error}")
+                    self.safe_print(f"[red]Error saving imported server config: {save_error}[/]")
             else:
                 self.safe_print(f"{STATUS_EMOJI['warning']} No new servers imported from Claude desktop config")
         
-        except FileNotFoundError:
-            log.debug("Claude desktop config file not found")
+        except FileNotFoundError as file_error:
+            log.debug(f"Claude desktop config file not found: {file_error}")
         except json.JSONDecodeError as json_err:
             log.error(f"Invalid JSON in Claude desktop config file: {json_err}")
             # Try to show the problematic part of the JSON
@@ -5356,13 +5623,42 @@ class MCPClient:
                     file_content = await f.read()
                     prob_line = file_content.splitlines()[max(0, json_err.lineno - 1)]
                     log.error(f"JSON error at line {json_err.lineno}, column {json_err.colno}: {prob_line}")
-            except Exception:
-                pass
-        except Exception as e:
-            log.error(f"Error processing Claude desktop config: {e}")
+            except Exception as json_context_error:
+                log.error(f"Error getting JSON error context: {json_context_error}")
+        except Exception as outer_error:
+            # Ensure we're using str(outer_error) to avoid any issue with the error being a string itself
+            error_message = str(outer_error)
+            log.error(f"Error processing Claude desktop config: {error_message}")
+            self.safe_print(f"[red]Error processing Claude desktop config: {error_message}[/]")
             # Add more context for debugging
             import traceback
             log.debug(f"Full error: {traceback.format_exc()}")
+            
+        # Check for the 'warning' string bug
+        if error_message == 'warning':
+            log.error("Detected 'warning' string as exception. This might indicate a shadowed variable.")
+            self.safe_print("[red]Internal error: detected 'warning' variable shadowing issue. Check logs.[/]")
+            
+            # Try to recover by checking if there were any warnings logged asynchronously
+            try:
+                log_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mcpclient.log')
+                async with aiofiles.open(log_path, 'r') as log_file:
+                    # Read the file content
+                    content = await log_file.read()
+                    lines = content.splitlines()
+                    
+                    # Get the last 100 lines or all lines if fewer
+                    last_lines = lines[-100:] if len(lines) > 100 else lines
+                    
+                    # Filter for warning lines
+                    recent_warnings = [line for line in last_lines if 'WARNING' in line]
+                    if recent_warnings:
+                        # Log the last 5 warnings or fewer if there are less
+                        warnings_to_log = recent_warnings[-5:] if len(recent_warnings) > 5 else recent_warnings
+                        log.error(f"Recent warnings that might be related: {warnings_to_log}")
+            except Exception as log_read_error:
+                log.error(f"Error trying to read log file asynchronously: {log_read_error}")
+
 
     async def cmd_export(self, args):
         """Export the current conversation or a specific branch"""
@@ -5456,9 +5752,11 @@ class MCPClient:
                 status.update(f"{STATUS_EMOJI['failure']} Import failed")
                 self.safe_print(f"[red]Failed to import conversation from {file_path}[/]")
 
+    @ensure_safe_console
     async def print_status(self):
         """Print current status of servers, tools, and capabilities with progress bars"""
-        safe_console = get_safe_console()
+        # Use the stored safe console instance to prevent multiple calls
+        safe_console = self._current_safe_console
         
         # Count connected servers, available tools/resources
         connected_servers = len(self.server_manager.active_sessions)
@@ -5566,65 +5864,114 @@ class MCPClient:
         Returns:
             A list of results from the tasks
         """
+        # Check if we already have an active progress display to prevent nesting
+        if hasattr(self, '_active_progress') and self._active_progress:
+            log.warning("Attempted to create nested progress display, using simpler output")
+            return await self._run_with_simple_progress(tasks, title)
+            
+        # Set a flag that we have an active progress
+        self._active_progress = True
+        
         safe_console = get_safe_console()
         results = []
         
-        # Set total based on whether we're using health scores or not
-        task_total = 100 if use_health_scores else 1
-        
-        # Create columns for progress display
-        columns = [
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(complete_style="green", finished_style="green"),
-        ]
-        
-        # For health score mode (0-100), add percentage
-        if use_health_scores:
-            columns.append(TextColumn("[progress.percentage]{task.percentage:>3.0f}%"))
-        else:
-            columns.append(TaskProgressColumn())
+        try:
+            # Set total based on whether we're using health scores or not
+            task_total = 100 if use_health_scores else 1
             
-        # Always add spinner for active tasks
-        columns.append(SpinnerColumn("dots"))
-        
-        # Create a Progress context that only lives for this group of tasks
-        with Progress(
-            *columns,
-            console=safe_console,
-            transient=transient
-        ) as progress:
-            # Create all tasks up front
-            task_ids = []
-            for _, description, _ in tasks:
-                task_id = progress.add_task(description, total=task_total)
-                task_ids.append(task_id)
+            # Create columns for progress display
+            columns = [
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(complete_style="green", finished_style="green"),
+            ]
             
-            # Run each task sequentially
-            for i, (task_func, _, task_args) in enumerate(tasks):
-                try:
-                    result = await task_func(*task_args) if task_args else await task_func()
-                    results.append(result)
-                    
-                    # Update progress based on mode
-                    if use_health_scores and isinstance(result, dict) and 'health' in result:
-                        # Use the health score as the progress value (0-100)
-                        progress.update(task_ids[i], completed=result['health'])
-                        # Add info about tools to the description if available
-                        if 'tools' in result:
-                            current_desc = progress._tasks[task_ids[i]].description
-                            progress.update(task_ids[i], 
-                                description=f"{current_desc} - {result['tools']} tools")
-                    else:
-                        # Just mark as complete
-                        progress.update(task_ids[i], completed=task_total)
+            # For health score mode (0-100), add percentage
+            if use_health_scores:
+                columns.append(TextColumn("[progress.percentage]{task.percentage:>3.0f}%"))
+            else:
+                columns.append(TaskProgressColumn())
+                
+            # Always add spinner for active tasks
+            columns.append(SpinnerColumn("dots"))
+            
+            # Create a Progress context that only lives for this group of tasks
+            with Progress(
+                *columns,
+                console=safe_console,
+                transient=transient,
+                expand=False  # This helps prevent display expansion issues
+            ) as progress:
+                # Create all tasks up front
+                task_ids = []
+                for _, description, _ in tasks:
+                    task_id = progress.add_task(description, total=task_total)
+                    task_ids.append(task_id)
+                
+                # Run each task sequentially
+                for i, (task_func, _, task_args) in enumerate(tasks):
+                    try:
+                        # Actually run the task
+                        result = await task_func(*task_args) if task_args else await task_func()
+                        results.append(result)
                         
-                except Exception as e:
-                    # Mark this task as failed
-                    progress.update(task_ids[i], description=f"[red]Failed: {tasks[i][1]}[/red]")
-                    # Re-raise the exception
-                    raise e
+                        # Update progress based on mode
+                        if use_health_scores and isinstance(result, dict) and 'health' in result:
+                            # Use the health score as the progress value (0-100)
+                            progress.update(task_ids[i], completed=result['health'])
+                            # Add info about tools to the description if available
+                            if 'tools' in result:
+                                current_desc = progress._tasks[task_ids[i]].description
+                                progress.update(task_ids[i], 
+                                    description=f"{current_desc} - {result['tools']} tools")
+                        else:
+                            # Just mark as complete
+                            progress.update(task_ids[i], completed=task_total)
+                            
+                    except Exception as e:
+                        # Mark this task as failed
+                        progress.update(task_ids[i], description=f"[red]Failed: {str(e)}[/red]")
+                        log.error(f"Task {i} failed: {str(e)}")
+                        # Re-raise the exception
+                        raise e
+                
+                return results
+        finally:
+            # CRITICAL: Always clear the flag when done, even if an exception occurred
+            self._active_progress = False
+
+    async def _run_with_simple_progress(self, tasks, title):
+        """Simpler version of _run_with_progress without Rich Live display.
+        Used as a fallback when nested progress displays would occur.
         
-        return results
+        Args:
+            tasks: A list of tuples with (task_func, task_description, task_args)
+            title: The title for the progress bar
+            
+        Returns:
+            A list of results from the tasks
+        """
+        safe_console = get_safe_console()
+        results = []
+        
+        safe_console.print(f"[cyan]{title}[/]")
+        
+        for i, (task_func, description, task_args) in enumerate(tasks):
+            try:
+                # Print status without requiring Live display
+                safe_console.print(f"  [cyan]→[/] {description}...", end="", flush=True)
+                
+                # Run the task
+                result = await task_func(*task_args) if task_args else await task_func()
+                safe_console.print(" [green]✓[/]")
+                results.append(result)
+            except Exception as e:
+                safe_console.print(" [red]✗[/]")
+                safe_console.print(f"    [red]Error: {str(e)}[/]")
+                log.error(f"Task {i} ({description}) failed: {str(e)}")
+                # Continue with other tasks instead of failing completely
+                continue
+        
+        return results        
 
 @app.command()
 def export(
@@ -5719,6 +6066,9 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
     client = MCPClient()
     safe_console = get_safe_console()
     
+    # Set up timeout for overall execution
+    max_shutdown_timeout = 10  # seconds
+    
     try:
         # Set up client with error handling for each step
         try:
@@ -5803,10 +6153,25 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             await client.interactive_loop()
             
     except KeyboardInterrupt:
-        safe_console.print("\n[yellow]Interrupted[/]")
+        safe_console.print("\n[yellow]Interrupted, shutting down...[/]")
         # Ensure cleanup happens if main loop interrupted
         if 'client' in locals() and client: 
-             await client.close()
+            try:
+                # Use timeout to prevent hanging during shutdown
+                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout)
+            except asyncio.TimeoutError:
+                safe_console.print("[red]Shutdown timed out. Some processes may still be running.[/]")
+                # Force kill any stubborn processes
+                if hasattr(client, 'server_manager'):
+                    for name, process in client.server_manager.processes.items():
+                        if process and process.poll() is None:
+                            try:
+                                safe_console.print(f"[yellow]Force killing process: {name}[/]")
+                                process.kill()
+                            except Exception:
+                                pass
+            except Exception as e:
+                safe_console.print(f"[red]Error during shutdown: {e}[/]")
     
     except Exception as e:
         # Use client.safe_print if client is available, otherwise use safe_console
@@ -5825,7 +6190,12 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
         
         # For unhandled exceptions in non-interactive mode, still try to clean up
         if 'client' in locals() and client and hasattr(client, 'server_manager'):
-            await client.close()
+            try:
+                # Use timeout to prevent hanging during error cleanup
+                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout)
+            except (asyncio.TimeoutError, Exception):
+                # Just continue with exit on any errors during error handling
+                pass
         
         # Return non-zero exit code for script usage
         if not interactive:
@@ -5836,7 +6206,19 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
         # Ensure close is called if setup succeeded but something else failed
         if 'client' in locals() and client and hasattr(client, 'server_manager'): 
             try:
-                await client.close()
+                # Add timeout to prevent hanging
+                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout)
+            except asyncio.TimeoutError:
+                safe_console.print("[red]Shutdown timed out. Some processes may still be running.[/]")
+                # Force kill processes that didn't shut down cleanly
+                if hasattr(client, 'server_manager') and hasattr(client.server_manager, 'processes'):
+                    for name, process in client.server_manager.processes.items():
+                        if process and process.poll() is None:
+                            try:
+                                safe_console.print(f"[yellow]Force killing process: {name}[/]")
+                                process.kill()
+                            except Exception:
+                                pass
             except Exception as close_error:
                 log.error(f"Error during cleanup: {close_error}")
                 # Continue shutdown regardless of cleanup errors
