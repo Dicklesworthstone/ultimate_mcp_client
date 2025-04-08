@@ -389,6 +389,11 @@ class ServerConfig:
     metrics: ServerMetrics = field(default_factory=ServerMetrics)
     registry_url: Optional[str] = None  # URL of registry where found
     last_updated: datetime = field(default_factory=datetime.now)
+    retry_policy: Dict[str, Any] = field(default_factory=lambda: {
+        "max_attempts": 3,
+        "backoff_factor": 0.5,
+        "timeout_increment": 5
+    })
     capabilities: Dict[str, bool] = field(default_factory=lambda: {
         "tools": True,
         "resources": True,
@@ -1049,6 +1054,11 @@ class Config:
                             timeout=server_data.get('timeout', 30.0),
                             metrics=metrics,
                             registry_url=server_data.get('registry_url'),
+                            retry_policy=server_data.get('retry_policy', {
+                                "max_attempts": 3,
+                                "backoff_factor": 0.5,
+                                "timeout_increment": 5
+                            }),
                             capabilities=server_data.get('capabilities', {
                                 "tools": True,
                                 "resources": True,
@@ -1106,6 +1116,7 @@ class Config:
                     'rating': server.rating,
                     'retry_count': server.retry_count,
                     'timeout': server.timeout,
+                    'retry_policy': server.retry_policy,
                     'metrics': {
                         'uptime': server.metrics.uptime,
                         'request_count': server.metrics.request_count,
@@ -2003,7 +2014,80 @@ class MCPClient:
         # Set up readline for command history in interactive mode
         readline.set_completer(self.completer)
         readline.parse_and_bind("tab: complete")
+    
+    # Add decorator for retry logic
+    @staticmethod
+    def retry_with_circuit_breaker(func):
+        async def wrapper(self, server_name, *args, **kwargs):
+            server_config = self.config.servers.get(server_name)
+            if not server_config:
+                raise McpError(f"Server {server_name} not found")
+                
+            if server_config.metrics.error_rate > 0.5:
+                log.warning(f"Circuit breaker triggered for server {server_name} (error rate: {server_config.metrics.error_rate:.2f})")
+                raise McpError(f"Server {server_name} in circuit breaker state")
+                
+            last_error = None
+            for attempt in range(server_config.retry_policy["max_attempts"]):
+                try:
+                    # For each attempt, slightly increase the timeout
+                    request_timeout = server_config.timeout + (attempt * server_config.retry_policy["timeout_increment"])
+                    return await func(self, server_name, *args, **kwargs, request_timeout=request_timeout)
+                except (McpError, httpx.RequestError) as e:
+                    last_error = e
+                    server_config.metrics.request_count += 1
+                    
+                    if attempt < server_config.retry_policy["max_attempts"] - 1:
+                        delay = server_config.retry_policy["backoff_factor"] * (2 ** attempt) + random.random()
+                        log.warning(f"Retrying tool execution for server {server_name} (attempt {attempt+1}/{server_config.retry_policy['max_attempts']})")
+                        log.warning(f"Retry will happen after {delay:.2f}s delay. Error: {str(e)}")
+                        await asyncio.sleep(delay)
+                    else:
+                        server_config.metrics.error_count += 1
+                        server_config.metrics.update_status()
+                        raise McpError(f"All {server_config.retry_policy['max_attempts']} attempts failed for server {server_name}: {str(last_error)}") from last_error
+            
+            return None  # Should never reach here
+        return wrapper
         
+    @retry_with_circuit_breaker
+    async def execute_tool(self, server_name, tool_name, tool_args, request_timeout=None):
+        """Execute a tool with retry and circuit breaker logic
+        
+        Args:
+            server_name: Name of the server to execute the tool on
+            tool_name: Name of the tool to execute
+            tool_args: Arguments for the tool
+            request_timeout: Optional timeout override in seconds
+            
+        Returns:
+            The tool execution result
+        """
+        session = self.server_manager.active_sessions.get(server_name)
+        if not session:
+            raise McpError(f"Server {server_name} not connected")
+            
+        # Get the tool from the server_manager
+        tool = self.server_manager.tools.get(tool_name)
+        if not tool:
+            raise McpError(f"Tool {tool_name} not found")
+            
+        # Set timeout if provided
+        original_timeout = None
+        if request_timeout and hasattr(session, 'timeout'):
+            # Some session types might have configurable timeouts
+            original_timeout = session.timeout
+            session.timeout = request_timeout
+            
+        try:
+            # Call the tool
+            result = await session.call_tool(tool.original_tool.name, tool_args)
+            return result.result
+        finally:
+            # Restore original timeout if it was changed
+            if original_timeout is not None and hasattr(session, 'timeout'):
+                session.timeout = original_timeout
+
     def completer(self, text, state):
         """Tab completion for commands"""
         options = [cmd for cmd in self.commands.keys() if cmd.startswith(text)]
@@ -2317,16 +2401,13 @@ class MCPClient:
                             if not cache_used:
                                 yield f"\n[{STATUS_EMOJI['tool']}] Executing {tool_name}..."
                                 
-                                # Use the new context manager for tool execution
                                 try:
-                                    async with self.tool_execution_context(tool_name, tool_args, tool.server_name):
-                                        # Call the tool
-                                        result = await session.call_tool(tool.original_tool.name, tool_args)
-                                        tool_result = result.result
-                                        
-                                        # Cache the result if enabled
-                                        if self.tool_cache:
-                                            self.tool_cache.set(tool_name, tool_args, tool_result)
+                                    # Use the new execute_tool method with retry and circuit breaker
+                                    tool_result = await self.execute_tool(tool.server_name, tool_name, tool_args)
+                                    
+                                    # Cache the result if enabled
+                                    if self.tool_cache:
+                                        self.tool_cache.set(tool_name, tool_args, tool_result)
                                         
                                 except Exception as e:
                                     log.error(f"Error executing tool {tool_name}: {e}")
@@ -2531,19 +2612,16 @@ class MCPClient:
                             status.update(f"{STATUS_EMOJI['tool']} Executing tool: {tool_name}...")
                             
                             try:
-                                # Use the new context manager for tool execution
-                                async with self.tool_execution_context(tool_name, tool_args, tool.server_name):
-                                    # Call the tool
-                                    result = await session.call_tool(tool.original_tool.name, tool_args)
-                                    tool_result = result.result
-                                    
-                                    # Update progress
-                                    status.update(f"{STATUS_EMOJI['success']} Tool {tool_name} execution complete")
-                                    
-                                    # Cache the result if enabled
-                                    if self.tool_cache:
-                                        self.tool_cache.set(tool_name, tool_args, tool_result)
-                                    
+                                # Use the new execute_tool method with retry and circuit breaker
+                                tool_result = await self.execute_tool(tool.server_name, tool_name, tool_args)
+                                
+                                # Update progress
+                                status.update(f"{STATUS_EMOJI['success']} Tool {tool_name} execution complete")
+                                
+                                # Cache the result if enabled
+                                if self.tool_cache:
+                                    self.tool_cache.set(tool_name, tool_args, tool_result)
+                                
                             except Exception as e:
                                 log.error(f"Error executing tool {tool_name}: {e}")
                                 status.update(f"{STATUS_EMOJI['failure']} Tool {tool_name} execution failed: {e}")
