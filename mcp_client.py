@@ -119,7 +119,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -280,7 +280,38 @@ log = logging.getLogger("mcpclient")
 #   - get_safe_console().print() for direct access
 #   - self.safe_print() for class instance methods
 #   - safe_console = get_safe_console() for local variables
+#   - safe_stdout() context manager for any code that interacts with stdio servers
 # =============================================================================
+
+@contextmanager
+def safe_stdout():
+    """Context manager that redirects stdout to stderr during critical stdio operations.
+    
+    This provides an additional layer of protection beyond get_safe_console() by
+    ensuring that any direct writes to sys.stdout (not just through Rich) are
+    safely redirected during critical operations with stdio servers.
+    
+    Use this in any code block that interacts with stdio MCP servers:
+        with safe_stdout():
+            # Code that interacts with stdio servers
+    """
+    # Check if we have any active stdio servers
+    has_stdio_servers = False
+    try:
+        if hasattr(app, "mcp_client") and app.mcp_client and hasattr(app.mcp_client, "server_manager"):
+            for name, server in app.mcp_client.server_manager.config.servers.items():
+                if server.type == ServerType.STDIO and name in app.mcp_client.server_manager.active_sessions:
+                    has_stdio_servers = True
+                    break
+    except (NameError, AttributeError):
+        pass
+    
+    # Only redirect if we have stdio servers active
+    if has_stdio_servers:
+        with redirect_stdout(sys.stderr):
+            yield
+    else:
+        yield
 
 
 def get_safe_console():
@@ -1489,7 +1520,7 @@ class History:
         # Keep broad exception for unexpected saving issues
         except Exception as e: 
              log.error(f"Unexpected error saving history: {e}")
-    
+             
     async def load(self):
         """Load history from file asynchronously"""
         if not HISTORY_FILE.exists():
@@ -1724,24 +1755,26 @@ class ServerManager:
         session = None
         connected = False
         
-        try:
-            # Use existing connection logic
-            session = await self.connect_to_server(server_config)
-            if session:
-                self.active_sessions[server_name] = session
-                connected = True
-                yield session
-            else:
-                yield None
-        finally:
-            # Clean up if we connected successfully
-            if connected and server_name in self.active_sessions:
-                # Note: We're not removing from self.active_sessions here
-                # as that should be managed by higher-level disconnect method
-                # This just ensures session cleanup resources are released
-                log.debug(f"Cleaning up server session for {server_name}")
-                # Close could be added if a specific per-session close is implemented
-                # For now we rely on the exit_stack in close() method
+        # Use safe_stdout context manager to protect against stdout pollution during connection
+        with safe_stdout():
+            try:
+                # Use existing connection logic
+                session = await self.connect_to_server(server_config)
+                if session:
+                    self.active_sessions[server_name] = session
+                    connected = True
+                    yield session
+                else:
+                    yield None
+            finally:
+                # Clean up if we connected successfully
+                if connected and server_name in self.active_sessions:
+                    # Note: We're not removing from self.active_sessions here
+                    # as that should be managed by higher-level disconnect method
+                    # This just ensures session cleanup resources are released
+                    log.debug(f"Cleaning up server session for {server_name}")
+                    # Close could be added if a specific per-session close is implemented
+                    # For now we rely on the exit_stack in close() method
 
     async def _discover_local_servers(self):
         """Discover MCP servers in local filesystem paths"""
@@ -1995,243 +2028,245 @@ class ServerManager:
         # Ensure we're using stderr for output during connection to avoid stdio interference
         safe_console = stderr_console if server_config.type == ServerType.STDIO else console
         
-        while retry_count <= max_retries:
-            # Track metrics for this connection attempt
-            start_time = time.time()
-            
-            try:
-                # Start span for observability if available
-                span_ctx = None
-                if tracer:
-                    try:
-                        span_ctx = tracer.start_as_current_span(
-                            f"connect_server.{server_name}",
-                            attributes={
-                                "server.name": server_name,
-                                "server.type": server_config.type.value,
-                                "server.path": server_config.path,
-                                "retry": retry_count
+        # Use safe_stdout context manager to protect against stdout pollution during the entire connection process
+        with safe_stdout():
+            while retry_count <= max_retries:
+                # Track metrics for this connection attempt
+                start_time = time.time()
+                
+                try:
+                    # Start span for observability if available
+                    span_ctx = None
+                    if tracer:
+                        try:
+                            span_ctx = tracer.start_as_current_span(
+                                f"connect_server.{server_name}",
+                                attributes={
+                                    "server.name": server_name,
+                                    "server.type": server_config.type.value,
+                                    "server.path": server_config.path,
+                                    "retry": retry_count
+                                }
+                            )
+                        except Exception as e:
+                            log.warning(f"Failed to create trace span: {e}")
+                            span_ctx = None
+                    
+                    # Log connection info using safe_console
+                    safe_console.print(f"[cyan]Attempting to connect to server {server_name}...[/]")
+
+                    if server_config.type == ServerType.STDIO:
+                        # Check if we need to start the server process
+                        if server_config.auto_start and server_config.path:
+                            # Check if a process is already running for this server
+                            existing_process = self.processes.get(server_config.name)
+                            restart_process = False
+                            
+                            if existing_process:
+                                # Check if the process is still alive
+                                if existing_process.poll() is None:
+                                    # Process is running, but if we've hit an error before, we might want to restart
+                                    if retry_count > 0:
+                                        log.warning(f"Restarting process for {server_name} on retry {retry_count}")
+                                        safe_console.print(f"[yellow]Restarting process for {server_name} on retry {retry_count}[/]")
+                                        restart_process = True
+                                        
+                                        # Try to terminate gracefully
+                                        try:
+                                            existing_process.terminate()
+                                            try:
+                                                # Wait with timeout for termination
+                                                await asyncio.wait_for(existing_process.wait(), timeout=2.0)
+                                            except asyncio.TimeoutError:
+                                                # Force kill if necessary
+                                                log.warning(f"Process for {server_name} not responding to terminate, killing")
+                                                safe_console.print(f"[red]Process for {server_name} not responding, forcing kill[/]")
+                                                existing_process.kill()
+                                                await existing_process.wait()
+                                        except Exception as e:
+                                            log.error(f"Error terminating process for {server_name}: {e}")
+                                            safe_console.print(f"[red]Error terminating process: {e}[/]")
+                                else:
+                                    # Process has exited
+                                    log.warning(f"Process for {server_name} has exited with code {existing_process.returncode}")
+                                    safe_console.print(f"[yellow]Process for {server_name} has exited with code {existing_process.returncode}[/]")
+                                    
+                                    # Try to get stderr output for diagnostics if process has terminated
+                                    try:
+                                        if existing_process.stderr:
+                                            stderr_data = await existing_process.stderr.read()
+                                            if stderr_data:
+                                                log.error(f"Process stderr: {stderr_data.decode('utf-8', errors='replace')}")
+                                    except Exception as e:
+                                        log.warning(f"Couldn't read stderr: {e}")
+                                    
+                                    restart_process = True
+                            else:
+                                # No existing process
+                                restart_process = True
+                            
+                            # Start or restart the process if needed
+                            if restart_process:
+                                # Start the process
+                                cmd = [server_config.path] + server_config.args
+                                
+                                # Detect if it's a Python file
+                                if server_config.path.endswith('.py'):
+                                    python_cmd = sys.executable
+                                    cmd = [python_cmd] + cmd
+                                # Detect if it's a JS file
+                                elif server_config.path.endswith('.js'):
+                                    node_cmd = 'node'
+                                    cmd = [node_cmd] + cmd
+                                
+                                log.info(f"Starting server process: {' '.join(cmd)}")
+                                safe_console.print(f"[cyan]Starting server process: {' '.join(cmd)}[/]")
+                                
+                                # Create process with pipes and set resource limits
+                                # Add a unique identifier to each process to prevent interference
+                                env = os.environ.copy()
+                                # These environment variables are critical for preventing interference between
+                                # multiple stdio MCP servers running on the same machine:
+                                # - MCP_SERVER_ID: Unique name for each server to distinguish protocol messages
+                                # - MCP_CLIENT_ID: Unique ID for this client instance to prevent cross-talk
+                                env["MCP_SERVER_ID"] = server_name
+                                env["MCP_CLIENT_ID"] = str(uuid.uuid4())
+                                
+                                process = await asyncio.create_subprocess_exec(
+                                    *cmd,
+                                    stdin=asyncio.subprocess.PIPE,
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE,
+                                    env=env
+                                )
+                                
+                                self.processes[server_config.name] = process
+                                
+                                # Register the server with zeroconf if local discovery is enabled
+                                if self.config.enable_local_discovery and self.registry:
+                                    await self.register_local_server(server_config)
+                        
+                        # Set up parameters with timeout - include existing process if available
+                        params = StdioServerParameters(
+                            command=server_config.path, 
+                            args=server_config.args,
+                            timeout=server_config.timeout,
+                            process=self.processes.get(server_name)  # Pass existing process if available
+                        )
+                        
+                        # Create client with context manager to ensure proper cleanup
+                        # FIX: Remove the extra await before stdio_client
+                        session = await self.exit_stack.enter_async_context(stdio_client(params))
+                        
+                    elif server_config.type == ServerType.SSE:
+                        # Connect to SSE server using direct parameters
+                        # FIX: Remove the extra await before sse_client
+                        session = await self.exit_stack.enter_async_context(
+                            sse_client(
+                                url=server_config.path,
+                                timeout=server_config.timeout,
+                                sse_read_timeout=server_config.timeout * 12  # Set longer timeout for events
+                            )
+                        )
+                    else:
+                        if span_ctx and hasattr(span_ctx, 'set_status'):
+                            span_ctx.set_status(trace.StatusCode.ERROR, f"Unknown server type: {server_config.type}")
+                        log.error(f"Unknown server type: {server_config.type}")
+                        safe_console.print(f"[red]Unknown server type: {server_config.type}[/]")
+                        return None
+                    
+                    # Calculate connection time
+                    connection_time = (time.time() - start_time) * 1000  # ms
+                    
+                    # Update metrics
+                    server_config.metrics.request_count += 1
+                    server_config.metrics.update_response_time(connection_time)
+                    server_config.metrics.update_status()
+                    
+                    # Record metrics if available
+                    if latency_histogram:
+                        latency_histogram.record(
+                            connection_time,
+                            {
+                                "operation": "connect",
+                                "server": server_name,
+                                "server_type": server_config.type.value
                             }
                         )
-                    except Exception as e:
-                        log.warning(f"Failed to create trace span: {e}")
-                        span_ctx = None
-                
-                # Log connection info using safe_console
-                safe_console.print(f"[cyan]Attempting to connect to server {server_name}...[/]")
-
-                if server_config.type == ServerType.STDIO:
-                    # Check if we need to start the server process
-                    if server_config.auto_start and server_config.path:
-                        # Check if a process is already running for this server
-                        existing_process = self.processes.get(server_config.name)
-                        restart_process = False
-                        
-                        if existing_process:
-                            # Check if the process is still alive
-                            if existing_process.poll() is None:
-                                # Process is running, but if we've hit an error before, we might want to restart
-                                if retry_count > 0:
-                                    log.warning(f"Restarting process for {server_name} on retry {retry_count}")
-                                    safe_console.print(f"[yellow]Restarting process for {server_name} on retry {retry_count}[/]")
-                                    restart_process = True
-                                    
-                                    # Try to terminate gracefully
-                                    try:
-                                        existing_process.terminate()
-                                        try:
-                                            # Wait with timeout for termination
-                                            await asyncio.wait_for(existing_process.wait(), timeout=2.0)
-                                        except asyncio.TimeoutError:
-                                            # Force kill if necessary
-                                            log.warning(f"Process for {server_name} not responding to terminate, killing")
-                                            safe_console.print(f"[red]Process for {server_name} not responding, forcing kill[/]")
-                                            existing_process.kill()
-                                            await existing_process.wait()
-                                    except Exception as e:
-                                        log.error(f"Error terminating process for {server_name}: {e}")
-                                        safe_console.print(f"[red]Error terminating process: {e}[/]")
-                            else:
-                                # Process has exited
-                                log.warning(f"Process for {server_name} has exited with code {existing_process.returncode}")
-                                safe_console.print(f"[yellow]Process for {server_name} has exited with code {existing_process.returncode}[/]")
-                                
-                                # Try to get stderr output for diagnostics if process has terminated
-                                try:
-                                    if existing_process.stderr:
-                                        stderr_data = await existing_process.stderr.read()
-                                        if stderr_data:
-                                            log.error(f"Process stderr: {stderr_data.decode('utf-8', errors='replace')}")
-                                except Exception as e:
-                                    log.warning(f"Couldn't read stderr: {e}")
-                                
-                                restart_process = True
-                        else:
-                            # No existing process
-                            restart_process = True
-                        
-                        # Start or restart the process if needed
-                        if restart_process:
-                            # Start the process
-                            cmd = [server_config.path] + server_config.args
-                            
-                            # Detect if it's a Python file
-                            if server_config.path.endswith('.py'):
-                                python_cmd = sys.executable
-                                cmd = [python_cmd] + cmd
-                            # Detect if it's a JS file
-                            elif server_config.path.endswith('.js'):
-                                node_cmd = 'node'
-                                cmd = [node_cmd] + cmd
-                            
-                            log.info(f"Starting server process: {' '.join(cmd)}")
-                            safe_console.print(f"[cyan]Starting server process: {' '.join(cmd)}[/]")
-                            
-                            # Create process with pipes and set resource limits
-                            # Add a unique identifier to each process to prevent interference
-                            env = os.environ.copy()
-                            # These environment variables are critical for preventing interference between
-                            # multiple stdio MCP servers running on the same machine:
-                            # - MCP_SERVER_ID: Unique name for each server to distinguish protocol messages
-                            # - MCP_CLIENT_ID: Unique ID for this client instance to prevent cross-talk
-                            env["MCP_SERVER_ID"] = server_name
-                            env["MCP_CLIENT_ID"] = str(uuid.uuid4())
-                            
-                            process = await asyncio.create_subprocess_exec(
-                                *cmd,
-                                stdin=asyncio.subprocess.PIPE,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                                env=env
-                            )
-                            
-                            self.processes[server_config.name] = process
-                            
-                            # Register the server with zeroconf if local discovery is enabled
-                            if self.config.enable_local_discovery and self.registry:
-                                await self.register_local_server(server_config)
                     
-                    # Set up parameters with timeout - include existing process if available
-                    params = StdioServerParameters(
-                        command=server_config.path, 
-                        args=server_config.args,
-                        timeout=server_config.timeout,
-                        process=self.processes.get(server_name)  # Pass existing process if available
-                    )
-                    
-                    # Create client with context manager to ensure proper cleanup
-                    # FIX: Remove the extra await before stdio_client
-                    session = await self.exit_stack.enter_async_context(stdio_client(params))
-                    
-                elif server_config.type == ServerType.SSE:
-                    # Connect to SSE server using direct parameters
-                    # FIX: Remove the extra await before sse_client
-                    session = await self.exit_stack.enter_async_context(
-                        sse_client(
-                            url=server_config.path,
-                            timeout=server_config.timeout,
-                            sse_read_timeout=server_config.timeout * 12  # Set longer timeout for events
-                        )
-                    )
-                else:
+                    # Mark span as successful
                     if span_ctx and hasattr(span_ctx, 'set_status'):
-                        span_ctx.set_status(trace.StatusCode.ERROR, f"Unknown server type: {server_config.type}")
-                    log.error(f"Unknown server type: {server_config.type}")
-                    safe_console.print(f"[red]Unknown server type: {server_config.type}[/]")
-                    return None
-                
-                # Calculate connection time
-                connection_time = (time.time() - start_time) * 1000  # ms
-                
-                # Update metrics
-                server_config.metrics.request_count += 1
-                server_config.metrics.update_response_time(connection_time)
+                        try:
+                            span_ctx.set_status(trace.StatusCode.OK)
+                            if hasattr(span_ctx, 'end'):
+                                span_ctx.end()
+                        except Exception as e:
+                            log.warning(f"Error updating span status: {e}")
+                    
+                    log.info(f"Connected to server {server_name} in {connection_time:.2f}ms")
+                    safe_console.print(f"[green]Connected to server {server_name} in {connection_time:.2f}ms[/]")
+                    return session
+                    
+                except McpError as e: # Catch MCP client errors
+                    connection_error = e
+                except httpx.RequestError as e: # Network errors for SSE
+                    connection_error = e
+                except subprocess.SubprocessError as e: # Errors starting/communicating with STDIO process
+                    connection_error = e
+                    # Check if the process terminated unexpectedly
+                    if server_config.name in self.processes:
+                        proc = self.processes[server_config.name]
+                        if proc.poll() is not None:
+                            try:
+                                stderr_data = await proc.stderr.read() if proc.stderr else b"stderr not captured"
+                                stderr_output = stderr_data.decode('utf-8', errors='replace')
+                                log.error(f"STDIO server process for '{server_config.name}' exited with code {proc.returncode}. Stderr: {stderr_output}")
+                                safe_console.print(f"[red]STDIO server process for '{server_config.name}' exited with code {proc.returncode}[/]")
+                            except Exception as err:
+                                log.error(f"Error reading stderr: {err}")
+                except OSError as e: # OS level errors (e.g., command not found)
+                    connection_error = e
+                # Keep broad exception for truly unexpected connection issues
+                except Exception as e: 
+                    connection_error = e
+
+                # Shared error handling for caught exceptions
+                retry_count += 1
+                server_config.metrics.error_count += 1
                 server_config.metrics.update_status()
-                
-                # Record metrics if available
-                if latency_histogram:
-                    latency_histogram.record(
-                        connection_time,
-                        {
-                            "operation": "connect",
-                            "server": server_name,
-                            "server_type": server_config.type.value
-                        }
-                    )
-                
-                # Mark span as successful
+
                 if span_ctx and hasattr(span_ctx, 'set_status'):
                     try:
-                        span_ctx.set_status(trace.StatusCode.OK)
-                        if hasattr(span_ctx, 'end'):
-                            span_ctx.end()
+                        span_ctx.set_status(trace.StatusCode.ERROR, str(connection_error))
+                        # Don't end yet, we might retry
                     except Exception as e:
-                        log.warning(f"Error updating span status: {e}")
-                
-                log.info(f"Connected to server {server_name} in {connection_time:.2f}ms")
-                safe_console.print(f"[green]Connected to server {server_name} in {connection_time:.2f}ms[/]")
-                return session
-                
-            except McpError as e: # Catch MCP client errors
-                connection_error = e
-            except httpx.RequestError as e: # Network errors for SSE
-                connection_error = e
-            except subprocess.SubprocessError as e: # Errors starting/communicating with STDIO process
-                connection_error = e
-                # Check if the process terminated unexpectedly
-                if server_config.name in self.processes:
-                    proc = self.processes[server_config.name]
-                    if proc.poll() is not None:
+                        log.warning(f"Error updating span error status: {e}")
+
+                connection_time = (time.time() - start_time) * 1000
+                    
+                if retry_count <= max_retries:
+                    delay = min(1 * (2 ** (retry_count - 1)) + random.random(), 10)
+                    log.warning(f"Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}")
+                    safe_console.print(f"[yellow]Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}[/]")
+                    log.info(f"Retrying in {delay:.2f} seconds...")
+                    safe_console.print(f"[cyan]Retrying in {delay:.2f} seconds...[/]")
+                    await asyncio.sleep(delay)
+                else:
+                    log.error(f"Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}")
+                    safe_console.print(f"[red]Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}[/]")
+                    if span_ctx and hasattr(span_ctx, 'end'): 
                         try:
-                            stderr_data = await proc.stderr.read() if proc.stderr else b"stderr not captured"
-                            stderr_output = stderr_data.decode('utf-8', errors='replace')
-                            log.error(f"STDIO server process for '{server_config.name}' exited with code {proc.returncode}. Stderr: {stderr_output}")
-                            safe_console.print(f"[red]STDIO server process for '{server_config.name}' exited with code {proc.returncode}[/]")
-                        except Exception as err:
-                            log.error(f"Error reading stderr: {err}")
-            except OSError as e: # OS level errors (e.g., command not found)
-                connection_error = e
-            # Keep broad exception for truly unexpected connection issues
-            except Exception as e: 
-                connection_error = e
+                            span_ctx.end() # End span after final failure
+                        except Exception as e:
+                            log.warning(f"Error ending span: {e}")
+                    return None
 
-            # Shared error handling for caught exceptions
-            retry_count += 1
-            server_config.metrics.error_count += 1
-            server_config.metrics.update_status()
-
-            if span_ctx and hasattr(span_ctx, 'set_status'):
+            if span_ctx and hasattr(span_ctx, 'end'): 
                 try:
-                    span_ctx.set_status(trace.StatusCode.ERROR, str(connection_error))
-                    # Don't end yet, we might retry
+                    span_ctx.end() # End span if loop finishes unexpectedly
                 except Exception as e:
-                    log.warning(f"Error updating span error status: {e}")
-
-            connection_time = (time.time() - start_time) * 1000
-                
-            if retry_count <= max_retries:
-                delay = min(1 * (2 ** (retry_count - 1)) + random.random(), 10)
-                log.warning(f"Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}")
-                safe_console.print(f"[yellow]Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}[/]")
-                log.info(f"Retrying in {delay:.2f} seconds...")
-                safe_console.print(f"[cyan]Retrying in {delay:.2f} seconds...[/]")
-                await asyncio.sleep(delay)
-            else:
-                log.error(f"Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}")
-                safe_console.print(f"[red]Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}[/]")
-                if span_ctx and hasattr(span_ctx, 'end'): 
-                    try:
-                        span_ctx.end() # End span after final failure
-                    except Exception as e:
-                        log.warning(f"Error ending span: {e}")
-                return None
-
-        if span_ctx and hasattr(span_ctx, 'end'): 
-            try:
-                span_ctx.end() # End span if loop finishes unexpectedly
-            except Exception as e:
-                log.warning(f"Error ending span: {e}")
-        return None
+                    log.warning(f"Error ending span: {e}")
+            return None
 
     async def register_local_server(self, server_config: ServerConfig):
         """Register a locally started MCP server with zeroconf so other clients can discover it"""
@@ -2714,17 +2749,19 @@ class MCPClient:
             
         try:
             # Use the tool_execution_context context manager for metrics and tracing
-            async with self.tool_execution_context(tool_name, tool_args, server_name):
-                # Call the tool - this is unchanged from the original implementation
-                result = await session.call_tool(tool.original_tool.name, tool_args)
-                
-                # Check dependencies - unchanged from original implementation
-                if self.tool_cache:
-                    dependencies = self.tool_cache.dependency_graph.get(tool_name, set())
-                    if dependencies:
-                        log.debug(f"Tool {tool_name} has dependencies: {dependencies}")
-                
-                return result.result
+            # Wrap with safe_stdout to protect against stdout pollution during tool execution
+            with safe_stdout():
+                async with self.tool_execution_context(tool_name, tool_args, server_name):
+                    # Call the tool - this is unchanged from the original implementation
+                    result = await session.call_tool(tool.original_tool.name, tool_args)
+                    
+                    # Check dependencies - unchanged from original implementation
+                    if self.tool_cache:
+                        dependencies = self.tool_cache.dependency_graph.get(tool_name, set())
+                        if dependencies:
+                            log.debug(f"Tool {tool_name} has dependencies: {dependencies}")
+                    
+                    return result.result
         finally:
             # Restore original timeout if it was changed - unchanged from original implementation
             if original_timeout is not None and hasattr(session, 'timeout'):
@@ -2741,17 +2778,17 @@ class MCPClient:
         """Set up the client, connect to servers, and load capabilities"""
         # Ensure API key is set
         if not self.config.api_key:
-            console.print("[bold red]ERROR: Anthropic API key not found[/]")
-            console.print("Please set your API key using one of these methods:")
-            console.print("1. Set the ANTHROPIC_API_KEY environment variable")
-            console.print("2. Run 'python mcp_client.py run --interactive' and then use '/config api-key YOUR_API_KEY'")
+            self.safe_print("[bold red]ERROR: Anthropic API key not found[/]")
+            self.safe_print("Please set your API key using one of these methods:")
+            self.safe_print("1. Set the ANTHROPIC_API_KEY environment variable")
+            self.safe_print("2. Run 'python mcp_client.py run --interactive' and then use '/config api-key YOUR_API_KEY'")
             
             # Only exit if not in interactive mode
             if not interactive_mode:
                 sys.exit(1)
             else:
-                console.print("[yellow]Running in interactive mode without API key.[/]")
-                console.print("[yellow]Please set your API key using '/config api-key YOUR_API_KEY'[/]")
+                self.safe_print("[yellow]Running in interactive mode without API key.[/]")
+                self.safe_print("[yellow]Please set your API key using '/config api-key YOUR_API_KEY'[/]")
                 # Continue setup without API features
                 self.anthropic = None  # Set to None until API key is provided
                 
@@ -2855,11 +2892,11 @@ class MCPClient:
                     
                     # If there are new servers, notify the user
                     if new_servers:
-                        console.print(f"\n[bold cyan]{STATUS_EMOJI['search']} New MCP servers discovered on local network:[/]")
+                        self.safe_print(f"\n[bold cyan]{STATUS_EMOJI['search']} New MCP servers discovered on local network:[/]")
                         for server_name in new_servers:
                             server_info = self.server_manager.registry.discovered_servers[server_name]
-                            console.print(f"  - [bold cyan]{server_name}[/] at [cyan]{server_info.get('url', 'unknown URL')}[/]")
-                        console.print("Use [bold cyan]/discover list[/] to view details and [bold cyan]/discover connect NAME[/] to connect")
+                            self.safe_print(f"  - [bold cyan]{server_name}[/] at [cyan]{server_info.get('url', 'unknown URL')}[/]")
+                        self.safe_print("Use [bold cyan]/discover list[/] to view details and [bold cyan]/discover connect NAME[/] to connect")
                         
                         # Update tracked servers
                         self.discovered_local_servers = current_servers
@@ -3065,125 +3102,6 @@ class MCPClient:
         # Close cache
         if self.tool_cache:
             self.tool_cache.close()
-    
-    async def print_status(self):
-        """Print client status summary"""
-        safe_console = get_safe_console()
-        safe_console.print("\n[bold]MCP Client Status[/]")
-        safe_console.print(f"Model: [cyan]{self.current_model}[/]")
-        
-        # Server connections
-        server_table = Table(title="Connected Servers")
-        server_table.add_column("Name")
-        server_table.add_column("Type")
-        server_table.add_column("Tools")
-        server_table.add_column("Resources")
-        server_table.add_column("Prompts")
-        
-        for name, session in self.server_manager.active_sessions.items():
-            server_config = self.config.servers.get(name)
-            if not server_config:
-                continue
-                
-            # Count capabilities from this server
-            tools_count = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
-            resources_count = sum(1 for r in self.server_manager.resources.values() if r.server_name == name)
-            prompts_count = sum(1 for p in self.server_manager.prompts.values() if p.server_name == name)
-            
-            server_table.add_row(
-                name,
-                server_config.type.value,
-                str(tools_count),
-                str(resources_count),
-                str(prompts_count)
-            )
-        
-        safe_console.print(server_table)
-        
-        # Tool summary
-        if self.server_manager.tools:
-            safe_console.print(f"\nAvailable tools: [green]{len(self.server_manager.tools)}[/]")
-            safe_console.print(f"Available resources: [green]{len(self.server_manager.resources)}[/]")
-            safe_console.print(f"Available prompts: [green]{len(self.server_manager.prompts)}[/]")
-        else:
-            safe_console.print("\n[yellow]No tools available. Connect to MCP servers to access tools.[/]")
-    
-    @asynccontextmanager
-    async def tool_execution_context(self, tool_name: str, tool_args: dict, server_name: str):
-        """Context manager for tool execution with metrics and tracing.
-        
-        This centralizes all the tool execution boilerplate like tracing,
-        metrics collection, and error handling.
-        
-        Args:
-            tool_name: Name of the tool being executed
-            tool_args: Arguments for the tool
-            server_name: Name of the server running the tool
-            
-        Yields:
-            The execution time in milliseconds on successful completion
-        """
-        tool_start_time = time.time()
-        tool_span = None
-        
-        if tracer:
-            tool_span = tracer.start_as_current_span(
-                f"tool.{tool_name}",
-                attributes={
-                    "tool.name": tool_name,
-                    "server.name": server_name,
-                    "params": str(tool_args)
-                }
-            )
-        
-        try:
-            # We yield a placeholder here - we'll calculate and track the execution time after the yield
-            yield None
-            
-            # Calculate execution time
-            tool_execution_time = (time.time() - tool_start_time) * 1000  # ms
-            
-            # Update tool metrics in tool collection
-            tool = self.server_manager.tools.get(tool_name)
-            if tool:
-                tool.update_execution_time(tool_execution_time)
-            
-            # Record metrics if available
-            if tool_execution_counter:
-                tool_execution_counter.add(
-                    1, 
-                    {"tool": tool_name, "server": server_name, "success": "true"}
-                )
-            
-            if latency_histogram:
-                latency_histogram.record(
-                    tool_execution_time,
-                    {"operation": "tool_execution", "tool": tool_name, "server": server_name}
-                )
-            
-            # End span if tracking with success status
-            if tool_span:
-                tool_span.set_status(trace.StatusCode.OK)
-            
-        except Exception as e:
-            # Record error metrics
-            if tool_execution_counter:
-                tool_execution_counter.add(
-                    1, 
-                    {"tool": tool_name, "server": server_name, "success": "false"}
-                )
-            
-            # End span with error status
-            if tool_span:
-                tool_span.set_status(trace.StatusCode.ERROR, str(e))
-                
-            # Re-raise the exception
-            raise
-            
-        finally:
-            # Always end the span if it exists
-            if tool_span:
-                tool_span.end()
     
     async def process_streaming_query(self, query: str, model: Optional[str] = None, 
                                max_tokens: Optional[int] = None) -> AsyncIterator[str]:
@@ -3616,6 +3534,7 @@ class MCPClient:
                     span_ctx.end()
                 
                 return f"[Error: {error_msg}]"
+        
     
     async def interactive_loop(self):
         """Run interactive command loop"""
@@ -3760,46 +3679,46 @@ class MCPClient:
         
         if subcmd == "api-key":
             if not subargs:
-                console.print("[yellow]Usage: /config api-key YOUR_API_KEY[/]")
+                self.safe_print("[yellow]Usage: /config api-key YOUR_API_KEY[/]")
                 return
                 
             self.config.api_key = subargs
             try:
                 self.anthropic = AsyncAnthropic(api_key=self.config.api_key)
                 self.config.save()
-                console.print("[green]API key updated[/]")
+                self.safe_print("[green]API key updated[/]")
             except Exception as e:
-                console.print(f"[red]Error initializing Anthropic client: {e}[/]")
+                self.safe_print(f"[red]Error initializing Anthropic client: {e}[/]")
                 self.anthropic = None
             
         elif subcmd == "model":
             if not subargs:
-                console.print("[yellow]Usage: /config model MODEL_NAME[/]")
+                self.safe_print("[yellow]Usage: /config model MODEL_NAME[/]")
                 return
                 
             self.config.default_model = subargs
             self.current_model = subargs
             self.config.save()
-            console.print(f"[green]Default model updated to {subargs}[/]")
+            self.safe_print(f"[green]Default model updated to {subargs}[/]")
             
         elif subcmd == "max-tokens":
             if not subargs or not subargs.isdigit():
-                console.print("[yellow]Usage: /config max-tokens NUMBER[/]")
+                self.safe_print("[yellow]Usage: /config max-tokens NUMBER[/]")
                 return
                 
             self.config.default_max_tokens = int(subargs)
             self.config.save()
-            console.print(f"[green]Default max tokens updated to {subargs}[/]")
+            self.safe_print(f"[green]Default max tokens updated to {subargs}[/]")
             
         elif subcmd == "history-size":
             if not subargs or not subargs.isdigit():
-                console.print("[yellow]Usage: /config history-size NUMBER[/]")
+                self.safe_print("[yellow]Usage: /config history-size NUMBER[/]")
                 return
                 
             self.config.history_size = int(subargs)
             self.history.max_entries = int(subargs)
             self.config.save()
-            console.print(f"[green]History size updated to {subargs}[/]")
+            self.safe_print(f"[green]History size updated to {subargs}[/]")
             
         elif subcmd == "auto-discover":
             if subargs.lower() in ("true", "yes", "on", "1"):
@@ -3807,11 +3726,11 @@ class MCPClient:
             elif subargs.lower() in ("false", "no", "off", "0"):
                 self.config.auto_discover = False
             else:
-                console.print("[yellow]Usage: /config auto-discover [true|false][/]")
+                self.safe_print("[yellow]Usage: /config auto-discover [true|false][/]")
                 return
                 
             self.config.save()
-            console.print(f"[green]Auto-discovery {'enabled' if self.config.auto_discover else 'disabled'}[/]")
+            self.safe_print(f"[green]Auto-discovery {'enabled' if self.config.auto_discover else 'disabled'}[/]")
             
         elif subcmd == "discovery-path":
             parts = subargs.split(maxsplit=1)
@@ -3822,28 +3741,28 @@ class MCPClient:
                 if path not in self.config.discovery_paths:
                     self.config.discovery_paths.append(path)
                     self.config.save()
-                    console.print(f"[green]Added discovery path: {path}[/]")
+                    self.safe_print(f"[green]Added discovery path: {path}[/]")
                 else:
-                    console.print(f"[yellow]Path already exists: {path}[/]")
+                    self.safe_print(f"[yellow]Path already exists: {path}[/]")
                     
             elif action == "remove" and path:
                 if path in self.config.discovery_paths:
                     self.config.discovery_paths.remove(path)
                     self.config.save()
-                    console.print(f"[green]Removed discovery path: {path}[/]")
+                    self.safe_print(f"[green]Removed discovery path: {path}[/]")
                 else:
-                    console.print(f"[yellow]Path not found: {path}[/]")
+                    self.safe_print(f"[yellow]Path not found: {path}[/]")
                     
             elif action == "list" or not action:
-                console.print("\n[bold]Discovery Paths:[/]")
+                self.safe_print("\n[bold]Discovery Paths:[/]")
                 for i, path in enumerate(self.config.discovery_paths, 1):
-                    console.print(f"{i}. {path}")
+                    self.safe_print(f"{i}. {path}")
                     
             else:
-                console.print("[yellow]Usage: /config discovery-path [add|remove|list] [PATH][/]")
+                self.safe_print("[yellow]Usage: /config discovery-path [add|remove|list] [PATH][/]")
                 
         else:
-            console.print("[yellow]Unknown config command. Available: api-key, model, max-tokens, history-size, auto-discover, discovery-path[/]")
+            self.safe_print("[yellow]Unknown config command. Available: api-key, model, max-tokens, history-size, auto-discover, discovery-path[/]")
     
     async def cmd_servers(self, args):
         """Handle server management commands"""
@@ -4363,13 +4282,13 @@ class MCPClient:
                  # Need to prune orphaned nodes from self.conversation_graph.nodes if we clear children
                  # For now, just reset messages and current node
                  root_node.messages = []
-             console.print("[green]Conversation reset to root node.[/]")
+             self.safe_print("[green]Conversation reset to root node.[/]")
         else:
-             console.print("[yellow]Clear cancelled. Still on root node, messages preserved.[/]")
+             self.safe_print("[yellow]Clear cancelled. Still on root node, messages preserved.[/]")
 
     async def cmd_reload(self, args):
         """Reload servers and capabilities"""
-        console.print("[yellow]Reloading servers and capabilities...[/]")
+        self.safe_print("[yellow]Reloading servers and capabilities...[/]")
         
         # Close existing connections
         with Status(f"{STATUS_EMOJI['server']} Closing existing connections...", spinner="dots") as status:
@@ -4384,7 +4303,7 @@ class MCPClient:
             await self.server_manager.connect_to_servers()
             status.update(f"{STATUS_EMOJI['success']} Servers reconnected")
         
-        console.print("[green]Servers and capabilities reloaded[/]")
+        self.safe_print("[green]Servers and capabilities reloaded[/]")
         await self.print_status()
     
     async def cmd_cache(self, args):
@@ -4397,7 +4316,7 @@ class MCPClient:
           dependencies (deps) - View tool dependency graph
         """
         if not self.tool_cache:
-            console.print("[yellow]Caching is disabled.[/]")
+            self.safe_print("[yellow]Caching is disabled.[/]")
             return
 
         parts = args.split(maxsplit=1)
@@ -4405,7 +4324,7 @@ class MCPClient:
         subargs = parts[1] if len(parts) > 1 else ""
 
         if subcmd == "list":
-            console.print("\n[bold]Cached Tool Results:[/]")
+            self.safe_print("\n[bold]Cached Tool Results:[/]")
             cache_table = Table(title="Cache Entries")
             cache_table.add_column("Key")
             cache_table.add_column("Tool Name")
@@ -4418,7 +4337,7 @@ class MCPClient:
                 all_keys.update(self.tool_cache.disk_cache.iterkeys())
 
             if not all_keys:
-                 console.print("[yellow]Cache is empty.[/]")
+                 self.safe_print("[yellow]Cache is empty.[/]")
                  return
             
             # Use progress bar for loading cache entries - especially useful for large caches
@@ -4427,7 +4346,7 @@ class MCPClient:
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 TaskProgressColumn(),
-                console=console,
+                console=get_safe_console(),
                 transient=True
             ) as progress:
                 task = progress.add_task(f"{STATUS_EMOJI['package']} Loading cache entries...", total=len(all_keys))
@@ -4458,19 +4377,19 @@ class MCPClient:
             for entry_data in entries:
                 cache_table.add_row(*entry_data)
             
-            console.print(cache_table)
-            console.print(f"Total entries: {len(entries)}")
+            self.safe_print(cache_table)
+            self.safe_print(f"Total entries: {len(entries)}")
 
         elif subcmd == "clear":
             if not subargs or subargs == "--all":
-                if Confirm.ask("Are you sure you want to clear the entire cache?"):
+                if Confirm.ask("Are you sure you want to clear the entire cache?", console=get_safe_console()):
                     # Use Progress for cache clearing - especially useful for large caches
                     with Progress(
                         SpinnerColumn(),
                         TextColumn("[progress.description]{task.description}"),
                         BarColumn(),
                         TaskProgressColumn(),
-                        console=console,
+                        console=get_safe_console(),
                         transient=True
                     ) as progress:
                         # Getting approximate count of items
@@ -4498,16 +4417,16 @@ class MCPClient:
                         
                         progress.update(task, description=f"{STATUS_EMOJI['success']} Cache cleared successfully")
                     
-                    console.print("[green]Cache cleared.[/]")
+                    self.safe_print("[green]Cache cleared.[/]")
                 else:
-                    console.print("[yellow]Cache clear cancelled.[/]")
+                    self.safe_print("[yellow]Cache clear cancelled.[/]")
             else:
                 tool_name_to_clear = subargs
                 # Invalidate based on tool name prefix
-                with Status(f"{STATUS_EMOJI['package']} Clearing cache for {tool_name_to_clear}...", spinner="dots") as status:
+                with Status(f"{STATUS_EMOJI['package']} Clearing cache for {tool_name_to_clear}...", spinner="dots", console=get_safe_console()) as status:
                     self.tool_cache.invalidate(tool_name=tool_name_to_clear)
                     status.update(f"{STATUS_EMOJI['success']} Cache entries for {tool_name_to_clear} cleared")
-                console.print(f"[green]Cleared cache entries for tool: {tool_name_to_clear}[/]")
+                self.safe_print(f"[green]Cleared cache entries for tool: {tool_name_to_clear}[/]")
         
         
         elif subcmd == "clean":
@@ -4517,7 +4436,7 @@ class MCPClient:
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 TaskProgressColumn(),
-                console=console,
+                console=get_safe_console(),
                 transient=True
             ) as progress:
                 task = progress.add_task(f"{STATUS_EMOJI['package']} Scanning for expired entries...", total=None)
@@ -4546,14 +4465,14 @@ class MCPClient:
                 removed_count = (memory_count_before - memory_count_after) + (disk_count_before - disk_count_after)
                 progress.update(task, description=f"{STATUS_EMOJI['success']} Removed {removed_count} expired entries")
             
-            console.print(f"[green]Expired cache entries cleaned. Removed {removed_count} entries.[/]")
+            self.safe_print(f"[green]Expired cache entries cleaned. Removed {removed_count} entries.[/]")
         
         elif subcmd == "dependencies" or subcmd == "deps":
             # Show dependency graph
-            console.print("\n[bold]Tool Dependency Graph:[/]")
+            self.safe_print("\n[bold]Tool Dependency Graph:[/]")
             
             if not self.tool_cache.dependency_graph:
-                console.print("[yellow]No dependencies registered.[/]")
+                self.safe_print("[yellow]No dependencies registered.[/]")
                 return
             
             dependency_table = Table(title="Tool Dependencies")
@@ -4568,8 +4487,8 @@ class MCPClient:
                         ", ".join(dependencies)
                     )
             
-            console.print(dependency_table)
-            console.print(f"Total tools with dependencies: {len(self.tool_cache.dependency_graph)}")
+            self.safe_print(dependency_table)
+            self.safe_print(f"Total tools with dependencies: {len(self.tool_cache.dependency_graph)}")
             
             # Process specific tool's dependencies
             if subargs:
@@ -4582,13 +4501,13 @@ class MCPClient:
                     for dep in dependencies:
                         tree.add(f"[magenta]{dep}[/]")
                     
-                    console.print("\n[bold]Dependencies for selected tool:[/]")
-                    console.print(tree)
+                    self.safe_print("\n[bold]Dependencies for selected tool:[/]")
+                    self.safe_print(tree)
                 else:
-                    console.print(f"\n[yellow]Tool '{tool_name}' has no dependencies or was not found.[/]")
+                    self.safe_print(f"\n[yellow]Tool '{tool_name}' has no dependencies or was not found.[/]")
         
         else:
-            console.print("[yellow]Unknown cache command. Available: list, clear [tool_name | --all], clean, dependencies[/]")
+            self.safe_print("[yellow]Unknown cache command. Available: list, clear [tool_name | --all], clean, dependencies[/]")
 
     async def cmd_fork(self, args):
         """Create a new conversation fork/branch"""
@@ -4596,12 +4515,12 @@ class MCPClient:
         try:
             new_node = self.conversation_graph.create_fork(name=fork_name)
             self.conversation_graph.set_current_node(new_node.id)
-            console.print(f"[green]Created and switched to new branch:[/]")
-            console.print(f"  ID: [cyan]{new_node.id}[/]" )
-            console.print(f"  Name: [yellow]{new_node.name}[/]")
-            console.print(f"Branched from node: [magenta]{new_node.parent.id if new_node.parent else 'None'}[/]")
+            self.safe_print(f"[green]Created and switched to new branch:[/]")
+            self.safe_print(f"  ID: [cyan]{new_node.id}[/]" )
+            self.safe_print(f"  Name: [yellow]{new_node.name}[/]")
+            self.safe_print(f"Branched from node: [magenta]{new_node.parent.id if new_node.parent else 'None'}[/]")
         except Exception as e:
-            console.print(f"[red]Error creating fork: {e}[/]")
+            self.safe_print(f"[red]Error creating fork: {e}[/]")
 
     async def cmd_branch(self, args):
         """Manage conversation branches"""
@@ -4610,7 +4529,7 @@ class MCPClient:
         subargs = parts[1] if len(parts) > 1 else ""
 
         if subcmd == "list":
-            console.print("\n[bold]Conversation Branches:[/]")
+            self.safe_print("\n[bold]Conversation Branches:[/]")
             branch_tree = Tree("[cyan]Conversations[/]")
 
             def build_tree(node: ConversationNode, tree_node):
@@ -4624,11 +4543,11 @@ class MCPClient:
                     build_tree(child, current_branch)
 
             build_tree(self.conversation_graph.root, branch_tree)
-            console.print(branch_tree)
+            self.safe_print(branch_tree)
 
         elif subcmd == "checkout":
             if not subargs:
-                console.print("[yellow]Usage: /branch checkout NODE_ID[/]")
+                self.safe_print("[yellow]Usage: /branch checkout NODE_ID[/]")
                 return
             
             node_id = subargs
@@ -4640,27 +4559,27 @@ class MCPClient:
                 for n_id, node in self.conversation_graph.nodes.items():
                     if n_id.startswith(node_id):
                         if matched_node:
-                             console.print(f"[red]Ambiguous node ID prefix: {node_id}. Multiple matches found.[/]")
+                             self.safe_print(f"[red]Ambiguous node ID prefix: {node_id}. Multiple matches found.[/]")
                              return # Ambiguous prefix
                         matched_node = node
             
             if matched_node:
                 if self.conversation_graph.set_current_node(matched_node.id):
-                    console.print(f"[green]Switched to branch:[/]")
-                    console.print(f"  ID: [cyan]{matched_node.id}[/]")
-                    console.print(f"  Name: [yellow]{matched_node.name}[/]")
+                    self.safe_print(f"[green]Switched to branch:[/]")
+                    self.safe_print(f"  ID: [cyan]{matched_node.id}[/]")
+                    self.safe_print(f"  Name: [yellow]{matched_node.name}[/]")
                 else:
                     # Should not happen if matched_node is valid
-                    console.print(f"[red]Failed to switch to node {node_id}[/]") 
+                    self.safe_print(f"[red]Failed to switch to node {node_id}[/]") 
             else:
-                console.print(f"[red]Node ID '{node_id}' not found.[/]")
+                self.safe_print(f"[red]Node ID '{node_id}' not found.[/]")
 
         # Add other subcommands like rename, delete later if needed
         # elif subcmd == "rename": ...
         # elif subcmd == "delete": ...
 
         else:
-            console.print("[yellow]Unknown branch command. Available: list, checkout NODE_ID[/]")
+            self.safe_print("[yellow]Unknown branch command. Available: list, checkout NODE_ID[/]")
 
     # --- Dashboard Implementation ---
 
@@ -4833,7 +4752,7 @@ class MCPClient:
         """Export a conversation branch to a file with progress tracking"""
         node = self.conversation_graph.get_node(conversation_id)
         if not node:
-            console.print(f"[red]Conversation ID '{conversation_id}' not found[/]")
+            self.safe_print(f"[red]Conversation ID '{conversation_id}' not found[/]")
             return False
             
         # Get all messages from this branch and its ancestors
@@ -4846,7 +4765,7 @@ class MCPClient:
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
-            console=console
+            console=get_safe_console()
         ) as progress:
             export_task = progress.add_task(f"{STATUS_EMOJI['scroll']} Exporting conversation...", total=len(all_nodes))
             
@@ -4877,7 +4796,7 @@ class MCPClient:
                 
             except Exception as e:
                 progress.update(export_task, description=f"{STATUS_EMOJI['error']} Export failed: {e}")
-                console.print(f"[red]Failed to export conversation: {e}[/]")
+                self.safe_print(f"[red]Failed to export conversation: {e}[/]")
                 return False
 
     async def cmd_optimize(self, args):
@@ -4895,9 +4814,9 @@ class MCPClient:
                     try:
                         target_length = int(parts[i+1])
                     except ValueError:
-                        console.print(f"[yellow]Invalid token count: {parts[i+1]}[/]")
+                        self.safe_print(f"[yellow]Invalid token count: {parts[i+1]}[/]")
         
-        console.print(f"[yellow]Optimizing conversation context...[/]")
+        self.safe_print(f"[yellow]Optimizing conversation context...[/]")
         
         # Use specified model or default summarization model
         summarization_model = custom_model or self.config.summarization_model
@@ -4950,16 +4869,16 @@ class MCPClient:
         
         if success:
             # Report results
-            console.print(f"[green]Conversation optimized: {current_tokens} → {new_tokens} tokens[/]")
+            self.safe_print(f"[green]Conversation optimized: {current_tokens} → {new_tokens} tokens[/]")
         else:
-            console.print(f"[red]Failed to optimize conversation.[/]")
+            self.safe_print(f"[red]Failed to optimize conversation.[/]")
     
     async def auto_prune_context(self):
         """Auto-prune context based on token count"""
         token_count = await self.count_tokens()
         if token_count > self.config.auto_summarize_threshold:
-            console.print(f"[yellow]Context size ({token_count} tokens) exceeds threshold "
-                          f"({self.config.auto_summarize_threshold}). Auto-summarizing...[/]")
+            self.safe_print(f"[yellow]Context size ({token_count} tokens) exceeds threshold "
+                         f"({self.config.auto_summarize_threshold}). Auto-summarizing...[/]")
             await self.cmd_optimize(f"--tokens {self.config.max_summarized_tokens}")
 
     async def cmd_tool(self, args):
@@ -5013,21 +4932,21 @@ class MCPClient:
     async def cmd_prompt(self, args):
         """Apply a prompt template to the conversation"""
         if not args:
-            console.print("[yellow]Available prompt templates:[/yellow]")
+            self.safe_print("[yellow]Available prompt templates:[/yellow]")
             for name in self.server_manager.prompts:
-                console.print(f"  - {name}")
+                self.safe_print(f"  - {name}")
             return
         
         prompt = self.server_manager.prompts.get(args)
         if not prompt:
-            console.print(f"[red]Prompt not found: {args}[/red]")
+            self.safe_print(f"[red]Prompt not found: {args}[/red]")
             return
             
         self.conversation_graph.current_node.messages.insert(0, {
             "role": "system",
             "content": prompt.template
         })
-        console.print(f"[green]Applied prompt: {args}[/green]")
+        self.safe_print(f"[green]Applied prompt: {args}[/green]")
 
     async def load_claude_desktop_config(self):
         """Look for and load the Claude desktop config file (claude_desktop_config.json) if it exists."""
@@ -5036,7 +4955,7 @@ class MCPClient:
             return
             
         try:
-            console.print(f"{STATUS_EMOJI['config']} Found Claude desktop config file, processing...")
+            self.safe_print(f"{STATUS_EMOJI['config']} Found Claude desktop config file, processing...")
             
             # Read the file content
             async with aiofiles.open(config_path, 'r') as f:
@@ -5047,7 +4966,7 @@ class MCPClient:
                 # Log the structure
                 log.debug(f"Claude desktop config keys: {list(desktop_config.keys())}")
             except json.JSONDecodeError as e:
-                console.print(f"[red]Invalid JSON in Claude desktop config: {e}[/]")
+                self.safe_print(f"[red]Invalid JSON in Claude desktop config: {e}[/]")
                 return
             
             # The primary key is 'mcpServers', but check alternatives if needed
@@ -5061,13 +4980,13 @@ class MCPClient:
                         desktop_config['mcpServers'] = desktop_config[alt_key]
                         break
                 else:
-                    console.print(f"{STATUS_EMOJI['warning']} No MCP servers defined in Claude desktop config")
+                    self.safe_print(f"{STATUS_EMOJI['warning']} No MCP servers defined in Claude desktop config")
                     return
             
             # We now should have a mcpServers key
             mcp_servers = desktop_config['mcpServers']
             if not mcp_servers or not isinstance(mcp_servers, dict):
-                console.print(f"{STATUS_EMOJI['warning']} No valid MCP servers found in config")
+                self.safe_print(f"{STATUS_EMOJI['warning']} No valid MCP servers found in config")
                 return
             
             # Track successful imports and skipped servers
@@ -5188,7 +5107,7 @@ class MCPClient:
             # Save config
             if imported_servers:
                 await self.config.save_async()
-                console.print(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config")
+                self.safe_print(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config")
                 
                 # Create a nice report
                 if imported_servers:
@@ -5205,7 +5124,7 @@ class MCPClient:
                             " ".join(str(arg) for arg in server.args) if server.args else ""
                         )
                     
-                    console.print(server_table)
+                    self.safe_print(server_table)
                 
                 if skipped_servers:
                     skipped_table = Table(title="Skipped Servers")
@@ -5215,9 +5134,9 @@ class MCPClient:
                     for name, reason in skipped_servers:
                         skipped_table.add_row(name, reason)
                     
-                    console.print(skipped_table)
+                    self.safe_print(skipped_table)
             else:
-                console.print(f"{STATUS_EMOJI['warning']} No new servers imported from Claude desktop config")
+                self.safe_print(f"{STATUS_EMOJI['warning']} No new servers imported from Claude desktop config")
         
         except FileNotFoundError:
             log.debug("Claude desktop config file not found")
@@ -5256,14 +5175,14 @@ class MCPClient:
             output_path = f"conversation_{conversation_id[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         
         # Call the export method
-        with Status(f"{STATUS_EMOJI['scroll']} Exporting conversation...", spinner="dots") as status:
+        with Status(f"{STATUS_EMOJI['scroll']} Exporting conversation...", spinner="dots", console=get_safe_console()) as status:
             success = await self.export_conversation(conversation_id, output_path)
             if success:
                 status.update(f"{STATUS_EMOJI['success']} Conversation exported successfully")
-                console.print(f"[green]Conversation exported to: {output_path}[/]")
+                self.safe_print(f"[green]Conversation exported to: {output_path}[/]")
             else:
                 status.update(f"{STATUS_EMOJI['failure']} Export failed")
-                console.print(f"[red]Failed to export conversation[/]")
+                self.safe_print(f"[red]Failed to export conversation[/]")
 
     async def import_conversation(self, file_path: str) -> bool:
         """Import a conversation from a file
