@@ -94,6 +94,7 @@ Interactive mode commands:
 - /dashboard - Open health monitoring dashboard
 - /monitor - Control server monitoring
 - /registry - Manage server registry connections
+- /discover - Discover and connect to MCP servers on local network
 - /optimize - Optimize conversation context through summarization
 - /clear - Clear the conversation context
 
@@ -103,6 +104,7 @@ Version: 1.0.0
 """
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -1476,92 +1478,119 @@ class ServerManager:
                 # Close could be added if a specific per-session close is implemented
                 # For now we rely on the exit_stack in close() method
 
-    async def discover_servers(self):
-        """Auto-discover MCP servers in configured paths and from registry"""
-        # Keep track of all discoveries
+    async def _discover_local_servers(self):
+        """Discover MCP servers in local filesystem paths"""
         discovered_local = []
-        discovered_remote = []
-        discovered_mdns = []
         
-        # Local filesystem discovery
-        if self.config.auto_discover:
-            for base_path in self.config.discovery_paths:
-                base_path = os.path.expanduser(base_path)
-                if not os.path.exists(base_path):
-                    continue
-                    
-                log.info(f"Discovering servers in {base_path}")
+        for base_path in self.config.discovery_paths:
+            base_path = os.path.expanduser(base_path)
+            if not os.path.exists(base_path):
+                continue
                 
-                # Look for python and js files
-                for ext, server_type in [('.py', 'stdio'), ('.js', 'stdio')]:
-                    for root, _, files in os.walk(base_path):
-                        for file in files:
-                            if file.endswith(ext) and 'mcp' in file.lower():
-                                path = os.path.join(root, file)
-                                name = os.path.splitext(file)[0]
-                                
-                                # Skip if already in config
-                                if any(s.path == path for s in self.config.servers.values()):
-                                    continue
-                                    
-                                discovered_local.append((name, path, server_type))
-        
-        # Registry discovery
-        if self.config.enable_registry and self.registry:
-            try:
-                # Try to discover from remote registry
-                remote_servers = await self.registry.discover_remote_servers()
-                for server in remote_servers:
-                    name = server.get("name", "")
-                    url = server.get("url", "")
-                    server_type = "sse"  # Remote servers are always SSE
-                    
-                    # Skip if already in config
-                    if any(s.path == url for s in self.config.servers.values()):
-                        continue
-                        
-                    server_version = None
-                    if "version" in server:
-                        server_version = ServerVersion.from_string(server["version"])
-                        
-                    categories = server.get("categories", [])
-                    rating = server.get("rating", 5.0)
-                    
-                    discovered_remote.append((name, url, server_type, server_version, categories, rating))
-            except httpx.RequestError as e:
-                log.error(f"Network error during registry discovery: {e}")
-            except httpx.HTTPStatusError as e:
-                 log.error(f"HTTP error during registry discovery: {e.response.status_code}")
-            except json.JSONDecodeError as e:
-                 log.error(f"JSON decode error during registry discovery: {e}")
-            # Keep broad exception for unexpected discovery issues
-            except Exception as e: 
-                log.error(f"Unexpected error discovering from registry: {e}")
-                
-        # Local network discovery via mDNS
-        if self.config.enable_local_discovery and self.registry:
-            # Start discovery if not already running
-            if not self.registry.zeroconf:
-                self.registry.start_local_discovery()
-                
-            # Wait a moment for discovery
-            await asyncio.sleep(2)
+            log.info(f"Discovering servers in {base_path}")
             
-            # Process discovered servers
-            for name, server in self.registry.discovered_servers.items():
+            # Look for python and js files
+            for ext, server_type in [('.py', 'stdio'), ('.js', 'stdio')]:
+                for root, _, files in os.walk(base_path):
+                    for file in files:
+                        if file.endswith(ext) and 'mcp' in file.lower():
+                            path = os.path.join(root, file)
+                            name = os.path.splitext(file)[0]
+                            
+                            # Skip if already in config
+                            if any(s.path == path for s in self.config.servers.values()):
+                                continue
+                                
+                            discovered_local.append((name, path, server_type))
+        
+        # Store in a class attribute to be accessed by _process_discovery_results
+        self._discovered_local = discovered_local
+        log.info(f"Discovered {len(discovered_local)} local servers")
+    
+    async def _discover_registry_servers(self):
+        """Discover MCP servers from remote registry"""
+        discovered_remote = []
+        
+        if not self.registry:
+            log.warning("Registry not available, skipping remote discovery")
+            self._discovered_remote = discovered_remote
+            return
+            
+        try:
+            # Try to discover from remote registry
+            remote_servers = await self.registry.discover_remote_servers()
+            for server in remote_servers:
+                name = server.get("name", "")
                 url = server.get("url", "")
-                server_type = server.get("type", "sse")
+                server_type = "sse"  # Remote servers are always SSE
                 
                 # Skip if already in config
                 if any(s.path == url for s in self.config.servers.values()):
                     continue
-                
-                # Get additional information
-                version = server.get("version")
+                    
+                server_version = None
+                if "version" in server:
+                    server_version = ServerVersion.from_string(server["version"])
+                    
                 categories = server.get("categories", [])
-                description = server.get("description", "")
+                rating = server.get("rating", 5.0)
                 
-                discovered_mdns.append((name, url, server_type, version, categories, description))
+                discovered_remote.append((name, url, server_type, server_version, categories, rating))
+        except httpx.RequestError as e:
+            log.error(f"Network error during registry discovery: {e}")
+        except httpx.HTTPStatusError as e:
+            log.error(f"HTTP error during registry discovery: {e.response.status_code}")
+        except json.JSONDecodeError as e:
+            log.error(f"JSON decode error during registry discovery: {e}")
+        except Exception as e: 
+            log.error(f"Unexpected error discovering from registry: {e}")
+            
+        # Store in a class attribute
+        self._discovered_remote = discovered_remote
+        log.info(f"Discovered {len(discovered_remote)} registry servers")
+    
+    async def _discover_mdns_servers(self):
+        """Discover MCP servers from local network using mDNS"""
+        discovered_mdns = []
+        
+        if not self.registry:
+            log.warning("Registry not available, skipping mDNS discovery")
+            self._discovered_mdns = discovered_mdns
+            return
+            
+        # Start discovery if not already running
+        if not self.registry.zeroconf:
+            self.registry.start_local_discovery()
+            
+        # Wait a moment for discovery
+        await asyncio.sleep(2)
+        
+        # Process discovered servers
+        for name, server in self.registry.discovered_servers.items():
+            url = server.get("url", "")
+            server_type = server.get("type", "sse")
+            
+            # Skip if already in config
+            if any(s.path == url for s in self.config.servers.values()):
+                continue
+        
+            # Get additional information
+            version = server.get("version")
+            categories = server.get("categories", [])
+            description = server.get("description", "")
+            
+            discovered_mdns.append((name, url, server_type, version, categories, description))
+            
+        # Store in a class attribute
+        self._discovered_mdns = discovered_mdns
+        log.info(f"Discovered {len(discovered_mdns)} local network servers via mDNS")
+    
+    async def _process_discovery_results(self):
+        """Process and display discovery results, prompting user to add servers"""
+        # Get all discovered servers from class attributes
+        discovered_local = getattr(self, '_discovered_local', [])
+        discovered_remote = getattr(self, '_discovered_remote', [])
+        discovered_mdns = getattr(self, '_discovered_mdns', [])
         
         # Show discoveries to user with clear categorization
         total_discovered = len(discovered_local) + len(discovered_remote) + len(discovered_mdns)
@@ -1654,6 +1683,41 @@ class ServerManager:
                 
                 self.config.save()
                 console.print("[green]Selected servers added to configuration[/]")
+        else:
+            console.print("[yellow]No new servers discovered.[/]")
+
+    async def discover_servers(self):
+        """Auto-discover MCP servers in configured paths and from registry"""
+        steps = []
+        descriptions = []
+        
+        # Add filesystem discovery step if enabled
+        if self.config.auto_discover:
+            steps.append(self._discover_local_servers)
+            descriptions.append(f"{STATUS_EMOJI['search']} Discovering local file system servers...")
+        
+        # Add registry discovery step if enabled
+        if self.config.enable_registry and self.registry:
+            steps.append(self._discover_registry_servers)
+            descriptions.append(f"{STATUS_EMOJI['search']} Discovering registry servers...")
+        
+        # Add mDNS discovery step if enabled
+        if self.config.enable_local_discovery and self.registry:
+            steps.append(self._discover_mdns_servers)
+            descriptions.append(f"{STATUS_EMOJI['search']} Discovering local network servers...")
+        
+        # Run the discovery steps with progress tracking
+        if steps:
+            await self.run_multi_step_task(
+                steps=steps,
+                step_descriptions=descriptions,
+                title=f"{STATUS_EMOJI['search']} Discovering MCP servers..."
+            )
+            
+            # Process and display discovery results
+            await self._process_discovery_results()
+        else:
+            console.print("[yellow]Server discovery is disabled in configuration.[/]")
     
     async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
         """Connect to a single MCP server with retry logic and health monitoring"""
@@ -2027,6 +2091,83 @@ class ServerManager:
             
         return tool_params
 
+    async def run_multi_step_task(self, 
+                                steps: List[Callable], 
+                                step_descriptions: List[str],
+                                title: str = "Processing...",
+                                show_spinner: bool = True) -> bool:
+        """Run a multi-step task with progress tracking.
+        
+        Args:
+            steps: List of async callables to execute
+            step_descriptions: List of descriptions for each step
+            title: Title for the progress bar
+            show_spinner: Whether to show a spinner
+            
+        Returns:
+            Boolean indicating success
+        """
+        if len(steps) != len(step_descriptions):
+            log.error("Steps and descriptions must have the same length")
+            return False
+            
+        progress_columns = []
+        if show_spinner:
+            progress_columns.append(SpinnerColumn())
+        
+        progress_columns.extend([
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[cyan]{task.completed}/{task.total}"),
+            TaskProgressColumn()
+        ])
+        
+        with Progress(*progress_columns, console=console) as progress:
+            task = progress.add_task(title, total=len(steps))
+            
+            for i, (step, description) in enumerate(zip(steps, step_descriptions, strict=False)):
+                try:
+                    progress.update(task, description=description)
+                    await step()
+                    progress.update(task, advance=1)
+                except Exception as e:
+                    log.error(f"Error in step {i+1}: {e}")
+                    progress.update(task, description=f"{STATUS_EMOJI['error']} {description} failed: {e}")
+                    return False
+            
+            progress.update(task, description=f"{STATUS_EMOJI['success']} Complete")
+            return True
+
+    async def count_tokens(self, messages=None) -> int:
+        """Count the number of tokens in the current conversation context"""
+        if messages is None:
+            messages = self.conversation_graph.current_node.messages
+            
+        # Use tiktoken for accurate counting
+        # Use cl100k_base encoding which is used by Claude
+        encoding = tiktoken.get_encoding("cl100k_base")
+        token_count = 0
+        
+        for message in messages:
+            # Get the message content
+            content = message.get("content", "")
+            
+            # Handle content that might be a list of blocks (text/image blocks)
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "text" in block:
+                        token_count += len(encoding.encode(block["text"]))
+                    elif isinstance(block, str):
+                        token_count += len(encoding.encode(block))
+                else:
+                    # Simple string content
+                    token_count += len(encoding.encode(str(content)))
+            
+            # Add a small overhead for message formatting
+            token_count += 4  # Approximate overhead per message
+            
+        return token_count
+
 class MCPClient:
     def __init__(self):
         self.config = Config()
@@ -2044,6 +2185,10 @@ class MCPClient:
 
         # Instantiate Server Monitoring
         self.server_monitor = ServerMonitor(self.server_manager)
+
+        # For tracking newly discovered local servers
+        self.discovered_local_servers = set()
+        self.local_discovery_task = None
 
         # Instantiate Conversation Graph
         self.conversation_graph_file = Path(self.config.conversation_graphs_dir) / "default_conversation.json"
@@ -2090,12 +2235,32 @@ class MCPClient:
             'prompt': self.cmd_prompt, # Add prompt command for dynamic injection
             'export': self.cmd_export, # Add export command
             'import': self.cmd_import, # Add import command
+            'discover': self.cmd_discover, # Add local discovery command
         }
         
         # Set up readline for command history in interactive mode
         readline.set_completer(self.completer)
         readline.parse_and_bind("tab: complete")
     
+    @staticmethod
+    def with_tool_error_handling(func):
+        """Decorator for consistent tool error handling"""
+        @functools.wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            tool_name = kwargs.get("tool_name", args[1] if len(args) > 1 else "unknown")
+            try:
+                return await func(self, *args, **kwargs)
+            except McpError as e:
+                log.error(f"MCP error executing {tool_name}: {e}")
+                raise McpError(f"MCP error: {e}") from e
+            except httpx.RequestError as e:
+                log.error(f"Network error executing {tool_name}: {e}")
+                raise McpError(f"Network error: {e}") from e
+            except Exception as e:
+                log.error(f"Unexpected error executing {tool_name}: {e}")
+                raise McpError(f"Unexpected error: {e}") from e
+        return wrapper
+        
     # Add decorator for retry logic
     @staticmethod
     def retry_with_circuit_breaker(func):
@@ -2132,6 +2297,7 @@ class MCPClient:
         return wrapper
         
     @retry_with_circuit_breaker
+    @with_tool_error_handling
     async def execute_tool(self, server_name, tool_name, tool_args, request_timeout=None):
         """Execute a tool with retry and circuit breaker logic
         
@@ -2204,6 +2370,10 @@ class MCPClient:
                 await self.server_manager.discover_servers()
                 status.update(f"{STATUS_EMOJI['success']} Server discovery complete")
         
+        # Start continuous local discovery if enabled
+        if self.config.enable_local_discovery and self.server_manager.registry:
+            await self.start_local_discovery_monitoring()
+        
         # Connect to all enabled servers - Use Progress instead of Status for better visual tracking
         enabled_servers = [s for s in self.config.servers.values() if s.enabled]
         if enabled_servers:
@@ -2243,6 +2413,243 @@ class MCPClient:
         
         # Display status
         await self.print_status()
+
+    async def start_local_discovery_monitoring(self):
+        """Start monitoring for local network MCP servers continuously"""
+        # Start the registry's discovery if not already running
+        if self.server_manager.registry and not self.server_manager.registry.zeroconf:
+            self.server_manager.registry.start_local_discovery()
+            log.info("Started continuous local MCP server discovery")
+            
+            # Create background task for periodic checks
+            self.local_discovery_task = asyncio.create_task(self._monitor_local_servers())
+    
+    async def stop_local_discovery_monitoring(self):
+        """Stop monitoring for local network MCP servers"""
+        if self.local_discovery_task:
+            self.local_discovery_task.cancel()
+            try:
+                await self.local_discovery_task
+            except asyncio.CancelledError:
+                pass
+            self.local_discovery_task = None
+        
+        # Stop the registry's discovery if running
+        if self.server_manager.registry:
+            self.server_manager.registry.stop_local_discovery()
+            log.info("Stopped continuous local MCP server discovery")
+    
+    async def _monitor_local_servers(self):
+        """Background task to periodically check for new locally discovered servers"""
+        try:
+            while True:
+                # Get the current set of discovered server names
+                if self.server_manager.registry:
+                    current_servers = set(self.server_manager.registry.discovered_servers.keys())
+                    
+                    # Find newly discovered servers since last check
+                    new_servers = current_servers - self.discovered_local_servers
+                    
+                    # If there are new servers, notify the user
+                    if new_servers:
+                        console.print(f"\n[bold cyan]{STATUS_EMOJI['search']} New MCP servers discovered on local network:[/]")
+                        for server_name in new_servers:
+                            server_info = self.server_manager.registry.discovered_servers[server_name]
+                            console.print(f"  - [bold cyan]{server_name}[/] at [cyan]{server_info.get('url', 'unknown URL')}[/]")
+                        console.print("Use [bold cyan]/discover list[/] to view details and [bold cyan]/discover connect NAME[/] to connect")
+                        
+                        # Update tracked servers
+                        self.discovered_local_servers = current_servers
+                
+                # Wait before checking again (every 15 seconds)
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            # Task was cancelled, exit cleanly
+            pass
+        except Exception as e:
+            log.error(f"Error in local server monitoring task: {e}")
+
+    async def cmd_discover(self, args):
+        """Command to interact with locally discovered MCP servers
+        
+        Subcommands:
+          list - List all locally discovered servers
+          connect SERVER_NAME - Connect to a specific discovered server
+          refresh - Force a refresh of the local discovery
+          auto on|off - Enable/disable automatic local discovery
+        """
+        if not self.server_manager.registry:
+            console.print("[yellow]Registry not available, local discovery is disabled.[/]")
+            return
+            
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else "list"
+        subargs = parts[1] if len(parts) > 1 else ""
+        
+        if subcmd == "list":
+            # List all discovered servers
+            discovered_servers = self.server_manager.registry.discovered_servers
+            
+            if not discovered_servers:
+                console.print("[yellow]No MCP servers discovered on local network.[/]")
+                console.print("Try running [bold blue]/discover refresh[/] to scan again.")
+                return
+                
+            console.print(f"\n[bold cyan]{STATUS_EMOJI['search']} Discovered Local Network Servers:[/]")
+            
+            # Create a table to display servers
+            server_table = Table(title="Local MCP Servers")
+            server_table.add_column("Name")
+            server_table.add_column("URL")
+            server_table.add_column("Type")
+            server_table.add_column("Description")
+            server_table.add_column("Status")
+            
+            for name, server in discovered_servers.items():
+                url = server.get("url", "unknown")
+                server_type = server.get("type", "unknown")
+                description = server.get("description", "No description")
+                
+                # Check if already in config
+                in_config = any(s.path == url for s in self.config.servers.values())
+                status = "[green]In config[/]" if in_config else "[yellow]Not in config[/]"
+                
+                server_table.add_row(name, url, server_type, description, status)
+            
+            console.print(server_table)
+            console.print("\nUse [bold blue]/discover connect NAME[/] to connect to a server.")
+            
+        elif subcmd == "connect":
+            if not subargs:
+                console.print("[yellow]Usage: /discover connect SERVER_NAME[/]")
+                return
+                
+            server_name = subargs
+            
+            # Check if server exists in discovered servers
+            if server_name not in self.server_manager.registry.discovered_servers:
+                console.print(f"[red]Server '{server_name}' not found in discovered servers.[/]")
+                console.print("Use [bold blue]/discover list[/] to see available servers.")
+                return
+                
+            # Get server info
+            server_info = self.server_manager.registry.discovered_servers[server_name]
+            url = server_info.get("url", "")
+            server_type = server_info.get("type", "sse")
+            description = server_info.get("description", "Discovered on local network")
+            
+            # Check if server already in config with the same URL
+            existing_server = None
+            for name, server in self.config.servers.items():
+                if server.path == url:
+                    existing_server = name
+                    break
+            
+            if existing_server:
+                console.print(f"[yellow]Server with URL '{url}' already exists as '{existing_server}'.[/]")
+                if existing_server not in self.server_manager.active_sessions:
+                    if Confirm.ask(f"Connect to existing server '{existing_server}'?"):
+                        await self.connect_server(existing_server)
+                else:
+                    console.print(f"[yellow]Server '{existing_server}' is already connected.[/]")
+                return
+                
+            # Add server to config
+            log.info(f"Adding discovered server '{server_name}' to configuration")
+            self.config.servers[server_name] = ServerConfig(
+                name=server_name,
+                type=ServerType(server_type),
+                path=url,
+                enabled=True,
+                auto_start=False,  # Don't auto-start by default
+                description=description,
+                categories=server_info.get("categories", []),
+                version=server_info.get("version")
+            )
+            
+            # Save the configuration
+            self.config.save()
+            console.print(f"[green]Added server '{server_name}' to configuration.[/]")
+            
+            # Offer to connect
+            if Confirm.ask(f"Connect to server '{server_name}' now?"):
+                await self.connect_server(server_name)
+                
+        elif subcmd == "refresh":
+            # Force a refresh of the discovery
+            with Status(f"{STATUS_EMOJI['search']} Refreshing local MCP server discovery...", spinner="dots") as status:
+                # Restart the discovery to refresh
+                if self.server_manager.registry.zeroconf:
+                    self.server_manager.registry.stop_local_discovery()
+                
+                self.server_manager.registry.start_local_discovery()
+                
+                # Wait a moment for discovery
+                await asyncio.sleep(2)
+                
+                status.update(f"{STATUS_EMOJI['success']} Local discovery refreshed")
+                
+                # Clear tracked servers to force notification of all currently discovered servers
+                self.discovered_local_servers.clear()
+                
+                # Trigger a check for newly discovered servers
+                current_servers = set(self.server_manager.registry.discovered_servers.keys())
+                if current_servers:
+                    console.print(f"\n[bold cyan]Found {len(current_servers)} servers on the local network[/]")
+                    console.print("Use [bold blue]/discover list[/] to see details.")
+                else:
+                    console.print("[yellow]No servers found on the local network.[/]")
+                    
+        elif subcmd == "auto":
+            # Enable/disable automatic discovery
+            if subargs.lower() in ("on", "yes", "true", "1"):
+                self.config.enable_local_discovery = True
+                self.config.save()
+                console.print("[green]Automatic local discovery enabled.[/]")
+                
+                # Start discovery if not already running
+                if not self.local_discovery_task:
+                    await self.start_local_discovery_monitoring()
+                    
+            elif subargs.lower() in ("off", "no", "false", "0"):
+                self.config.enable_local_discovery = False
+                self.config.save()
+                console.print("[yellow]Automatic local discovery disabled.[/]")
+                
+                # Stop discovery if running
+                await self.stop_local_discovery_monitoring()
+                
+            else:
+                # Show current status
+                status = "enabled" if self.config.enable_local_discovery else "disabled"
+                console.print(f"[cyan]Automatic local discovery is currently {status}.[/]")
+                console.print("Usage: [bold blue]/discover auto [on|off][/]")
+                
+        else:
+            console.print("[yellow]Unknown discover command. Available: list, connect, refresh, auto[/]")
+
+    async def close(self):
+        """Clean up resources before exit"""
+        # Stop local discovery monitoring if running
+        if self.local_discovery_task:
+            await self.stop_local_discovery_monitoring()
+            
+        # Save conversation graph
+        try:
+            self.conversation_graph.save(str(self.conversation_graph_file))
+            log.info(f"Saved conversation graph to {self.conversation_graph_file}")
+        except Exception as e:
+            log.error(f"Failed to save conversation graph: {e}")
+
+        # Stop server monitor
+        if hasattr(self, 'server_monitor'): # Ensure monitor was initialized
+             await self.server_monitor.stop_monitoring()
+        # Close server connections and processes
+        if hasattr(self, 'server_manager'):
+             await self.server_manager.close()
+        # Close cache
+        if self.tool_cache:
+            self.tool_cache.close()
     
     async def print_status(self):
         """Print client status summary"""
@@ -2861,6 +3268,7 @@ class MCPClient:
         
         server_commands = [
             Text(f"{STATUS_EMOJI['server']} /servers", style="bold"), Text(" - Manage MCP servers"),
+            Text(f"{STATUS_EMOJI['search']} /discover", style="bold"), Text(" - Discover and connect to local network servers"),
             Text(f"{STATUS_EMOJI['tool']} /tools", style="bold"), Text(" - List available tools"),
             Text(f"{STATUS_EMOJI['tool']} /tool", style="bold"), Text(" - Directly execute a tool with parameters"),
             Text(f"{STATUS_EMOJI['resource']} /resources", style="bold"), Text(" - List available resources"),
@@ -3738,25 +4146,6 @@ class MCPClient:
         else:
             console.print("[yellow]Unknown cache command. Available: list, clear [tool_name | --all], clean, dependencies[/]")
 
-    async def close(self):
-        """Clean up resources before exit"""
-        # Save conversation graph
-        try:
-            self.conversation_graph.save(str(self.conversation_graph_file))
-            log.info(f"Saved conversation graph to {self.conversation_graph_file}")
-        except Exception as e:
-            log.error(f"Failed to save conversation graph: {e}")
-
-        # Stop server monitor
-        if hasattr(self, 'server_monitor'): # Ensure monitor was initialized
-             await self.server_monitor.stop_monitoring()
-        # Close server connections and processes
-        if hasattr(self, 'server_manager'):
-             await self.server_manager.close()
-        # Close cache
-        if self.tool_cache:
-            self.tool_cache.close()
-
     async def cmd_fork(self, args):
         """Create a new conversation fork/branch"""
         fork_name = args if args else None
@@ -4040,84 +4429,6 @@ class MCPClient:
                 console.print(f"[red]Failed to export conversation: {e}[/]")
                 return False
 
-    # Add a new helper method for handling multi-step operations with progress tracking
-    async def run_multi_step_task(self, 
-                                 steps: List[Callable], 
-                                 step_descriptions: List[str],
-                                 title: str = "Processing...",
-                                 show_spinner: bool = True) -> bool:
-        """Run a multi-step task with progress tracking.
-        
-        Args:
-            steps: List of async callables to execute
-            step_descriptions: List of descriptions for each step
-            title: Title for the progress bar
-            show_spinner: Whether to show a spinner
-            
-        Returns:
-            Boolean indicating success
-        """
-        if len(steps) != len(step_descriptions):
-            log.error("Steps and descriptions must have the same length")
-            return False
-            
-        progress_columns = []
-        if show_spinner:
-            progress_columns.append(SpinnerColumn())
-        
-        progress_columns.extend([
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[cyan]{task.completed}/{task.total}"),
-            TaskProgressColumn()
-        ])
-        
-        with Progress(*progress_columns, console=console) as progress:
-            task = progress.add_task(title, total=len(steps))
-            
-            for i, (step, description) in enumerate(zip(steps, step_descriptions, strict=False)):
-                try:
-                    progress.update(task, description=description)
-                    await step()
-                    progress.update(task, advance=1)
-                except Exception as e:
-                    log.error(f"Error in step {i+1}: {e}")
-                    progress.update(task, description=f"{STATUS_EMOJI['error']} {description} failed: {e}")
-                    return False
-            
-            progress.update(task, description=f"{STATUS_EMOJI['success']} Complete")
-            return True
-
-    async def count_tokens(self, messages=None) -> int:
-        """Count the number of tokens in the current conversation context"""
-        if messages is None:
-            messages = self.conversation_graph.current_node.messages
-            
-        # Use tiktoken for accurate counting
-        # Use cl100k_base encoding which is used by Claude
-        encoding = tiktoken.get_encoding("cl100k_base")
-        token_count = 0
-        
-        for message in messages:
-            # Get the message content
-            content = message.get("content", "")
-            
-            # Handle content that might be a list of blocks (text/image blocks)
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and "text" in block:
-                        token_count += len(encoding.encode(block["text"]))
-                    elif isinstance(block, str):
-                        token_count += len(encoding.encode(block))
-                else:
-                    # Simple string content
-                    token_count += len(encoding.encode(str(content)))
-            
-            # Add a small overhead for message formatting
-            token_count += 4  # Approximate overhead per message
-            
-        return token_count
-        
     async def cmd_optimize(self, args):
         """Optimize conversation context through summarization"""
         # Parse arguments for custom model or target length
@@ -4137,14 +4448,21 @@ class MCPClient:
         
         console.print(f"[yellow]Optimizing conversation context...[/]")
         
-        # Get current token count
-        current_tokens = await self.count_tokens()
-        console.print(f"Current context: approximately {current_tokens} tokens")
-        
         # Use specified model or default summarization model
         summarization_model = custom_model or self.config.summarization_model
         
-        with Status(f"{STATUS_EMOJI['speech_balloon']} Summarizing conversation...", spinner="dots") as status:
+        # Variables to track between steps
+        current_tokens = 0
+        new_tokens = 0
+        summary = ""
+        
+        # Define the optimization steps
+        async def count_initial_tokens():
+            nonlocal current_tokens
+            current_tokens = await self.count_tokens()
+            
+        async def generate_summary():
+            nonlocal summary
             summary = await self.process_query(
                 "Summarize this conversation history preserving key facts, "
                 "decisions, and context needed for future interactions. "
@@ -4154,16 +4472,36 @@ class MCPClient:
                 model=summarization_model
             )
             
-            # Replace conversation context with summary
+        async def apply_summary():
+            nonlocal summary
             self.conversation_graph.current_node.messages = [
                 {"role": "system", "content": "Conversation summary: " + summary}
             ]
             
-            # Get new token count
+        async def count_final_tokens():
+            nonlocal new_tokens
             new_tokens = await self.count_tokens()
-            status.update(f"{STATUS_EMOJI['success']} Conversation optimized: {current_tokens} → {new_tokens} tokens")
         
-        console.print(f"[green]Conversation optimized: {current_tokens} → {new_tokens} tokens[/]")
+        # Execute with progress tracking
+        steps = [count_initial_tokens, generate_summary, apply_summary, count_final_tokens]
+        descriptions = [
+            f"{STATUS_EMOJI['scroll']} Counting initial tokens...",
+            f"{STATUS_EMOJI['speech_balloon']} Generating summary...",
+            f"{STATUS_EMOJI['scroll']} Applying summary...",
+            f"{STATUS_EMOJI['scroll']} Counting final tokens..."
+        ]
+        
+        success = await self.server_manager.run_multi_step_task(
+            steps=steps, 
+            step_descriptions=descriptions,
+            title=f"{STATUS_EMOJI['package']} Optimizing conversation"
+        )
+        
+        if success:
+            # Report results
+            console.print(f"[green]Conversation optimized: {current_tokens} → {new_tokens} tokens[/]")
+        else:
+            console.print(f"[red]Failed to optimize conversation.[/]")
     
     async def auto_prune_context(self):
         """Auto-prune context based on token count"""

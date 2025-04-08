@@ -10,7 +10,8 @@ A comprehensive command-line client for the **Model Context Protocol (MCP)** tha
 
 - **Server Discovery**  
   - Auto-discovers local `stdio` servers (Python/JS scripts)
-  - mDNS-based discovery of LAN servers
+  - mDNS-based discovery of LAN servers with real-time notifications
+  - Interactive commands for exploring and connecting to local network servers
   - Integration with public MCP registries
   - Re-use your existing json settings file from Claude Desktop, for easy import of existing server configurations
 
@@ -147,6 +148,7 @@ mcpclient run --help
 ```text
 /help         Show available commands  
 /servers      Manage MCP servers (list, connect, add, etc.)  
+/discover     Discover and connect to MCP servers on local network
 /tools        List or inspect tools  
 /tool         Directly execute a tool with custom parameters
 /resources    List available resources  
@@ -203,6 +205,12 @@ If the current weather data is updated, both the forecast and travel recommendat
 - Auto-adds servers found via:
   - Registry (e.g., `https://registry.modelcontextprotocol.io`)
   - Zeroconf (`_mcp._tcp.local`) on LAN
+- Continuous local network discovery:
+  - Real-time notifications of new MCP servers on your network
+  - `/discover list` - View all discovered servers with their details
+  - `/discover connect NAME` - Connect to a specific discovered server
+  - `/discover refresh` - Force a refresh of the discovery process
+  - `/discover auto [on|off]` - Toggle automatic discovery
 
 ---
 
