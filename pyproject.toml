@@ -1,0 +1,93 @@
+# pyproject.toml
+
+[project]
+name = "ultimate_mcp_client"
+version = "1.0.0" # Pulled from your script's docstring
+description = "A comprehensive client for the Model Context Protocol (MCP) that connects AI models with external tools, servers, and data sources." # Pulled from your script's docstring
+readme = "README.md" # Assumes you have or will create this file
+requires-python = ">=3.13" # Explicitly set to 3.13 and later
+license = { text = "MIT" } # Pulled from your script's docstring
+authors = [
+    { name = "Jeffrey Emanuel", email = "jeffrey.emanuel@gmail.com" }, 
+]
+classifiers = [
+    # Updated classifiers to reflect Python 3.13+ support
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    # Add future Python versions as they become relevant, e.g., "Programming Language :: Python :: 3.14",
+    "Environment :: Console",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
+
+# Core dependencies derived directly from script imports
+dependencies = [
+    # --- Directly Imported Libraries ---
+    "anthropic",          
+    "mcp",                 
+    "typer", 
+    "rich",              
+    "httpx",              
+    "pyyaml",              
+    "python-dotenv",       
+    "colorama",
+    "psutil",              
+    "typing-extensions",   
+    "zeroconf",
+    "opentelemetry-sdk",
+    "opentelemetry-api",
+    "diskcache",
+    "ruff", # Linter and formatter
+    "mypy", # Static type checker
+]
+
+# Defines the command-line script entry point
+[project.scripts]
+# Assumes the file is named mcpclient.py and the typer object is named 'app'
+mcpclient = "mcpclient:app"
+
+[project.urls]
+# Optional: Add links to your project repository or homepage
+# Homepage = "https://github.com/Dicklesworthstone/mcp-ultimate-client"
+# Repository = "https://github.com/Dicklesworthstone/mcp-ultimate-client"
+
+# --- Tool Configurations (Optional but Recommended) ---
+
+[tool.ruff]
+line-length = 150
+select = [
+    "E", "W", "F", "I", "C4", "B", "A", "ASYNC", "TCH", # Added more useful checks
+]
+ignore = [
+    "E501", # Line too long (handled by formatter)
+    "W293",
+    "W291",
+    "E402",
+    "B007",
+    "E701",
+    "F541",
+]
+# Specify the target Python version for ruff
+target-version = "py313"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+# Specify the target Python version for mypy
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true # Start with this, tighten later if possible
+
+# ---------------------------------------------------------------
+# Notes for uv:
+# - Create/activate venv: uv venv --python 3.13 && source .venv/bin/activate
+# - Install:              uv sync --all-extras
+# ---------------------------------------------------------------
