@@ -119,6 +119,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, redirect_stdout
@@ -391,89 +392,54 @@ signal.signal(signal.SIGINT, sigint_handler)
 atexit.register(lambda: force_exit_handler(is_force=False))
 
 # Helper function to adapt paths for different platforms, used for processing Claude Desktop JSON config file 
-def adapt_path_for_platform(command, args):
-    is_windows = platform.system() == "Windows"
-    is_wsl = "WSL" in platform.platform().upper() or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
-    
-    # Improved Windows path to WSL path conversion
-    def convert_to_wsl_path(win_path):
-        if not win_path or not isinstance(win_path, str):
-            return win_path
-        
-        # Handle C:\ style paths for WSL - convert to /mnt/c/...
-        if len(win_path) > 2 and win_path[1] == ":" and win_path[2] in ["\\", "/"]:
-            drive_letter = win_path[0].lower()
-            # Remove the drive letter and colon, then replace backslashes with forward slashes
-            rest_of_path = win_path[2:].replace("\\", "/")
-            
-            # Ensure there's only one leading slash and no trailing slashes
-            if rest_of_path.startswith("/"):
+def adapt_path_for_platform(command: str, args: List[str]) -> Tuple[str, List[str]]:
+    """
+    ALWAYS assumes running on Linux/WSL.
+    Converts Windows-style paths (e.g., 'C:\\Users\\...') found in the command
+    or arguments to their corresponding /mnt/ drive equivalents
+    (e.g., '/mnt/c/Users/...').
+    """
+
+    def convert_windows_path_to_linux(path_str: str) -> str:
+        """
+        Directly converts 'DRIVE:\\path' or 'DRIVE:/path' to '/mnt/drive/path'.
+        Handles drive letters C-Z, case-insensitive.
+        Replaces backslashes (represented as '\\' in Python strings) with forward slashes.
+        """
+        # Check for DRIVE:\ or DRIVE:/ pattern (case-insensitive)
+        # Note: It checks the actual string value, which might be 'C:\\Users\\...'
+        if isinstance(path_str, str) and len(path_str) > 2 and path_str[1] == ':' and path_str[2] in ['\\', '/'] and path_str[0].isalpha():
+            drive_letter = path_str[0].lower()
+            # path_str[2:] correctly gets the part after 'C:'
+            # .replace("\\", "/") correctly handles the single literal backslash in the Python string
+            rest_of_path = path_str[2:].replace("\\", "/")
+            # Ensure rest_of_path doesn't start with / after C:
+            if rest_of_path.startswith('/'):
                 rest_of_path = rest_of_path[1:]
-            rest_of_path = rest_of_path.rstrip("/")
-                
-            wsl_path = f"/mnt/{drive_letter}/{rest_of_path}"
-            log.info(f"Converted Windows path '{win_path}' to WSL path '{wsl_path}'")
-            return wsl_path
-        return win_path
-    
-    # If we're running on Windows, no need to adapt paths
-    if is_windows and not is_wsl:
-        return command, args
-    
-    # If we're on Linux/WSL and command contains Windows paths
-    if not is_windows or is_wsl:
-        # For filesystem server specifically
-        if "npx" in command and "@modelcontextprotocol/server-filesystem" in str(args):
-            new_args = []
-            for arg in args:
-                if isinstance(arg, str) and ":" in arg:
-                    # Convert Windows path to WSL path
-                    new_args.append(convert_to_wsl_path(arg))
-                else:
-                    new_args.append(arg)
-            
-            log.info(f"Adapted filesystem server args: {args} -> {new_args}")
-            return command, new_args
-        
-        # For wsl.exe commands running in Linux (extract the bash command)
-        elif "wsl.exe" in command:
-            if isinstance(args, list) and len(args) >= 3:
-                try:
-                    bash_c_index = args.index("-c")
-                    if bash_c_index + 1 < len(args):
-                        actual_command = args[bash_c_index + 1]
-                        log.info(f"Converting wsl.exe command to direct bash command")
-                        return "bash", ["-c", actual_command]
-                except ValueError:
-                    # If we can't parse it, just return as is
-                    log.warning(f"Could not extract bash command from wsl.exe args: {args}")
-                    # Still try to convert any Windows paths in args
-                    new_args = []
-                    for arg in args:
-                        if isinstance(arg, str) and ":" in arg and len(arg) > 2 and arg[1] == ":":
-                            new_args.append(convert_to_wsl_path(arg))
-                        else:
-                            new_args.append(arg)
-                    return command, new_args
-        
-        # For any command with Windows paths
+            linux_path = f"/mnt/{drive_letter}/{rest_of_path}"
+            # Use logger configured elsewhere in your script
+            log.info(f"Converted Windows path '{path_str}' to Linux path '{linux_path}'")
+            return linux_path
+        # If it doesn't look like a Windows path, return it unchanged
+        return path_str
+
+    # Apply conversion to the command string itself
+    adapted_command = convert_windows_path_to_linux(command)
+
+    # Apply conversion to each argument if it's a string
+    adapted_args = []
+    for arg in args:
+        # Make sure we only try to convert strings
+        if isinstance(arg, str):
+            adapted_args.append(convert_windows_path_to_linux(arg))
         else:
-            new_args = []
-            windows_path_found = False
-            
-            for arg in args:
-                if isinstance(arg, str) and ":" in arg and len(arg) > 2 and arg[1] == ":":
-                    windows_path_found = True
-                    new_args.append(convert_to_wsl_path(arg))
-                else:
-                    new_args.append(arg)
-            
-            if windows_path_found:
-                log.info(f"Converted Windows paths in command args: {args} -> {new_args}")
-                return command, new_args
-    
-    # Default case - return unchanged
-    return command, args
+            adapted_args.append(arg) # Keep non-string args (like numbers, bools) as is
+
+    # Log if changes were made
+    if adapted_command != command or adapted_args != args:
+        log.debug(f"Path adaptation result: command='{adapted_command}', args={adapted_args}")
+
+    return adapted_command, adapted_args
 
 # =============================================================================
 # CRITICAL STDIO SAFETY MECHANISM
@@ -627,7 +593,9 @@ STATUS_EMOJI = {
     "history": Emoji("scroll"),
     "search": Emoji("magnifying_glass_tilted_right"),
     "success": Emoji("party_popper"),
-    "failure": Emoji("collision")
+    "failure": Emoji("collision"),
+    "warning": Emoji("warning"),
+    "model": Emoji("robot"),      
 }
 
 # Constants
@@ -986,22 +954,40 @@ class ServerRegistry:
     def start_local_discovery(self):
         """Start discovering MCP servers on the local network using mDNS"""
         try:
-            from zeroconf import ServiceBrowser, Zeroconf
-            
+            # Make sure zeroconf is importable
+            from zeroconf import EventLoopBlocked, ServiceBrowser, Zeroconf
+        except ImportError:
+            log.warning("Zeroconf not available, local discovery disabled")
+            self.zeroconf = None # Ensure it's None if import fails
+            return # Cannot proceed
+
+        try:
+            # Inner try block for Zeroconf setup
             class MCPServiceListener:
                 def __init__(self, registry):
                     self.registry = registry
-                
-                def add_service(self, zeroconf, service_type, name):
-                    info = zeroconf.get_service_info(service_type, name)
+
+                def add_service(self, zeroconf_obj, service_type, name):
+                    info = None # Initialize info
+                    try:
+                        # *** ADDED Try/Except around get_service_info ***
+                        info = zeroconf_obj.get_service_info(service_type, name, timeout=1000) # Use 1 sec timeout
+                    except EventLoopBlocked:
+                         log.warning(f"Zeroconf event loop blocked getting info for {name}, will retry later.")
+                         return # Skip processing this time, might get it on update
+                    except Exception as e:
+                         log.error(f"Error getting zeroconf service info for {name}: {e}")
+                         return # Skip if error getting info
+
                     if not info:
-                        return
-                        
+                        log.debug(f"No service info found for {name} after query.")
+                        return # No info retrieved
+
+                    # --- Rest of the add_service logic as before ---
                     server_name = name.replace("._mcp._tcp.local.", "")
                     host = socket.inet_ntoa(info.addresses[0]) if info.addresses else "localhost"
                     port = info.port
-                    
-                    # Extract and parse properties from TXT records
+
                     properties = {}
                     if info.properties:
                         for k, v in info.properties.items():
@@ -1010,33 +996,14 @@ class ServerRegistry:
                                 value = v.decode('utf-8')
                                 properties[key] = value
                             except UnicodeDecodeError:
-                                # Skip binary properties that can't be decoded as UTF-8
                                 continue
 
-                    # Determine server type from properties or default to SSE
-                    server_type = "sse"
-                    if "type" in properties:
-                        server_type = properties["type"]
-                        
-                    # Extract version information if available
-                    version = None
-                    if "version" in properties:
-                        try:
-                            version = properties["version"]
-                        except Exception:
-                            pass
-                            
-                    # Extract categories information if available
-                    categories = []
-                    if "categories" in properties:
-                        try:
-                            categories = properties["categories"].split(",")
-                        except Exception:
-                            pass
-                            
-                    # Get description if available
+                    server_type = properties.get("type", "sse") # Default to sse if not specified
+                    version_str = properties.get("version")
+                    version = ServerVersion.from_string(version_str) if version_str else None
+                    categories = properties.get("categories", "").split(",") if properties.get("categories") else []
                     description = properties.get("description", f"mDNS discovered server at {host}:{port}")
-                    
+
                     self.registry.discovered_servers[server_name] = {
                         "name": server_name,
                         "host": host,
@@ -1044,33 +1011,37 @@ class ServerRegistry:
                         "type": server_type,
                         "url": f"http://{host}:{port}",
                         "properties": properties,
-                        "version": version,
+                        "version": version, # Store parsed version object or None
                         "categories": categories,
                         "description": description,
                         "discovered_via": "mdns"
                     }
-                    
                     log.info(f"Discovered local MCP server: {server_name} at {host}:{port} ({description})")
-                
-                def remove_service(self, zeroconf, service_type, name):
+                    # --- End of original add_service logic ---
+
+                def remove_service(self, zeroconf_obj, service_type, name):
+                    # (Keep existing remove_service logic)
                     server_name = name.replace("._mcp._tcp.local.", "")
                     if server_name in self.registry.discovered_servers:
                         del self.registry.discovered_servers[server_name]
                         log.info(f"Removed local MCP server: {server_name}")
-                
+
                 def update_service(self, zeroconf, service_type, name):
-                    # This method is required by newer versions of Zeroconf
-                    # Can be empty if we don't need to handle service updates
+                    # Optional: Could call add_service again here to refresh info
+                    log.debug(f"Zeroconf update event for {name}")
+                    # For simplicity, we can just rely on add_service/remove_service
                     pass
-            
-            self.zeroconf = Zeroconf()
+
+            if self.zeroconf is None: # Initialize only if not already done
+                 self.zeroconf = Zeroconf()
             listener = MCPServiceListener(self)
             self.browser = ServiceBrowser(self.zeroconf, "_mcp._tcp.local.", listener)
             log.info("Started local MCP server discovery")
-        except ImportError:
-            log.warning("Zeroconf not available, local discovery disabled")
-        except OSError as e: # Catch potential socket errors (Corrected indentation)
+
+        except OSError as e:
              log.error(f"Error starting local discovery (network issue?): {e}")
+        except Exception as e:
+             log.error(f"Unexpected error during zeroconf setup: {e}") # Catch other potential errors
     
     def stop_local_discovery(self):
         """Stop local server discovery"""
@@ -1997,7 +1968,7 @@ class ServerMonitor:
 
 
 class ServerManager:
-    def __init__(self, config: Config, tool_cache=None):
+    def __init__(self, config: Config, tool_cache=None, safe_printer=None):
         self.config = config
         self.exit_stack = AsyncExitStack()
         self.active_sessions: Dict[str, ClientSession] = {}
@@ -2006,6 +1977,7 @@ class ServerManager:
         self.prompts: Dict[str, MCPPrompt] = {}
         self.processes: Dict[str, subprocess.Popen] = {}
         self.tool_cache = tool_cache
+        self._safe_printer = safe_printer or print
         
         # Server monitoring
         self.monitor = ServerMonitor(self)
@@ -2329,7 +2301,7 @@ class ServerManager:
                             span_ctx = None
                     
                     # Log connection info using safe_console
-                    safe_console.print(f"[cyan]Attempting to connect to server {server_name}...[/]")
+                    self._safe_printer(f"[cyan]Attempting to connect to server {server_name}...[/]")
 
                     if server_config.type == ServerType.STDIO:
                         # Check if we need to start the server process
@@ -2480,7 +2452,7 @@ class ServerManager:
                             log.warning(f"Error updating span status: {e}")
                     
                     log.info(f"Connected to server {server_name} in {connection_time:.2f}ms")
-                    safe_console.print(f"[green]Connected to server {server_name} in {connection_time:.2f}ms[/]")
+                    self._safe_printer(f"[green]Connected to server {server_name} in {connection_time:.2f}ms[/]")
                     return session
                     
                 except McpError as e: # Catch MCP client errors
@@ -2523,13 +2495,13 @@ class ServerManager:
                 if retry_count <= max_retries:
                     delay = min(1 * (2 ** (retry_count - 1)) + random.random(), 10)
                     log.warning(f"Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}")
-                    safe_console.print(f"[yellow]Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}[/]")
+                    self._safe_printer(f"[yellow]Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}[/]")
                     log.info(f"Retrying in {delay:.2f} seconds...")
-                    safe_console.print(f"[cyan]Retrying in {delay:.2f} seconds...[/]")
+                    self._safe_printer(f"[cyan]Retrying in {delay:.2f} seconds...[/]")
                     await asyncio.sleep(delay)
                 else:
                     log.error(f"Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}")
-                    safe_console.print(f"[red]Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}[/]")
+                    self._safe_printer(f"[red]Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}[/]")
                     if span_ctx and hasattr(span_ctx, 'end'): 
                         try:
                             span_ctx.end() # End span after final failure
@@ -2627,14 +2599,13 @@ class ServerManager:
             return
         
         # Connect to each enabled server
-        safe_console = get_safe_console()
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
             SpinnerColumn("dots"),
             TextColumn("[cyan]{task.fields[server]}"),
-            console=safe_console,
+            console=get_safe_console(),
             transient=True
         ) as progress:
             task = progress.add_task("[cyan]Connecting to servers...", total=len([s for s in self.config.servers.values() if s.enabled]))
@@ -2660,7 +2631,7 @@ class ServerManager:
                 verify_no_stdout_pollution()
         
         # Start server monitoring
-        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots", console=safe_console) as status:
+        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots", console=get_safe_console()) as status:
             await self.server_monitor.start_monitoring()
             status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
         
@@ -2843,7 +2814,7 @@ class ServerManager:
             
         finally:
             # Let user know we're done
-            self.safe_print("[yellow]Shutdown complete[/]")
+            self._safe_printer("[yellow]Shutdown complete[/]")
 
     def format_tools_for_anthropic(self) -> List[ToolParam]:
         """Format MCP tools for Anthropic API"""
@@ -2964,7 +2935,7 @@ class MCPClient:
             custom_ttl_mapping=self.config.cache_ttl_mapping
         )
         
-        self.server_manager = ServerManager(self.config, tool_cache=self.tool_cache)
+        self.server_manager = ServerManager(self.config, tool_cache=self.tool_cache, safe_printer=self.safe_print)
         # Only initialize Anthropic client if API key is available
         if self.config.api_key:
             self.anthropic = AsyncAnthropic(api_key=self.config.api_key)
@@ -3268,9 +3239,6 @@ class MCPClient:
 
         # Check for and load Claude desktop config if it exists
         await self.load_claude_desktop_config()
-
-        # Use get_safe_console for all status and progress widgets
-        safe_console = get_safe_console()
         
         # Verify no stdout pollution before connecting to servers
         if os.environ.get("MCP_VERIFY_STDOUT", "1") == "1":
@@ -3283,7 +3251,7 @@ class MCPClient:
         # Discover servers if enabled - use a simple status instead of Progress
         if self.config.auto_discover:
             with Status(f"{STATUS_EMOJI['search']} Discovering MCP servers...", 
-                    spinner="dots", console=safe_console) as status:
+                    spinner="dots", console=get_safe_console()) as status:
                 await self.server_manager.discover_servers()
                 status.update(f"{STATUS_EMOJI['success']} Server discovery complete")
         
@@ -3314,7 +3282,7 @@ class MCPClient:
         
         # Start server monitoring
         with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", 
-                spinner="dots", console=safe_console) as status:
+                spinner="dots", console=get_safe_console()) as status:
             await self.server_monitor.start_monitoring()
             status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
         
@@ -3504,7 +3472,7 @@ class MCPClient:
         elif subcmd == "refresh":
             safe_console = get_safe_console()
             # Force a refresh of the discovery
-            with Status(f"{STATUS_EMOJI['search']} Refreshing local MCP server discovery...", spinner="dots", console=safe_console) as status:
+            with Status(f"{STATUS_EMOJI['search']} Refreshing local MCP server discovery...", spinner="dots", console=get_safe_console()) as status:
                 # Restart the discovery to refresh
                 if self.server_manager.registry.zeroconf:
                     self.server_manager.registry.stop_local_discovery()
@@ -3858,8 +3826,7 @@ class MCPClient:
                 }
             )
         
-        safe_console = get_safe_console()
-        with Status(f"{STATUS_EMOJI['speech_balloon']} Claude is thinking...", spinner="dots", console=safe_console) as status:
+        with Status(f"{STATUS_EMOJI['speech_balloon']} Claude is thinking...", spinner="dots", console=get_safe_console()) as status:
             try:
                 # Make initial API call
                 status.update(f"{STATUS_EMOJI['speech_balloon']} Sending query to Claude ({model})...")
@@ -4407,7 +4374,6 @@ class MCPClient:
     
     async def connect_server(self, name):
         """Connect to a specific server"""
-        safe_console = get_safe_console()
         if not name:
             self.safe_print("[yellow]Usage: /servers connect SERVER_NAME[/]")
             return
@@ -4424,7 +4390,7 @@ class MCPClient:
         server_config = self.config.servers[name]
         
         try:
-            with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots", console=safe_console) as status:
+            with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots", console=get_safe_console()) as status:
                 try:
                     # Use safe_stdout to prevent any stdout pollution during server connection
                     with safe_stdout():
@@ -4804,11 +4770,8 @@ class MCPClient:
         """Reload servers and capabilities"""
         self.safe_print("[yellow]Reloading servers and capabilities...[/]")
         
-        # Use safe_console for all output
-        safe_console = get_safe_console()
-        
         # Close existing connections
-        with Status(f"{STATUS_EMOJI['server']} Closing existing connections...", spinner="dots", console=safe_console) as status:
+        with Status(f"{STATUS_EMOJI['server']} Closing existing connections...", spinner="dots", console=get_safe_console()) as status:
             await self.server_manager.close()
             status.update(f"{STATUS_EMOJI['success']} Existing connections closed")
         
@@ -4816,7 +4779,7 @@ class MCPClient:
         self.server_manager = ServerManager(self.config)
         
         # Reconnect
-        with Status(f"{STATUS_EMOJI['server']} Reconnecting to servers...", spinner="dots", console=safe_console) as status:
+        with Status(f"{STATUS_EMOJI['server']} Reconnecting to servers...", spinner="dots", console=get_safe_console()) as status:
             await self.server_manager.connect_to_servers()
             status.update(f"{STATUS_EMOJI['success']} Servers reconnected")
         
@@ -5207,15 +5170,12 @@ class MCPClient:
             # Set the flag to prevent other live displays
             self._active_progress = True
             
-            # Use get_safe_console() for the dashboard
-            safe_console = get_safe_console()
-            
             # Use a single Live display context for the dashboard
             with Live(self.generate_dashboard_renderable(), 
                     refresh_per_second=1.0/self.config.dashboard_refresh_rate, 
                     screen=True, 
                     transient=False,
-                    console=safe_console) as live:
+                    console=get_safe_console()) as live:
                 while True:
                     await asyncio.sleep(self.config.dashboard_refresh_rate)
                     # Generate a new renderable and update the display
@@ -5440,7 +5400,7 @@ class MCPClient:
         tool = self.server_manager.tools[tool_name]
         server_name = tool.server_name
         
-        with Status(f"{STATUS_EMOJI['tool']} Executing {tool_name}...", spinner="dots", console=safe_console) as status:
+        with Status(f"{STATUS_EMOJI['tool']} Executing {tool_name}...", spinner="dots", console=get_safe_console()) as status:
             try:
                 start_time = time.time()
                 result = await self.execute_tool(server_name, tool_name, params)
@@ -5482,183 +5442,141 @@ class MCPClient:
         """Look for and load the Claude desktop config file (claude_desktop_config.json) if it exists."""
         config_path = Path("claude_desktop_config.json")
         if not config_path.exists():
-            return
-            
+            log.debug("claude_desktop_config.json not found, skipping.")
+            return # No file, nothing to do
+
         try:
             self.safe_print(f"{STATUS_EMOJI['config']} Found Claude desktop config file, processing...")
-            
+
             # Read the file content
             async with aiofiles.open(config_path, 'r') as f:
                 content = await f.read()
-                
+
+            # Attempt to parse JSON
             try:
                 desktop_config = json.loads(content)
-                # Log the structure
                 log.debug(f"Claude desktop config keys: {list(desktop_config.keys())}")
             except json.JSONDecodeError as json_error:
+                # Print user-facing error and log details
                 self.safe_print(f"[red]Invalid JSON in Claude desktop config: {json_error}[/]")
-                return
-            
-            # The primary key is 'mcpServers', but check alternatives if needed
-            if 'mcpServers' not in desktop_config:
-                log.warning(f"Expected 'mcpServers' key not found in Claude desktop config")
-                log.debug(f"Available keys: {list(desktop_config.keys())}")
-                # Check for alternative keys
+                try:
+                    # Try to log the specific line from the content for easier debugging
+                    problem_line = content.splitlines()[max(0, json_error.lineno - 1)]
+                    log.error(f"JSON error in {config_path} at line {json_error.lineno}, col {json_error.colno}: '{problem_line}'", exc_info=True)
+                except Exception:
+                    log.error(f"Failed to parse JSON from {config_path}", exc_info=True) # Log generic parse error with traceback
+                return # Stop processing if JSON is invalid
+
+            # --- Find the mcpServers key ---
+            mcp_servers_key = 'mcpServers'
+            if mcp_servers_key not in desktop_config:
+                found_alt = False
                 for alt_key in ['mcp_servers', 'servers', 'MCP_SERVERS']:
                     if alt_key in desktop_config:
                         log.info(f"Using alternative key '{alt_key}' for MCP servers")
-                        desktop_config['mcpServers'] = desktop_config[alt_key]
+                        mcp_servers_key = alt_key
+                        found_alt = True
                         break
-                else:
-                    self.safe_print(f"{STATUS_EMOJI['warning']} No MCP servers defined in Claude desktop config")
-                    return
-            
-            # We now should have a mcpServers key
-            mcp_servers = desktop_config['mcpServers']
+                if not found_alt:
+                    self.safe_print(f"{STATUS_EMOJI['warning']} No MCP servers key ('mcpServers' or alternatives) found in {config_path}")
+                    return # Stop if no server list found
+
+            mcp_servers = desktop_config.get(mcp_servers_key) # Use .get for safety
             if not mcp_servers or not isinstance(mcp_servers, dict):
-                self.safe_print(f"{STATUS_EMOJI['warning']} No valid MCP servers found in config")
-                return
-            
-            # Track successful imports and skipped servers
+                self.safe_print(f"{STATUS_EMOJI['warning']} No valid MCP server entries found under key '{mcp_servers_key}' in {config_path}")
+                return # Stop if server list is empty or not a dictionary
+
+            # --- Process Servers ---
             imported_servers = []
             skipped_servers = []
-                        
-            # Process each server
+
             for server_name, server_data in mcp_servers.items():
+                # Inner try block for processing each server individually
                 try:
-                    # Skip if server already exists
                     if server_name in self.config.servers:
-                        log.info(f"Server '{server_name}' already exists in config, skipping")
+                        log.info(f"Server '{server_name}' already exists in local config, skipping import.")
                         skipped_servers.append((server_name, "already exists"))
                         continue
-                    
-                    # Log server info for debugging
-                    log.debug(f"Processing server '{server_name}' with data: {server_data}")
-                    
-                    # Extract command and args
+
+                    log.debug(f"Processing server '{server_name}' from desktop config: {server_data}")
+
                     if 'command' not in server_data:
-                        log.warning(f"No 'command' field for server '{server_name}'")
+                        log.warning(f"Skipping server '{server_name}': Missing 'command' field.")
                         skipped_servers.append((server_name, "missing command field"))
                         continue
-                        
+
                     command = server_data['command']
                     args = server_data.get('args', [])
-                    
-                    # Adapt paths for the current platform
-                    try:
-                        adapted_command, adapted_args = adapt_path_for_platform(command, args)
-                        log.info(f"Server '{server_name}': Adapted command from '{command}' to '{adapted_command}'")
-                        log.debug(f"Server '{server_name}': Adapted args from '{args}' to '{adapted_args}'")
-                    except Exception as adapt_error:
-                        log.error(f"Error adapting paths for server '{server_name}': {adapt_error}")
-                        # Use original command and args as fallback
-                        adapted_command, adapted_args = command, args
-                    
-                    # Create new server config
+
+                    # Adapt paths simply, assuming Linux/WSL
+                    adapted_command, adapted_args = adapt_path_for_platform(command, args)
+
                     server_config = ServerConfig(
                         name=server_name,
-                        type=ServerType.STDIO,  # Claude desktop uses STDIO servers
+                        type=ServerType.STDIO, # Claude desktop uses STDIO
                         path=adapted_command,
                         args=adapted_args,
                         enabled=True,
                         auto_start=True,
-                        description=f"Imported from Claude desktop config",
-                        trusted=True,  # Assume trusted since configured in Claude desktop
+                        description="Imported from Claude desktop config",
+                        trusted=True, # Assume trusted
                     )
-                    
-                    # Add to our config
+
                     self.config.servers[server_name] = server_config
                     imported_servers.append(server_name)
-                    log.info(f"Imported server '{server_name}' from Claude desktop config")
-                except Exception as server_error:
-                    server_error_str = str(server_error)
-                    log.error(f"Error processing server '{server_name}': {server_error_str}")
-                    skipped_servers.append((server_name, f"processing error: {server_error_str}"))
-            
-            # Save config
+                    log.info(f"Prepared server '{server_name}' for import.")
+
+                except Exception as server_proc_error:
+                    # Catch errors processing a single server definition
+                    log.error(f"Error processing server definition '{server_name}' from desktop config", exc_info=True)
+                    skipped_servers.append((server_name, f"processing error: {server_proc_error}"))
+                    continue # Skip this server and continue with the next
+
+            # --- Save Config and Report ---
             if imported_servers:
                 try:
                     await self.config.save_async()
-                    self.safe_print(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config")
-                    
-                    # Create a nice report
-                    if imported_servers:
-                        server_table = Table(title="Imported Servers")
-                        server_table.add_column("Name")
-                        server_table.add_column("Command")
-                        server_table.add_column("Arguments")
-                        
-                        for name in imported_servers:
-                            server = self.config.servers[name]
-                            server_table.add_row(
-                                name,
-                                server.path,
-                                " ".join(str(arg) for arg in server.args) if server.args else ""
-                            )
-                        
-                        self.safe_print(server_table)
-                    
-                    if skipped_servers:
-                        skipped_table = Table(title="Skipped Servers")
-                        skipped_table.add_column("Name")
-                        skipped_table.add_column("Reason")
-                        
-                        for name, reason in skipped_servers:
-                            skipped_table.add_row(name, reason)
-                        
-                        self.safe_print(skipped_table)
+                    self.safe_print(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config.")
+
+                    # Report imported servers
+                    server_table = Table(title="Imported Servers")
+                    server_table.add_column("Name")
+                    server_table.add_column("Command")
+                    server_table.add_column("Arguments")
+                    for name in imported_servers:
+                        server = self.config.servers[name]
+                        server_table.add_row(name, server.path, " ".join(map(str, server.args)))
+                    self.safe_print(server_table)
+
                 except Exception as save_error:
-                    log.error(f"Error saving config after importing servers: {save_error}")
+                    log.error("Error saving config after importing servers", exc_info=True)
                     self.safe_print(f"[red]Error saving imported server config: {save_error}[/]")
             else:
-                self.safe_print(f"{STATUS_EMOJI['warning']} No new servers imported from Claude desktop config")
-        
-        except FileNotFoundError as file_error:
-            log.debug(f"Claude desktop config file not found: {file_error}")
-        except json.JSONDecodeError as json_err:
-            log.error(f"Invalid JSON in Claude desktop config file: {json_err}")
-            # Try to show the problematic part of the JSON
-            try:
-                async with aiofiles.open(config_path, 'r') as f:
-                    file_content = await f.read()
-                    prob_line = file_content.splitlines()[max(0, json_err.lineno - 1)]
-                    log.error(f"JSON error at line {json_err.lineno}, column {json_err.colno}: {prob_line}")
-            except Exception as json_context_error:
-                log.error(f"Error getting JSON error context: {json_context_error}")
-        except Exception as outer_error:
-            # Ensure we're using str(outer_error) to avoid any issue with the error being a string itself
-            error_message = str(outer_error)
-            log.error(f"Error processing Claude desktop config: {error_message}")
-            self.safe_print(f"[red]Error processing Claude desktop config: {error_message}[/]")
-            # Add more context for debugging
-            import traceback
-            log.debug(f"Full error: {traceback.format_exc()}")
-            
-        # Check for the 'warning' string bug
-        if error_message == 'warning':
-            log.error("Detected 'warning' string as exception. This might indicate a shadowed variable.")
-            self.safe_print("[red]Internal error: detected 'warning' variable shadowing issue. Check logs.[/]")
-            
-            # Try to recover by checking if there were any warnings logged asynchronously
-            try:
-                log_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'mcpclient.log')
-                async with aiofiles.open(log_path, 'r') as log_file:
-                    # Read the file content
-                    content = await log_file.read()
-                    lines = content.splitlines()
-                    
-                    # Get the last 100 lines or all lines if fewer
-                    last_lines = lines[-100:] if len(lines) > 100 else lines
-                    
-                    # Filter for warning lines
-                    recent_warnings = [line for line in last_lines if 'WARNING' in line]
-                    if recent_warnings:
-                        # Log the last 5 warnings or fewer if there are less
-                        warnings_to_log = recent_warnings[-5:] if len(recent_warnings) > 5 else recent_warnings
-                        log.error(f"Recent warnings that might be related: {warnings_to_log}")
-            except Exception as log_read_error:
-                log.error(f"Error trying to read log file asynchronously: {log_read_error}")
+                self.safe_print(f"{STATUS_EMOJI['warning']} No new servers were imported from Claude desktop config.")
 
+            # Report skipped servers, if any
+            if skipped_servers:
+                skipped_table = Table(title="Skipped Servers During Import")
+                skipped_table.add_column("Name")
+                skipped_table.add_column("Reason")
+                for name, reason in skipped_servers:
+                    skipped_table.add_row(name, reason)
+                self.safe_print(skipped_table)
+
+        # --- Outer Exception Handling ---
+        except FileNotFoundError:
+            # This is normal if the file doesn't exist, already handled by the initial check.
+            # Log as debug just in case.
+            log.debug(f"{config_path} not found.")
+        except Exception as outer_config_error:
+            # Catch any other unexpected error during the whole process (file read, json parse, server loop)
+            # Use safe_print for the user message
+            self.safe_print(f"[bold red]An unexpected error occurred while processing {config_path}: {outer_config_error}[/]")
+            # Print the traceback directly to stderr for diagnostics
+            # This bypasses logging and ensures it doesn't interfere with stdio, while providing debug info.
+            print(f"\n--- Traceback for Claude Desktop Config Error ({type(outer_config_error).__name__}) ---", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            print("--- End Traceback ---", file=sys.stderr)
 
     async def cmd_export(self, args):
         """Export the current conversation or a specific branch"""
@@ -5872,7 +5790,6 @@ class MCPClient:
         # Set a flag that we have an active progress
         self._active_progress = True
         
-        safe_console = get_safe_console()
         results = []
         
         try:
@@ -5897,7 +5814,7 @@ class MCPClient:
             # Create a Progress context that only lives for this group of tasks
             with Progress(
                 *columns,
-                console=safe_console,
+                console=get_safe_console(),
                 transient=transient,
                 expand=False  # This helps prevent display expansion issues
             ) as progress:
@@ -6062,27 +5979,25 @@ def config(
 
 async def main_async(query, model, server, dashboard, interactive, verbose_logging):
     """Main async entry point"""
-    # Initialize client
-    client = MCPClient()
+    client = None # Initialize client to None
     safe_console = get_safe_console()
-    
-    # Set up timeout for overall execution
-    max_shutdown_timeout = 10  # seconds
-    
+    max_shutdown_timeout = 10
+
     try:
-        # Set up client with error handling for each step
+        # Initialize client
+        client = MCPClient() # Instantiation inside the try block
+
+        # Set up client with error handling
         try:
+            # Pass interactive flag here correctly
             await client.setup(interactive_mode=interactive)
         except Exception as setup_error:
-            if verbose_logging:
-                safe_console.print(f"[bold red]Error during setup:[/] {str(setup_error)}")
-                import traceback
-                safe_console.print(traceback.format_exc())
-            else:
-                safe_console.print(f"[bold red]Error during setup:[/] {str(setup_error)}")
-            # Continue anyway for interactive mode
+            # Log with traceback using standard logging
+            log.error("Error occurred during client setup", exc_info=True)
+            # Print user-facing message
+            safe_console.print(f"[bold red]Error during setup:[/] {setup_error}")
             if not interactive:
-                raise  # Re-raise for non-interactive mode
+                raise # Re-raise to exit non-interactive mode
 
         # Connect to specific server(s) if provided
         if server:
@@ -6173,34 +6088,26 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             except Exception as e:
                 safe_console.print(f"[red]Error during shutdown: {e}[/]")
     
-    except Exception as e:
-        # Use client.safe_print if client is available, otherwise use safe_console
-        if 'client' in locals() and client:
-            client.safe_print(f"[bold red]Error:[/] {str(e)}")
-            if verbose_logging:
-                import traceback
-                client.safe_print(traceback.format_exc())
-        else:
-            # Fall back to safe_console if client isn't available
-            safe_console = get_safe_console()
-            safe_console.print(f"[bold red]Error:[/] {str(e)}")
-            if verbose_logging:
-                import traceback
-                safe_console.print(traceback.format_exc())
-        
-        # For unhandled exceptions in non-interactive mode, still try to clean up
-        if 'client' in locals() and client and hasattr(client, 'server_manager'):
-            try:
-                # Use timeout to prevent hanging during error cleanup
-                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout)
-            except (asyncio.TimeoutError, Exception):
-                # Just continue with exit on any errors during error handling
-                pass
-        
-        # Return non-zero exit code for script usage
-        if not interactive:
-            sys.exit(1)
-    
+    except Exception as main_async_error:
+            # Catch any other exception originating from setup or main logic
+
+            # Print user-facing error message
+            safe_console.print(f"[bold red]An unexpected error occurred in the main process: {main_async_error}[/]")
+
+            # Print traceback directly to stderr for diagnostics
+            print(f"\n--- Traceback for Main Process Error ({type(main_async_error).__name__}) ---", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            print("--- End Traceback ---", file=sys.stderr)
+
+            # Exit non-interactive mode with an error code
+            if not interactive:
+                # Attempt graceful cleanup even on error
+                if client and hasattr(client, 'close'):
+                    try:
+                        await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout / 2) # Shorter timeout on error
+                    except Exception:
+                        pass # Ignore cleanup errors during error handling
+                sys.exit(1)
     finally:
         # Clean up (already handled in KeyboardInterrupt and normal exit paths)
         # Ensure close is called if setup succeeded but something else failed
