@@ -12,15 +12,19 @@ A comprehensive command-line client for the **Model Context Protocol (MCP)** tha
   - Auto-discovers local `stdio` servers (Python/JS scripts)
   - mDNS-based discovery of LAN servers
   - Integration with public MCP registries
+  - Re-use your existing json settings file from Claude Desktop, for easy import of existing server configurations
 
 - **Streaming AI with Tools**  
   - Claude integration (via Anthropic SDK) with full support for tool use  
   - Intelligent routing of tool calls to the correct server
+  - Direct tool execution with custom parameters
 
 - **Advanced Conversation Management**  
   - Branching/forkable conversation graphs  
   - Persistent history across sessions  
   - Per-branch model tracking
+  - Dynamic contextual prompt injection
+  - Automatic context optimization through summarization
 
 - **Observability**  
   - OpenTelemetry metrics and spans  
@@ -29,6 +33,7 @@ A comprehensive command-line client for the **Model Context Protocol (MCP)** tha
 - **Smart Caching**  
   - Optional disk and in-memory caching for tool results  
   - Per-tool TTLs and runtime cache invalidation
+  - Dependency graph for automatic invalidation of related caches
 
 - **Rich CLI UX**  
   - Interactive shell with `/commands`, autocompletion, and Markdown rendering  
@@ -63,6 +68,37 @@ Or, you can run it using uv's self-contained script functionality:
 uv run mcp_client.py
 ```
 
+### Claude Desktop Integration
+
+If you're already using Claude Desktop, you can easily import your existing MCP server configurations:
+
+1. Copy your `claude_desktop_config.json` file to the project root directory
+2. Start the client with any command (e.g., `mcpclient run --interactive`)
+3. The client will automatically detect the file, import the server configurations, and display a summary
+
+Example Claude Desktop config structure:
+```json
+{
+  "mcpServers": {
+    "llm_gateway": {
+      "command": "wsl.exe",
+      "args": [
+        "bash",
+        "-c",
+        "cd /home/user/llm_gateway && python -m server run"
+      ]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "C:\\Users\\user\\Documents"
+      ]
+    }
+  }
+}
+```
 
 ### Run Interactive Mode
 
@@ -73,7 +109,7 @@ mcpclient run --interactive
 ### Run a One-Off Query
 
 ```bash
-mcpclient run --query "What’s the weather in New York?"
+mcpclient run --query "What's the weather in New York?"
 ```
 
 ### Show the Dashboard
@@ -98,13 +134,17 @@ mcpclient run --help
 /help         Show available commands  
 /servers      Manage MCP servers (list, connect, add, etc.)  
 /tools        List or inspect tools  
+/tool         Directly execute a tool with custom parameters
 /resources    List available resources  
 /prompts      List available prompt templates  
+/prompt       Apply a prompt template to the current conversation
 /model        Change Claude model  
 /fork         Create a conversation branch  
 /branch       List or switch between branches  
-/cache        Manage tool result cache  
+/cache        Manage tool result cache and dependencies  (list, clear, clean, dependencies)
 /dashboard    Open real-time monitoring dashboard  
+/optimize     Optimize conversation context through summarization
+/clear        Clear the conversation context
 ```
 
 ---
@@ -118,6 +158,23 @@ Claude ↔ MCPClient ↔ Tool Registry + Conversation Graph
                   ↘
                ToolCache
 ```
+
+---
+
+## 🔄 Smart Cache Dependency Tracking
+
+The Smart Cache Dependency system allows tools to declare dependencies on other tools:
+
+- When a tool's cache is invalidated, all dependent tools are automatically invalidated
+- Dependencies are registered when servers declare tool relationships
+- View the dependency graph with `/cache dependencies`
+- Improves data consistency by ensuring related tools use fresh data
+
+Example dependency flow:
+```
+weather:current → weather:forecast → travel:recommendations
+```
+If the current weather data is updated, both the forecast and travel recommendations caches are automatically invalidated.
 
 ---
 
@@ -176,17 +233,11 @@ All settings are stored in:
 - Project is monolithic by design for ease of deployment and introspection.
 - Linting: `ruff`
 - Type checks: `mypy`
-- Optional: OpenTelemetry for spans, counters, histograms
+- OpenTelemetry for spans, counters, histograms
 
 ---
 
 ## 📝 License
 
-MIT License. See `LICENSE` file.
+MIT License.
 
----
-
-## 👤 Author
-
-Jeffrey Emanuel  
-<jeffrey.emanuel@gmail.com>

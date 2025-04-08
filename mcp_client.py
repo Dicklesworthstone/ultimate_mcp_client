@@ -43,6 +43,10 @@ Key Features:
 - Observability: Comprehensive metrics and tracing
 - Registry Integration: Connect to remote registries to discover servers
 - Local Discovery: Discover MCP servers on your local network via mDNS
+- Context Optimization: Automatic summarization of long conversations
+- Direct Tool Execution: Run specific tools directly with custom parameters
+- Dynamic Prompting: Apply pre-defined prompt templates to conversations
+- Claude Desktop Integration: Automatically import server configs from Claude desktop
 
 Usage:
 ------
@@ -62,14 +66,20 @@ python mcpclient.py servers --list
 # Configuration
 python mcpclient.py config --show
 
+# Claude Desktop Integration
+# Place a claude_desktop_config.json file in the project root directory
+# The client will automatically detect and import server configurations on startup
+
 Command Reference:
 -----------------
 Interactive mode commands:
 - /help - Show available commands
 - /servers - Manage MCP servers (list, add, connect, etc.)
 - /tools - List and inspect available tools
+- /tool - Directly execute a tool with custom parameters
 - /resources - List available resources
 - /prompts - List available prompts
+- /prompt - Apply a prompt template to the current conversation
 - /model - Change AI model
 - /fork - Create a conversation branch
 - /branch - Manage conversation branches
@@ -77,6 +87,8 @@ Interactive mode commands:
 - /dashboard - Open health monitoring dashboard
 - /monitor - Control server monitoring
 - /registry - Manage server registry connections
+- /optimize - Optimize conversation context through summarization
+- /clear - Clear the conversation context
 
 Author: Jeffrey Emanuel
 License: MIT
@@ -109,6 +121,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Set,
     Tuple,
 )
 
@@ -221,7 +234,7 @@ console = Console(theme=custom_theme)
 
 # Status emoji mapping
 STATUS_EMOJI = {
-    "healthy": Emoji("check_mark_button"),
+    "healthy": Emoji("white_check_mark"),
     "degraded": Emoji("warning"),
     "error": Emoji("cross_mark"),
     "connected": Emoji("green_circle"),
@@ -267,32 +280,50 @@ span_processor = BatchSpanProcessor(console_exporter)
 trace_provider.add_span_processor(span_processor)
 trace.set_tracer_provider(trace_provider)
 
-meter_provider = MeterProvider()
-metric_reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
-meter_provider.add_metric_reader(metric_reader)
-metrics.set_meter_provider(meter_provider)
+# Initialize metrics with the current API
+try:
+    # Try the newer API first
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
+    
+    reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
+    meter_provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(meter_provider)
+except (ImportError, AttributeError):
+    # Fallback to older API or handle gracefully
+    log.warning("OpenTelemetry metrics API initialization failed. Metrics may not be available.")
+    # Create a dummy meter_provider for compatibility
+    meter_provider = MeterProvider()
+    metrics.set_meter_provider(meter_provider)
 
 tracer = trace.get_tracer("mcpclient")
 meter = metrics.get_meter("mcpclient")
 
 # Create instruments
-request_counter = meter.create_counter(
-    name="mcp_requests",
-    description="Number of MCP requests",
-    unit="1"
-)
+try:
+    request_counter = meter.create_counter(
+        name="mcp_requests",
+        description="Number of MCP requests",
+        unit="1"
+    )
 
-latency_histogram = meter.create_histogram(
-    name="mcp_latency",
-    description="Latency of MCP requests",
-    unit="ms"
-)
+    latency_histogram = meter.create_histogram(
+        name="mcp_latency",
+        description="Latency of MCP requests",
+        unit="ms"
+    )
 
-tool_execution_counter = meter.create_counter(
-    name="tool_executions",
-    description="Number of tool executions",
-    unit="1"
-)
+    tool_execution_counter = meter.create_counter(
+        name="tool_executions",
+        description="Number of tool executions",
+        unit="1"
+    )
+except Exception as e:
+    log.warning(f"Failed to create metrics instruments: {e}")
+    # Create dummy objects to avoid None checks
+    request_counter = None
+    latency_histogram = None
+    tool_execution_counter = None
 
 class ServerType(Enum):
     STDIO = "stdio"
@@ -714,6 +745,36 @@ class ToolCache:
         if custom_ttl_mapping:
             self.ttl_mapping.update(custom_ttl_mapping)
 
+        # Add dependency tracking
+        self.dependency_graph: Dict[str, Set[str]] = {}
+
+    def add_dependency(self, tool_name, depends_on):
+        """Register a dependency between tools"""
+        self.dependency_graph.setdefault(tool_name, set()).add(depends_on)
+        
+    def invalidate_related(self, tool_name):
+        """Invalidate all dependent cache entries"""
+        affected = set()
+        stack = [tool_name]
+        
+        while stack:
+            current = stack.pop()
+            affected.add(current)
+            
+            # Find all tools that depend on the current tool
+            for dependent, dependencies in self.dependency_graph.items():
+                if current in dependencies and dependent not in affected:
+                    stack.append(dependent)
+        
+        # Remove the originating tool - we only want to invalidate dependents
+        if tool_name in affected:
+            affected.remove(tool_name)
+            
+        # Invalidate each affected tool
+        for tool in affected:
+            self.invalidate(tool_name=tool)
+            log.info(f"Invalidated dependent tool cache: {tool} (depends on {tool_name})")
+
     def get_ttl(self, tool_name):
         """Get TTL for a tool based on its name, prioritizing custom mapping."""
         # Check custom/updated mapping first (already merged in __init__)
@@ -799,6 +860,9 @@ class ToolCache:
                 for key in list(self.disk_cache.keys()):
                     if key.startswith(f"{tool_name}:"):
                         del self.disk_cache[key]
+                        
+            # Invalidate dependent tools
+            self.invalidate_related(tool_name)
         else:
             # Invalidate all entries
             self.memory_cache.clear()
@@ -1353,7 +1417,7 @@ class ServerMonitor:
 
 
 class ServerManager:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, tool_cache=None):
         self.config = config
         self.exit_stack = AsyncExitStack()
         self.active_sessions: Dict[str, ClientSession] = {}
@@ -1361,6 +1425,7 @@ class ServerManager:
         self.resources: Dict[str, MCPResource] = {}
         self.prompts: Dict[str, MCPPrompt] = {}
         self.processes: Dict[str, subprocess.Popen] = {}
+        self.tool_cache = tool_cache
         
         # Server monitoring
         self.monitor = ServerMonitor(self)
@@ -1845,9 +1910,19 @@ class ServerManager:
                     name=tool_name,
                     description=tool.description,
                     server_name=server_name,
-                    input_schema=tool.inputSchema,
+                    input_schema=tool.input_schema,
                     original_tool=tool
                 )
+                
+                # Register tool dependencies if present
+                if hasattr(tool, 'dependencies') and isinstance(tool.dependencies, list):
+                    for dependency in tool.dependencies:
+                        # Make sure dependency has the server prefix if needed
+                        dependency_name = f"{server_name}:{dependency}" if ":" not in dependency else dependency
+                        # Add the dependency to the cache dependency graph
+                        if hasattr(self, 'tool_cache') and self.tool_cache:
+                            self.tool_cache.add_dependency(tool_name, dependency_name)
+                            log.debug(f"Registered dependency: {tool_name} depends on {dependency_name}")
             
             # Load resources
             try:
@@ -1949,15 +2024,16 @@ class MCPClient:
     def __init__(self):
         self.config = Config()
         self.history = History(max_entries=self.config.history_size)
-        self.server_manager = ServerManager(self.config)
-        self.anthropic = AsyncAnthropic(api_key=self.config.api_key)  # Changed to AsyncAnthropic
-        self.current_model = self.config.default_model
         
         # Instantiate Caching
         self.tool_cache = ToolCache(
             cache_dir=CACHE_DIR,
             custom_ttl_mapping=self.config.cache_ttl_mapping
         )
+        
+        self.server_manager = ServerManager(self.config, tool_cache=self.tool_cache)
+        self.anthropic = AsyncAnthropic(api_key=self.config.api_key)  # Changed to AsyncAnthropic
+        self.current_model = self.config.default_model
 
         # Instantiate Server Monitoring
         self.server_monitor = ServerMonitor(self.server_manager)
@@ -2003,6 +2079,8 @@ class MCPClient:
             'branch': self.cmd_branch,
             'dashboard': self.cmd_dashboard, # Add dashboard command
             'optimize': self.cmd_optimize, # Add optimize command
+            'tool': self.cmd_tool, # Add tool playground command
+            'prompt': self.cmd_prompt, # Add prompt command for dynamic injection
         }
         
         # Set up readline for command history in interactive mode
@@ -2074,11 +2152,20 @@ class MCPClient:
             session.timeout = request_timeout
             
         try:
-            # Call the tool
-            result = await session.call_tool(tool.original_tool.name, tool_args)
-            return result.result
+            # Use the tool_execution_context context manager for metrics and tracing
+            async with self.tool_execution_context(tool_name, tool_args, server_name):
+                # Call the tool - this is unchanged from the original implementation
+                result = await session.call_tool(tool.original_tool.name, tool_args)
+                
+                # Check dependencies - unchanged from original implementation
+                if self.tool_cache:
+                    dependencies = self.tool_cache.dependency_graph.get(tool_name, set())
+                    if dependencies:
+                        log.debug(f"Tool {tool_name} has dependencies: {dependencies}")
+                
+                return result.result
         finally:
-            # Restore original timeout if it was changed
+            # Restore original timeout if it was changed - unchanged from original implementation
             if original_timeout is not None and hasattr(session, 'timeout'):
                 session.timeout = original_timeout
 
@@ -2098,6 +2185,9 @@ class MCPClient:
             console.print("1. Set the ANTHROPIC_API_KEY environment variable")
             console.print("2. Run 'config api-key YOUR_API_KEY'")
             sys.exit(1)
+        
+        # Check for and load Claude desktop config if it exists
+        await self.load_claude_desktop_config()
         
         # Discover servers if enabled
         if self.config.auto_discover:
@@ -2199,9 +2289,6 @@ class MCPClient:
             server_name: Name of the server running the tool
             
         Yields:
-            None (just provides the context)
-            
-        Returns:
             The execution time in milliseconds on successful completion
         """
         tool_start_time = time.time()
@@ -2218,7 +2305,8 @@ class MCPClient:
             )
         
         try:
-            yield
+            # We yield a placeholder here - we'll calculate and track the execution time after the yield
+            yield None
             
             # Calculate execution time
             tool_execution_time = (time.time() - tool_start_time) * 1000  # ms
@@ -2244,8 +2332,6 @@ class MCPClient:
             # End span if tracking with success status
             if tool_span:
                 tool_span.set_status(trace.StatusCode.OK)
-            
-            return tool_execution_time
             
         except Exception as e:
             # Record error metrics
@@ -2774,6 +2860,7 @@ class MCPClient:
         server_commands = [
             Text(f"{STATUS_EMOJI['server']} /servers", style="bold"), Text(" - Manage MCP servers"),
             Text(f"{STATUS_EMOJI['tool']} /tools", style="bold"), Text(" - List available tools"),
+            Text(f"{STATUS_EMOJI['tool']} /tool", style="bold"), Text(" - Directly execute a tool with parameters"),
             Text(f"{STATUS_EMOJI['resource']} /resources", style="bold"), Text(" - List available resources"),
             Text(f"{STATUS_EMOJI['prompt']} /prompts", style="bold"), Text(" - List available prompts"),
             Text(f"{STATUS_EMOJI['green_circle']} /reload", style="bold"), Text(" - Reload servers and capabilities")
@@ -2979,8 +3066,8 @@ class MCPClient:
         for name, server in self.config.servers.items():
             connected = name in self.server_manager.active_sessions
             status = f"{STATUS_EMOJI['connected']} [green]Connected[/]" if connected else f"{STATUS_EMOJI['disconnected']} [red]Disconnected[/]"
-            enabled = f"{STATUS_EMOJI['check_mark_button']} [green]Yes[/]" if server.enabled else f"{STATUS_EMOJI['cross_mark']} [red]No[/]"
-            auto_start = f"{STATUS_EMOJI['check_mark_button']} [green]Yes[/]" if server.auto_start else f"{STATUS_EMOJI['cross_mark']} [red]No[/]"
+            enabled = f"{STATUS_EMOJI['white_check_mark']} [green]Yes[/]" if server.enabled else f"{STATUS_EMOJI['cross_mark']} [red]No[/]"
+            auto_start = f"{STATUS_EMOJI['white_check_mark']} [green]Yes[/]" if server.auto_start else f"{STATUS_EMOJI['cross_mark']} [red]No[/]"
             
             server_table.add_row(
                 name,
@@ -3445,7 +3532,14 @@ class MCPClient:
         await self.print_status()
     
     async def cmd_cache(self, args):
-        """Manage the tool result cache"""
+        """Manage the tool result cache and tool dependencies
+        
+        Subcommands:
+          list - List cached entries
+          clear - Clear cache entries
+          clean - Remove expired entries
+          dependencies (deps) - View tool dependency graph
+        """
         if not self.tool_cache:
             console.print("[yellow]Caching is disabled.[/]")
             return
@@ -3597,8 +3691,48 @@ class MCPClient:
                 progress.update(task, description=f"{STATUS_EMOJI['success']} Removed {removed_count} expired entries")
             
             console.print(f"[green]Expired cache entries cleaned. Removed {removed_count} entries.[/]")
+        
+        elif subcmd == "dependencies" or subcmd == "deps":
+            # Show dependency graph
+            console.print("\n[bold]Tool Dependency Graph:[/]")
+            
+            if not self.tool_cache.dependency_graph:
+                console.print("[yellow]No dependencies registered.[/]")
+                return
+            
+            dependency_table = Table(title="Tool Dependencies")
+            dependency_table.add_column("Tool")
+            dependency_table.add_column("Depends On")
+            
+            # Process the dependency graph for display
+            for tool_name, dependencies in self.tool_cache.dependency_graph.items():
+                if dependencies:
+                    dependency_table.add_row(
+                        tool_name,
+                        ", ".join(dependencies)
+                    )
+            
+            console.print(dependency_table)
+            console.print(f"Total tools with dependencies: {len(self.tool_cache.dependency_graph)}")
+            
+            # Process specific tool's dependencies
+            if subargs:
+                tool_name = subargs
+                dependencies = self.tool_cache.dependency_graph.get(tool_name, set())
+                
+                if dependencies:
+                    # Show the tool's dependencies in a tree
+                    tree = Tree(f"[bold cyan]{tool_name}[/]")
+                    for dep in dependencies:
+                        tree.add(f"[magenta]{dep}[/]")
+                    
+                    console.print("\n[bold]Dependencies for selected tool:[/]")
+                    console.print(tree)
+                else:
+                    console.print(f"\n[yellow]Tool '{tool_name}' has no dependencies or was not found.[/]")
+        
         else:
-            console.print("[yellow]Unknown cache command. Available: list, clear [tool_name | --all], clean[/]")
+            console.print("[yellow]Unknown cache command. Available: list, clear [tool_name | --all], clean, dependencies[/]")
 
     async def close(self):
         """Clean up resources before exit"""
@@ -3659,7 +3793,7 @@ class MCPClient:
             if not subargs:
                 console.print("[yellow]Usage: /branch checkout NODE_ID[/]")
                 return
-
+            
             node_id = subargs
             # Allow partial ID matching (e.g., first 8 chars)
             matched_node = None
@@ -3971,9 +4105,9 @@ class MCPClient:
                         token_count += len(encoding.encode(block["text"]))
                     elif isinstance(block, str):
                         token_count += len(encoding.encode(block))
-            else:
-                # Simple string content
-                token_count += len(encoding.encode(str(content)))
+                else:
+                    # Simple string content
+                    token_count += len(encoding.encode(str(content)))
             
             # Add a small overhead for message formatting
             token_count += 4  # Approximate overhead per message
@@ -4035,6 +4169,169 @@ class MCPClient:
                           f"({self.config.auto_summarize_threshold}). Auto-summarizing...[/]")
             await self.cmd_optimize(f"--tokens {self.config.max_summarized_tokens}")
 
+    async def cmd_tool(self, args):
+        """Directly execute a tool with parameters"""
+        if not args:
+            console.print("[yellow]Usage: /tool NAME {JSON_PARAMS}[/yellow]")
+            return
+            
+        # Split into tool name and params
+        try:
+            parts = args.split(" ", 1)
+            tool_name = parts[0]
+            params_str = parts[1] if len(parts) > 1 else "{}"
+            params = json.loads(params_str)
+        except json.JSONDecodeError:
+            console.print("[red]Invalid JSON parameters. Use valid JSON format.[/red]")
+            return
+        except Exception as e:
+            console.print(f"[red]Error parsing command: {e}[/red]")
+            return
+
+        # Check if tool exists
+        if tool_name not in self.server_manager.tools:
+            console.print(f"[red]Tool not found: {tool_name}[/red]")
+            return
+        
+        # Get the tool and its server
+        tool = self.server_manager.tools[tool_name]
+        server_name = tool.server_name
+        
+        with Status(f"{STATUS_EMOJI['tool']} Executing {tool_name}...", spinner="dots") as status:
+            try:
+                start_time = time.time()
+                result = await self.execute_tool(server_name, tool_name, params)
+                latency = time.time() - start_time
+                
+                status.update(f"{STATUS_EMOJI['success']} Tool execution completed in {latency:.2f}s")
+                
+                # Show result
+                console.print(Panel.fit(
+                    Syntax(json.dumps(result, indent=2), "json", theme="monokai"),
+                    title=f"Tool Result: {tool_name} (executed in {latency:.2f}s)",
+                    border_style="magenta"
+                ))
+            except Exception as e:
+                status.update(f"{STATUS_EMOJI['failure']} Tool execution failed: {e}")
+                console.print(f"[red]Error executing tool: {e}[/red]")
+
+    # After the cmd_tool method (around line 4295)
+    async def cmd_prompt(self, args):
+        """Apply a prompt template to the conversation"""
+        if not args:
+            console.print("[yellow]Available prompt templates:[/yellow]")
+            for name in self.server_manager.prompts:
+                console.print(f"  - {name}")
+            return
+        
+        prompt = self.server_manager.prompts.get(args)
+        if not prompt:
+            console.print(f"[red]Prompt not found: {args}[/red]")
+            return
+            
+        self.conversation_graph.current_node.messages.insert(0, {
+            "role": "system",
+            "content": prompt.template
+        })
+        console.print(f"[green]Applied prompt: {args}[/green]")
+
+    async def load_claude_desktop_config(self):
+        """Look for and load the Claude desktop config file (claude_desktop_config.json) if it exists.
+        
+        This enables users to easily import MCP server configurations from Claude desktop.
+        """
+        config_path = Path("claude_desktop_config.json")
+        if not config_path.exists():
+            return
+            
+        try:
+            with Status(f"{STATUS_EMOJI['config']} Found Claude desktop config file, processing...", spinner="dots") as status:
+                async with aiofiles.open(config_path, 'r') as f:
+                    content = await f.read()
+                    desktop_config = json.loads(content)
+                
+                if not desktop_config.get('mcpServers'):
+                    status.update(f"{STATUS_EMOJI['warning']} No MCP servers defined in Claude desktop config")
+                    return
+                
+                # Track successful imports and skipped servers
+                imported_servers = []
+                skipped_servers = []
+                
+                for server_name, server_data in desktop_config['mcpServers'].items():
+                    # Skip if server already exists
+                    if server_name in self.config.servers:
+                        log.info(f"Server '{server_name}' already exists in config, skipping")
+                        skipped_servers.append((server_name, "already exists"))
+                        continue
+                    
+                    # Convert to our server config format
+                    command = server_data.get('command', '')
+                    args = server_data.get('args', [])
+                    
+                    if not command:
+                        log.warning(f"No command specified for server '{server_name}', skipping")
+                        skipped_servers.append((server_name, "missing command"))
+                        continue
+                    
+                    # Create new server config
+                    server_config = ServerConfig(
+                        name=server_name,
+                        type=ServerType.STDIO,  # Claude desktop only supports STDIO servers
+                        path=command,
+                        args=args,
+                        enabled=True,
+                        auto_start=True,
+                        description=f"Imported from Claude desktop config",
+                        trusted=True,  # Assume trusted since user configured it in Claude desktop
+                    )
+                    
+                    # Add to our config
+                    self.config.servers[server_name] = server_config
+                    imported_servers.append(server_name)
+                    log.info(f"Imported server '{server_name}' from Claude desktop config")
+                
+                # Save config
+                if imported_servers:
+                    self.config.save()
+                    status.update(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config")
+                    
+                    # Create a nice report
+                    if imported_servers:
+                        server_table = Table(title="Imported Servers")
+                        server_table.add_column("Name")
+                        server_table.add_column("Command")
+                        server_table.add_column("Arguments")
+                        
+                        for name in imported_servers:
+                            server = self.config.servers[name]
+                            server_table.add_row(
+                                name,
+                                server.path,
+                                " ".join(server.args) if server.args else ""
+                            )
+                        
+                        console.print(server_table)
+                    
+                    if skipped_servers:
+                        skipped_table = Table(title="Skipped Servers")
+                        skipped_table.add_column("Name")
+                        skipped_table.add_column("Reason")
+                        
+                        for name, reason in skipped_servers:
+                            skipped_table.add_row(name, reason)
+                        
+                        console.print(skipped_table)
+                else:
+                    status.update(f"{STATUS_EMOJI['warning']} No new servers imported from Claude desktop config")
+        
+        except FileNotFoundError:
+            log.debug("Claude desktop config file not found")
+        except json.JSONDecodeError:
+            log.error("Invalid JSON in Claude desktop config file")
+        except Exception as e:
+            log.error(f"Error processing Claude desktop config: {e}")
+
 # Define Typer CLI commands
 @app.command()
 def run(
@@ -4087,7 +4384,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             for s in server:
                 if s in client.config.servers:
                     await client.connect_server(s)
-                else:
+        else:
                     console.print(f"[yellow]Server not found: {s}[/]")
         
         # Launch dashboard if requested
