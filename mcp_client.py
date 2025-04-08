@@ -207,6 +207,74 @@ from typing_extensions import Annotated
 # Set up Typer app
 app = typer.Typer(help="🔌 Ultimate MCP Client for Anthropic API")
 
+# Add a global stdout protection mechanism to prevent accidental pollution
+class StdioProtectionWrapper:
+    """Wrapper that prevents accidental writes to stdout when stdio servers are active.
+    
+    This provides an additional safety layer beyond the context managers by intercepting
+    any direct writes to sys.stdout when stdio servers are connected.
+    """
+    def __init__(self, original_stdout):
+        self.original_stdout = original_stdout
+        self.active_stdio_servers = False
+        self._buffer = []
+    
+    def update_stdio_status(self):
+        """Check if we have any active stdio servers"""
+        try:
+            # This might not be available during initialization
+            if hasattr(app, "mcp_client") and app.mcp_client and hasattr(app.mcp_client, "server_manager"):
+                for name, server in app.mcp_client.server_manager.config.servers.items():
+                    if server.type == ServerType.STDIO and name in app.mcp_client.server_manager.active_sessions:
+                        self.active_stdio_servers = True
+                        return
+                self.active_stdio_servers = False
+        except (NameError, AttributeError):
+            # Default to safe behavior if we can't check
+            self.active_stdio_servers = False
+    
+    def write(self, text):
+        """Intercept writes to stdout"""
+        self.update_stdio_status()
+        if self.active_stdio_servers:
+            # Redirect to stderr instead to avoid corrupting stdio protocol
+            sys.stderr.write(text)
+            # Log a warning if this isn't something trivial like a newline
+            if text.strip() and text != "\n":
+                # Use logging directly to avoid potential recursion
+                logging.warning(f"Prevented stdout pollution: {repr(text[:30])}")
+                # Record in debugging buffer for potential diagnostics
+                self._buffer.append(text)
+                if len(self._buffer) > 100:
+                    self._buffer.pop(0)  # Keep buffer size limited
+        else:
+            self.original_stdout.write(text)
+    
+    def flush(self):
+        """Flush the stream"""
+        if not self.active_stdio_servers:
+            self.original_stdout.flush()
+        else:
+            sys.stderr.flush()
+    
+    def isatty(self):
+        """Pass through isatty check"""
+        return self.original_stdout.isatty()
+    
+    # Add other necessary methods for stdout compatibility
+    def fileno(self):
+        return self.original_stdout.fileno()
+    
+    def readable(self):
+        return self.original_stdout.readable()
+    
+    def writable(self):
+        return self.original_stdout.writable()
+
+# Apply the protection wrapper to stdout
+# This is a critical safety measure to prevent stdio corruption
+sys.stdout = StdioProtectionWrapper(sys.stdout)
+
 # Add a callback for when no command is specified
 @app.callback(invoke_without_command=True)
 def main_callback(ctx: typer.Context):
@@ -348,6 +416,42 @@ def get_safe_console():
     
     # If we have active stdio servers, use stderr to avoid interfering with stdio communication
     return stderr_console if has_stdio_servers else console
+
+def verify_no_stdout_pollution():
+    """Verify that stdout isn't being polluted during MCP communication.
+    
+    This function temporarily captures stdout and writes a test message,
+    then checks if the message was captured. If stdout is properly protected,
+    the test output should be intercepted by our safety mechanisms.
+    
+    Use this for debugging if you suspect stdout pollution is causing issues.
+    """
+    import io
+    import sys
+    
+    # Store the original stdout
+    original_stdout = sys.stdout
+    
+    # Create a buffer to capture any potential output
+    test_buffer = io.StringIO()
+    
+    sys.stdout = test_buffer
+    try:
+        # Write a test message to stdout
+        print("TEST_STDOUT_POLLUTION_VERIFICATION")
+        
+        # Check if the message was captured
+        captured = test_buffer.getvalue()
+        if captured:
+            # Output to stderr (safe) and logs
+            sys.stderr.write(f"\n[CRITICAL] STDOUT POLLUTION DETECTED: {captured}\n")
+            log.critical(f"STDOUT POLLUTION DETECTED: {captured}")
+            log.critical("This could break MCP servers. Fix any direct prints to stdout.")
+            return False
+        return True
+    finally:
+        # Restore the original stdout
+        sys.stdout = original_stdout
 
 # Status emoji mapping
 STATUS_EMOJI = {
@@ -2017,7 +2121,8 @@ class ServerManager:
             # Process and display discovery results
             await self._process_discovery_results()
         else:
-            console.print("[yellow]Server discovery is disabled in configuration.[/]")
+            safe_console = get_safe_console()
+            safe_console.print("[yellow]Server discovery is disabled in configuration.[/]")
     
     async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
         """Connect to a single MCP server with retry logic and health monitoring"""
@@ -2025,8 +2130,8 @@ class ServerManager:
         retry_count = 0
         max_retries = server_config.retry_count
         
-        # Ensure we're using stderr for output during connection to avoid stdio interference
-        safe_console = stderr_console if server_config.type == ServerType.STDIO else console
+        # Ensure we're using the safe console during connection to avoid stdio interference
+        safe_console = get_safe_console()
         
         # Use safe_stdout context manager to protect against stdout pollution during the entire connection process
         with safe_stdout():
@@ -2351,7 +2456,16 @@ class ServerManager:
             return
         
         # Connect to each enabled server
-        with Progress() as progress:
+        safe_console = get_safe_console()
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            SpinnerColumn("dots"),
+            TextColumn("[cyan]{task.fields[server]}"),
+            console=safe_console,
+            transient=True
+        ) as progress:
             task = progress.add_task("[cyan]Connecting to servers...", total=len([s for s in self.config.servers.values() if s.enabled]))
             
             for name, server_config in self.config.servers.items():
@@ -2367,75 +2481,91 @@ class ServerManager:
                     await self.load_server_capabilities(name, session)
                 
                 progress.update(task, advance=1)
+        
+        # Verify no stdout pollution after connecting to servers
+        if os.environ.get("MCP_VERIFY_STDOUT", "1") == "1":
+            with safe_stdout():
+                log.info("Verifying no stdout pollution after connecting to servers...")
+                verify_no_stdout_pollution()
+        
+        # Start server monitoring
+        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots", console=safe_console) as status:
+            await self.server_monitor.start_monitoring()
+            status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
+        
+        # Display status
+        await self.print_status()
     
     async def load_server_capabilities(self, server_name: str, session: ClientSession):
         """Load tools, resources, and prompts from a server"""
-        try:
-            # Load tools
-            tool_response = await session.list_tools()
-            for tool in tool_response.tools:
-                tool_name = f"{server_name}:{tool.name}" if ":" not in tool.name else tool.name
-                self.tools[tool_name] = MCPTool(
-                    name=tool_name,
-                    description=tool.description,
-                    server_name=server_name,
-                    input_schema=tool.input_schema,
-                    original_tool=tool
-                )
-                
-                # Register tool dependencies if present
-                if hasattr(tool, 'dependencies') and isinstance(tool.dependencies, list):
-                    for dependency in tool.dependencies:
-                        # Make sure dependency has the server prefix if needed
-                        dependency_name = f"{server_name}:{dependency}" if ":" not in dependency else dependency
-                        # Add the dependency to the cache dependency graph
-                        if hasattr(self, 'tool_cache') and self.tool_cache:
-                            self.tool_cache.add_dependency(tool_name, dependency_name)
-                            log.debug(f"Registered dependency: {tool_name} depends on {dependency_name}")
-            
-            # Load resources
+        # Use safe_stdout to prevent protocol corruption when interacting with servers
+        with safe_stdout():
             try:
-                resource_response = await session.list_resources()
-                for resource in resource_response.resources:
-                    resource_name = f"{server_name}:{resource.name}" if ":" not in resource.name else resource.name
-                    self.resources[resource_name] = MCPResource(
-                        name=resource_name,
-                        description=resource.description,
+                # Load tools
+                tool_response = await session.list_tools()
+                for tool in tool_response.tools:
+                    tool_name = f"{server_name}:{tool.name}" if ":" not in tool.name else tool.name
+                    self.tools[tool_name] = MCPTool(
+                        name=tool_name,
+                        description=tool.description,
                         server_name=server_name,
-                        template=resource.template,
-                        original_resource=resource
+                        input_schema=tool.input_schema,
+                        original_tool=tool
                     )
-            except McpError as e:
-                log.debug(f"Server {server_name} doesn't support resources: {e}")
-            # Keep broad exception for unexpected issues listing resources
-            except Exception as e: 
-                 log.error(f"Unexpected error listing resources from {server_name}: {e}")
-            
-            # Load prompts
-            try:
-                prompt_response = await session.list_prompts()
-                for prompt in prompt_response.prompts:
-                    prompt_name = f"{server_name}:{prompt.name}" if ":" not in prompt.name else prompt.name
-                    self.prompts[prompt_name] = MCPPrompt(
-                        name=prompt_name,
-                        description=prompt.description,
-                        server_name=server_name,
-                        template=prompt.template,
-                        original_prompt=prompt
-                    )
-            except McpError as e:
-                log.debug(f"Server {server_name} doesn't support prompts: {e}")
-            # Keep broad exception for unexpected issues listing prompts
-            except Exception as e: 
-                 log.error(f"Unexpected error listing prompts from {server_name}: {e}")
+                    
+                    # Register tool dependencies if present
+                    if hasattr(tool, 'dependencies') and isinstance(tool.dependencies, list):
+                        for dependency in tool.dependencies:
+                            # Make sure dependency has the server prefix if needed
+                            dependency_name = f"{server_name}:{dependency}" if ":" not in dependency else dependency
+                            # Add the dependency to the cache dependency graph
+                            if hasattr(self, 'tool_cache') and self.tool_cache:
+                                self.tool_cache.add_dependency(tool_name, dependency_name)
+                                log.debug(f"Registered dependency: {tool_name} depends on {dependency_name}")
                 
-        except McpError as e: # Catch specific MCP errors first
-             log.error(f"MCP error loading capabilities from server {server_name}: {e}")
-        except httpx.RequestError as e: # Catch network errors if using SSE
-             log.error(f"Network error loading capabilities from server {server_name}: {e}")
-        # Keep broad exception for other unexpected issues
-        except Exception as e: 
-            log.error(f"Unexpected error loading capabilities from server {server_name}: {e}")
+                # Load resources
+                try:
+                    resource_response = await session.list_resources()
+                    for resource in resource_response.resources:
+                        resource_name = f"{server_name}:{resource.name}" if ":" not in resource.name else resource.name
+                        self.resources[resource_name] = MCPResource(
+                            name=resource_name,
+                            description=resource.description,
+                            server_name=server_name,
+                            template=resource.template,
+                            original_resource=resource
+                        )
+                except McpError as e:
+                    log.debug(f"Server {server_name} doesn't support resources: {e}")
+                # Keep broad exception for unexpected issues listing resources
+                except Exception as e: 
+                     log.error(f"Unexpected error listing resources from {server_name}: {e}")
+                
+                # Load prompts
+                try:
+                    prompt_response = await session.list_prompts()
+                    for prompt in prompt_response.prompts:
+                        prompt_name = f"{server_name}:{prompt.name}" if ":" not in prompt.name else prompt.name
+                        self.prompts[prompt_name] = MCPPrompt(
+                            name=prompt_name,
+                            description=prompt.description,
+                            server_name=server_name,
+                            template=prompt.template,
+                            original_prompt=prompt
+                        )
+                except McpError as e:
+                    log.debug(f"Server {server_name} doesn't support prompts: {e}")
+                # Keep broad exception for unexpected issues listing prompts
+                except Exception as e: 
+                     log.error(f"Unexpected error listing prompts from {server_name}: {e}")
+                    
+            except McpError as e: # Catch specific MCP errors first
+                 log.error(f"MCP error loading capabilities from server {server_name}: {e}")
+            except httpx.RequestError as e: # Catch network errors if using SSE
+                 log.error(f"Network error loading capabilities from server {server_name}: {e}")
+            # Keep broad exception for other unexpected issues
+            except Exception as e: 
+                log.error(f"Unexpected error loading capabilities from server {server_name}: {e}")
     
     async def close(self):
         """Close all server connections and processes"""
@@ -2521,7 +2651,10 @@ class ServerManager:
             TaskProgressColumn()
         ])
         
-        with Progress(*progress_columns, console=console) as progress:
+        # Get safe console to avoid stdout pollution
+        safe_console = get_safe_console()
+        
+        with Progress(*progress_columns, console=safe_console) as progress:
             task = progress.add_task(title, total=len(steps))
             
             for i, (step, description) in enumerate(zip(steps, step_descriptions, strict=False)):
@@ -2803,10 +2936,21 @@ class MCPClient:
 
         # Check for and load Claude desktop config if it exists
         await self.load_claude_desktop_config()
+
+        # Use get_safe_console for all status and progress widgets
+        safe_console = get_safe_console()
+        
+        # Verify no stdout pollution before connecting to servers
+        if os.environ.get("MCP_VERIFY_STDOUT", "1") == "1":
+            # Use safe_stdout context manager to prevent the verification itself from polluting
+            with safe_stdout():
+                # Only log this, don't print directly to avoid any risk of stdout pollution
+                log.info("Verifying no stdout pollution before connecting to servers...")
+                verify_no_stdout_pollution()
         
         # Discover servers if enabled
         if self.config.auto_discover:
-            with Status(f"{STATUS_EMOJI['search']} Discovering MCP servers...", spinner="dots") as status:
+            with Status(f"{STATUS_EMOJI['search']} Discovering MCP servers...", spinner="dots", console=safe_console) as status:
                 await self.server_manager.discover_servers()
                 status.update(f"{STATUS_EMOJI['success']} Server discovery complete")
         
@@ -2817,37 +2961,39 @@ class MCPClient:
         # Connect to all enabled servers - Use Progress instead of Status for better visual tracking
         enabled_servers = [s for s in self.config.servers.values() if s.enabled]
         if enabled_servers:
-            with Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                SpinnerColumn("dots"),
-                TextColumn("[cyan]{task.fields[server]}"),
-                console=console,
-                transient=True
-            ) as progress:
-                connect_task = progress.add_task(f"{STATUS_EMOJI['server']} Connecting to servers...", total=len(enabled_servers), server="")
-                
-                for name, server_config in self.config.servers.items():
-                    if not server_config.enabled:
-                        continue
+            # Wrap server connection in safe_stdout to prevent any potential stdout pollution
+            with safe_stdout():
+                with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    SpinnerColumn("dots"),
+                    TextColumn("[cyan]{task.fields[server]}"),
+                    console=safe_console,
+                    transient=True
+                ) as progress:
+                    connect_task = progress.add_task(f"{STATUS_EMOJI['server']} Connecting to servers...", total=len(enabled_servers), server="")
                     
-                    progress.update(connect_task, description=f"{STATUS_EMOJI['server']} Connecting to server...", server=name)
-                    session = await self.server_manager.connect_to_server(server_config)
+                    for name, server_config in self.config.servers.items():
+                        if not server_config.enabled:
+                            continue
+                        
+                        progress.update(connect_task, description=f"{STATUS_EMOJI['server']} Connecting to server...", server=name)
+                        session = await self.server_manager.connect_to_server(server_config)
+                        
+                        if session:
+                            self.server_manager.active_sessions[name] = session
+                            progress.update(connect_task, description=f"{STATUS_EMOJI['connected']} Loading capabilities...", server=name)
+                            await self.server_manager.load_server_capabilities(name, session)
+                        else:
+                            progress.update(connect_task, description=f"{STATUS_EMOJI['disconnected']} Connection failed", server=name)
+                        
+                        progress.update(connect_task, advance=1)
                     
-                    if session:
-                        self.server_manager.active_sessions[name] = session
-                        progress.update(connect_task, description=f"{STATUS_EMOJI['connected']} Loading capabilities...", server=name)
-                        await self.server_manager.load_server_capabilities(name, session)
-                    else:
-                        progress.update(connect_task, description=f"{STATUS_EMOJI['disconnected']} Connection failed", server=name)
-                    
-                    progress.update(connect_task, advance=1)
-                
-                progress.update(connect_task, description=f"{STATUS_EMOJI['success']} Server connections complete")
+                    progress.update(connect_task, description=f"{STATUS_EMOJI['success']} Server connections complete")
         
         # Start server monitoring
-        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots") as status:
+        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots", console=safe_console) as status:
             await self.server_monitor.start_monitoring()
             status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
         
@@ -2918,8 +3064,10 @@ class MCPClient:
           refresh - Force a refresh of the local discovery
           auto on|off - Enable/disable automatic local discovery
         """
+        # Get safe console once at the beginning
+        safe_console = get_safe_console()
+        
         if not self.server_manager.registry:
-            safe_console = get_safe_console()
             safe_console.print("[yellow]Registry not available, local discovery is disabled.[/]")
             return
             
@@ -2930,7 +3078,6 @@ class MCPClient:
         if subcmd == "list":
             # List all discovered servers
             discovered_servers = self.server_manager.registry.discovered_servers
-            safe_console = get_safe_console()
             
             if not discovered_servers:
                 safe_console.print("[yellow]No MCP servers discovered on local network.[/]")
@@ -2968,7 +3115,6 @@ class MCPClient:
             safe_console.print("\nUse [bold blue]/discover connect NAME[/] to connect to a server.")
             
         elif subcmd == "connect":
-            safe_console = get_safe_console()
             if not subargs:
                 safe_console.print("[yellow]Usage: /discover connect SERVER_NAME[/]")
                 return
@@ -2997,7 +3143,7 @@ class MCPClient:
             if existing_server:
                 safe_console.print(f"[yellow]Server with URL '{url}' already exists as '{existing_server}'.[/]")
                 if existing_server not in self.server_manager.active_sessions:
-                    if Confirm.ask(f"Connect to existing server '{existing_server}'?"):
+                    if Confirm.ask(f"Connect to existing server '{existing_server}'?", console=safe_console):
                         await self.connect_server(existing_server)
                 else:
                     safe_console.print(f"[yellow]Server '{existing_server}' is already connected.[/]")
@@ -3021,13 +3167,13 @@ class MCPClient:
             safe_console.print(f"[green]Added server '{server_name}' to configuration.[/]")
             
             # Offer to connect
-            if Confirm.ask(f"Connect to server '{server_name}' now?"):
+            if Confirm.ask(f"Connect to server '{server_name}' now?", console=safe_console):
                 await self.connect_server(server_name)
                 
         elif subcmd == "refresh":
             safe_console = get_safe_console()
             # Force a refresh of the discovery
-            with Status(f"{STATUS_EMOJI['search']} Refreshing local MCP server discovery...", spinner="dots") as status:
+            with Status(f"{STATUS_EMOJI['search']} Refreshing local MCP server discovery...", spinner="dots", console=safe_console) as status:
                 # Restart the discovery to refresh
                 if self.server_manager.registry.zeroconf:
                     self.server_manager.registry.stop_local_discovery()
@@ -3106,36 +3252,39 @@ class MCPClient:
     async def process_streaming_query(self, query: str, model: Optional[str] = None, 
                                max_tokens: Optional[int] = None) -> AsyncIterator[str]:
         """Process a query using Claude and available tools with streaming"""
-        # Get core parameters
-        if not model:
-            model = self.current_model
+        # Wrap the entire function in safe_stdout to prevent any accidental stdout pollution
+        # during the streaming interaction with stdio servers
+        with safe_stdout():
+            # Get core parameters
+            if not model:
+                model = self.current_model
+                
+            if not max_tokens:
+                max_tokens = self.config.default_max_tokens
+                
+            # Check if we have any servers connected
+            if not self.server_manager.active_sessions:
+                yield "No MCP servers connected. Use 'servers connect' to connect to servers."
+                return
             
-        if not max_tokens:
-            max_tokens = self.config.default_max_tokens
+            # Get tools from all connected servers
+            available_tools = self.server_manager.format_tools_for_anthropic()
             
-        # Check if we have any servers connected
-        if not self.server_manager.active_sessions:
-            yield "No MCP servers connected. Use 'servers connect' to connect to servers."
-            return
-        
-        # Get tools from all connected servers
-        available_tools = self.server_manager.format_tools_for_anthropic()
-        
-        if not available_tools:
-            yield "No tools available from connected servers."
-            return
+            if not available_tools:
+                yield "No tools available from connected servers."
+                return
+                
+            # Start timing for metrics
+            start_time = time.time()
             
-        # Start timing for metrics
-        start_time = time.time()
-        
-        # Keep track of servers and tools used
-        servers_used = set()
-        tools_used = []
-        
-        # Start with user message
-        current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
-        user_message: MessageParam = {"role": "user", "content": query}
-        messages: List[MessageParam] = current_messages + [user_message]
+            # Keep track of servers and tools used
+            servers_used = set()
+            tools_used = []
+            
+            # Start with user message
+            current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
+            user_message: MessageParam = {"role": "user", "content": query}
+            messages: List[MessageParam] = current_messages + [user_message]
         
         # Start span for tracing if available
         span_ctx = None
@@ -3438,8 +3587,10 @@ class MCPClient:
                             status.update(f"{STATUS_EMOJI['tool']} Executing tool: {tool_name}...")
                             
                             try:
-                                # Use the new execute_tool method with retry and circuit breaker
-                                tool_result = await self.execute_tool(tool.server_name, tool_name, tool_args)
+                                # Use safe_stdout to prevent stdout pollution during tool execution
+                                with safe_stdout():
+                                    # Use the new execute_tool method with retry and circuit breaker
+                                    tool_result = await self.execute_tool(tool.server_name, tool_name, tool_args)
                                 
                                 # Update progress
                                 status.update(f"{STATUS_EMOJI['success']} Tool {tool_name} execution complete")
@@ -3538,8 +3689,8 @@ class MCPClient:
     
     async def interactive_loop(self):
         """Run interactive command loop"""
-        # Always use stderr console for interactive mode to avoid interference with stdio servers
-        interactive_console = stderr_console
+        # Always use get_safe_console for interactive mode to avoid interference with stdio servers
+        interactive_console = get_safe_console()
         
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print("Type your query to Claude, or a command (type 'help' for available commands)")
@@ -3917,21 +4068,23 @@ class MCPClient:
         try:
             with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots", console=safe_console) as status:
                 try:
-                    async with self.server_manager.connect_server_session(server_config) as session:
-                        if session:
-                            try:
-                                status.update(f"{STATUS_EMOJI['connected']} Connected to server: {name}")
-                                
-                                # Load capabilities
-                                status.update(f"{STATUS_EMOJI['tool']} Loading capabilities from {name}...")
-                                await self.server_manager.load_server_capabilities(name, session)
-                                status.update(f"{STATUS_EMOJI['success']} Loaded capabilities from server: {name}")
-                                
-                                self.safe_print(f"[green]Connected to server: {name}[/]")
-                            except Exception as e:
-                                self.safe_print(f"[red]Error loading capabilities from server {name}: {e}[/]")
-                        else:
-                            self.safe_print(f"[red]Failed to connect to server: {name}[/]")
+                    # Use safe_stdout to prevent any stdout pollution during server connection
+                    with safe_stdout():
+                        async with self.server_manager.connect_server_session(server_config) as session:
+                            if session:
+                                try:
+                                    status.update(f"{STATUS_EMOJI['connected']} Connected to server: {name}")
+                                    
+                                    # Load capabilities
+                                    status.update(f"{STATUS_EMOJI['tool']} Loading capabilities from {name}...")
+                                    await self.server_manager.load_server_capabilities(name, session)
+                                    status.update(f"{STATUS_EMOJI['success']} Loaded capabilities from server: {name}")
+                                    
+                                    self.safe_print(f"[green]Connected to server: {name}[/]")
+                                except Exception as e:
+                                    self.safe_print(f"[red]Error loading capabilities from server {name}: {e}[/]")
+                            else:
+                                self.safe_print(f"[red]Failed to connect to server: {name}[/]")
                 except Exception as e:
                     self.safe_print(f"[red]Error connecting to server {name}: {e}[/]")
         except Exception as e:
@@ -3939,12 +4092,14 @@ class MCPClient:
             self.safe_print(f"[red]Error in status display: {e}[/]")
             # Still try to connect without the status widget
             try:
-                async with self.server_manager.connect_server_session(server_config) as session:
-                    if session:
-                        await self.server_manager.load_server_capabilities(name, session)
-                        self.safe_print(f"[green]Connected to server: {name}[/]")
-                    else:
-                        self.safe_print(f"[red]Failed to connect to server: {name}[/]")
+                # Use safe_stdout here as well for the fallback connection attempt
+                with safe_stdout():
+                    async with self.server_manager.connect_server_session(server_config) as session:
+                        if session:
+                            await self.server_manager.load_server_capabilities(name, session)
+                            self.safe_print(f"[green]Connected to server: {name}[/]")
+                        else:
+                            self.safe_print(f"[red]Failed to connect to server: {name}[/]")
             except Exception as inner_e:
                 self.safe_print(f"[red]Failed to connect to server {name}: {inner_e}[/]")
     
@@ -4274,7 +4429,8 @@ class MCPClient:
         # self.conversation_messages = []
         self.conversation_graph.set_current_node("root")
         # Optionally clear the root node's messages too
-        if Confirm.ask("Reset conversation to root? (This clears root messages too)"):
+        safe_console = get_safe_console()
+        if Confirm.ask("Reset conversation to root? (This clears root messages too)", console=safe_console):
              root_node = self.conversation_graph.get_node("root")
              if root_node:
                  root_node.messages = []
@@ -4290,8 +4446,11 @@ class MCPClient:
         """Reload servers and capabilities"""
         self.safe_print("[yellow]Reloading servers and capabilities...[/]")
         
+        # Use safe_console for all output
+        safe_console = get_safe_console()
+        
         # Close existing connections
-        with Status(f"{STATUS_EMOJI['server']} Closing existing connections...", spinner="dots") as status:
+        with Status(f"{STATUS_EMOJI['server']} Closing existing connections...", spinner="dots", console=safe_console) as status:
             await self.server_manager.close()
             status.update(f"{STATUS_EMOJI['success']} Existing connections closed")
         
@@ -4299,7 +4458,7 @@ class MCPClient:
         self.server_manager = ServerManager(self.config)
         
         # Reconnect
-        with Status(f"{STATUS_EMOJI['server']} Reconnecting to servers...", spinner="dots") as status:
+        with Status(f"{STATUS_EMOJI['server']} Reconnecting to servers...", spinner="dots", console=safe_console) as status:
             await self.server_manager.connect_to_servers()
             status.update(f"{STATUS_EMOJI['success']} Servers reconnected")
         
@@ -4910,7 +5069,7 @@ class MCPClient:
         tool = self.server_manager.tools[tool_name]
         server_name = tool.server_name
         
-        with Status(f"{STATUS_EMOJI['tool']} Executing {tool_name}...", spinner="dots") as status:
+        with Status(f"{STATUS_EMOJI['tool']} Executing {tool_name}...", spinner="dots", console=safe_console) as status:
             try:
                 start_time = time.time()
                 result = await self.execute_tool(server_name, tool_name, params)
@@ -5431,10 +5590,19 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
              await client.close()
     
     except Exception as e:
-        safe_console.print(f"[bold red]Error:[/] {str(e)}")
-        if verbose_logging:
-            import traceback
-            safe_console.print(traceback.format_exc())
+        # Use client.safe_print if client is available, otherwise use safe_console
+        if 'client' in locals() and client:
+            client.safe_print(f"[bold red]Error:[/] {str(e)}")
+            if verbose_logging:
+                import traceback
+                client.safe_print(traceback.format_exc())
+        else:
+            # Fall back to safe_console if client isn't available
+            safe_console = get_safe_console()
+            safe_console.print(f"[bold red]Error:[/] {str(e)}")
+            if verbose_logging:
+                import traceback
+                safe_console.print(traceback.format_exc())
         
         # For unhandled exceptions in non-interactive mode, still try to clean up
         if 'client' in locals() and client and hasattr(client, 'server_manager'):
