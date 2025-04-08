@@ -19,6 +19,7 @@
 #     "opentelemetry-instrumentation>=0.41b0",
 #     "asyncio>=3.4.3",
 #     "aiofiles>=23.2.0"
+#     "tiktoken>=0.5.1"
 # ]
 # ///
 
@@ -115,8 +116,20 @@ from typing import (
 import aiofiles  # For async file operations
 import anthropic
 
+# Additional utilities
+import colorama
+
+# Cache libraries
+import diskcache
+import httpx
+import psutil
+
+# Token counting
+import tiktoken
+
 # Typer CLI
 import typer
+import yaml
 from anthropic import AsyncAnthropic
 from anthropic.types import (
     ContentBlockDeltaEvent,
@@ -124,6 +137,7 @@ from anthropic.types import (
     MessageStreamEvent,
     ToolParam,
 )
+from dotenv import load_dotenv
 
 # MCP SDK imports
 from mcp import ClientSession, StdioServerParameters
@@ -132,6 +146,16 @@ from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
 from mcp.types import Prompt as McpPrompt
 from mcp.types import Resource, Tool
+
+# Observability
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import (
+    ConsoleMetricExporter,
+    PeriodicExportingMetricReader,
+)
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from rich import box
 
 # Rich UI components
@@ -156,34 +180,6 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 from typing_extensions import Annotated
-
-# Observability
-try:
-    from opentelemetry import metrics, trace
-    from opentelemetry.sdk.metrics import MeterProvider
-    from opentelemetry.sdk.metrics.export import (
-        ConsoleMetricExporter,
-        PeriodicExportingMetricReader,
-    )
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-    HAS_OPENTELEMETRY = True
-except ImportError:
-    HAS_OPENTELEMETRY = False
-
-# Additional utilities
-import colorama
-import httpx
-import psutil
-import yaml
-from dotenv import load_dotenv
-
-# Cache libraries
-try:
-    import diskcache
-    HAS_DISKCACHE = True
-except ImportError:
-    HAS_DISKCACHE = False
 
 # Set up Typer app
 app = typer.Typer(help="🔌 Ultimate MCP Client for Anthropic API")
@@ -264,46 +260,39 @@ SERVER_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
 
-# Initialize OpenTelemetry if available
-if HAS_OPENTELEMETRY:
-    trace_provider = TracerProvider()
-    console_exporter = ConsoleSpanExporter()
-    span_processor = BatchSpanProcessor(console_exporter)
-    trace_provider.add_span_processor(span_processor)
-    trace.set_tracer_provider(trace_provider)
-    
-    meter_provider = MeterProvider()
-    metric_reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
-    meter_provider.add_metric_reader(metric_reader)
-    metrics.set_meter_provider(meter_provider)
-    
-    tracer = trace.get_tracer("mcpclient")
-    meter = metrics.get_meter("mcpclient")
-    
-    # Create instruments
-    request_counter = meter.create_counter(
-        name="mcp_requests",
-        description="Number of MCP requests",
-        unit="1"
-    )
-    
-    latency_histogram = meter.create_histogram(
-        name="mcp_latency",
-        description="Latency of MCP requests",
-        unit="ms"
-    )
-    
-    tool_execution_counter = meter.create_counter(
-        name="tool_executions",
-        description="Number of tool executions",
-        unit="1"
-    )
-else:
-    tracer = None
-    meter = None
-    request_counter = None
-    latency_histogram = None
-    tool_execution_counter = None
+# Initialize OpenTelemetry
+trace_provider = TracerProvider()
+console_exporter = ConsoleSpanExporter()
+span_processor = BatchSpanProcessor(console_exporter)
+trace_provider.add_span_processor(span_processor)
+trace.set_tracer_provider(trace_provider)
+
+meter_provider = MeterProvider()
+metric_reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
+meter_provider.add_metric_reader(metric_reader)
+metrics.set_meter_provider(meter_provider)
+
+tracer = trace.get_tracer("mcpclient")
+meter = metrics.get_meter("mcpclient")
+
+# Create instruments
+request_counter = meter.create_counter(
+    name="mcp_requests",
+    description="Number of MCP requests",
+    unit="1"
+)
+
+latency_histogram = meter.create_histogram(
+    name="mcp_latency",
+    description="Latency of MCP requests",
+    unit="ms"
+)
+
+tool_execution_counter = meter.create_counter(
+    name="tool_executions",
+    description="Number of tool executions",
+    unit="1"
+)
 
 class ServerType(Enum):
     STDIO = "stdio"
@@ -709,11 +698,9 @@ class ToolCache:
     def __init__(self, cache_dir=CACHE_DIR, custom_ttl_mapping=None):
         self.cache_dir = Path(cache_dir)
         self.memory_cache: Dict[str, CacheEntry] = {}
-        self.disk_cache = None
         
-        # Set up disk cache if available
-        if HAS_DISKCACHE:
-            self.disk_cache = diskcache.Cache(str(self.cache_dir / "tool_results"))
+        # Set up disk cache
+        self.disk_cache = diskcache.Cache(str(self.cache_dir / "tool_results"))
         
         # Default TTL mapping - overridden by custom mapping
         self.ttl_mapping = {
@@ -1003,6 +990,9 @@ class Config:
         self.conversation_graphs_dir: str = str(CONFIG_DIR / "conversations")
         self.registry_urls: List[str] = REGISTRY_URLS.copy()
         self.dashboard_refresh_rate: float = 2.0  # seconds
+        self.summarization_model: str = "claude-3-7-sonnet-latest"  # Model used for conversation summarization
+        self.auto_summarize_threshold: int = 6000  # Auto-summarize when token count exceeds this
+        self.max_summarized_tokens: int = 1500  # Target token count after summarization
         
         self.load()
     
@@ -1102,6 +1092,9 @@ class Config:
             'conversation_graphs_dir': self.conversation_graphs_dir,
             'registry_urls': self.registry_urls,
             'dashboard_refresh_rate': self.dashboard_refresh_rate,
+            'summarization_model': self.summarization_model,
+            'auto_summarize_threshold': self.auto_summarize_threshold,
+            'max_summarized_tokens': self.max_summarized_tokens,
             'servers': {
                 name: {
                     'type': server.type.value,
@@ -1964,7 +1957,7 @@ class MCPClient:
         self.tool_cache = ToolCache(
             cache_dir=CACHE_DIR,
             custom_ttl_mapping=self.config.cache_ttl_mapping
-        ) if self.config.enable_caching else None
+        )
 
         # Instantiate Server Monitoring
         self.server_monitor = ServerMonitor(self.server_manager)
@@ -2009,6 +2002,7 @@ class MCPClient:
             'fork': self.cmd_fork,
             'branch': self.cmd_branch,
             'dashboard': self.cmd_dashboard, # Add dashboard command
+            'optimize': self.cmd_optimize, # Add optimize command
         }
         
         # Set up readline for command history in interactive mode
@@ -2143,11 +2137,10 @@ class MCPClient:
                 
                 progress.update(connect_task, description=f"{STATUS_EMOJI['success']} Server connections complete")
         
-        # Start server monitoring if enabled
-        if self.config.enable_metrics: # Assuming metrics enablement controls monitoring
-            with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots") as status:
-                await self.server_monitor.start_monitoring()
-                status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
+        # Start server monitoring
+        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots") as status:
+            await self.server_monitor.start_monitoring()
+            status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
         
         # Display status
         await self.print_status()
@@ -2511,6 +2504,9 @@ class MCPClient:
         if not max_tokens:
             max_tokens = self.config.default_max_tokens
         
+        # Check if context needs pruning before processing
+        await self.auto_prune_context()
+        
         # Use streaming if enabled, but collect all results
         if self.config.enable_streaming:
             chunks = []
@@ -2787,7 +2783,8 @@ class MCPClient:
             Text(f"{STATUS_EMOJI['cross_mark']} /clear", style="bold"), Text(" - Clear the conversation context"),
             Text(f"{STATUS_EMOJI['scroll']} /history", style="bold"), Text(" - View conversation history"),
             Text(f"{STATUS_EMOJI['trident_emblem']} /fork [NAME]", style="bold"), Text(" - Create a conversation branch"),
-            Text(f"{STATUS_EMOJI['trident_emblem']} /branch", style="bold"), Text(" - Manage conversation branches (list, checkout ID)")
+            Text(f"{STATUS_EMOJI['trident_emblem']} /branch", style="bold"), Text(" - Manage conversation branches (list, checkout ID)"),
+            Text(f"{STATUS_EMOJI['package']} /optimize", style="bold"), Text(" - Optimize conversation through summarization")
         ]
         
         monitoring_commands = [
@@ -3953,6 +3950,91 @@ class MCPClient:
             progress.update(task, description=f"{STATUS_EMOJI['success']} Complete")
             return True
 
+    async def count_tokens(self, messages=None) -> int:
+        """Count the number of tokens in the current conversation context"""
+        if messages is None:
+            messages = self.conversation_graph.current_node.messages
+            
+        # Use tiktoken for accurate counting
+        # Use cl100k_base encoding which is used by Claude
+        encoding = tiktoken.get_encoding("cl100k_base")
+        token_count = 0
+        
+        for message in messages:
+            # Get the message content
+            content = message.get("content", "")
+            
+            # Handle content that might be a list of blocks (text/image blocks)
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "text" in block:
+                        token_count += len(encoding.encode(block["text"]))
+                    elif isinstance(block, str):
+                        token_count += len(encoding.encode(block))
+            else:
+                # Simple string content
+                token_count += len(encoding.encode(str(content)))
+            
+            # Add a small overhead for message formatting
+            token_count += 4  # Approximate overhead per message
+            
+        return token_count
+        
+    async def cmd_optimize(self, args):
+        """Optimize conversation context through summarization"""
+        # Parse arguments for custom model or target length
+        custom_model = None
+        target_length = self.config.max_summarized_tokens
+        
+        if args:
+            parts = args.split()
+            for i in range(len(parts)-1):
+                if parts[i] == "--model" or parts[i] == "-m":
+                    custom_model = parts[i+1]
+                elif parts[i] == "--tokens" or parts[i] == "-t":
+                    try:
+                        target_length = int(parts[i+1])
+                    except ValueError:
+                        console.print(f"[yellow]Invalid token count: {parts[i+1]}[/]")
+        
+        console.print(f"[yellow]Optimizing conversation context...[/]")
+        
+        # Get current token count
+        current_tokens = await self.count_tokens()
+        console.print(f"Current context: approximately {current_tokens} tokens")
+        
+        # Use specified model or default summarization model
+        summarization_model = custom_model or self.config.summarization_model
+        
+        with Status(f"{STATUS_EMOJI['speech_balloon']} Summarizing conversation...", spinner="dots") as status:
+            summary = await self.process_query(
+                "Summarize this conversation history preserving key facts, "
+                "decisions, and context needed for future interactions. "
+                "Keep technical details, code snippets, and numbers intact. "
+                f"Create a summary that captures all essential information "
+                f"while being concise enough to fit in roughly {target_length} tokens.",
+                model=summarization_model
+            )
+            
+            # Replace conversation context with summary
+            self.conversation_graph.current_node.messages = [
+                {"role": "system", "content": "Conversation summary: " + summary}
+            ]
+            
+            # Get new token count
+            new_tokens = await self.count_tokens()
+            status.update(f"{STATUS_EMOJI['success']} Conversation optimized: {current_tokens} → {new_tokens} tokens")
+        
+        console.print(f"[green]Conversation optimized: {current_tokens} → {new_tokens} tokens[/]")
+    
+    async def auto_prune_context(self):
+        """Auto-prune context based on token count"""
+        token_count = await self.count_tokens()
+        if token_count > self.config.auto_summarize_threshold:
+            console.print(f"[yellow]Context size ({token_count} tokens) exceeds threshold "
+                          f"({self.config.auto_summarize_threshold}). Auto-summarizing...[/]")
+            await self.cmd_optimize(f"--tokens {self.config.max_summarized_tokens}")
+
 # Define Typer CLI commands
 @app.command()
 def run(
@@ -4011,8 +4093,8 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
         # Launch dashboard if requested
         if dashboard:
             # Ensure monitor is running for dashboard data
-            if client.config.enable_metrics and not client.server_monitor.monitoring:
-                 await client.server_monitor.start_monitoring()
+            if not client.server_monitor.monitoring:
+                await client.server_monitor.start_monitoring()
             await client.cmd_dashboard("") # Call the command method
             # Dashboard is blocking, exit after it's closed
             # We need to ensure cleanup happens, maybe move setup/close logic

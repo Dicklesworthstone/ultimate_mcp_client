@@ -42,7 +42,9 @@ dependencies = [
     "zeroconf",
     "opentelemetry-sdk",
     "opentelemetry-api",
+    "opentelemetry-instrumentation",
     "diskcache",
+    "tiktoken",
     "ruff", # Linter and formatter
     "mypy", # Static type checker
 ]
