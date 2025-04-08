@@ -2415,19 +2415,15 @@ class MCPClient:
             ) as stream:
                 # Process the streaming response
                 async for message_delta in stream:
-                    # Explicit type annotation for the stream event
+                    # Process event using helper method
                     event: MessageStreamEvent = message_delta
                     
                     if event.type == "content_block_delta":
-                        # We now know this is a ContentBlockDeltaEvent
-                        delta_event: ContentBlockDeltaEvent = event  # Explicit type cast for clarity
-                        delta = delta_event.delta
-                        
-                        # Handle text deltas
-                        if delta.type == "text_delta":
-                            current_text += delta.text
-                            chunks.append(delta.text)
-                            yield delta.text
+                        # Process text delta using helper
+                        current_text, delta_text = self._process_text_delta(event, current_text)
+                        if delta_text:
+                            chunks.append(delta_text)
+                            yield delta_text
                             
                     elif event.type == "message_start":
                         # Message started, initialize containers
@@ -2516,18 +2512,17 @@ class MCPClient:
                                 temperature=self.config.temperature,
                             ) as continuation_stream:
                                 async for continued_delta in continuation_stream:
-                                    # Explicit type annotation for the continuation stream event
+                                    # Process event using helper method
                                     continued_event: MessageStreamEvent = continued_delta
                                     
-                                    if continued_event.type == "content_block_delta":
-                                        # Again, this is a ContentBlockDeltaEvent
-                                        continued_delta_event: ContentBlockDeltaEvent = continued_event
-                                        delta = continued_delta_event.delta
-                                        if delta.type == "text_delta":
-                                            current_text += delta.text
-                                            chunks.append(delta.text)
-                                            yield delta.text
-                                    elif continued_event.type == "content_block_stop" and continued_event.content_block.type == "text":
+                                    # Use the stream event processing helper
+                                    current_text, text_to_yield = self._process_stream_event(continued_event, current_text)
+                                    if text_to_yield:
+                                        chunks.append(text_to_yield)
+                                        yield text_to_yield
+                                        
+                                    # Handle content block stop specially
+                                    if continued_event.type == "content_block_stop" and continued_event.content_block.type == "text":
                                         assistant_message.append({"type": "text", "text": current_text})
                     
                     elif event.type == "message_stop":
@@ -2535,8 +2530,6 @@ class MCPClient:
                         pass
             
             # Update conversation messages for future continuations
-            # self.conversation_messages = messages + [{"role": "assistant", "content": assistant_message}]
-            # Update the current node in the graph instead
             self.conversation_graph.current_node.add_message(user_message)
             self.conversation_graph.current_node.add_message({"role": "assistant", "content": assistant_message})
             self.conversation_graph.current_node.model = model # Store model used for this node
@@ -3978,7 +3971,7 @@ class MCPClient:
             if event.content_block.type == "text":
                 current_text = ""  # Reset current text for new block
             elif event.content_block.type == "tool_use":
-                text_to_yield = f"\n[Using tool: {event.content_block.name}...]"
+                text_to_yield = f"\n[{STATUS_EMOJI['tool']}] Using tool: {event.content_block.name}..."
                 
         # Other event types could be handled here
                 
