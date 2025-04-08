@@ -18,7 +18,7 @@
 #     "opentelemetry-sdk>=1.19.0",
 #     "opentelemetry-instrumentation>=0.41b0",
 #     "asyncio>=3.4.3",
-#     "aiofiles>=23.2.0"
+#     "aiofiles>=23.2.0",
 #     "tiktoken>=0.5.1"
 # ]
 # ///
@@ -206,6 +206,24 @@ from typing_extensions import Annotated
 # Set up Typer app
 app = typer.Typer(help="🔌 Ultimate MCP Client for Anthropic API")
 
+# Add a callback for when no command is specified
+@app.callback(invoke_without_command=True)
+def main_callback(ctx: typer.Context):
+    """Ultimate MCP Client for connecting Claude and other AI models with MCP servers."""
+    if ctx.invoked_subcommand is None:
+        # Display helpful information when no command is provided
+        console.print("\n[bold green]Ultimate MCP Client[/]")
+        console.print("A comprehensive client for the Model Context Protocol (MCP)")
+        console.print("\n[bold]Common Commands:[/]")
+        console.print("  [cyan]run --interactive[/]  Start an interactive chat session")
+        console.print("  [cyan]run --query TEXT[/]   Run a single query")
+        console.print("  [cyan]run --dashboard[/]    Show the monitoring dashboard")
+        console.print("  [cyan]servers --list[/]     List configured servers")
+        console.print("  [cyan]config --show[/]      Display current configuration")
+        console.print("\n[bold]For more information:[/]")
+        console.print("  [cyan]--help[/]             Show detailed help for all commands")
+        console.print("  [cyan]COMMAND --help[/]     Show help for a specific command\n")
+
 # Configure Rich theme
 from rich.theme import Theme
 
@@ -229,17 +247,40 @@ custom_theme = Theme({
     "metric.bad": "red",
 })
 
+# Initialize Rich consoles with theme
+console = Console(theme=custom_theme)
+stderr_console = Console(theme=custom_theme, stderr=True, highlight=False)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True, markup=True)]
+    handlers=[RichHandler(rich_tracebacks=True, markup=True, console=stderr_console)]
 )
 log = logging.getLogger("mcpclient")
 
-# Initialize Rich console with theme
-console = Console(theme=custom_theme)
+# Add a helper function to determine if we should use stderr
+def get_safe_console():
+    """Get the appropriate console based on whether we're using stdio servers.
+    
+    Returns stderr_console if there are any active stdio servers to prevent
+    interfering with stdio communication channels.
+    """
+    # Check if we have any active stdio servers
+    has_stdio_servers = False
+    try:
+        # This might not be available during initialization, so we use a try block
+        if hasattr(app, "mcp_client") and app.mcp_client and hasattr(app.mcp_client, "server_manager"):
+            for name, server in app.mcp_client.server_manager.config.servers.items():
+                if server.type == ServerType.STDIO and name in app.mcp_client.server_manager.active_sessions:
+                    has_stdio_servers = True
+                    break
+    except (NameError, AttributeError):
+        pass
+    
+    # If we have active stdio servers, use stderr to avoid interfering with stdio communication
+    return stderr_console if has_stdio_servers else console
 
 # Status emoji mapping
 STATUS_EMOJI = {
@@ -272,8 +313,7 @@ REGISTRY_DIR = CONFIG_DIR / "registry"
 DEFAULT_MODEL = "claude-3-7-sonnet-20250219"
 MAX_HISTORY_ENTRIES = 100
 REGISTRY_URLS = [
-    "https://mcp-registry.anthropic.com",
-    "https://registry.modelcontextprotocol.io"
+    # Leave empty by default - users can add their own registries later
 ]
 
 # Create necessary directories
@@ -558,6 +598,10 @@ class ServerRegistry:
         """Discover servers from remote registries"""
         all_servers = []
         
+        if not self.registry_urls:
+            log.info("No registry URLs configured, skipping remote discovery")
+            return all_servers
+            
         for registry_url in self.registry_urls:
             try:
                 # Construct query parameters
@@ -570,7 +614,8 @@ class ServerRegistry:
                 # Make request to registry
                 response = await self.http_client.get(
                     f"{registry_url}/servers",
-                    params=params
+                    params=params,
+                    timeout=5.0  # Add a shorter timeout
                 )
                 
                 if response.status_code == 200:
@@ -580,6 +625,8 @@ class ServerRegistry:
                         all_servers.append(server)
                 else:
                     log.warning(f"Failed to get servers from {registry_url}: {response.status_code}")
+            except httpx.TimeoutException:
+                log.warning(f"Timeout connecting to registry {registry_url}")
             except Exception as e:
                 log.error(f"Error querying registry {registry_url}: {e}")
         
@@ -683,6 +730,11 @@ class ServerRegistry:
                     if server_name in self.registry.discovered_servers:
                         del self.registry.discovered_servers[server_name]
                         log.info(f"Removed local MCP server: {server_name}")
+                
+                def update_service(self, zeroconf, service_type, name):
+                    # This method is required by newer versions of Zeroconf
+                    # Can be empty if we don't need to handle service updates
+                    pass
             
             self.zeroconf = Zeroconf()
             listener = MCPServiceListener(self)
@@ -962,8 +1014,8 @@ class ConversationGraph:
             
         return list(reversed(path))
     
-    def save(self, file_path: str):
-        """Save the conversation graph to file"""
+    async def save(self, file_path: str):
+        """Save the conversation graph to file asynchronously"""
         data = {
             "current_node_id": self.current_node.id,
             "nodes": {
@@ -973,19 +1025,20 @@ class ConversationGraph:
         }
         
         try:
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=2)
+            async with aiofiles.open(file_path, 'w') as f:
+                await f.write(json.dumps(data, indent=2))
         except IOError as e:
              log.error(f"Could not write conversation graph to {file_path}: {e}")
         except TypeError as e: # Handle potential issues with non-serializable data
              log.error(f"Could not serialize conversation graph: {e}")
     
     @classmethod
-    def load(cls, file_path: str) -> "ConversationGraph":
-        """Load a conversation graph from file"""
+    async def load(cls, file_path: str) -> "ConversationGraph":
+        """Load a conversation graph from file asynchronously"""
         try:
-            with open(file_path, 'r') as f:
-                data = json.load(f)
+            async with aiofiles.open(file_path, 'r') as f:
+                content = await f.read()
+                data = json.loads(content)
         except FileNotFoundError:
             log.warning(f"Conversation graph file not found: {file_path}")
             raise # Re-raise to be handled by the caller (__init__)
@@ -1067,10 +1120,63 @@ class Config:
         self.auto_summarize_threshold: int = 6000  # Auto-summarize when token count exceeds this
         self.max_summarized_tokens: int = 1500  # Target token count after summarization
         
+        # Use synchronous load for initialization since __init__ can't be async
         self.load()
     
+    def _prepare_config_data(self):
+        """Prepare configuration data for saving"""
+        return {
+            'api_key': self.api_key,
+            'default_model': self.default_model,
+            'default_max_tokens': self.default_max_tokens,
+            'history_size': self.history_size,
+            'auto_discover': self.auto_discover,
+            'discovery_paths': self.discovery_paths,
+            'enable_streaming': self.enable_streaming,
+            'enable_caching': self.enable_caching,
+            'enable_metrics': self.enable_metrics,
+            'enable_registry': self.enable_registry,
+            'enable_local_discovery': self.enable_local_discovery,
+            'temperature': self.temperature,
+            'cache_ttl_mapping': self.cache_ttl_mapping,
+            'conversation_graphs_dir': self.conversation_graphs_dir,
+            'registry_urls': self.registry_urls,
+            'dashboard_refresh_rate': self.dashboard_refresh_rate,
+            'summarization_model': self.summarization_model,
+            'auto_summarize_threshold': self.auto_summarize_threshold,
+            'max_summarized_tokens': self.max_summarized_tokens,
+            'servers': {
+                name: {
+                    'type': server.type.value,
+                    'path': server.path,
+                    'args': server.args,
+                    'enabled': server.enabled,
+                    'auto_start': server.auto_start,
+                    'description': server.description,
+                    'trusted': server.trusted,
+                    'categories': server.categories,
+                    'version': str(server.version) if server.version else None,
+                    'rating': server.rating,
+                    'retry_count': server.retry_count,
+                    'timeout': server.timeout,
+                    'retry_policy': server.retry_policy,
+                    'metrics': {
+                        'uptime': server.metrics.uptime,
+                        'request_count': server.metrics.request_count,
+                        'error_count': server.metrics.error_count,
+                        'avg_response_time': server.metrics.avg_response_time,
+                        'status': server.metrics.status.value,
+                        'error_rate': server.metrics.error_rate
+                    },
+                    'registry_url': server.registry_url,
+                    'capabilities': server.capabilities
+                }
+                for name, server in self.servers.items()
+            }
+        }
+    
     def load(self):
-        """Load configuration from file"""
+        """Load configuration from file synchronously"""
         if not CONFIG_FILE.exists():
             self.save()  # Create default config
             return
@@ -1147,56 +1253,8 @@ class Config:
             log.error(f"Unexpected error loading config: {e}")
     
     def save(self):
-        """Save configuration to file"""
-        config_data = {
-            'api_key': self.api_key,
-            'default_model': self.default_model,
-            'default_max_tokens': self.default_max_tokens,
-            'history_size': self.history_size,
-            'auto_discover': self.auto_discover,
-            'discovery_paths': self.discovery_paths,
-            'enable_streaming': self.enable_streaming,
-            'enable_caching': self.enable_caching,
-            'enable_metrics': self.enable_metrics,
-            'enable_registry': self.enable_registry,
-            'enable_local_discovery': self.enable_local_discovery,
-            'temperature': self.temperature,
-            'cache_ttl_mapping': self.cache_ttl_mapping,
-            'conversation_graphs_dir': self.conversation_graphs_dir,
-            'registry_urls': self.registry_urls,
-            'dashboard_refresh_rate': self.dashboard_refresh_rate,
-            'summarization_model': self.summarization_model,
-            'auto_summarize_threshold': self.auto_summarize_threshold,
-            'max_summarized_tokens': self.max_summarized_tokens,
-            'servers': {
-                name: {
-                    'type': server.type.value,
-                    'path': server.path,
-                    'args': server.args,
-                    'enabled': server.enabled,
-                    'auto_start': server.auto_start,
-                    'description': server.description,
-                    'trusted': server.trusted,
-                    'categories': server.categories,
-                    'version': str(server.version) if server.version else None,
-                    'rating': server.rating,
-                    'retry_count': server.retry_count,
-                    'timeout': server.timeout,
-                    'retry_policy': server.retry_policy,
-                    'metrics': {
-                        'uptime': server.metrics.uptime,
-                        'request_count': server.metrics.request_count,
-                        'error_count': server.metrics.error_count,
-                        'avg_response_time': server.metrics.avg_response_time,
-                        'status': server.metrics.status.value,
-                        'error_rate': server.metrics.error_rate
-                    },
-                    'registry_url': server.registry_url,
-                    'capabilities': server.capabilities
-                }
-                for name, server in self.servers.items()
-            }
-        }
+        """Save configuration to file synchronously"""
+        config_data = self._prepare_config_data()
         
         try:
             with open(CONFIG_FILE, 'w') as f:
@@ -1213,21 +1271,125 @@ class Config:
         # Keep broad exception for unexpected saving issues
         except Exception as e: 
             log.error(f"Unexpected error saving config: {e}")
+            
+    async def load_async(self):
+        """Load configuration from file asynchronously"""
+        if not CONFIG_FILE.exists():
+            await self.save_async()  # Create default config
+            return
+        
+        try:
+            async with aiofiles.open(CONFIG_FILE, 'r') as f:
+                content = await f.read()
+                config_data = yaml.safe_load(content) or {}
+            
+            # Update config with loaded values (reuse the same logic)
+            for key, value in config_data.items():
+                if key == 'servers':
+                    self.servers = {}
+                    for server_name, server_data in value.items():
+                        server_type = ServerType(server_data.get('type', 'stdio'))
+                        
+                        # Parse version if available
+                        version = None
+                        if 'version' in server_data:
+                            version_str = server_data['version']
+                            if version_str:
+                                version = ServerVersion.from_string(version_str)
+                        
+                        # Parse metrics if available
+                        metrics = ServerMetrics()
+                        if 'metrics' in server_data:
+                            metrics_data = server_data['metrics']
+                            for metric_key, metric_value in metrics_data.items():
+                                if hasattr(metrics, metric_key):
+                                    setattr(metrics, metric_key, metric_value)
+                        
+                        self.servers[server_name] = ServerConfig(
+                            name=server_name,
+                            type=server_type,
+                            path=server_data.get('path', ''),
+                            args=server_data.get('args', []),
+                            enabled=server_data.get('enabled', True),
+                            auto_start=server_data.get('auto_start', True),
+                            description=server_data.get('description', ''),
+                            trusted=server_data.get('trusted', False),
+                            categories=server_data.get('categories', []),
+                            version=version,
+                            rating=server_data.get('rating', 5.0),
+                            retry_count=server_data.get('retry_count', 3),
+                            timeout=server_data.get('timeout', 30.0),
+                            metrics=metrics,
+                            registry_url=server_data.get('registry_url'),
+                            retry_policy=server_data.get('retry_policy', {
+                                "max_attempts": 3,
+                                "backoff_factor": 0.5,
+                                "timeout_increment": 5
+                            }),
+                            capabilities=server_data.get('capabilities', {
+                                "tools": True,
+                                "resources": True,
+                                "prompts": True
+                            })
+                        )
+                elif key == 'cache_ttl_mapping':
+                    self.cache_ttl_mapping = value
+                else:
+                    if hasattr(self, key):
+                        setattr(self, key, value)
+            
+        except FileNotFoundError:
+            # This is expected if the file doesn't exist yet
+            await self.save_async() # Create default config
+            return
+        except IOError as e:
+            log.error(f"Error reading config file {CONFIG_FILE}: {e}")
+        except yaml.YAMLError as e:
+            log.error(f"Error parsing config file {CONFIG_FILE}: {e}")
+        # Keep a broad exception for unexpected issues during config parsing/application
+        except Exception as e: 
+            log.error(f"Unexpected error loading config: {e}")
+    
+    async def save_async(self):
+        """Save configuration to file asynchronously"""
+        config_data = self._prepare_config_data()
+        
+        try:
+            # Use a temporary dict to avoid saving the API key if loaded from env
+            save_data = config_data.copy()
+            if 'api_key' in save_data and os.environ.get("ANTHROPIC_API_KEY"):
+                # Don't save the key if it came from the environment
+                del save_data['api_key']
+                
+            async with aiofiles.open(CONFIG_FILE, 'w') as f:
+                await f.write(yaml.safe_dump(save_data))
+        except IOError as e:
+            log.error(f"Error writing config file {CONFIG_FILE}: {e}")
+        except yaml.YAMLError as e:
+            log.error(f"Error formatting config data for saving: {e}")
+        # Keep broad exception for unexpected saving issues
+        except Exception as e: 
+            log.error(f"Unexpected error saving config: {e}")
 
 
 class History:
     def __init__(self, max_entries=MAX_HISTORY_ENTRIES):
         self.entries = deque(maxlen=max_entries)
         self.max_entries = max_entries
-        self.load()
+        self.load_sync()  # Use sync version for initialization
     
     def add(self, entry: ChatHistory):
         """Add a new entry to history"""
         self.entries.append(entry)
-        self.save()
+        self.save_sync()  # Use sync version for immediate updates
+        
+    async def add_async(self, entry: ChatHistory):
+        """Add a new entry to history (async version)"""
+        self.entries.append(entry)
+        await self.save()
     
-    def load(self):
-        """Load history from file"""
+    def load_sync(self):
+        """Load history from file synchronously (for initialization)"""
         if not HISTORY_FILE.exists():
             return
         
@@ -1262,8 +1424,8 @@ class History:
         except Exception as e: 
              log.error(f"Unexpected error loading history: {e}")
     
-    def save(self):
-        """Save history to file"""
+    def save_sync(self):
+        """Save history to file synchronously"""
         try:
             history_data = []
             for entry in self.entries:
@@ -1291,7 +1453,74 @@ class History:
         # Keep broad exception for unexpected saving issues
         except Exception as e: 
              log.error(f"Unexpected error saving history: {e}")
+    
+    async def load(self):
+        """Load history from file asynchronously"""
+        if not HISTORY_FILE.exists():
+            return
+        
+        try:
+            async with aiofiles.open(HISTORY_FILE, 'r') as f:
+                content = await f.read()
+                history_data = json.loads(content)
             
+            self.entries.clear()
+            for entry_data in history_data:
+                self.entries.append(ChatHistory(
+                    query=entry_data.get('query', ''),
+                    response=entry_data.get('response', ''),
+                    model=entry_data.get('model', DEFAULT_MODEL),
+                    timestamp=entry_data.get('timestamp', ''),
+                    server_names=entry_data.get('server_names', []),
+                    tools_used=entry_data.get('tools_used', []),
+                    conversation_id=entry_data.get('conversation_id'),
+                    latency_ms=entry_data.get('latency_ms', 0.0),
+                    tokens_used=entry_data.get('tokens_used', 0),
+                    cached=entry_data.get('cached', False),
+                    streamed=entry_data.get('streamed', False)
+                ))
+                
+        except FileNotFoundError:
+            # Expected if no history yet
+            return
+        except IOError as e:
+            log.error(f"Error reading history file {HISTORY_FILE}: {e}")
+        except json.JSONDecodeError as e:
+            log.error(f"Error decoding history JSON from {HISTORY_FILE}: {e}")
+        # Keep broad exception for unexpected issues during history loading/parsing
+        except Exception as e: 
+             log.error(f"Unexpected error loading history: {e}")
+             
+    async def save(self):
+        """Save history to file asynchronously"""
+        try:
+            history_data = []
+            for entry in self.entries:
+                history_data.append({
+                    'query': entry.query,
+                    'response': entry.response,
+                    'model': entry.model,
+                    'timestamp': entry.timestamp,
+                    'server_names': entry.server_names,
+                    'tools_used': entry.tools_used,
+                    'conversation_id': entry.conversation_id,
+                    'latency_ms': entry.latency_ms,
+                    'tokens_used': entry.tokens_used,
+                    'cached': entry.cached,
+                    'streamed': entry.streamed
+                })
+            
+            async with aiofiles.open(HISTORY_FILE, 'w') as f:
+                await f.write(json.dumps(history_data, indent=2))
+                
+        except IOError as e:
+            log.error(f"Error writing history file {HISTORY_FILE}: {e}")
+        except TypeError as e: # Handle non-serializable data in history entries
+             log.error(f"Could not serialize history data: {e}")
+        # Keep broad exception for unexpected saving issues
+        except Exception as e: 
+             log.error(f"Unexpected error saving history: {e}")
+             
     def search(self, query: str, limit: int = 5) -> List[ChatHistory]:
         """Search history entries for a query"""
         results = []
@@ -1725,82 +1954,148 @@ class ServerManager:
         retry_count = 0
         max_retries = server_config.retry_count
         
+        # Ensure we're using stderr for output during connection to avoid stdio interference
+        safe_console = stderr_console if server_config.type == ServerType.STDIO else console
+        
         while retry_count <= max_retries:
             # Track metrics for this connection attempt
             start_time = time.time()
             
             try:
-                # Create span for observability if available
+                # Start span for observability if available
                 span_ctx = None
                 if tracer:
-                    span_ctx = tracer.start_as_current_span(
-                        f"connect_server.{server_name}",
-                        attributes={
-                            "server.name": server_name,
-                            "server.type": server_config.type.value,
-                            "server.path": server_config.path,
-                            "retry": retry_count
-                        }
-                    )
+                    try:
+                        span_ctx = tracer.start_as_current_span(
+                            f"connect_server.{server_name}",
+                            attributes={
+                                "server.name": server_name,
+                                "server.type": server_config.type.value,
+                                "server.path": server_config.path,
+                                "retry": retry_count
+                            }
+                        )
+                    except Exception as e:
+                        log.warning(f"Failed to create trace span: {e}")
+                        span_ctx = None
                 
+                # Log connection info using safe_console
+                safe_console.print(f"[cyan]Attempting to connect to server {server_name}...[/]")
+
                 if server_config.type == ServerType.STDIO:
                     # Check if we need to start the server process
                     if server_config.auto_start and server_config.path:
-                        # Start the process
-                        cmd = [server_config.path] + server_config.args
+                        # Check if a process is already running for this server
+                        existing_process = self.processes.get(server_config.name)
+                        restart_process = False
                         
-                        # Detect if it's a Python file
-                        if server_config.path.endswith('.py'):
-                            python_cmd = sys.executable
-                            cmd = [python_cmd] + cmd
-                        # Detect if it's a JS file
-                        elif server_config.path.endswith('.js'):
-                            node_cmd = 'node'
-                            cmd = [node_cmd] + cmd
+                        if existing_process:
+                            # Check if the process is still alive
+                            if existing_process.poll() is None:
+                                # Process is running, but if we've hit an error before, we might want to restart
+                                if retry_count > 0:
+                                    log.warning(f"Restarting process for {server_name} on retry {retry_count}")
+                                    safe_console.print(f"[yellow]Restarting process for {server_name} on retry {retry_count}[/]")
+                                    restart_process = True
+                                    
+                                    # Try to terminate gracefully
+                                    try:
+                                        existing_process.terminate()
+                                        try:
+                                            # Wait with timeout for termination
+                                            await asyncio.wait_for(existing_process.wait(), timeout=2.0)
+                                        except asyncio.TimeoutError:
+                                            # Force kill if necessary
+                                            log.warning(f"Process for {server_name} not responding to terminate, killing")
+                                            safe_console.print(f"[red]Process for {server_name} not responding, forcing kill[/]")
+                                            existing_process.kill()
+                                            await existing_process.wait()
+                                    except Exception as e:
+                                        log.error(f"Error terminating process for {server_name}: {e}")
+                                        safe_console.print(f"[red]Error terminating process: {e}[/]")
+                            else:
+                                # Process has exited
+                                log.warning(f"Process for {server_name} has exited with code {existing_process.returncode}")
+                                safe_console.print(f"[yellow]Process for {server_name} has exited with code {existing_process.returncode}[/]")
+                                
+                                # Try to get stderr output for diagnostics if process has terminated
+                                try:
+                                    if existing_process.stderr:
+                                        stderr_data = await existing_process.stderr.read()
+                                        if stderr_data:
+                                            log.error(f"Process stderr: {stderr_data.decode('utf-8', errors='replace')}")
+                                except Exception as e:
+                                    log.warning(f"Couldn't read stderr: {e}")
+                                
+                                restart_process = True
+                        else:
+                            # No existing process
+                            restart_process = True
                         
-                        log.info(f"Starting server process: {' '.join(cmd)}")
-                        
-                        # Create process with pipes and set resource limits
-                        process = await asyncio.create_subprocess_exec(
-                            *cmd,
-                            stdin=asyncio.subprocess.PIPE,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        
-                        # Read stderr in a separate thread/task to prevent blocking? (More complex change)
-                        # For now, just capture it. Check poll() status after connect attempt fails.
-                        
-                        self.processes[server_config.name] = process
-                        
-                        # Register the server with zeroconf if local discovery is enabled
-                        if self.config.enable_local_discovery and self.registry:
-                            await self.register_local_server(server_config)
+                        # Start or restart the process if needed
+                        if restart_process:
+                            # Start the process
+                            cmd = [server_config.path] + server_config.args
+                            
+                            # Detect if it's a Python file
+                            if server_config.path.endswith('.py'):
+                                python_cmd = sys.executable
+                                cmd = [python_cmd] + cmd
+                            # Detect if it's a JS file
+                            elif server_config.path.endswith('.js'):
+                                node_cmd = 'node'
+                                cmd = [node_cmd] + cmd
+                            
+                            log.info(f"Starting server process: {' '.join(cmd)}")
+                            safe_console.print(f"[cyan]Starting server process: {' '.join(cmd)}[/]")
+                            
+                            # Create process with pipes and set resource limits
+                            # Add a unique identifier to each process to prevent interference
+                            env = os.environ.copy()
+                            env["MCP_SERVER_ID"] = server_name
+                            env["MCP_CLIENT_ID"] = str(uuid.uuid4())
+                            
+                            process = await asyncio.create_subprocess_exec(
+                                *cmd,
+                                stdin=asyncio.subprocess.PIPE,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                                env=env
+                            )
+                            
+                            self.processes[server_config.name] = process
+                            
+                            # Register the server with zeroconf if local discovery is enabled
+                            if self.config.enable_local_discovery and self.registry:
+                                await self.register_local_server(server_config)
                     
-                    # Set up parameters with timeout
+                    # Set up parameters with timeout - include existing process if available
                     params = StdioServerParameters(
                         command=server_config.path, 
                         args=server_config.args,
-                        timeout=server_config.timeout
+                        timeout=server_config.timeout,
+                        process=self.processes.get(server_name)  # Pass existing process if available
                     )
                     
                     # Create client with context manager to ensure proper cleanup
-                    session = await self.exit_stack.enter_async_context(await stdio_client(params))
+                    # FIX: Remove the extra await before stdio_client
+                    session = await self.exit_stack.enter_async_context(stdio_client(params))
                     
                 elif server_config.type == ServerType.SSE:
                     # Connect to SSE server using direct parameters
-                    # (sse_client takes url, headers, timeout, sse_read_timeout parameters)
+                    # FIX: Remove the extra await before sse_client
                     session = await self.exit_stack.enter_async_context(
-                        await sse_client(
+                        sse_client(
                             url=server_config.path,
                             timeout=server_config.timeout,
                             sse_read_timeout=server_config.timeout * 12  # Set longer timeout for events
                         )
                     )
                 else:
-                    if span_ctx:
+                    if span_ctx and hasattr(span_ctx, 'set_status'):
                         span_ctx.set_status(trace.StatusCode.ERROR, f"Unknown server type: {server_config.type}")
                     log.error(f"Unknown server type: {server_config.type}")
+                    safe_console.print(f"[red]Unknown server type: {server_config.type}[/]")
                     return None
                 
                 # Calculate connection time
@@ -1823,53 +2118,77 @@ class ServerManager:
                     )
                 
                 # Mark span as successful
-                if span_ctx:
-                    span_ctx.set_status(trace.StatusCode.OK)
-                    span_ctx.end()
+                if span_ctx and hasattr(span_ctx, 'set_status'):
+                    try:
+                        span_ctx.set_status(trace.StatusCode.OK)
+                        if hasattr(span_ctx, 'end'):
+                            span_ctx.end()
+                    except Exception as e:
+                        log.warning(f"Error updating span status: {e}")
                 
                 log.info(f"Connected to server {server_name} in {connection_time:.2f}ms")
+                safe_console.print(f"[green]Connected to server {server_name} in {connection_time:.2f}ms[/]")
                 return session
                 
             except McpError as e: # Catch MCP client errors
-                 connection_error = e
+                connection_error = e
             except httpx.RequestError as e: # Network errors for SSE
-                 connection_error = e
+                connection_error = e
             except subprocess.SubprocessError as e: # Errors starting/communicating with STDIO process
-                 connection_error = e
-                 # Check if the process terminated unexpectedly
-                 if server_config.name in self.processes:
-                     proc = self.processes[server_config.name]
-                     if proc.poll() is not None:
-                         stderr_output = proc.stderr.read() if proc.stderr else "stderr not captured"
-                         log.error(f"STDIO server process for '{server_config.name}' exited with code {proc.returncode}. Stderr: {stderr_output}")
+                connection_error = e
+                # Check if the process terminated unexpectedly
+                if server_config.name in self.processes:
+                    proc = self.processes[server_config.name]
+                    if proc.poll() is not None:
+                        try:
+                            stderr_data = await proc.stderr.read() if proc.stderr else b"stderr not captured"
+                            stderr_output = stderr_data.decode('utf-8', errors='replace')
+                            log.error(f"STDIO server process for '{server_config.name}' exited with code {proc.returncode}. Stderr: {stderr_output}")
+                            safe_console.print(f"[red]STDIO server process for '{server_config.name}' exited with code {proc.returncode}[/]")
+                        except Exception as err:
+                            log.error(f"Error reading stderr: {err}")
             except OSError as e: # OS level errors (e.g., command not found)
-                 connection_error = e
+                connection_error = e
             # Keep broad exception for truly unexpected connection issues
             except Exception as e: 
-                 connection_error = e
+                connection_error = e
 
             # Shared error handling for caught exceptions
             retry_count += 1
             server_config.metrics.error_count += 1
             server_config.metrics.update_status()
 
-            if span_ctx:
-                span_ctx.set_status(trace.StatusCode.ERROR, str(connection_error))
-                # span_ctx.end() # Don't end yet, we might retry
+            if span_ctx and hasattr(span_ctx, 'set_status'):
+                try:
+                    span_ctx.set_status(trace.StatusCode.ERROR, str(connection_error))
+                    # Don't end yet, we might retry
+                except Exception as e:
+                    log.warning(f"Error updating span error status: {e}")
 
             connection_time = (time.time() - start_time) * 1000
                 
             if retry_count <= max_retries:
                 delay = min(1 * (2 ** (retry_count - 1)) + random.random(), 10)
                 log.warning(f"Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}")
+                safe_console.print(f"[yellow]Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}[/]")
                 log.info(f"Retrying in {delay:.2f} seconds...")
+                safe_console.print(f"[cyan]Retrying in {delay:.2f} seconds...[/]")
                 await asyncio.sleep(delay)
             else:
                 log.error(f"Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}")
-                if span_ctx: span_ctx.end() # End span after final failure
+                safe_console.print(f"[red]Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}[/]")
+                if span_ctx and hasattr(span_ctx, 'end'): 
+                    try:
+                        span_ctx.end() # End span after final failure
+                    except Exception as e:
+                        log.warning(f"Error ending span: {e}")
                 return None
 
-        if span_ctx: span_ctx.end() # End span if loop finishes unexpectedly
+        if span_ctx and hasattr(span_ctx, 'end'): 
+            try:
+                span_ctx.end() # End span if loop finishes unexpectedly
+            except Exception as e:
+                log.warning(f"Error ending span: {e}")
         return None
 
     async def register_local_server(self, server_config: ServerConfig):
@@ -1901,8 +2220,6 @@ class ServerManager:
                 s.close()
             
             # Default to port 8080 for STDIO servers, but allow overriding
-            # In a real implementation, we'd need to determine the actual port
-            # the server is listening on, which might require modification of the server
             port = 8080
             
             # Check if the server specifies a port in its args
@@ -1932,19 +2249,23 @@ class ServerManager:
                 properties=props
             )
             
-            # Register the service
-            self.registry.zeroconf.register_service(service_info)
-            log.info(f"Registered local MCP server {server_config.name} with zeroconf on {local_ip}:{port}")
-            
-            # Store service info for later unregistering
-            if not hasattr(self, 'registered_services'):
-                self.registered_services = {}
-            self.registered_services[server_config.name] = service_info
+            # Register the service - Use async method and await it
+            try:
+                # Use async version of register_service
+                await self.registry.zeroconf.async_register_service(service_info)
+                log.info(f"Registered local MCP server {server_config.name} with zeroconf on {local_ip}:{port}")
+                
+                # Store service info for later unregistering
+                if not hasattr(self, 'registered_services'):
+                    self.registered_services = {}
+                self.registered_services[server_config.name] = service_info
+            except Exception as e:
+                log.error(f"Error registering service with zeroconf: {e}")
             
         except ImportError:
             log.warning("Zeroconf not available, cannot register local server")
         except Exception as e:
-            log.error(f"Error registering server with zeroconf: {e}")
+            log.error(f"Error preparing zeroconf registration: {e}")
 
     async def connect_to_servers(self):
         """Connect to all enabled MCP servers"""
@@ -2045,7 +2366,8 @@ class ServerManager:
         if hasattr(self, 'registered_services') and self.registry and self.registry.zeroconf:
             for name, service_info in self.registered_services.items():
                 try:
-                    self.registry.zeroconf.unregister_service(service_info)
+                    # Use async version of unregister_service
+                    await self.registry.zeroconf.async_unregister_service(service_info)
                     log.info(f"Unregistered zeroconf service for {name}")
                 except Exception as e:
                     log.error(f"Error unregistering zeroconf service for {name}: {e}")
@@ -2173,6 +2495,9 @@ class MCPClient:
         self.config = Config()
         self.history = History(max_entries=self.config.history_size)
         
+        # Store reference to this client instance on the app object for global access
+        app.mcp_client = self
+        
         # Instantiate Caching
         self.tool_cache = ToolCache(
             cache_dir=CACHE_DIR,
@@ -2180,7 +2505,11 @@ class MCPClient:
         )
         
         self.server_manager = ServerManager(self.config, tool_cache=self.tool_cache)
-        self.anthropic = AsyncAnthropic(api_key=self.config.api_key)  # Changed to AsyncAnthropic
+        # Only initialize Anthropic client if API key is available
+        if self.config.api_key:
+            self.anthropic = AsyncAnthropic(api_key=self.config.api_key)
+        else:
+            self.anthropic = None
         self.current_model = self.config.default_model
 
         # Instantiate Server Monitoring
@@ -2194,12 +2523,16 @@ class MCPClient:
         self.conversation_graph_file = Path(self.config.conversation_graphs_dir) / "default_conversation.json"
         self.conversation_graph_file.parent.mkdir(parents=True, exist_ok=True) # Ensure directory exists
         try:
-            self.conversation_graph = ConversationGraph.load(str(self.conversation_graph_file))
-            log.info(f"Loaded conversation graph from {self.conversation_graph_file}")
-        except (FileNotFoundError, IOError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e: # Catch specific load errors
-            log.warning(f"Could not load conversation graph ({type(e).__name__}: {e}), starting new graph.")
+            # Create a simple graph first
             self.conversation_graph = ConversationGraph()
-        # Keep broad exception for truly unexpected graph loading issues
+            
+            # Then try to load from file if it exists
+            if self.conversation_graph_file.exists():
+                # Since __init__ can't be async, we need to use a workaround
+                # We'll load it properly later in setup()
+                log.info(f"Found conversation graph file at {self.conversation_graph_file}, will load it during setup")
+            else:
+                log.info("No existing conversation graph found, using new graph")
         except Exception as e: 
             log.error(f"Unexpected error initializing conversation graph: {e}")
             self.conversation_graph = ConversationGraph() # Fallback to new graph
@@ -2351,16 +2684,33 @@ class MCPClient:
             return options[state]
         return None
         
-    async def setup(self):
+    async def setup(self, interactive_mode=False):
         """Set up the client, connect to servers, and load capabilities"""
         # Ensure API key is set
         if not self.config.api_key:
             console.print("[bold red]ERROR: Anthropic API key not found[/]")
             console.print("Please set your API key using one of these methods:")
             console.print("1. Set the ANTHROPIC_API_KEY environment variable")
-            console.print("2. Run 'config api-key YOUR_API_KEY'")
-            sys.exit(1)
-        
+            console.print("2. Run 'python mcp_client.py run --interactive' and then use '/config api-key YOUR_API_KEY'")
+            
+            # Only exit if not in interactive mode
+            if not interactive_mode:
+                sys.exit(1)
+            else:
+                console.print("[yellow]Running in interactive mode without API key.[/]")
+                console.print("[yellow]Please set your API key using '/config api-key YOUR_API_KEY'[/]")
+                # Continue setup without API features
+                self.anthropic = None  # Set to None until API key is provided
+                
+        # Load conversation graph if it exists
+        if self.conversation_graph_file.exists():
+            try:
+                self.conversation_graph = await ConversationGraph.load(str(self.conversation_graph_file))
+                log.info(f"Loaded conversation graph from {self.conversation_graph_file}")
+            except Exception as e:
+                log.warning(f"Could not load conversation graph ({type(e).__name__}: {e}), using new graph.")
+                # Keep the default graph we created in __init__
+
         # Check for and load Claude desktop config if it exists
         await self.load_claude_desktop_config()
         
@@ -2636,7 +2986,7 @@ class MCPClient:
             
         # Save conversation graph
         try:
-            self.conversation_graph.save(str(self.conversation_graph_file))
+            await self.conversation_graph.save(str(self.conversation_graph_file))
             log.info(f"Saved conversation graph to {self.conversation_graph_file}")
         except Exception as e:
             log.error(f"Failed to save conversation graph: {e}")
@@ -2653,8 +3003,9 @@ class MCPClient:
     
     async def print_status(self):
         """Print client status summary"""
-        console.print("\n[bold]MCP Client Status[/]")
-        console.print(f"Model: [cyan]{self.current_model}[/]")
+        safe_console = get_safe_console()
+        safe_console.print("\n[bold]MCP Client Status[/]")
+        safe_console.print(f"Model: [cyan]{self.current_model}[/]")
         
         # Server connections
         server_table = Table(title="Connected Servers")
@@ -2682,15 +3033,15 @@ class MCPClient:
                 str(prompts_count)
             )
         
-        console.print(server_table)
+        safe_console.print(server_table)
         
         # Tool summary
         if self.server_manager.tools:
-            console.print(f"\nAvailable tools: [green]{len(self.server_manager.tools)}[/]")
-            console.print(f"Available resources: [green]{len(self.server_manager.resources)}[/]")
-            console.print(f"Available prompts: [green]{len(self.server_manager.prompts)}[/]")
+            safe_console.print(f"\nAvailable tools: [green]{len(self.server_manager.tools)}[/]")
+            safe_console.print(f"Available resources: [green]{len(self.server_manager.resources)}[/]")
+            safe_console.print(f"Available prompts: [green]{len(self.server_manager.prompts)}[/]")
         else:
-            console.print("\n[yellow]No tools available. Connect to MCP servers to access tools.[/]")
+            safe_console.print("\n[yellow]No tools available. Connect to MCP servers to access tools.[/]")
     
     @asynccontextmanager
     async def tool_execution_context(self, tool_name: str, tool_args: dict, server_name: str):
@@ -3204,12 +3555,15 @@ class MCPClient:
     
     async def interactive_loop(self):
         """Run interactive command loop"""
-        console.print("\n[bold green]MCP Client Interactive Mode[/]")
-        console.print("Type your query to Claude, or a command (type 'help' for available commands)")
+        # Always use stderr console for interactive mode to avoid interference with stdio servers
+        interactive_console = stderr_console
+        
+        interactive_console.print("\n[bold green]MCP Client Interactive Mode[/]")
+        interactive_console.print("Type your query to Claude, or a command (type 'help' for available commands)")
         
         while True:
             try:
-                user_input = Prompt.ask("\n[bold blue]>>[/]")
+                user_input = Prompt.ask("\n[bold blue]>>[/]", console=interactive_console)
                 
                 # Check if it's a command
                 if user_input.startswith('/'):
@@ -3220,8 +3574,8 @@ class MCPClient:
                     if cmd in self.commands:
                         await self.commands[cmd](args)
                     else:
-                        console.print(f"[yellow]Unknown command: {cmd}[/]")
-                        console.print("Type '/help' for available commands")
+                        interactive_console.print(f"[yellow]Unknown command: {cmd}[/]")
+                        interactive_console.print("Type '/help' for available commands")
                 
                 # Empty input
                 elif not user_input.strip():
@@ -3230,8 +3584,8 @@ class MCPClient:
                 # Process as a query to Claude
                 else:
                     result = await self.process_query(user_input)
-                    console.print()
-                    console.print(Panel.fit(
+                    interactive_console.print()
+                    interactive_console.print(Panel.fit(
                         Markdown(result),
                         title="Claude",
                         border_style="green"
@@ -3346,9 +3700,13 @@ class MCPClient:
                 return
                 
             self.config.api_key = subargs
-            self.anthropic = AsyncAnthropic(api_key=self.config.api_key)  # Changed to AsyncAnthropic
-            self.config.save()
-            console.print("[green]API key updated[/]")
+            try:
+                self.anthropic = AsyncAnthropic(api_key=self.config.api_key)
+                self.config.save()
+                console.print("[green]API key updated[/]")
+            except Exception as e:
+                console.print(f"[red]Error initializing Anthropic client: {e}[/]")
+                self.anthropic = None
             
         elif subcmd == "model":
             if not subargs:
@@ -3463,8 +3821,10 @@ class MCPClient:
     
     async def list_servers(self):
         """List all configured servers"""
+        safe_console = get_safe_console()
+        
         if not self.config.servers:
-            console.print(f"{STATUS_EMOJI['warning']} [yellow]No servers configured[/]")
+            safe_console.print(f"{STATUS_EMOJI['warning']} [yellow]No servers configured[/]")
             return
             
         server_table = Table(title=f"{STATUS_EMOJI['server']} Configured Servers")
@@ -3490,15 +3850,16 @@ class MCPClient:
                 auto_start
             )
             
-        console.print(server_table)
+        safe_console.print(server_table)
     
     async def add_server(self, args):
         """Add a new server to configuration"""
+        safe_console = get_safe_console()
         parts = args.split(maxsplit=3)
         if len(parts) < 3:
-            console.print("[yellow]Usage: /servers add NAME TYPE PATH [ARGS...][/]")
-            console.print("Example: /servers add github stdio /path/to/github-server.js")
-            console.print("Example: /servers add github sse https://github-mcp-server.example.com")
+            safe_console.print("[yellow]Usage: /servers add NAME TYPE PATH [ARGS...][/]")
+            safe_console.print("Example: /servers add github stdio /path/to/github-server.js")
+            safe_console.print("Example: /servers add github sse https://github-mcp-server.example.com")
             return
             
         name, type_str, path = parts[0], parts[1], parts[2]
@@ -3506,13 +3867,13 @@ class MCPClient:
         
         # Validate inputs
         if name in self.config.servers:
-            console.print(f"[red]Server with name '{name}' already exists[/]")
+            safe_console.print(f"[red]Server with name '{name}' already exists[/]")
             return
             
         try:
             server_type = ServerType(type_str.lower())
         except ValueError:
-            console.print(f"[red]Invalid server type: {type_str}. Use 'stdio' or 'sse'[/]")
+            safe_console.print(f"[red]Invalid server type: {type_str}. Use 'stdio' or 'sse'[/]")
             return
             
         # Add server to config
@@ -3527,10 +3888,10 @@ class MCPClient:
         )
         
         self.config.save()
-        console.print(f"[green]Server '{name}' added to configuration[/]")
+        safe_console.print(f"[green]Server '{name}' added to configuration[/]")
         
         # Ask if user wants to connect now
-        if Confirm.ask("Connect to server now?"):
+        if Confirm.ask("Connect to server now?", console=safe_console):
             await self.connect_server(name)
     
     async def remove_server(self, name):
@@ -3555,35 +3916,55 @@ class MCPClient:
     
     async def connect_server(self, name):
         """Connect to a specific server"""
+        safe_console = get_safe_console()
         if not name:
-            console.print("[yellow]Usage: /servers connect SERVER_NAME[/]")
+            safe_console.print("[yellow]Usage: /servers connect SERVER_NAME[/]")
             return
             
         if name not in self.config.servers:
-            console.print(f"[red]Server '{name}' not found[/]")
+            safe_console.print(f"[red]Server '{name}' not found[/]")
             return
             
         if name in self.server_manager.active_sessions:
-            console.print(f"[yellow]Server '{name}' is already connected[/]")
+            safe_console.print(f"[yellow]Server '{name}' is already connected[/]")
             return
             
         # Connect to server using the context manager
         server_config = self.config.servers[name]
         
-        with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots") as status:
-            async with self.server_manager.connect_server_session(server_config) as session:
-                if session:
-                    status.update(f"{STATUS_EMOJI['connected']} Connected to server: {name}")
-                    
-                    # Load capabilities
-                    status.update(f"{STATUS_EMOJI['tool']} Loading capabilities from {name}...")
-                    await self.server_manager.load_server_capabilities(name, session)
-                    status.update(f"{STATUS_EMOJI['success']} Loaded capabilities from server: {name}")
-                    
-                    console.print(f"[green]Connected to server: {name}[/]")
-                else:
-                    status.update(f"{STATUS_EMOJI['error']} Failed to connect to server: {name}")
-                    console.print(f"[red]Failed to connect to server: {name}[/]")
+        try:
+            with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots") as status:
+                try:
+                    async with self.server_manager.connect_server_session(server_config) as session:
+                        if session:
+                            try:
+                                status.update(f"{STATUS_EMOJI['connected']} Connected to server: {name}")
+                                
+                                # Load capabilities
+                                status.update(f"{STATUS_EMOJI['tool']} Loading capabilities from {name}...")
+                                await self.server_manager.load_server_capabilities(name, session)
+                                status.update(f"{STATUS_EMOJI['success']} Loaded capabilities from server: {name}")
+                                
+                                console.print(f"[green]Connected to server: {name}[/]")
+                            except Exception as e:
+                                console.print(f"[red]Error loading capabilities from server {name}: {e}[/]")
+                        else:
+                            console.print(f"[red]Failed to connect to server: {name}[/]")
+                except Exception as e:
+                    console.print(f"[red]Error connecting to server {name}: {e}[/]")
+        except Exception as e:
+            # This captures any exceptions from the Status widget itself
+            console.print(f"[red]Error in status display: {e}[/]")
+            # Still try to connect without the status widget
+            try:
+                async with self.server_manager.connect_server_session(server_config) as session:
+                    if session:
+                        await self.server_manager.load_server_capabilities(name, session)
+                        console.print(f"[green]Connected to server: {name}[/]")
+                    else:
+                        console.print(f"[red]Failed to connect to server: {name}[/]")
+            except Exception as inner_e:
+                console.print(f"[red]Failed to connect to server {name}: {inner_e}[/]")
     
     async def disconnect_server(self, name):
         """Disconnect from a specific server"""
@@ -4578,101 +4959,212 @@ class MCPClient:
         console.print(f"[green]Applied prompt: {args}[/green]")
 
     async def load_claude_desktop_config(self):
-        """Look for and load the Claude desktop config file (claude_desktop_config.json) if it exists.
-        
-        This enables users to easily import MCP server configurations from Claude desktop.
-        """
+        """Look for and load the Claude desktop config file (claude_desktop_config.json) if it exists."""
         config_path = Path("claude_desktop_config.json")
         if not config_path.exists():
             return
             
         try:
-            with Status(f"{STATUS_EMOJI['config']} Found Claude desktop config file, processing...", spinner="dots") as status:
-                async with aiofiles.open(config_path, 'r') as f:
-                    content = await f.read()
-                    desktop_config = json.loads(content)
+            console.print(f"{STATUS_EMOJI['config']} Found Claude desktop config file, processing...")
+            
+            # Read the file content
+            async with aiofiles.open(config_path, 'r') as f:
+                content = await f.read()
                 
-                if not desktop_config.get('mcpServers'):
-                    status.update(f"{STATUS_EMOJI['warning']} No MCP servers defined in Claude desktop config")
+            try:
+                desktop_config = json.loads(content)
+                # Log the structure
+                log.debug(f"Claude desktop config keys: {list(desktop_config.keys())}")
+            except json.JSONDecodeError as e:
+                console.print(f"[red]Invalid JSON in Claude desktop config: {e}[/]")
+                return
+            
+            # The primary key is 'mcpServers', but check alternatives if needed
+            if 'mcpServers' not in desktop_config:
+                log.warning(f"Expected 'mcpServers' key not found in Claude desktop config")
+                log.debug(f"Available keys: {list(desktop_config.keys())}")
+                # Check for alternative keys
+                for alt_key in ['mcp_servers', 'servers', 'MCP_SERVERS']:
+                    if alt_key in desktop_config:
+                        log.info(f"Using alternative key '{alt_key}' for MCP servers")
+                        desktop_config['mcpServers'] = desktop_config[alt_key]
+                        break
+                else:
+                    console.print(f"{STATUS_EMOJI['warning']} No MCP servers defined in Claude desktop config")
                     return
+            
+            # We now should have a mcpServers key
+            mcp_servers = desktop_config['mcpServers']
+            if not mcp_servers or not isinstance(mcp_servers, dict):
+                console.print(f"{STATUS_EMOJI['warning']} No valid MCP servers found in config")
+                return
+            
+            # Track successful imports and skipped servers
+            imported_servers = []
+            skipped_servers = []
+            
+            # Helper function to adjust paths based on platform
+            def adapt_path_for_platform(command, args):
+                is_windows = platform.system() == "Windows"
+                is_wsl = "WSL" in platform.platform().upper() or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop")
                 
-                # Track successful imports and skipped servers
-                imported_servers = []
-                skipped_servers = []
+                # Convert Windows path to WSL path
+                def convert_to_wsl_path(win_path):
+                    if not win_path or not isinstance(win_path, str):
+                        return win_path
+                    
+                    # Handle C:\ style paths for WSL
+                    if len(win_path) > 2 and win_path[1] == ":" and win_path[2] in ["\\", "/"]:
+                        drive_letter = win_path[0].lower()
+                        rest_of_path = win_path[2:].replace("\\", "/")
+                        return f"/mnt/{drive_letter}{rest_of_path}"
+                    return win_path
                 
-                for server_name, server_data in desktop_config['mcpServers'].items():
+                # Handle npx commands for the filesystem server
+                if "npx" in command and "@modelcontextprotocol/server-filesystem" in str(args):
+                    if is_windows and not is_wsl:
+                        # Keep Windows format for Windows
+                        return command, args
+                    else:
+                        # Adjust for Linux/WSL
+                        new_args = []
+                        for arg in args:
+                            # If it's a Windows path in a WSL environment, convert it
+                            if is_wsl and isinstance(arg, str) and ":" in arg:
+                                new_args.append(convert_to_wsl_path(arg))
+                            # If it's a regular Windows path with OneDrive or Downloads, map to common folders
+                            elif isinstance(arg, str) and ("\\Users\\" in arg or "/Users/" in arg):
+                                home_dir = str(Path.home())
+                                if "OneDrive\\Desktop" in arg or "OneDrive/Desktop" in arg:
+                                    new_args.append(os.path.join(home_dir, "Desktop"))
+                                elif "\\Downloads" in arg or "/Downloads" in arg:
+                                    new_args.append(os.path.join(home_dir, "Downloads"))
+                                else:
+                                    # For other Windows paths in WSL, try to convert them
+                                    new_args.append(convert_to_wsl_path(arg))
+                            else:
+                                new_args.append(arg)
+                        
+                        return command, new_args
+                        
+                # Handle WSL commands
+                elif "wsl.exe" in command:
+                    if is_windows and not is_wsl:
+                        # Keep Windows format for Windows
+                        return command, args
+                    else:
+                        # If running in Linux/WSL, just run the command directly without wsl.exe
+                        if isinstance(args, list) and len(args) >= 3:
+                            # Extract the actual command from the wsl.exe bash -c "actual command"
+                            # Find the index of the actual command
+                            try:
+                                bash_c_index = args.index("-c")
+                                if bash_c_index + 1 < len(args):
+                                    actual_command = args[bash_c_index + 1]
+                                    # Create a shell command to run it
+                                    return "bash", ["-c", actual_command]
+                            except ValueError:
+                                # If we can't parse it, just return as is
+                                pass
+                
+                # Default case - return unchanged
+                return command, args
+            
+            # Process each server
+            for server_name, server_data in mcp_servers.items():
+                try:
                     # Skip if server already exists
                     if server_name in self.config.servers:
                         log.info(f"Server '{server_name}' already exists in config, skipping")
                         skipped_servers.append((server_name, "already exists"))
                         continue
                     
-                    # Convert to our server config format
-                    command = server_data.get('command', '')
+                    # Log server info for debugging
+                    log.debug(f"Processing server '{server_name}' with data: {server_data}")
+                    
+                    # Extract command and args
+                    if 'command' not in server_data:
+                        log.warning(f"No 'command' field for server '{server_name}'")
+                        skipped_servers.append((server_name, "missing command field"))
+                        continue
+                        
+                    command = server_data['command']
                     args = server_data.get('args', [])
                     
-                    if not command:
-                        log.warning(f"No command specified for server '{server_name}', skipping")
-                        skipped_servers.append((server_name, "missing command"))
-                        continue
+                    # Adapt paths for the current platform
+                    adapted_command, adapted_args = adapt_path_for_platform(command, args)
                     
                     # Create new server config
                     server_config = ServerConfig(
                         name=server_name,
-                        type=ServerType.STDIO,  # Claude desktop only supports STDIO servers
-                        path=command,
-                        args=args,
+                        type=ServerType.STDIO,  # Claude desktop uses STDIO servers
+                        path=adapted_command,
+                        args=adapted_args,
                         enabled=True,
                         auto_start=True,
                         description=f"Imported from Claude desktop config",
-                        trusted=True,  # Assume trusted since user configured it in Claude desktop
+                        trusted=True,  # Assume trusted since configured in Claude desktop
                     )
                     
                     # Add to our config
                     self.config.servers[server_name] = server_config
                     imported_servers.append(server_name)
                     log.info(f"Imported server '{server_name}' from Claude desktop config")
+                except Exception as server_error:
+                    log.error(f"Error processing server '{server_name}': {server_error}")
+                    skipped_servers.append((server_name, f"processing error: {str(server_error)}"))
+            
+            # Save config
+            if imported_servers:
+                await self.config.save_async()
+                console.print(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config")
                 
-                # Save config
+                # Create a nice report
                 if imported_servers:
-                    self.config.save()
-                    status.update(f"{STATUS_EMOJI['success']} Imported {len(imported_servers)} servers from Claude desktop config")
+                    server_table = Table(title="Imported Servers")
+                    server_table.add_column("Name")
+                    server_table.add_column("Command")
+                    server_table.add_column("Arguments")
                     
-                    # Create a nice report
-                    if imported_servers:
-                        server_table = Table(title="Imported Servers")
-                        server_table.add_column("Name")
-                        server_table.add_column("Command")
-                        server_table.add_column("Arguments")
-                        
-                        for name in imported_servers:
-                            server = self.config.servers[name]
-                            server_table.add_row(
-                                name,
-                                server.path,
-                                " ".join(server.args) if server.args else ""
-                            )
-                        
-                        console.print(server_table)
+                    for name in imported_servers:
+                        server = self.config.servers[name]
+                        server_table.add_row(
+                            name,
+                            server.path,
+                            " ".join(str(arg) for arg in server.args) if server.args else ""
+                        )
                     
-                    if skipped_servers:
-                        skipped_table = Table(title="Skipped Servers")
-                        skipped_table.add_column("Name")
-                        skipped_table.add_column("Reason")
-                        
-                        for name, reason in skipped_servers:
-                            skipped_table.add_row(name, reason)
-                        
-                        console.print(skipped_table)
-                else:
-                    status.update(f"{STATUS_EMOJI['warning']} No new servers imported from Claude desktop config")
+                    console.print(server_table)
+                
+                if skipped_servers:
+                    skipped_table = Table(title="Skipped Servers")
+                    skipped_table.add_column("Name")
+                    skipped_table.add_column("Reason")
+                    
+                    for name, reason in skipped_servers:
+                        skipped_table.add_row(name, reason)
+                    
+                    console.print(skipped_table)
+            else:
+                console.print(f"{STATUS_EMOJI['warning']} No new servers imported from Claude desktop config")
         
         except FileNotFoundError:
             log.debug("Claude desktop config file not found")
-        except json.JSONDecodeError:
-            log.error("Invalid JSON in Claude desktop config file")
+        except json.JSONDecodeError as json_err:
+            log.error(f"Invalid JSON in Claude desktop config file: {json_err}")
+            # Try to show the problematic part of the JSON
+            try:
+                async with aiofiles.open(config_path, 'r') as f:
+                    file_content = await f.read()
+                    prob_line = file_content.splitlines()[max(0, json_err.lineno - 1)]
+                    log.error(f"JSON error at line {json_err.lineno}, column {json_err.colno}: {prob_line}")
+            except Exception:
+                pass
         except Exception as e:
             log.error(f"Error processing Claude desktop config: {e}")
+            # Add more context for debugging
+            import traceback
+            log.debug(f"Full error: {traceback.format_exc()}")
 
     async def cmd_export(self, args):
         """Export the current conversation or a specific branch"""
@@ -4857,16 +5349,37 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
     client = MCPClient()
     
     try:
-        # Set up client and connect to servers
-        await client.setup()
-        
+        # Set up client with error handling for each step
+        try:
+            await client.setup(interactive_mode=interactive)
+        except Exception as setup_error:
+            if verbose_logging:
+                console.print(f"[bold red]Error during setup:[/] {str(setup_error)}")
+                import traceback
+                console.print(traceback.format_exc())
+            else:
+                console.print(f"[bold red]Error during setup:[/] {str(setup_error)}")
+            # Continue anyway for interactive mode
+            if not interactive:
+                raise  # Re-raise for non-interactive mode
+
         # Connect to specific server(s) if provided
         if server:
+            connection_errors = []
             for s in server:
                 if s in client.config.servers:
-                    await client.connect_server(s)
-        else:
+                    try:
+                        with console.status(f"[cyan]Connecting to server {s}...[/]"):
+                            await client.connect_server(s)
+                    except Exception as e:
+                        connection_errors.append((s, str(e)))
+                        console.print(f"[red]Error connecting to server {s}: {e}[/]")
+                else:
                     console.print(f"[yellow]Server not found: {s}[/]")
+            
+            if connection_errors and not interactive and not query:
+                # Only exit for errors in non-interactive mode with no query
+                raise Exception(f"Failed to connect to servers: {', '.join(s for s, _ in connection_errors)}")
         
         # Launch dashboard if requested
         if dashboard:
@@ -4875,21 +5388,47 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 await client.server_monitor.start_monitoring()
             await client.cmd_dashboard("") # Call the command method
             # Dashboard is blocking, exit after it's closed
-            # We need to ensure cleanup happens, maybe move setup/close logic
             await client.close() # Ensure cleanup after dashboard closes
             return
         
         # Process single query if provided
         if query:
-            result = await client.process_query(query, model=model)
-            console.print()
-            console.print(Panel.fit(
-                Markdown(result),
-                title=f"Claude ({client.current_model})",
-                border_style="green"
-            ))
+            try:
+                result = await client.process_query(query, model=model)
+                console.print()
+                console.print(Panel.fit(
+                    Markdown(result),
+                    title=f"Claude ({client.current_model})",
+                    border_style="green"
+                ))
+            except Exception as query_error:
+                console.print(f"[bold red]Error processing query:[/] {str(query_error)}")
+                if verbose_logging:
+                    import traceback
+                    console.print(traceback.format_exc())
+        
+        # Run interactive loop if requested or if no query
         elif interactive or not query:
-            # Run interactive loop
+            # Prompt for API key if not set and in interactive mode
+            if not client.config.api_key and interactive:
+                stderr_console.print("\n[bold yellow]Anthropic API key required[/]")
+                stderr_console.print("An API key is needed to use Claude and MCP tools")
+                api_key = Prompt.ask("[bold green]Enter your Anthropic API key[/]", password=True, console=stderr_console)
+                
+                if api_key and api_key.strip():
+                    # Set the API key and initialize Anthropic client
+                    client.config.api_key = api_key.strip()
+                    try:
+                        client.anthropic = AsyncAnthropic(api_key=client.config.api_key)
+                        client.config.save()
+                        stderr_console.print("[green]API key saved successfully![/]")
+                    except Exception as e:
+                        stderr_console.print(f"[red]Error initializing Anthropic client: {e}[/]")
+                        client.anthropic = None
+                else:
+                    stderr_console.print("[yellow]No API key provided. You can set it later with [bold]/config api-key YOUR_KEY[/bold][/]")
+            
+            # Always run interactive loop if requested, even if there were errors
             await client.interactive_loop()
             
     except KeyboardInterrupt:
@@ -4903,15 +5442,24 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
         if verbose_logging:
             import traceback
             console.print(traceback.format_exc())
+        
+        # For unhandled exceptions in non-interactive mode, still try to clean up
+        if 'client' in locals() and client and hasattr(client, 'server_manager'):
+            await client.close()
+        
+        # Return non-zero exit code for script usage
+        if not interactive:
+            sys.exit(1)
     
     finally:
         # Clean up (already handled in KeyboardInterrupt and normal exit paths)
         # Ensure close is called if setup succeeded but something else failed
-        if 'client' in locals() and client and hasattr(client, 'server_manager'): # Check if client partially initialized
-            # Check if already closed (e.g. after dashboard)
-            # This logic might need refinement depending on exact exit paths
-            pass # await client.close() # Re-closing might cause issues
-        pass # Final cleanup logic might be needed here
+        if 'client' in locals() and client and hasattr(client, 'server_manager'): 
+            try:
+                await client.close()
+            except Exception as close_error:
+                log.error(f"Error during cleanup: {close_error}")
+                # Continue shutdown regardless of cleanup errors
 
 async def servers_async(search, list_all, json_output):
     """Server management async function"""

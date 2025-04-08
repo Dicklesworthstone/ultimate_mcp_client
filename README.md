@@ -1,8 +1,18 @@
 # 🧠 Ultimate MCP Client
 
+<div align="center">
+
+[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![MCP Protocol](https://img.shields.io/badge/Protocol-MCP-purple.svg)](https://github.com/mpctechdebt/mcp)
+
 A comprehensive command-line client for the **Model Context Protocol (MCP)** that connects AI models like Claude to external tools, local and remote servers, and contextual data sources.
 
-> Built by Jeffrey Emanuel — MIT Licensed — Python 3.13+
+![Illustration](https://github.com/Dicklesworthstone/ultimate_mcp_client/blob/main/banner.webp)
+
+</div>
+
+> Built by Jeffrey Emanuel
 
 ---
 
