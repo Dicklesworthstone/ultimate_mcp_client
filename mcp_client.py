@@ -94,8 +94,8 @@ import subprocess
 import sys
 import time
 import uuid
-from collections import deque
-from contextlib import AsyncExitStack
+from collections import defaultdict, deque
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -103,18 +103,26 @@ from pathlib import Path
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
+    Iterator,
     List,
     Optional,
+    Set,
+    Tuple,
+    Union,
 )
-
-# Typer CLI
-import typer
 
 # Anthropic API
 import anthropic
-from anthropic import Anthropic, AsyncAnthropic
+
+# Typer CLI
+import typer
+from anthropic import AsyncAnthropic
 from anthropic.types import (
+    ContentBlockDeltaEvent,
+    MessageParam,
+    MessageStreamEvent,
     ToolParam,
 )
 
@@ -123,11 +131,12 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
-from mcp.types import Prompt, Resource, Tool
+from mcp.types import Prompt as McpPrompt
+from mcp.types import Resource, Tool
 from rich import box
 
 # Rich UI components
-from rich.console import Console
+from rich.console import Console, Group
 from rich.emoji import Emoji
 from rich.layout import Layout
 from rich.live import Live
@@ -141,11 +150,11 @@ from rich.progress import (
     TaskProgressColumn,
     TextColumn,
 )
-from rich.prompt import Confirm, Prompt as RichPrompt
+from rich.prompt import Confirm, Prompt
+from rich.status import Status
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
-from rich.theme import Theme
 from rich.tree import Tree
 from typing_extensions import Annotated
 
@@ -159,14 +168,20 @@ try:
     )
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+    from opentelemetry.trace.propagation.tracecontext import (
+        TraceContextTextMapPropagator,
+    )
     HAS_OPENTELEMETRY = True
 except ImportError:
     HAS_OPENTELEMETRY = False
 
 # Additional utilities
+import colorama
 import httpx
 import psutil
 import yaml
+from dotenv import load_dotenv
+from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf
 
 # Cache libraries
 try:
@@ -179,6 +194,8 @@ except ImportError:
 app = typer.Typer(help="🔌 Ultimate MCP Client for Anthropic API")
 
 # Configure Rich theme
+from rich.theme import Theme
+
 custom_theme = Theme({
     "info": "cyan",
     "success": "green bold",
@@ -213,14 +230,23 @@ console = Console(theme=custom_theme)
 
 # Status emoji mapping
 STATUS_EMOJI = {
-    "healthy": Emoji("✅"),
-    "degraded": Emoji("⚠️"),
-    "error": Emoji("❌"),
-    "connected": Emoji("🟢"),
-    "disconnected": Emoji("🔴"),
-    "cached": Emoji("📦"),
-    "streaming": Emoji("🌊"),
-    "forked": Emoji("🔱"),
+    "healthy": Emoji("check_mark_button"),
+    "degraded": Emoji("warning"),
+    "error": Emoji("cross_mark"),
+    "connected": Emoji("green_circle"),
+    "disconnected": Emoji("red_circle"),
+    "cached": Emoji("package"),
+    "streaming": Emoji("water_wave"),
+    "forked": Emoji("trident_emblem"),
+    "tool": Emoji("hammer_and_wrench"),
+    "resource": Emoji("books"),
+    "prompt": Emoji("speech_balloon"),
+    "server": Emoji("desktop_computer"),
+    "config": Emoji("gear"),
+    "history": Emoji("scroll"),
+    "search": Emoji("magnifying_glass_tilted_right"),
+    "success": Emoji("party_popper"),
+    "failure": Emoji("collision")
 }
 
 # Constants
@@ -328,7 +354,7 @@ class ServerMetrics:
     avg_response_time: float = 0.0
     last_checked: datetime = field(default_factory=datetime.now)
     status: ServerStatus = ServerStatus.UNKNOWN
-    response_times: deque[float] = field(default_factory=deque)
+    response_times: List[float] = field(default_factory=list)
     error_rate: float = 0.0
     
     def update_response_time(self, response_time: float) -> None:
@@ -336,7 +362,7 @@ class ServerMetrics:
         self.response_times.append(response_time)
         # Keep only the last 100 responses
         if len(self.response_times) > 100:
-            self.response_times.popleft()
+            self.response_times = self.response_times[-100:]
         self.avg_response_time = sum(self.response_times) / len(self.response_times)
     
     def update_status(self) -> None:
@@ -383,14 +409,14 @@ class MCPTool:
     original_tool: Tool
     call_count: int = 0
     avg_execution_time: float = 0.0
-    execution_times: deque[float] = field(default_factory=deque)
+    execution_times: List[float] = field(default_factory=list)
     last_used: datetime = field(default_factory=datetime.now)
     
     def update_execution_time(self, time_ms: float) -> None:
         """Update execution time metrics"""
         self.execution_times.append(time_ms)
         if len(self.execution_times) > 100:
-            self.execution_times.popleft()
+            self.execution_times = self.execution_times[-100:]
         self.avg_execution_time = sum(self.execution_times) / len(self.execution_times)
         self.call_count += 1
         self.last_used = datetime.now()
@@ -411,14 +437,14 @@ class MCPPrompt:
     description: str
     server_name: str
     template: str
-    original_prompt: Prompt
+    original_prompt: McpPrompt
     call_count: int = 0
     last_used: datetime = field(default_factory=datetime.now)
 
 @dataclass
 class ConversationNode:
     id: str
-    messages: List[Dict[str, Any]] = field(default_factory=list)
+    messages: List[MessageParam] = field(default_factory=list)
     parent: Optional["ConversationNode"] = None
     children: List["ConversationNode"] = field(default_factory=list)
     name: str = "Root"
@@ -426,7 +452,7 @@ class ConversationNode:
     modified_at: datetime = field(default_factory=datetime.now)
     model: str = ""
     
-    def add_message(self, message: Dict[str, Any]) -> None:
+    def add_message(self, message: MessageParam) -> None:
         """Add a message to this conversation node"""
         self.messages.append(message)
         self.modified_at = datetime.now()
@@ -562,7 +588,7 @@ class ServerRegistry:
             from zeroconf import ServiceBrowser, Zeroconf
             
             class MCPServiceListener:
-                def __init__(self, registry: "ServerRegistry") -> None:
+                def __init__(self, registry):
                     self.registry = registry
                 
                 def add_service(self, zeroconf, service_type, name):
@@ -589,9 +615,6 @@ class ServerRegistry:
                 
                 def remove_service(self, zeroconf, service_type, name):
                     server_name = name.replace("._mcp._tcp.local.", "")
-                    # Ensure zeroconf is available before using it
-                    if not self.registry.zeroconf:
-                         return
                     if server_name in self.registry.discovered_servers:
                         del self.registry.discovered_servers[server_name]
                         log.info(f"Removed local MCP server: {server_name}")
@@ -1300,17 +1323,2660 @@ class ServerMonitor:
             await self.server_manager.reconnect_server(server_name)
 
 
+class ServerManager:
+    def __init__(self, config: Config):
+        self.config = config
+        self.exit_stack = AsyncExitStack()
+        self.active_sessions: Dict[str, ClientSession] = {}
+        self.tools: Dict[str, MCPTool] = {}
+        self.resources: Dict[str, MCPResource] = {}
+        self.prompts: Dict[str, MCPPrompt] = {}
+        self.processes: Dict[str, subprocess.Popen] = {}
+        
+        # Server monitoring
+        self.monitor = ServerMonitor(self)
+        
+        # Connect to registry if enabled
+        self.registry = ServerRegistry() if config.enable_registry else None
+    
+    async def discover_servers(self):
+        """Auto-discover MCP servers in configured paths and from registry"""
+        # Keep track of all discoveries
+        discovered_local = []
+        discovered_remote = []
+        discovered_mdns = []
+        
+        # Local filesystem discovery
+        if self.config.auto_discover:
+            for base_path in self.config.discovery_paths:
+                base_path = os.path.expanduser(base_path)
+                if not os.path.exists(base_path):
+                    continue
+                    
+                log.info(f"Discovering servers in {base_path}")
+                
+                # Look for python and js files
+                for ext, server_type in [('.py', 'stdio'), ('.js', 'stdio')]:
+                    for root, _, files in os.walk(base_path):
+                        for file in files:
+                            if file.endswith(ext) and 'mcp' in file.lower():
+                                path = os.path.join(root, file)
+                                name = os.path.splitext(file)[0]
+                                
+                                # Skip if already in config
+                                if any(s.path == path for s in self.config.servers.values()):
+                                    continue
+                                    
+                                discovered_local.append((name, path, server_type))
+        
+        # Registry discovery
+        if self.config.enable_registry and self.registry:
+            try:
+                # Try to discover from remote registry
+                remote_servers = await self.registry.discover_remote_servers()
+                for server in remote_servers:
+                    name = server.get("name", "")
+                    url = server.get("url", "")
+                    server_type = "sse"  # Remote servers are always SSE
+                    
+                    # Skip if already in config
+                    if any(s.path == url for s in self.config.servers.values()):
+                        continue
+                        
+                    server_version = None
+                    if "version" in server:
+                        server_version = ServerVersion.from_string(server["version"])
+                        
+                    categories = server.get("categories", [])
+                    rating = server.get("rating", 5.0)
+                    
+                    discovered_remote.append((name, url, server_type, server_version, categories, rating))
+            except httpx.RequestError as e:
+                log.error(f"Network error during registry discovery: {e}")
+            except httpx.HTTPStatusError as e:
+                 log.error(f"HTTP error during registry discovery: {e.response.status_code}")
+            except json.JSONDecodeError as e:
+                 log.error(f"JSON decode error during registry discovery: {e}")
+            # Keep broad exception for unexpected discovery issues
+            except Exception as e: 
+                log.error(f"Unexpected error discovering from registry: {e}")
+                
+        # Local network discovery via mDNS
+        if self.config.enable_local_discovery and self.registry:
+            # Start discovery if not already running
+            if not self.registry.zeroconf:
+                self.registry.start_local_discovery()
+                
+            # Wait a moment for discovery
+            await asyncio.sleep(2)
+            
+            # Process discovered servers
+            for name, server in self.registry.discovered_servers.items():
+                url = server.get("url", "")
+                server_type = "sse"
+                
+                # Skip if already in config
+                if any(s.path == url for s in self.config.servers.values()):
+                    continue
+                    
+                discovered_mdns.append((name, url, server_type))
+        
+        # Show discoveries to user with clear categorization
+        total_discovered = len(discovered_local) + len(discovered_remote) + len(discovered_mdns)
+        if total_discovered > 0:
+            console.print(f"\n[bold green]Discovered {total_discovered} potential MCP servers:[/]")
+            
+            if discovered_local:
+                console.print("\n[bold blue]Local File System:[/]")
+                for i, (name, path, server_type) in enumerate(discovered_local, 1):
+                    console.print(f"{i}. [bold]{name}[/] ({server_type}) - {path}")
+            
+            if discovered_remote:
+                console.print("\n[bold magenta]Remote Registry:[/]")
+                for i, (name, url, server_type, version, categories, rating) in enumerate(discovered_remote, 1):
+                    version_str = f"v{version}" if version else "unknown version"
+                    categories_str = ", ".join(categories) if categories else "no categories"
+                    console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - Rating: {rating:.1f}/5.0 - {categories_str}")
+            
+            if discovered_mdns:
+                console.print("\n[bold cyan]Local Network (mDNS):[/]")
+                for i, (name, url, server_type) in enumerate(discovered_mdns, 1):
+                    console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url}")
+            
+            # Ask user which ones to add
+            if Confirm.ask("\nAdd discovered servers to configuration?"):
+                # Create selection interface
+                selections = []
+                
+                if discovered_local:
+                    console.print("\n[bold blue]Local File System Servers:[/]")
+                    for i, (name, path, server_type) in enumerate(discovered_local, 1):
+                        if Confirm.ask(f"Add {name} ({path})?"):
+                            selections.append(("local", i-1))
+                
+                if discovered_remote:
+                    console.print("\n[bold magenta]Remote Registry Servers:[/]")
+                    for i, (name, url, server_type, version, categories, rating) in enumerate(discovered_remote, 1):
+                        if Confirm.ask(f"Add {name} ({url})?"):
+                            selections.append(("remote", i-1))
+                
+                if discovered_mdns:
+                    console.print("\n[bold cyan]Local Network Servers:[/]")
+                    for i, (name, url, server_type) in enumerate(discovered_mdns, 1):
+                        if Confirm.ask(f"Add {name} ({url})?"):
+                            selections.append(("mdns", i-1))
+                
+                # Process selections
+                for source, idx in selections:
+                    if source == "local":
+                        name, path, server_type = discovered_local[idx]
+                        self.config.servers[name] = ServerConfig(
+                            name=name,
+                            type=ServerType(server_type),
+                            path=path,
+                            enabled=True,
+                            auto_start=False,  # Default to not auto-starting discovered servers
+                            description=f"Auto-discovered {server_type} server"
+                        )
+                    
+                    elif source == "remote":
+                        name, url, server_type, version, categories, rating = discovered_remote[idx]
+                        self.config.servers[name] = ServerConfig(
+                            name=name,
+                            type=ServerType(server_type),
+                            path=url,
+                            enabled=True,
+                            auto_start=False,
+                            description="Discovered from registry",
+                            categories=categories,
+                            version=version,
+                            rating=rating,
+                            registry_url=self.registry.registry_urls[0]  # Use first registry as source
+                        )
+                    
+                    elif source == "mdns":
+                        name, url, server_type = discovered_mdns[idx]
+                        self.config.servers[name] = ServerConfig(
+                            name=name,
+                            type=ServerType(server_type),
+                            path=url,
+                            enabled=True,
+                            auto_start=False,
+                            description="Discovered on local network"
+                        )
+                
+                self.config.save()
+                console.print("[green]Selected servers added to configuration[/]")
+    
+    async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
+        """Connect to a single MCP server with retry logic and health monitoring"""
+        server_name = server_config.name
+        retry_count = 0
+        max_retries = server_config.retry_count
+        
+        while retry_count <= max_retries:
+            # Track metrics for this connection attempt
+            start_time = time.time()
+            
+            try:
+                # Create span for observability if available
+                span_ctx = None
+                if tracer:
+                    span_ctx = tracer.start_as_current_span(
+                        f"connect_server.{server_name}",
+                        attributes={
+                            "server.name": server_name,
+                            "server.type": server_config.type.value,
+                            "server.path": server_config.path,
+                            "retry": retry_count
+                        }
+                    )
+                
+                if server_config.type == ServerType.STDIO:
+                    # Check if we need to start the server process
+                    if server_config.auto_start and server_config.path:
+                        # Start the process
+                        cmd = [server_config.path] + server_config.args
+                        
+                        # Detect if it's a Python file
+                        if server_config.path.endswith('.py'):
+                            python_cmd = sys.executable
+                            cmd = [python_cmd] + cmd
+                        # Detect if it's a JS file
+                        elif server_config.path.endswith('.js'):
+                            node_cmd = 'node'
+                            cmd = [node_cmd] + cmd
+                        
+                        log.info(f"Starting server process: {' '.join(cmd)}")
+                        
+                        # Create process with pipes and set resource limits
+                        process = subprocess.Popen(
+                            cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            bufsize=0
+                        )
+                        
+                        # Read stderr in a separate thread/task to prevent blocking? (More complex change)
+                        # For now, just capture it. Check poll() status after connect attempt fails.
+                        
+                        self.processes[server_config.name] = process
+                    
+                    # Set up parameters with timeout
+                    params = StdioServerParameters(
+                        command=server_config.path, 
+                        args=server_config.args,
+                        timeout=server_config.timeout
+                    )
+                    
+                    # Create client with context manager to ensure proper cleanup
+                    session = await self.exit_stack.enter_async_context(await stdio_client(params))
+                    
+                elif server_config.type == ServerType.SSE:
+                    # Connect to SSE server using direct parameters
+                    # (sse_client takes url, headers, timeout, sse_read_timeout parameters)
+                    session = await self.exit_stack.enter_async_context(
+                        await sse_client(
+                            url=server_config.path,
+                            timeout=server_config.timeout,
+                            sse_read_timeout=server_config.timeout * 12  # Set longer timeout for events
+                        )
+                    )
+                else:
+                    if span_ctx:
+                        span_ctx.set_status(trace.StatusCode.ERROR, f"Unknown server type: {server_config.type}")
+                    log.error(f"Unknown server type: {server_config.type}")
+                    return None
+                
+                # Calculate connection time
+                connection_time = (time.time() - start_time) * 1000  # ms
+                
+                # Update metrics
+                server_config.metrics.request_count += 1
+                server_config.metrics.update_response_time(connection_time)
+                server_config.metrics.update_status()
+                
+                # Record metrics if available
+                if latency_histogram:
+                    latency_histogram.record(
+                        connection_time,
+                        {
+                            "operation": "connect",
+                            "server": server_name,
+                            "server_type": server_config.type.value
+                        }
+                    )
+                
+                # Mark span as successful
+                if span_ctx:
+                    span_ctx.set_status(trace.StatusCode.OK)
+                    span_ctx.end()
+                
+                log.info(f"Connected to server {server_name} in {connection_time:.2f}ms")
+                return session
+                
+            except McpError as e: # Catch MCP client errors
+                 connection_error = e
+            except httpx.RequestError as e: # Network errors for SSE
+                 connection_error = e
+            except subprocess.SubprocessError as e: # Errors starting/communicating with STDIO process
+                 connection_error = e
+                 # Check if the process terminated unexpectedly
+                 if server_config.name in self.processes:
+                     proc = self.processes[server_config.name]
+                     if proc.poll() is not None:
+                         stderr_output = proc.stderr.read() if proc.stderr else "stderr not captured"
+                         log.error(f"STDIO server process for '{server_config.name}' exited with code {proc.returncode}. Stderr: {stderr_output}")
+            except OSError as e: # OS level errors (e.g., command not found)
+                 connection_error = e
+            # Keep broad exception for truly unexpected connection issues
+            except Exception as e: 
+                 connection_error = e
+
+            # Shared error handling for caught exceptions
+            retry_count += 1
+            server_config.metrics.error_count += 1
+            server_config.metrics.update_status()
+
+            if span_ctx:
+                span_ctx.set_status(trace.StatusCode.ERROR, str(connection_error))
+                # span_ctx.end() # Don't end yet, we might retry
+
+            connection_time = (time.time() - start_time) * 1000
+                
+            if retry_count <= max_retries:
+                delay = min(1 * (2 ** (retry_count - 1)) + random.random(), 10)
+                log.warning(f"Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}")
+                log.info(f"Retrying in {delay:.2f} seconds...")
+                await asyncio.sleep(delay)
+            else:
+                log.error(f"Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}")
+                if span_ctx: span_ctx.end() # End span after final failure
+                return None
+
+        if span_ctx: span_ctx.end() # End span if loop finishes unexpectedly
+        return None
+
+    async def connect_to_servers(self):
+        """Connect to all enabled MCP servers"""
+        if not self.config.servers:
+            log.warning("No servers configured. Use 'config servers add' to add servers.")
+            return
+        
+        # Connect to each enabled server
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Connecting to servers...", total=len([s for s in self.config.servers.values() if s.enabled]))
+            
+            for name, server_config in self.config.servers.items():
+                if not server_config.enabled:
+                    continue
+                    
+                log.info(f"Connecting to server: {name}")
+                session = await self.connect_to_server(server_config)
+                
+                if session:
+                    self.active_sessions[name] = session
+                    log.info(f"Connected to server: {name}")
+                    await self.load_server_capabilities(name, session)
+                
+                progress.update(task, advance=1)
+    
+    async def load_server_capabilities(self, server_name: str, session: ClientSession):
+        """Load tools, resources, and prompts from a server"""
+        try:
+            # Load tools
+            tool_response = await session.list_tools()
+            for tool in tool_response.tools:
+                tool_name = f"{server_name}:{tool.name}" if ":" not in tool.name else tool.name
+                self.tools[tool_name] = MCPTool(
+                    name=tool_name,
+                    description=tool.description,
+                    server_name=server_name,
+                    input_schema=tool.inputSchema,
+                    original_tool=tool
+                )
+            
+            # Load resources
+            try:
+                resource_response = await session.list_resources()
+                for resource in resource_response.resources:
+                    resource_name = f"{server_name}:{resource.name}" if ":" not in resource.name else resource.name
+                    self.resources[resource_name] = MCPResource(
+                        name=resource_name,
+                        description=resource.description,
+                        server_name=server_name,
+                        template=resource.template,
+                        original_resource=resource
+                    )
+            except McpError as e:
+                log.debug(f"Server {server_name} doesn't support resources: {e}")
+            # Keep broad exception for unexpected issues listing resources
+            except Exception as e: 
+                 log.error(f"Unexpected error listing resources from {server_name}: {e}")
+            
+            # Load prompts
+            try:
+                prompt_response = await session.list_prompts()
+                for prompt in prompt_response.prompts:
+                    prompt_name = f"{server_name}:{prompt.name}" if ":" not in prompt.name else prompt.name
+                    self.prompts[prompt_name] = MCPPrompt(
+                        name=prompt_name,
+                        description=prompt.description,
+                        server_name=server_name,
+                        template=prompt.template,
+                        original_prompt=prompt
+                    )
+            except McpError as e:
+                log.debug(f"Server {server_name} doesn't support prompts: {e}")
+            # Keep broad exception for unexpected issues listing prompts
+            except Exception as e: 
+                 log.error(f"Unexpected error listing prompts from {server_name}: {e}")
+                
+        except McpError as e: # Catch specific MCP errors first
+             log.error(f"MCP error loading capabilities from server {server_name}: {e}")
+        except httpx.RequestError as e: # Catch network errors if using SSE
+             log.error(f"Network error loading capabilities from server {server_name}: {e}")
+        # Keep broad exception for other unexpected issues
+        except Exception as e: 
+            log.error(f"Unexpected error loading capabilities from server {server_name}: {e}")
+    
+    async def close(self):
+        """Close all server connections and processes"""
+        # Close all sessions
+        await self.exit_stack.aclose()
+        
+        # Terminate all processes
+        for name, process in self.processes.items():
+            try:
+                if process.poll() is None:  # If process is still running
+                    log.info(f"Terminating server process: {name}")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                         log.warning(f"Process {name} did not terminate gracefully, killing.")
+                         process.kill()
+                         process.wait() # Wait for kill
+            except OSError as e:
+                log.error(f"OS error terminating process {name} (PID {process.pid if process else 'unknown'}): {e}")
+            # Keep broad exception for other unexpected termination issues
+            except Exception as e: 
+                log.error(f"Unexpected error terminating process {name}: {e}")
+                
+                # Force kill as a last resort
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except Exception:
+                    pass
+
+    def format_tools_for_anthropic(self) -> List[ToolParam]:
+        """Format MCP tools for Anthropic API"""
+        tool_params: List[ToolParam] = []
+        
+        for tool in self.tools.values():
+            tool_params.append({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema
+            })
+            
+        return tool_params
+
+class MCPClient:
+    def __init__(self):
+        self.config = Config()
+        self.history = History(max_entries=self.config.history_size)
+        self.server_manager = ServerManager(self.config)
+        self.anthropic = AsyncAnthropic(api_key=self.config.api_key)  # Changed to AsyncAnthropic
+        self.current_model = self.config.default_model
+        
+        # Instantiate Caching
+        self.tool_cache = ToolCache(
+            cache_dir=CACHE_DIR,
+            custom_ttl_mapping=self.config.cache_ttl_mapping
+        ) if self.config.enable_caching else None
+
+        # Instantiate Server Monitoring
+        self.server_monitor = ServerMonitor(self.server_manager)
+
+        # Instantiate Conversation Graph
+        self.conversation_graph_file = Path(self.config.conversation_graphs_dir) / "default_conversation.json"
+        self.conversation_graph_file.parent.mkdir(parents=True, exist_ok=True) # Ensure directory exists
+        try:
+            self.conversation_graph = ConversationGraph.load(str(self.conversation_graph_file))
+            log.info(f"Loaded conversation graph from {self.conversation_graph_file}")
+        except (FileNotFoundError, IOError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e: # Catch specific load errors
+            log.warning(f"Could not load conversation graph ({type(e).__name__}: {e}), starting new graph.")
+            self.conversation_graph = ConversationGraph()
+        # Keep broad exception for truly unexpected graph loading issues
+        except Exception as e: 
+            log.error(f"Unexpected error initializing conversation graph: {e}")
+            self.conversation_graph = ConversationGraph() # Fallback to new graph
+        
+        # Ensure current node is valid after loading
+        if not self.conversation_graph.get_node(self.conversation_graph.current_node.id):
+            log.warning("Loaded current node ID not found in graph, resetting to root.")
+            self.conversation_graph.set_current_node("root")
+
+        # For storing conversation context (Now managed by ConversationGraph)
+        # self.conversation_messages = [] 
+
+        # Command handlers
+        self.commands = {
+            'exit': self.cmd_exit,
+            'quit': self.cmd_exit,
+            'help': self.cmd_help,
+            'config': self.cmd_config,
+            'servers': self.cmd_servers,
+            'tools': self.cmd_tools,
+            'resources': self.cmd_resources,
+            'prompts': self.cmd_prompts,
+            'history': self.cmd_history,
+            'model': self.cmd_model,
+            'clear': self.cmd_clear,
+            'reload': self.cmd_reload,
+            'cache': self.cmd_cache,
+            'fork': self.cmd_fork,
+            'branch': self.cmd_branch,
+            'dashboard': self.cmd_dashboard, # Add dashboard command
+        }
+        
+        # Set up readline for command history in interactive mode
+        readline.set_completer(self.completer)
+        readline.parse_and_bind("tab: complete")
+        
+    def completer(self, text, state):
+        """Tab completion for commands"""
+        options = [cmd for cmd in self.commands.keys() if cmd.startswith(text)]
+        if state < len(options):
+            return options[state]
+        return None
+        
+    async def setup(self):
+        """Set up the client, connect to servers, and load capabilities"""
+        # Ensure API key is set
+        if not self.config.api_key:
+            console.print("[bold red]ERROR: Anthropic API key not found[/]")
+            console.print("Please set your API key using one of these methods:")
+            console.print("1. Set the ANTHROPIC_API_KEY environment variable")
+            console.print("2. Run 'config api-key YOUR_API_KEY'")
+            sys.exit(1)
+        
+        # Discover servers if enabled
+        if self.config.auto_discover:
+            with Status(f"{STATUS_EMOJI['search']} Discovering MCP servers...", spinner="dots") as status:
+                await self.server_manager.discover_servers()
+                status.update(f"{STATUS_EMOJI['success']} Server discovery complete")
+        
+        # Connect to all enabled servers - Use Progress instead of Status for better visual tracking
+        enabled_servers = [s for s in self.config.servers.values() if s.enabled]
+        if enabled_servers:
+            with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                SpinnerColumn("dots"),
+                TextColumn("[cyan]{task.fields[server]}"),
+                console=console,
+                transient=True
+            ) as progress:
+                connect_task = progress.add_task(f"{STATUS_EMOJI['server']} Connecting to servers...", total=len(enabled_servers), server="")
+                
+                for name, server_config in self.config.servers.items():
+                    if not server_config.enabled:
+                        continue
+                    
+                    progress.update(connect_task, description=f"{STATUS_EMOJI['server']} Connecting to server...", server=name)
+                    session = await self.server_manager.connect_to_server(server_config)
+                    
+                    if session:
+                        self.server_manager.active_sessions[name] = session
+                        progress.update(connect_task, description=f"{STATUS_EMOJI['connected']} Loading capabilities...", server=name)
+                        await self.server_manager.load_server_capabilities(name, session)
+                    else:
+                        progress.update(connect_task, description=f"{STATUS_EMOJI['disconnected']} Connection failed", server=name)
+                    
+                    progress.update(connect_task, advance=1)
+                
+                progress.update(connect_task, description=f"{STATUS_EMOJI['success']} Server connections complete")
+        
+        # Start server monitoring if enabled
+        if self.config.enable_metrics: # Assuming metrics enablement controls monitoring
+            with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots") as status:
+                await self.server_monitor.start_monitoring()
+                status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
+        
+        # Display status
+        await self.print_status()
+    
+    async def print_status(self):
+        """Print client status summary"""
+        console.print("\n[bold]MCP Client Status[/]")
+        console.print(f"Model: [cyan]{self.current_model}[/]")
+        
+        # Server connections
+        server_table = Table(title="Connected Servers")
+        server_table.add_column("Name")
+        server_table.add_column("Type")
+        server_table.add_column("Tools")
+        server_table.add_column("Resources")
+        server_table.add_column("Prompts")
+        
+        for name, session in self.server_manager.active_sessions.items():
+            server_config = self.config.servers.get(name)
+            if not server_config:
+                continue
+                
+            # Count capabilities from this server
+            tools_count = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
+            resources_count = sum(1 for r in self.server_manager.resources.values() if r.server_name == name)
+            prompts_count = sum(1 for p in self.server_manager.prompts.values() if p.server_name == name)
+            
+            server_table.add_row(
+                name,
+                server_config.type.value,
+                str(tools_count),
+                str(resources_count),
+                str(prompts_count)
+            )
+        
+        console.print(server_table)
+        
+        # Tool summary
+        if self.server_manager.tools:
+            console.print(f"\nAvailable tools: [green]{len(self.server_manager.tools)}[/]")
+            console.print(f"Available resources: [green]{len(self.server_manager.resources)}[/]")
+            console.print(f"Available prompts: [green]{len(self.server_manager.prompts)}[/]")
+        else:
+            console.print("\n[yellow]No tools available. Connect to MCP servers to access tools.[/]")
+    
+    async def process_streaming_query(self, query: str, model: Optional[str] = None, 
+                               max_tokens: Optional[int] = None) -> AsyncIterator[str]:
+        """Process a query using Claude and available tools with streaming"""
+        # Get core parameters
+        if not model:
+            model = self.current_model
+            
+        if not max_tokens:
+            max_tokens = self.config.default_max_tokens
+            
+        # Check if we have any servers connected
+        if not self.server_manager.active_sessions:
+            yield "No MCP servers connected. Use 'servers connect' to connect to servers."
+            return
+        
+        # Get tools from all connected servers
+        available_tools = self.server_manager.format_tools_for_anthropic()
+        
+        if not available_tools:
+            yield "No tools available from connected servers."
+            return
+            
+        # Start timing for metrics
+        start_time = time.time()
+        
+        # Keep track of servers and tools used
+        servers_used = set()
+        tools_used = []
+        
+        # Start with user message
+        current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
+        user_message: MessageParam = {"role": "user", "content": query}
+        messages: List[MessageParam] = current_messages + [user_message]
+        
+        # Start span for tracing if available
+        span_ctx = None
+        if tracer:
+            span_ctx = tracer.start_as_current_span(
+                "process_query",
+                attributes={
+                    "model": model,
+                    "query_length": len(query),
+                    "conversation_length": len(messages)
+                }
+            )
+            
+        try:
+            # Initialize variables for streaming
+            chunks = []
+            assistant_message: List[MessageParam] = []
+            current_text = ""
+            
+            # Create stream
+            async with self.anthropic.messages.stream(
+                model=model,
+                max_tokens=max_tokens,
+                messages=messages,
+                tools=available_tools,
+                temperature=self.config.temperature,
+            ) as stream:
+                # Process the streaming response
+                async for message_delta in stream:
+                    # Explicit type annotation for the stream event
+                    event: MessageStreamEvent = message_delta
+                    
+                    if event.type == "content_block_delta":
+                        # We now know this is a ContentBlockDeltaEvent
+                        delta_event: ContentBlockDeltaEvent = event  # Explicit type cast for clarity
+                        delta = delta_event.delta
+                        
+                        # Handle text deltas
+                        if delta.type == "text_delta":
+                            current_text += delta.text
+                            chunks.append(delta.text)
+                            yield delta.text
+                            
+                    elif event.type == "message_start":
+                        # Message started, initialize containers
+                        pass
+                        
+                    elif event.type == "content_block_start":
+                        # Content block started
+                        block = event.content_block
+                        if block.type == "text":
+                            current_text = ""
+                        elif block.type == "tool_use":
+                            yield f"\n[{STATUS_EMOJI['tool']}] Using tool: {block.name}..."
+                            
+                    elif event.type == "content_block_stop":
+                        # Content block finished
+                        block = event.content_block
+                        if block.type == "text":
+                            assistant_message.append({"type": "text", "text": current_text})
+                        elif block.type == "tool_use":
+                            # Process tool call
+                            tool_name = block.name
+                            tool_args = block.input
+                            
+                            # Find the server for this tool
+                            tool = self.server_manager.tools.get(tool_name)
+                            if not tool:
+                                yield f"\n[Tool Error: '{tool_name}' not found]"
+                                continue
+                            
+                            # Keep track of this server
+                            servers_used.add(tool.server_name)
+                            tools_used.append(tool_name)
+                            
+                            # Get server session
+                            session = self.server_manager.active_sessions.get(tool.server_name)
+                            if not session:
+                                yield f"\n[Server Error: '{tool.server_name}' not connected]"
+                                continue
+                                
+                            # Check tool cache if enabled
+                            tool_result = None
+                            cache_used = False
+                            if self.tool_cache: # Check if cache is enabled and instantiated
+                                tool_result = self.tool_cache.get(tool_name, tool_args)
+                                if tool_result is not None:
+                                    cache_used = True
+                                    yield f"\n[{STATUS_EMOJI['cached']} Using cached result for {tool_name}]"
+                            
+                            # Execute the tool if not cached
+                            if not cache_used:
+                                yield f"\n[{STATUS_EMOJI['tool']}] Executing {tool_name}..."
+                                
+                                # Track tool execution time
+                                tool_start_time = time.time()
+                                
+                                try:
+                                    # Execute with tracing if available
+                                    tool_span = None
+                                    if tracer:
+                                        tool_span = tracer.start_as_current_span(
+                                            f"tool.{tool_name}",
+                                            attributes={
+                                                "tool.name": tool_name,
+                                                "server.name": tool.server_name,
+                                                "params": str(tool_args)
+                                            }
+                                        )
+                                    
+                                    # Call the tool
+                                    result = await session.call_tool(tool.original_tool.name, tool_args)
+                                    tool_result = result.result
+                                    
+                                    # Update tool metrics
+                                    tool_execution_time = (time.time() - tool_start_time) * 1000  # ms
+                                    tool.update_execution_time(tool_execution_time)
+                                    
+                                    # Record metrics if available
+                                    if tool_execution_counter:
+                                        tool_execution_counter.add(
+                                            1, 
+                                            {"tool": tool_name, "server": tool.server_name, "success": "true"}
+                                        )
+                                    
+                                    if latency_histogram:
+                                        latency_histogram.record(
+                                            tool_execution_time,
+                                            {"operation": "tool_execution", "tool": tool_name, "server": tool.server_name}
+                                        )
+                                    
+                                    # Cache the result if enabled
+                                    if self.tool_cache:
+                                        self.tool_cache.set(tool_name, tool_args, tool_result)
+                                    
+                                    # End span if tracking
+                                    if tool_span:
+                                        tool_span.set_status(trace.StatusCode.OK)
+                                        tool_span.end()
+                                        
+                                except Exception as e:
+                                    log.error(f"Error executing tool {tool_name}: {e}")
+                                    yield f"\n[{STATUS_EMOJI['failure']}] Tool Execution Error: {str(e)}"
+                                    
+                                    # Record error metrics
+                                    if tool_execution_counter:
+                                        tool_execution_counter.add(
+                                            1, 
+                                            {"tool": tool_name, "server": tool.server_name, "success": "false"}
+                                        )
+                                    
+                                    # End span with error if tracking
+                                    if tool_span:
+                                        tool_span.set_status(trace.StatusCode.ERROR, str(e))
+                                        tool_span.end()
+                                        
+                                    # Skip this tool call
+                                    continue
+                            
+                            # Add tool result to messages for context
+                            assistant_message.append({"type": "tool_use", "id": block.id, "name": tool_name, "input": tool_args})
+                            messages.append({"role": "assistant", "content": assistant_message})
+                            messages.append({"role": "tool", "tool_use_id": block.id, "content": tool_result})
+                            
+                            # Reset for next content
+                            assistant_message = []
+                            current_text = ""
+                            
+                            # Continue the stream with new context
+                            yield f"\n[{STATUS_EMOJI['success']}] Tool result received, continuing..."
+                            
+                            # Create new stream with updated context
+                            async with self.anthropic.messages.stream(
+                                model=model,
+                                max_tokens=max_tokens,
+                                messages=messages,
+                                tools=available_tools,
+                                temperature=self.config.temperature,
+                            ) as continuation_stream:
+                                async for continued_delta in continuation_stream:
+                                    # Explicit type annotation for the continuation stream event
+                                    continued_event: MessageStreamEvent = continued_delta
+                                    
+                                    if continued_event.type == "content_block_delta":
+                                        # Again, this is a ContentBlockDeltaEvent
+                                        continued_delta_event: ContentBlockDeltaEvent = continued_event
+                                        delta = continued_delta_event.delta
+                                        if delta.type == "text_delta":
+                                            current_text += delta.text
+                                            chunks.append(delta.text)
+                                            yield delta.text
+                                    elif continued_event.type == "content_block_stop" and continued_event.content_block.type == "text":
+                                        assistant_message.append({"type": "text", "text": current_text})
+                    
+                    elif event.type == "message_stop":
+                        # Message complete
+                        pass
+            
+            # Update conversation messages for future continuations
+            # self.conversation_messages = messages + [{"role": "assistant", "content": assistant_message}]
+            # Update the current node in the graph instead
+            self.conversation_graph.current_node.add_message(user_message)
+            self.conversation_graph.current_node.add_message({"role": "assistant", "content": assistant_message})
+            self.conversation_graph.current_node.model = model # Store model used for this node
+            
+            # Create a complete response for history
+            complete_response = "".join(chunks)
+            
+            # Calculate metrics
+            end_time = time.time()
+            latency_ms = (end_time - start_time) * 1000
+            
+            # Add to history
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.history.add(ChatHistory(
+                query=query,
+                response=complete_response,
+                model=model,
+                timestamp=timestamp,
+                server_names=list(servers_used),
+                tools_used=tools_used,
+                conversation_id=self.conversation_graph.current_node.id, # Add conversation ID
+                latency_ms=latency_ms,
+                streamed=True
+            ))
+            
+            # End trace span
+            if span_ctx:
+                span_ctx.set_status(trace.StatusCode.OK)
+                span_ctx.add_event("query_complete", {
+                    "latency_ms": latency_ms,
+                    "tools_used": len(tools_used),
+                    "servers_used": len(servers_used)
+                })
+                span_ctx.end()
+                
+        except Exception as e:
+            error_msg = f"Error processing query: {str(e)}"
+            log.error(error_msg)
+            yield f"\n[Error: {error_msg}]"
+            
+            # End trace span with error
+            if span_ctx:
+                span_ctx.set_status(trace.StatusCode.ERROR, error_msg)
+                span_ctx.end()
+
+    async def process_query(self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
+        """Process a query using Claude and available tools (non-streaming version)"""
+        if not model:
+            model = self.current_model
+            
+        if not max_tokens:
+            max_tokens = self.config.default_max_tokens
+        
+        # Use streaming if enabled, but collect all results
+        if self.config.enable_streaming:
+            chunks = []
+            async for chunk in self.process_streaming_query(query, model, max_tokens):
+                chunks.append(chunk)
+            return "".join(chunks)
+        
+        # Non-streaming implementation for backwards compatibility
+        start_time = time.time()
+        
+        # Check if we have any servers connected
+        if not self.server_manager.active_sessions:
+            return "No MCP servers connected. Use 'servers connect' to connect to servers."
+        
+        # Get tools from all connected servers
+        available_tools = self.server_manager.format_tools_for_anthropic()
+        
+        if not available_tools:
+            return "No tools available from connected servers."
+            
+        # Keep track of servers and tools used
+        servers_used = set()
+        tools_used = []
+        
+        # Start with user message
+        current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
+        user_message: MessageParam = {"role": "user", "content": query}
+        messages: List[MessageParam] = current_messages + [user_message]
+        
+        # Create span for tracing if available
+        span_ctx = None
+        if tracer:
+            span_ctx = tracer.start_as_current_span(
+                "process_query",
+                attributes={
+                    "model": model,
+                    "query_length": len(query),
+                    "conversation_length": len(messages),
+                    "streaming": False
+                }
+            )
+        
+        with Status(f"{STATUS_EMOJI['speech_balloon']} Claude is thinking...", spinner="dots") as status:
+            try:
+                # Make initial API call
+                status.update(f"{STATUS_EMOJI['speech_balloon']} Sending query to Claude ({model})...")
+                response = await self.anthropic.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                    tools=available_tools,
+                    temperature=self.config.temperature,
+                )
+                
+                status.update(f"{STATUS_EMOJI['success']} Received response from Claude")
+                
+                # Process response and handle tool calls
+                final_text = []
+                assistant_message: List[MessageParam] = []
+                
+                for content in response.content:
+                    if content.type == 'text':
+                        final_text.append(content.text)
+                        assistant_message.append(content)
+                        
+                    elif content.type == 'tool_use':
+                        tool_name = content.name
+                        tool_args = content.input
+                        
+                        # Find the server for this tool
+                        tool = self.server_manager.tools.get(tool_name)
+                        if not tool:
+                            final_text.append(f"\n[Tool Error: '{tool_name}' not found]")
+                            continue
+                        
+                        # Keep track of this server
+                        servers_used.add(tool.server_name)
+                        tools_used.append(tool_name)
+                        
+                        # Get server session
+                        session = self.server_manager.active_sessions.get(tool.server_name)
+                        if not session:
+                            final_text.append(f"\n[Server Error: '{tool.server_name}' not connected]")
+                            continue
+                        
+                        # Check tool cache if enabled
+                        tool_result = None
+                        cache_used = False
+                        if self.tool_cache: # Check if cache is enabled and instantiated
+                            tool_result = self.tool_cache.get(tool_name, tool_args)
+                            if tool_result is not None:
+                                cache_used = True
+                                status.update(f"{STATUS_EMOJI['package']} Using cached result for {tool_name}")
+                                log.info(f"Using cached result for {tool_name}")
+                        
+                        # Execute the tool if not cached
+                        if not cache_used:
+                            # Execute the tool
+                            status.update(f"{STATUS_EMOJI['tool']} Executing tool: {tool_name}...")
+                            
+                            # Track tool execution time
+                            tool_start_time = time.time()
+                            
+                            try:
+                                # Execute with tracing if available
+                                tool_span = None
+                                if tracer:
+                                    tool_span = tracer.start_as_current_span(
+                                        f"tool.{tool_name}",
+                                        attributes={
+                                            "tool.name": tool_name,
+                                            "server.name": tool.server_name,
+                                            "params": str(tool_args)
+                                        }
+                                    )
+                                
+                                # Call the tool
+                                result = await session.call_tool(tool.original_tool.name, tool_args)
+                                tool_result = result.result
+                                
+                                # Update progress
+                                status.update(f"{STATUS_EMOJI['success']} Tool {tool_name} execution complete")
+                                
+                                # Update tool metrics
+                                tool_execution_time = (time.time() - tool_start_time) * 1000  # ms
+                                tool.update_execution_time(tool_execution_time)
+                                
+                                # Record metrics if available
+                                if tool_execution_counter:
+                                    tool_execution_counter.add(
+                                        1, 
+                                        {"tool": tool_name, "server": tool.server_name, "success": "true"}
+                                    )
+                                
+                                if latency_histogram:
+                                    latency_histogram.record(
+                                        tool_execution_time,
+                                        {"operation": "tool_execution", "tool": tool_name, "server": tool.server_name}
+                                    )
+                                
+                                # Cache the result if enabled
+                                if self.tool_cache:
+                                    self.tool_cache.set(tool_name, tool_args, tool_result)
+                                
+                                # End span if tracking
+                                if tool_span:
+                                    tool_span.set_status(trace.StatusCode.OK)
+                                    tool_span.end()
+                                    
+                            except Exception as e:
+                                log.error(f"Error executing tool {tool_name}: {e}")
+                                status.update(f"{STATUS_EMOJI['failure']} Tool {tool_name} execution failed: {e}")
+                                final_text.append(f"\n[Tool Execution Error: {str(e)}]")
+                                
+                                # Record error metrics
+                                if tool_execution_counter:
+                                    tool_execution_counter.add(
+                                        1, 
+                                        {"tool": tool_name, "server": tool.server_name, "success": "false"}
+                                    )
+                                
+                                # End span with error if tracking
+                                if tool_span:
+                                    tool_span.set_status(trace.StatusCode.ERROR, str(e))
+                                    tool_span.end()
+                                    
+                                # Skip this tool call
+                                continue
+                        
+                        # Add tool result to messages list
+                        messages.append({"role": "assistant", "content": assistant_message})
+                        messages.append({"role": "tool", "tool_use_id": content.id, "content": tool_result})
+                        
+                        # Update assistant message for next potential tool call
+                        assistant_message = []
+                        
+                        # Make another API call with the tool result
+                        status.update(f"{STATUS_EMOJI['speech_balloon']} Claude is processing tool result...")
+                        
+                        response = await self.anthropic.messages.create(
+                            model=model,
+                            max_tokens=max_tokens,
+                            messages=messages,
+                            tools=available_tools,
+                            temperature=self.config.temperature,
+                        )
+                        
+                        status.update(f"{STATUS_EMOJI['success']} Received response from Claude")
+                        
+                        # Reset final_text to capture only the latest response
+                        final_text = []
+                        
+                        # Process the new response
+                        for content in response.content:
+                            if content.type == 'text':
+                                final_text.append(content.text)
+                                assistant_message.append(content)
+                
+                # Update conversation messages for future continuations
+                # self.conversation_messages = messages + [{"role": "assistant", "content": assistant_message}]
+                # Update the current node in the graph instead
+                self.conversation_graph.current_node.messages = messages # Store full history leading to this response
+                self.conversation_graph.current_node.add_message({"role": "assistant", "content": assistant_message}) # Add final assistant response
+                self.conversation_graph.current_node.model = model # Store model used for this node
+                
+                # Create a single string from all text pieces
+                result = "".join(final_text)
+                
+                # Calculate metrics
+                end_time = time.time()
+                latency_ms = (end_time - start_time) * 1000
+                
+                # Add to history
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.history.add(ChatHistory(
+                    query=query,
+                    response=result,
+                    model=model,
+                    timestamp=timestamp,
+                    server_names=list(servers_used),
+                    tools_used=tools_used,
+                    conversation_id=self.conversation_graph.current_node.id, # Add conversation ID
+                    latency_ms=latency_ms,
+                    streamed=False
+                ))
+                
+                # End trace span
+                if span_ctx:
+                    span_ctx.set_status(trace.StatusCode.OK)
+                    span_ctx.add_event("query_complete", {
+                        "latency_ms": latency_ms,
+                        "tools_used": len(tools_used),
+                        "servers_used": len(servers_used),
+                        "response_length": len(result)
+                    })
+                    span_ctx.end()
+                
+                return result
+                
+            except Exception as e:
+                error_msg = f"Error processing query: {str(e)}"
+                log.error(error_msg)
+                
+                # End trace span with error
+                if span_ctx:
+                    span_ctx.set_status(trace.StatusCode.ERROR, error_msg)
+                    span_ctx.end()
+                
+                return f"[Error: {error_msg}]"
+    
+    async def interactive_loop(self):
+        """Run interactive command loop"""
+        console.print("\n[bold green]MCP Client Interactive Mode[/]")
+        console.print("Type your query to Claude, or a command (type 'help' for available commands)")
+        
+        while True:
+            try:
+                user_input = Prompt.ask("\n[bold blue]>>[/]")
+                
+                # Check if it's a command
+                if user_input.startswith('/'):
+                    cmd_parts = user_input[1:].split(maxsplit=1)
+                    cmd = cmd_parts[0].lower()
+                    args = cmd_parts[1] if len(cmd_parts) > 1 else ""
+                    
+                    if cmd in self.commands:
+                        await self.commands[cmd](args)
+                    else:
+                        console.print(f"[yellow]Unknown command: {cmd}[/]")
+                        console.print("Type '/help' for available commands")
+                
+                # Empty input
+                elif not user_input.strip():
+                    continue
+                
+                # Process as a query to Claude
+                else:
+                    result = await self.process_query(user_input)
+                    console.print()
+                    console.print(Panel.fit(
+                        Markdown(result),
+                        title="Claude",
+                        border_style="green"
+                    ))
+                    
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted[/]")
+                break
+            # Catch specific errors related to command execution or query processing
+            except (anthropic.APIError, McpError, httpx.RequestError) as e: 
+                console.print(f"[bold red]Error ({type(e).__name__}):[/] {str(e)}")
+            # Keep broad exception for unexpected loop issues
+            except Exception as e: 
+                console.print(f"[bold red]Unexpected Error:[/] {str(e)}")
+    
+    async def cmd_exit(self, args):
+        """Exit the client"""
+        console.print("[yellow]Exiting...[/]")
+        sys.exit(0)
+        
+    async def cmd_help(self, args):
+        """Display help for commands"""
+        # Create groups of related commands
+        general_commands = [
+            Text(f"{STATUS_EMOJI['scroll']} /help", style="bold"), Text(" - Show this help message"),
+            Text(f"{STATUS_EMOJI['red_circle']} /exit, /quit", style="bold"), Text(" - Exit the client")
+        ]
+        
+        config_commands = [
+            Text(f"{STATUS_EMOJI['config']} /config", style="bold"), Text(" - Manage configuration"),
+            Text(f"{STATUS_EMOJI['speech_balloon']} /model", style="bold"), Text(" - Change the current model"),
+            Text(f"{STATUS_EMOJI['package']} /cache", style="bold"), Text(" - Manage tool result cache")
+        ]
+        
+        server_commands = [
+            Text(f"{STATUS_EMOJI['server']} /servers", style="bold"), Text(" - Manage MCP servers"),
+            Text(f"{STATUS_EMOJI['tool']} /tools", style="bold"), Text(" - List available tools"),
+            Text(f"{STATUS_EMOJI['resource']} /resources", style="bold"), Text(" - List available resources"),
+            Text(f"{STATUS_EMOJI['prompt']} /prompts", style="bold"), Text(" - List available prompts"),
+            Text(f"{STATUS_EMOJI['green_circle']} /reload", style="bold"), Text(" - Reload servers and capabilities")
+        ]
+        
+        conversation_commands = [
+            Text(f"{STATUS_EMOJI['cross_mark']} /clear", style="bold"), Text(" - Clear the conversation context"),
+            Text(f"{STATUS_EMOJI['scroll']} /history", style="bold"), Text(" - View conversation history"),
+            Text(f"{STATUS_EMOJI['trident_emblem']} /fork [NAME]", style="bold"), Text(" - Create a conversation branch"),
+            Text(f"{STATUS_EMOJI['trident_emblem']} /branch", style="bold"), Text(" - Manage conversation branches (list, checkout ID)")
+        ]
+        
+        monitoring_commands = [
+            Text(f"{STATUS_EMOJI['desktop_computer']} /dashboard", style="bold"), Text(" - Show a live monitoring dashboard")
+        ]
+        
+        # Display commands in organized groups
+        console.print("\n[bold]Available Commands:[/]")
+        
+        console.print(Panel(
+            Group(*general_commands),
+            title="General Commands",
+            border_style="blue"
+        ))
+        
+        console.print(Panel(
+            Group(*config_commands),
+            title="Configuration Commands",
+            border_style="cyan"
+        ))
+        
+        console.print(Panel(
+            Group(*server_commands),
+            title="Server & Tools Commands",
+            border_style="magenta"
+        ))
+        
+        console.print(Panel(
+            Group(*conversation_commands),
+            title="Conversation Commands",
+            border_style="green"
+        ))
+        
+        console.print(Panel(
+            Group(*monitoring_commands),
+            title="Monitoring Commands",
+            border_style="yellow"
+        ))
+    
+    async def cmd_config(self, args):
+        """Handle configuration commands"""
+        if not args:
+            # Show current config
+            console.print("\n[bold]Current Configuration:[/]")
+            console.print(f"API Key: {'*' * 8 + self.config.api_key[-4:] if self.config.api_key else 'Not set'}")
+            console.print(f"Default Model: {self.config.default_model}")
+            console.print(f"Max Tokens: {self.config.default_max_tokens}")
+            console.print(f"History Size: {self.config.history_size}")
+            console.print(f"Auto-Discovery: {'Enabled' if self.config.auto_discover else 'Disabled'}")
+            console.print(f"Discovery Paths: {', '.join(self.config.discovery_paths)}")
+            return
+        
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower()
+        subargs = parts[1] if len(parts) > 1 else ""
+        
+        if subcmd == "api-key":
+            if not subargs:
+                console.print("[yellow]Usage: /config api-key YOUR_API_KEY[/]")
+                return
+                
+            self.config.api_key = subargs
+            self.anthropic = AsyncAnthropic(api_key=self.config.api_key)  # Changed to AsyncAnthropic
+            self.config.save()
+            console.print("[green]API key updated[/]")
+            
+        elif subcmd == "model":
+            if not subargs:
+                console.print("[yellow]Usage: /config model MODEL_NAME[/]")
+                return
+                
+            self.config.default_model = subargs
+            self.current_model = subargs
+            self.config.save()
+            console.print(f"[green]Default model updated to {subargs}[/]")
+            
+        elif subcmd == "max-tokens":
+            if not subargs or not subargs.isdigit():
+                console.print("[yellow]Usage: /config max-tokens NUMBER[/]")
+                return
+                
+            self.config.default_max_tokens = int(subargs)
+            self.config.save()
+            console.print(f"[green]Default max tokens updated to {subargs}[/]")
+            
+        elif subcmd == "history-size":
+            if not subargs or not subargs.isdigit():
+                console.print("[yellow]Usage: /config history-size NUMBER[/]")
+                return
+                
+            self.config.history_size = int(subargs)
+            self.history.max_entries = int(subargs)
+            self.config.save()
+            console.print(f"[green]History size updated to {subargs}[/]")
+            
+        elif subcmd == "auto-discover":
+            if subargs.lower() in ("true", "yes", "on", "1"):
+                self.config.auto_discover = True
+            elif subargs.lower() in ("false", "no", "off", "0"):
+                self.config.auto_discover = False
+            else:
+                console.print("[yellow]Usage: /config auto-discover [true|false][/]")
+                return
+                
+            self.config.save()
+            console.print(f"[green]Auto-discovery {'enabled' if self.config.auto_discover else 'disabled'}[/]")
+            
+        elif subcmd == "discovery-path":
+            parts = subargs.split(maxsplit=1)
+            action = parts[0].lower() if parts else ""
+            path = parts[1] if len(parts) > 1 else ""
+            
+            if action == "add" and path:
+                if path not in self.config.discovery_paths:
+                    self.config.discovery_paths.append(path)
+                    self.config.save()
+                    console.print(f"[green]Added discovery path: {path}[/]")
+                else:
+                    console.print(f"[yellow]Path already exists: {path}[/]")
+                    
+            elif action == "remove" and path:
+                if path in self.config.discovery_paths:
+                    self.config.discovery_paths.remove(path)
+                    self.config.save()
+                    console.print(f"[green]Removed discovery path: {path}[/]")
+                else:
+                    console.print(f"[yellow]Path not found: {path}[/]")
+                    
+            elif action == "list" or not action:
+                console.print("\n[bold]Discovery Paths:[/]")
+                for i, path in enumerate(self.config.discovery_paths, 1):
+                    console.print(f"{i}. {path}")
+                    
+            else:
+                console.print("[yellow]Usage: /config discovery-path [add|remove|list] [PATH][/]")
+                
+        else:
+            console.print("[yellow]Unknown config command. Available: api-key, model, max-tokens, history-size, auto-discover, discovery-path[/]")
+    
+    async def cmd_servers(self, args):
+        """Handle server management commands"""
+        if not args:
+            # List servers
+            await self.list_servers()
+            return
+        
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower()
+        subargs = parts[1] if len(parts) > 1 else ""
+        
+        if subcmd == "list":
+            await self.list_servers()
+            
+        elif subcmd == "add":
+            await self.add_server(subargs)
+            
+        elif subcmd == "remove":
+            await self.remove_server(subargs)
+            
+        elif subcmd == "connect":
+            await self.connect_server(subargs)
+            
+        elif subcmd == "disconnect":
+            await self.disconnect_server(subargs)
+            
+        elif subcmd == "enable":
+            await self.enable_server(subargs, True)
+            
+        elif subcmd == "disable":
+            await self.enable_server(subargs, False)
+            
+        elif subcmd == "status":
+            await self.server_status(subargs)
+            
+        else:
+            console.print("[yellow]Unknown servers command. Available: list, add, remove, connect, disconnect, enable, disable, status[/]")
+    
+    async def list_servers(self):
+        """List all configured servers"""
+        if not self.config.servers:
+            console.print(f"{STATUS_EMOJI['warning']} [yellow]No servers configured[/]")
+            return
+            
+        server_table = Table(title=f"{STATUS_EMOJI['server']} Configured Servers")
+        server_table.add_column("Name")
+        server_table.add_column("Type")
+        server_table.add_column("Path/URL")
+        server_table.add_column("Status")
+        server_table.add_column("Enabled")
+        server_table.add_column("Auto-Start")
+        
+        for name, server in self.config.servers.items():
+            connected = name in self.server_manager.active_sessions
+            status = f"{STATUS_EMOJI['connected']} [green]Connected[/]" if connected else f"{STATUS_EMOJI['disconnected']} [red]Disconnected[/]"
+            enabled = f"{STATUS_EMOJI['check_mark_button']} [green]Yes[/]" if server.enabled else f"{STATUS_EMOJI['cross_mark']} [red]No[/]"
+            auto_start = f"{STATUS_EMOJI['check_mark_button']} [green]Yes[/]" if server.auto_start else f"{STATUS_EMOJI['cross_mark']} [red]No[/]"
+            
+            server_table.add_row(
+                name,
+                server.type.value,
+                server.path,
+                status,
+                enabled,
+                auto_start
+            )
+            
+        console.print(server_table)
+    
+    async def add_server(self, args):
+        """Add a new server to configuration"""
+        parts = args.split(maxsplit=3)
+        if len(parts) < 3:
+            console.print("[yellow]Usage: /servers add NAME TYPE PATH [ARGS...][/]")
+            console.print("Example: /servers add github stdio /path/to/github-server.js")
+            console.print("Example: /servers add github sse https://github-mcp-server.example.com")
+            return
+            
+        name, type_str, path = parts[0], parts[1], parts[2]
+        extra_args = parts[3].split() if len(parts) > 3 else []
+        
+        # Validate inputs
+        if name in self.config.servers:
+            console.print(f"[red]Server with name '{name}' already exists[/]")
+            return
+            
+        try:
+            server_type = ServerType(type_str.lower())
+        except ValueError:
+            console.print(f"[red]Invalid server type: {type_str}. Use 'stdio' or 'sse'[/]")
+            return
+            
+        # Add server to config
+        self.config.servers[name] = ServerConfig(
+            name=name,
+            type=server_type,
+            path=path,
+            args=extra_args,
+            enabled=True,
+            auto_start=True,
+            description=f"User-added {server_type.value} server"
+        )
+        
+        self.config.save()
+        console.print(f"[green]Server '{name}' added to configuration[/]")
+        
+        # Ask if user wants to connect now
+        if Confirm.ask("Connect to server now?"):
+            await self.connect_server(name)
+    
+    async def remove_server(self, name):
+        """Remove a server from configuration"""
+        if not name:
+            console.print("[yellow]Usage: /servers remove SERVER_NAME[/]")
+            return
+            
+        if name not in self.config.servers:
+            console.print(f"[red]Server '{name}' not found[/]")
+            return
+            
+        # Disconnect if connected
+        if name in self.server_manager.active_sessions:
+            await self.disconnect_server(name)
+            
+        # Remove from config
+        del self.config.servers[name]
+        self.config.save()
+        
+        console.print(f"[green]Server '{name}' removed from configuration[/]")
+    
+    async def connect_server(self, name):
+        """Connect to a specific server"""
+        if not name:
+            console.print("[yellow]Usage: /servers connect SERVER_NAME[/]")
+            return
+            
+        if name not in self.config.servers:
+            console.print(f"[red]Server '{name}' not found[/]")
+            return
+            
+        if name in self.server_manager.active_sessions:
+            console.print(f"[yellow]Server '{name}' is already connected[/]")
+            return
+            
+        # Connect to server
+        server_config = self.config.servers[name]
+        
+        with Status(f"{STATUS_EMOJI['server']} Connecting to {name}...", spinner="dots") as status:
+            session = await self.server_manager.connect_to_server(server_config)
+            
+            if session:
+                self.server_manager.active_sessions[name] = session
+                status.update(f"{STATUS_EMOJI['connected']} Connected to server: {name}")
+                
+                # Load capabilities
+                status.update(f"{STATUS_EMOJI['tool']} Loading capabilities from {name}...")
+                await self.server_manager.load_server_capabilities(name, session)
+                status.update(f"{STATUS_EMOJI['success']} Loaded capabilities from server: {name}")
+                
+                console.print(f"[green]Connected to server: {name}[/]")
+            else:
+                status.update(f"{STATUS_EMOJI['error']} Failed to connect to server: {name}")
+                console.print(f"[red]Failed to connect to server: {name}[/]")
+    
+    async def disconnect_server(self, name):
+        """Disconnect from a specific server"""
+        if not name:
+            console.print("[yellow]Usage: /servers disconnect SERVER_NAME[/]")
+            return
+            
+        if name not in self.server_manager.active_sessions:
+            console.print(f"[yellow]Server '{name}' is not connected[/]")
+            return
+            
+        # Remove tools, resources, and prompts from this server
+        self.server_manager.tools = {
+            k: v for k, v in self.server_manager.tools.items() 
+            if v.server_name != name
+        }
+        
+        self.server_manager.resources = {
+            k: v for k, v in self.server_manager.resources.items() 
+            if v.server_name != name
+        }
+        
+        self.server_manager.prompts = {
+            k: v for k, v in self.server_manager.prompts.items() 
+            if v.server_name != name
+        }
+        
+        # Close session
+        session = self.server_manager.active_sessions[name]
+        # TODO: Properly close individual session
+        
+        # Remove from active sessions
+        del self.server_manager.active_sessions[name]
+        
+        # Terminate process if applicable
+        if name in self.server_manager.processes:
+            process = self.server_manager.processes[name]
+            if process.poll() is None:  # If process is still running
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+                    
+            del self.server_manager.processes[name]
+            
+        console.print(f"[green]Disconnected from server: {name}[/]")
+    
+    async def enable_server(self, name, enable=True):
+        """Enable or disable a server"""
+        if not name:
+            action = "enable" if enable else "disable"
+            console.print(f"[yellow]Usage: /servers {action} SERVER_NAME[/]")
+            return
+            
+        if name not in self.config.servers:
+            console.print(f"[red]Server '{name}' not found[/]")
+            return
+            
+        # Update config
+        self.config.servers[name].enabled = enable
+        self.config.save()
+        
+        action = "enabled" if enable else "disabled"
+        console.print(f"[green]Server '{name}' {action}[/]")
+        
+        # Connect or disconnect if needed
+        if enable and name not in self.server_manager.active_sessions:
+            if Confirm.ask(f"Connect to server '{name}' now?"):
+                await self.connect_server(name)
+        elif not enable and name in self.server_manager.active_sessions:
+            if Confirm.ask(f"Disconnect from server '{name}' now?"):
+                await self.disconnect_server(name)
+    
+    async def server_status(self, name):
+        """Show detailed status for a server"""
+        if not name:
+            console.print("[yellow]Usage: /servers status SERVER_NAME[/]")
+            return
+            
+        if name not in self.config.servers:
+            console.print(f"[red]Server '{name}' not found[/]")
+            return
+            
+        server_config = self.config.servers[name]
+        connected = name in self.server_manager.active_sessions
+        
+        # Create basic info group
+        basic_info = Group(
+            Text(f"Type: {server_config.type.value}"),
+            Text(f"Path/URL: {server_config.path}"),
+            Text(f"Args: {' '.join(server_config.args)}"),
+            Text(f"Enabled: {'Yes' if server_config.enabled else 'No'}"),
+            Text(f"Auto-Start: {'Yes' if server_config.auto_start else 'No'}"),
+            Text(f"Description: {server_config.description}"),
+            Text(f"Status: {'Connected' if connected else 'Disconnected'}", 
+                style="green" if connected else "red")
+        )
+        
+        console.print(Panel(basic_info, title=f"Server Status: {name}", border_style="blue"))
+        
+        if connected:
+            # Count capabilities
+            tools_count = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
+            resources_count = sum(1 for r in self.server_manager.resources.values() if r.server_name == name)
+            prompts_count = sum(1 for p in self.server_manager.prompts.values() if p.server_name == name)
+            
+            capability_info = Group(
+                Text(f"Tools: {tools_count}", style="magenta"),
+                Text(f"Resources: {resources_count}", style="cyan"),
+                Text(f"Prompts: {prompts_count}", style="yellow")
+            )
+            
+            console.print(Panel(capability_info, title="Capabilities", border_style="green"))
+            
+            # Process info if applicable
+            if name in self.server_manager.processes:
+                process = self.server_manager.processes[name]
+                if process.poll() is None:  # If process is still running
+                    pid = process.pid
+                    try:
+                        p = psutil.Process(pid)
+                        cpu_percent = p.cpu_percent(interval=0.1)
+                        memory_info = p.memory_info()
+                        
+                        process_info = Group(
+                            Text(f"Process ID: {pid}"),
+                            Text(f"CPU Usage: {cpu_percent:.1f}%"),
+                            Text(f"Memory Usage: {memory_info.rss / (1024 * 1024):.1f} MB")
+                        )
+                        
+                        console.print(Panel(process_info, title="Process Information", border_style="yellow"))
+                    except Exception:
+                        console.print(Panel(f"Process ID: {pid} (stats unavailable)", 
+                                           title="Process Information", 
+                                           border_style="yellow"))
+    
+    async def cmd_tools(self, args):
+        """List available tools"""
+        if not self.server_manager.tools:
+            console.print(f"{STATUS_EMOJI['warning']} [yellow]No tools available from connected servers[/]")
+            return
+            
+        # Parse args for filtering
+        server_filter = None
+        if args:
+            server_filter = args
+            
+        tool_table = Table(title=f"{STATUS_EMOJI['tool']} Available Tools")
+        tool_table.add_column("Name")
+        tool_table.add_column("Server")
+        tool_table.add_column("Description")
+        
+        for name, tool in self.server_manager.tools.items():
+            if server_filter and tool.server_name != server_filter:
+                continue
+                
+            tool_table.add_row(
+                name,
+                tool.server_name,
+                tool.description
+            )
+            
+        console.print(tool_table)
+        
+        # Offer to show schema for a specific tool
+        if not args:
+            tool_name = Prompt.ask("Enter tool name to see schema (or press Enter to skip)")
+            if tool_name in self.server_manager.tools:
+                tool = self.server_manager.tools[tool_name]
+                
+                # Use Group to combine the title and schema
+                schema_display = Group(
+                    Text(f"Schema for {tool_name}:", style="bold"),
+                    Syntax(json.dumps(tool.input_schema, indent=2), "json", theme="monokai")
+                )
+                
+                console.print(Panel(
+                    schema_display, 
+                    title=f"Tool: {tool_name}", 
+                    border_style="magenta"
+                ))
+    
+    async def cmd_resources(self, args):
+        """List available resources"""
+        if not self.server_manager.resources:
+            console.print(f"{STATUS_EMOJI['warning']} [yellow]No resources available from connected servers[/]")
+            return
+            
+        # Parse args for filtering
+        server_filter = None
+        if args:
+            server_filter = args
+            
+        resource_table = Table(title=f"{STATUS_EMOJI['resource']} Available Resources")
+        resource_table.add_column("Name")
+        resource_table.add_column("Server")
+        resource_table.add_column("Description")
+        resource_table.add_column("Template")
+        
+        for name, resource in self.server_manager.resources.items():
+            if server_filter and resource.server_name != server_filter:
+                continue
+                
+            resource_table.add_row(
+                name,
+                resource.server_name,
+                resource.description,
+                resource.template
+            )
+            
+        console.print(resource_table)
+    
+    async def cmd_prompts(self, args):
+        """List available prompts"""
+        if not self.server_manager.prompts:
+            console.print(f"{STATUS_EMOJI['warning']} [yellow]No prompts available from connected servers[/]")
+            return
+            
+        # Parse args for filtering
+        server_filter = None
+        if args:
+            server_filter = args
+            
+        prompt_table = Table(title=f"{STATUS_EMOJI['prompt']} Available Prompts")
+        prompt_table.add_column("Name")
+        prompt_table.add_column("Server")
+        prompt_table.add_column("Description")
+        
+        for name, prompt in self.server_manager.prompts.items():
+            if server_filter and prompt.server_name != server_filter:
+                continue
+                
+            prompt_table.add_row(
+                name,
+                prompt.server_name,
+                prompt.description
+            )
+            
+        console.print(prompt_table)
+        
+        # Offer to show template for a specific prompt
+        if not args:
+            prompt_name = Prompt.ask("Enter prompt name to see template (or press Enter to skip)")
+            if prompt_name in self.server_manager.prompts:
+                prompt = self.server_manager.prompts[prompt_name]
+                console.print(f"\n[bold]Template for {prompt_name}:[/]")
+                console.print(prompt.template)
+    
+    async def cmd_history(self, args):
+        """View conversation history"""
+        if not self.history.entries:
+            console.print("[yellow]No conversation history[/]")
+            return
+            
+        # Parse args for count limit
+        limit = 5  # Default
+        try:
+            if args and args.isdigit():
+                limit = int(args)
+        except Exception:
+            pass
+        
+        total_entries = len(self.history.entries)
+        entries_to_show = min(limit, total_entries)
+        
+        # Show loading progress for history (especially useful for large histories)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            TextColumn("[cyan]{task.completed}/{task.total}"),
+            TextColumn("[cyan]{task.percentage:>3.0f}%"),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task(f"{STATUS_EMOJI['history']} Loading conversation history...", total=entries_to_show)
+            
+            recent_entries = []
+            for i, entry in enumerate(reversed(self.history.entries[-limit:])):
+                recent_entries.append(entry)
+                progress.update(task, advance=1, description=f"{STATUS_EMOJI['history']} Processing entry {i+1}/{entries_to_show}...")
+                # Simulate some processing time for very fast machines
+                if len(self.history.entries) > 100:  # Only add delay for large histories
+                    await asyncio.sleep(0.01)
+            
+            progress.update(task, description=f"{STATUS_EMOJI['success']} History loaded")
+        
+        console.print(f"\n[bold]Recent Conversations (last {entries_to_show}):[/]")
+        
+        for i, entry in enumerate(recent_entries, 1):
+            console.print(f"\n[bold cyan]{i}. {entry.timestamp}[/] - Model: {entry.model}")
+            console.print(f"Servers: {', '.join(entry.server_names) if entry.server_names else 'None'}")
+            console.print(f"Tools: {', '.join(entry.tools_used) if entry.tools_used else 'None'}")
+            console.print(f"[bold blue]Q:[/] {entry.query[:100]}..." if len(entry.query) > 100 else f"[bold blue]Q:[/] {entry.query}")
+            console.print(f"[bold green]A:[/] {entry.response[:100]}..." if len(entry.response) > 100 else f"[bold green]A:[/] {entry.response}")
+    
+    async def cmd_model(self, args):
+        """Change the current model"""
+        if not args:
+            console.print(f"Current model: [cyan]{self.current_model}[/]")
+            console.print("Usage: /model MODEL_NAME")
+            console.print("Example models: claude-3-7-sonnet-20250219, claude-3-5-sonnet-latest")
+            return
+            
+        self.current_model = args
+        console.print(f"[green]Model changed to: {args}[/]")
+    
+    async def cmd_clear(self, args):
+        """Clear the conversation context"""
+        # self.conversation_messages = []
+        self.conversation_graph.set_current_node("root")
+        # Optionally clear the root node's messages too
+        if Confirm.ask("Reset conversation to root? (This clears root messages too)"):
+             root_node = self.conversation_graph.get_node("root")
+             if root_node:
+                 root_node.messages = []
+                 root_node.children = [] # Also clear children if resetting completely? Discuss.
+                 # Need to prune orphaned nodes from self.conversation_graph.nodes if we clear children
+                 # For now, just reset messages and current node
+                 root_node.messages = []
+             console.print("[green]Conversation reset to root node.[/]")
+        else:
+             console.print("[yellow]Clear cancelled. Still on root node, messages preserved.[/]")
+
+    async def cmd_reload(self, args):
+        """Reload servers and capabilities"""
+        console.print("[yellow]Reloading servers and capabilities...[/]")
+        
+        # Close existing connections
+        with Status(f"{STATUS_EMOJI['server']} Closing existing connections...", spinner="dots") as status:
+            await self.server_manager.close()
+            status.update(f"{STATUS_EMOJI['success']} Existing connections closed")
+        
+        # Reset collections
+        self.server_manager = ServerManager(self.config)
+        
+        # Reconnect
+        with Status(f"{STATUS_EMOJI['server']} Reconnecting to servers...", spinner="dots") as status:
+            await self.server_manager.connect_to_servers()
+            status.update(f"{STATUS_EMOJI['success']} Servers reconnected")
+        
+        console.print("[green]Servers and capabilities reloaded[/]")
+        await self.print_status()
+    
+    async def cmd_cache(self, args):
+        """Manage the tool result cache"""
+        if not self.tool_cache:
+            console.print("[yellow]Caching is disabled.[/]")
+            return
+
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else "list"
+        subargs = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "list":
+            console.print("\n[bold]Cached Tool Results:[/]")
+            cache_table = Table(title="Cache Entries")
+            cache_table.add_column("Key")
+            cache_table.add_column("Tool Name")
+            cache_table.add_column("Created At")
+            cache_table.add_column("Expires At")
+
+            # List from both memory and disk cache if available
+            all_keys = set(self.tool_cache.memory_cache.keys())
+            if self.tool_cache.disk_cache:
+                all_keys.update(self.tool_cache.disk_cache.iterkeys())
+
+            if not all_keys:
+                 console.print("[yellow]Cache is empty.[/]")
+                 return
+            
+            # Use progress bar for loading cache entries - especially useful for large caches
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+                transient=True
+            ) as progress:
+                task = progress.add_task(f"{STATUS_EMOJI['package']} Loading cache entries...", total=len(all_keys))
+                
+                entries = []
+                for key in all_keys:
+                    entry = self.tool_cache.memory_cache.get(key)
+                    if not entry and self.tool_cache.disk_cache:
+                        try:
+                            entry = self.tool_cache.disk_cache.get(key)
+                        except Exception:
+                            entry = None # Skip potentially corrupted entries
+                    
+                    if entry:
+                        expires_str = entry.expires_at.strftime("%Y-%m-%d %H:%M:%S") if entry.expires_at else "Never"
+                        entries.append((
+                            key,
+                            entry.tool_name,
+                            entry.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                            expires_str
+                        ))
+                    
+                    progress.update(task, advance=1)
+                
+                progress.update(task, description=f"{STATUS_EMOJI['success']} Cache entries loaded")
+            
+            # Add entries to table
+            for entry_data in entries:
+                cache_table.add_row(*entry_data)
+            
+            console.print(cache_table)
+            console.print(f"Total entries: {len(entries)}")
+
+        elif subcmd == "clear":
+            if not subargs or subargs == "--all":
+                if Confirm.ask("Are you sure you want to clear the entire cache?"):
+                    # Use Progress for cache clearing - especially useful for large caches
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TaskProgressColumn(),
+                        console=console,
+                        transient=True
+                    ) as progress:
+                        # Getting approximate count of items
+                        memory_count = len(self.tool_cache.memory_cache)
+                        disk_count = 0
+                        if self.tool_cache.disk_cache:
+                            try:
+                                disk_count = sum(1 for _ in self.tool_cache.disk_cache.iterkeys())
+                            except Exception:
+                                pass
+                        
+                        task = progress.add_task(
+                            f"{STATUS_EMOJI['package']} Clearing cache...", 
+                            total=memory_count + (1 if disk_count > 0 else 0)
+                        )
+                        
+                        # Clear memory cache
+                        self.tool_cache.memory_cache.clear()
+                        progress.update(task, advance=1, description=f"{STATUS_EMOJI['package']} Memory cache cleared")
+                        
+                        # Clear disk cache if available
+                        if self.tool_cache.disk_cache:
+                            self.tool_cache.disk_cache.clear()
+                            progress.update(task, advance=1, description=f"{STATUS_EMOJI['package']} Disk cache cleared")
+                        
+                        progress.update(task, description=f"{STATUS_EMOJI['success']} Cache cleared successfully")
+                    
+                    console.print("[green]Cache cleared.[/]")
+                else:
+                    console.print("[yellow]Cache clear cancelled.[/]")
+            else:
+                tool_name_to_clear = subargs
+                # Invalidate based on tool name prefix
+                with Status(f"{STATUS_EMOJI['package']} Clearing cache for {tool_name_to_clear}...", spinner="dots") as status:
+                    self.tool_cache.invalidate(tool_name=tool_name_to_clear)
+                    status.update(f"{STATUS_EMOJI['success']} Cache entries for {tool_name_to_clear} cleared")
+                console.print(f"[green]Cleared cache entries for tool: {tool_name_to_clear}[/]")
+        
+        
+        elif subcmd == "clean":
+            # Use Progress for cache cleaning - especially useful for large caches
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+                transient=True
+            ) as progress:
+                task = progress.add_task(f"{STATUS_EMOJI['package']} Scanning for expired entries...", total=None)
+                
+                # Count before cleaning
+                memory_count_before = len(self.tool_cache.memory_cache)
+                disk_count_before = 0
+                if self.tool_cache.disk_cache:
+                    try:
+                        disk_count_before = sum(1 for _ in self.tool_cache.disk_cache.iterkeys())
+                    except Exception:
+                        pass
+                
+                progress.update(task, description=f"{STATUS_EMOJI['package']} Cleaning expired entries...")
+                self.tool_cache.clean()
+                
+                # Count after cleaning
+                memory_count_after = len(self.tool_cache.memory_cache)
+                disk_count_after = 0
+                if self.tool_cache.disk_cache:
+                    try:
+                        disk_count_after = sum(1 for _ in self.tool_cache.disk_cache.iterkeys())
+                    except Exception:
+                        pass
+                
+                removed_count = (memory_count_before - memory_count_after) + (disk_count_before - disk_count_after)
+                progress.update(task, description=f"{STATUS_EMOJI['success']} Removed {removed_count} expired entries")
+            
+            console.print(f"[green]Expired cache entries cleaned. Removed {removed_count} entries.[/]")
+        else:
+            console.print("[yellow]Unknown cache command. Available: list, clear [tool_name | --all], clean[/]")
+
+    async def close(self):
+        """Clean up resources before exit"""
+        # Save conversation graph
+        try:
+            self.conversation_graph.save(str(self.conversation_graph_file))
+            log.info(f"Saved conversation graph to {self.conversation_graph_file}")
+        except Exception as e:
+            log.error(f"Failed to save conversation graph: {e}")
+
+        # Stop server monitor
+        if hasattr(self, 'server_monitor'): # Ensure monitor was initialized
+             await self.server_monitor.stop_monitoring()
+        # Close server connections and processes
+        if hasattr(self, 'server_manager'):
+             await self.server_manager.close()
+        # Close cache
+        if self.tool_cache:
+            self.tool_cache.close()
+
+    async def cmd_fork(self, args):
+        """Create a new conversation fork/branch"""
+        fork_name = args if args else None
+        try:
+            new_node = self.conversation_graph.create_fork(name=fork_name)
+            self.conversation_graph.set_current_node(new_node.id)
+            console.print(f"[green]Created and switched to new branch:[/]")
+            console.print(f"  ID: [cyan]{new_node.id}[/]" )
+            console.print(f"  Name: [yellow]{new_node.name}[/]")
+            console.print(f"Branched from node: [magenta]{new_node.parent.id if new_node.parent else 'None'}[/]")
+        except Exception as e:
+            console.print(f"[red]Error creating fork: {e}[/]")
+
+    async def cmd_branch(self, args):
+        """Manage conversation branches"""
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else "list"
+        subargs = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "list":
+            console.print("\n[bold]Conversation Branches:[/]")
+            branch_tree = Tree("[cyan]Conversations[/]")
+
+            def build_tree(node: ConversationNode, tree_node):
+                # Display node info
+                label = f"[yellow]{node.name}[/] ([cyan]{node.id[:8]}[/])"
+                if node.id == self.conversation_graph.current_node.id:
+                    label = f"[bold green]>> {label}[/bold green]"
+                
+                current_branch = tree_node.add(label)
+                for child in node.children:
+                    build_tree(child, current_branch)
+
+            build_tree(self.conversation_graph.root, branch_tree)
+            console.print(branch_tree)
+
+        elif subcmd == "checkout":
+            if not subargs:
+                console.print("[yellow]Usage: /branch checkout NODE_ID[/]")
+                return
+
+            node_id = subargs
+            # Allow partial ID matching (e.g., first 8 chars)
+            matched_node = None
+            if node_id in self.conversation_graph.nodes:
+                 matched_node = self.conversation_graph.get_node(node_id)
+            else:
+                for n_id, node in self.conversation_graph.nodes.items():
+                    if n_id.startswith(node_id):
+                        if matched_node:
+                             console.print(f"[red]Ambiguous node ID prefix: {node_id}. Multiple matches found.[/]")
+                             return # Ambiguous prefix
+                        matched_node = node
+            
+            if matched_node:
+                if self.conversation_graph.set_current_node(matched_node.id):
+                    console.print(f"[green]Switched to branch:[/]")
+                    console.print(f"  ID: [cyan]{matched_node.id}[/]")
+                    console.print(f"  Name: [yellow]{matched_node.name}[/]")
+                else:
+                    # Should not happen if matched_node is valid
+                    console.print(f"[red]Failed to switch to node {node_id}[/]") 
+            else:
+                console.print(f"[red]Node ID '{node_id}' not found.[/]")
+
+        # Add other subcommands like rename, delete later if needed
+        # elif subcmd == "rename": ...
+        # elif subcmd == "delete": ...
+
+        else:
+            console.print("[yellow]Unknown branch command. Available: list, checkout NODE_ID[/]")
+
+    # --- Dashboard Implementation ---
+
+    def generate_dashboard_renderable(self) -> Layout:
+        """Generates the Rich renderable for the live dashboard."""
+        layout = Layout(name="root")
+
+        layout.split(
+            Layout(name="header", size=3),
+            Layout(name="main", ratio=1),
+            Layout(name="footer", size=1),
+        )
+
+        layout["main"].split_row(
+            Layout(name="servers", ratio=2),
+            Layout(name="sidebar", ratio=1),
+        )
+
+        layout["sidebar"].split(
+             Layout(name="tools", ratio=1),
+             Layout(name="stats", size=7),
+        )
+
+        # Header
+        header_text = Text(f"MCP Client Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="bold white on blue")
+        layout["header"].update(Panel(header_text, title="Status", border_style="dashboard.border"))
+
+        # Footer
+        layout["footer"].update(Text("Press Ctrl+C to exit dashboard", style="dim"))
+
+        # Servers Panel
+        server_table = Table(title=f"{STATUS_EMOJI['server']} Servers", box=box.ROUNDED, border_style="blue")
+        server_table.add_column("Name", style="server")
+        server_table.add_column("Status", justify="center")
+        server_table.add_column("Type")
+        server_table.add_column("Conn Status", justify="center")
+        server_table.add_column("Avg Resp (ms)", justify="right")
+        server_table.add_column("Errors", justify="right")
+        server_table.add_column("Req Count", justify="right")
+
+        for name, server_config in self.config.servers.items():
+            if not server_config.enabled:
+                continue # Optionally show disabled servers
+            
+            metrics = server_config.metrics
+            conn_status_emoji = STATUS_EMOJI["connected"] if name in self.server_manager.active_sessions else STATUS_EMOJI["disconnected"]
+            health_status_emoji = STATUS_EMOJI.get(metrics.status.value, Emoji("question_mark"))
+            avg_resp_ms = metrics.avg_response_time * 1000 if metrics.avg_response_time else 0
+            status_style = f"status.{metrics.status.value}" if metrics.status != ServerStatus.UNKNOWN else "dim"
+
+            server_table.add_row(
+                name,
+                Text(f"{health_status_emoji} {metrics.status.value.capitalize()}", style=status_style),
+                server_config.type.value,
+                conn_status_emoji,
+                f"{avg_resp_ms:.1f}",
+                f"{metrics.error_count}",
+                f"{metrics.request_count}"
+            )
+        layout["servers"].update(Panel(server_table, title="[bold blue]Servers[/]", border_style="blue"))
+
+        # Tools Panel
+        tool_table = Table(title=f"{STATUS_EMOJI['tool']} Tools", box=box.ROUNDED, border_style="magenta")
+        tool_table.add_column("Name", style="tool")
+        tool_table.add_column("Server", style="server")
+        tool_table.add_column("Calls", justify="right")
+        tool_table.add_column("Avg Time (ms)", justify="right")
+
+        # Sort tools by call count or last used potentially
+        sorted_tools = sorted(self.server_manager.tools.values(), key=lambda t: t.call_count, reverse=True)[:15] # Show top 15
+
+        for tool in sorted_tools:
+             avg_time_ms = tool.avg_execution_time # Already in ms?
+             tool_table.add_row(
+                 tool.name.split(':')[-1], # Show short name
+                 tool.server_name,
+                 str(tool.call_count),
+                 f"{avg_time_ms:.1f}"
+             )
+        layout["tools"].update(Panel(tool_table, title="[bold magenta]Tool Usage[/]", border_style="magenta"))
+
+        # General Stats Panel
+        stats_text = Text()
+        stats_text.append(f"{STATUS_EMOJI['speech_balloon']} Model: [model]{self.current_model}[/]\n")
+        stats_text.append(f"{STATUS_EMOJI['server']} Connected Servers: {len(self.server_manager.active_sessions)}\n")
+        stats_text.append(f"{STATUS_EMOJI['tool']} Total Tools: {len(self.server_manager.tools)}\n")
+        stats_text.append(f"{STATUS_EMOJI['scroll']} History Entries: {len(self.history.entries)}\n")
+        cache_size = len(self.tool_cache.memory_cache) if self.tool_cache else 0
+        if self.tool_cache and self.tool_cache.disk_cache:
+             # Getting exact disk cache size can be slow, maybe approximate or show memory only
+             # cache_size += len(self.tool_cache.disk_cache) # Example
+             pass 
+        stats_text.append(f"{STATUS_EMOJI['package']} Cache Entries (Mem): {cache_size}\n")
+        stats_text.append(f"{STATUS_EMOJI['trident_emblem']} Current Branch: [yellow]{self.conversation_graph.current_node.name}[/] ([cyan]{self.conversation_graph.current_node.id[:8]}[/])")
+
+        layout["stats"].update(Panel(stats_text, title="[bold cyan]Client Info[/]", border_style="cyan"))
+
+        return layout
+
+    async def cmd_dashboard(self, args):
+        """Show the live monitoring dashboard."""
+        try:
+            with Live(self.generate_dashboard_renderable(), refresh_per_second=1.0/self.config.dashboard_refresh_rate, screen=True, transient=True) as live:
+                while True:
+                    await asyncio.sleep(self.config.dashboard_refresh_rate)
+                    live.update(self.generate_dashboard_renderable())
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Dashboard stopped.[/]")
+        except Exception as e:
+            log.error(f"Dashboard error: {e}")
+            console.print(f"\n[red]Dashboard encountered an error: {e}[/]")
+
+    # Helper method to process a content block delta event
+    def _process_text_delta(self, delta_event: ContentBlockDeltaEvent, current_text: str) -> Tuple[str, str]:
+        """Process a text delta event and return the updated text and the delta text.
+        
+        Args:
+            delta_event: The content block delta event
+            current_text: The current accumulated text
+            
+        Returns:
+            Tuple containing (updated_text, delta_text)
+        """
+        delta = delta_event.delta
+        if delta.type == "text_delta":
+            delta_text = delta.text
+            updated_text = current_text + delta_text
+            return updated_text, delta_text
+        return current_text, ""
+
+    # Add a helper method for processing stream events
+    def _process_stream_event(self, event: MessageStreamEvent, current_text: str) -> Tuple[str, Optional[str]]:
+        """Process a message stream event and handle different event types.
+        
+        Args:
+            event: The message stream event from Claude API
+            current_text: The current accumulated text for content blocks
+            
+        Returns:
+            Tuple containing (updated_text, text_to_yield or None)
+        """
+        text_to_yield = None
+        
+        if event.type == "content_block_delta":
+            delta_event: ContentBlockDeltaEvent = event
+            delta = delta_event.delta
+            if delta.type == "text_delta":
+                current_text += delta.text
+                text_to_yield = delta.text
+                
+        elif event.type == "content_block_start":
+            if event.content_block.type == "text":
+                current_text = ""  # Reset current text for new block
+            elif event.content_block.type == "tool_use":
+                text_to_yield = f"\n[Using tool: {event.content_block.name}...]"
+                
+        # Other event types could be handled here
+                
+        return current_text, text_to_yield
+
+    # Add a new method for importing/exporting conversation branches with a progress bar
+    async def export_conversation(self, conversation_id: str, file_path: str) -> bool:
+        """Export a conversation branch to a file with progress tracking"""
+        node = self.conversation_graph.get_node(conversation_id)
+        if not node:
+            console.print(f"[red]Conversation ID '{conversation_id}' not found[/]")
+            return False
+            
+        # Get all messages from this branch and its ancestors
+        all_nodes = self.conversation_graph.get_path_to_root(node)
+        messages = []
+        
+        # Use progress bar to show export progress
+        with Progress(
+            SpinnerColumn("dots"),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console
+        ) as progress:
+            export_task = progress.add_task(f"{STATUS_EMOJI['scroll']} Exporting conversation...", total=len(all_nodes))
+            
+            # Collect messages from all nodes in the path
+            for ancestor in all_nodes:
+                messages.extend(ancestor.messages)
+                progress.update(export_task, advance=1)
+            
+            # Prepare export data
+            export_data = {
+                "id": node.id,
+                "name": node.name,
+                "messages": messages,
+                "model": node.model,
+                "exported_at": datetime.now().isoformat(),
+                "path": [n.id for n in all_nodes]
+            }
+            
+            # Write to file with progress tracking
+            try:
+                progress.update(export_task, description=f"{STATUS_EMOJI['scroll']} Writing to file...")
+                
+                with open(file_path, 'w') as f:
+                    json.dump(export_data, f, indent=2)
+                
+                progress.update(export_task, description=f"{STATUS_EMOJI['success']} Export complete")
+                return True
+                
+            except Exception as e:
+                progress.update(export_task, description=f"{STATUS_EMOJI['error']} Export failed: {e}")
+                console.print(f"[red]Failed to export conversation: {e}[/]")
+                return False
+
+    # Add a new helper method for handling multi-step operations with progress tracking
+    async def run_multi_step_task(self, 
+                                 steps: List[Callable], 
+                                 step_descriptions: List[str],
+                                 title: str = "Processing...",
+                                 show_spinner: bool = True) -> bool:
+        """Run a multi-step task with progress tracking.
+        
+        Args:
+            steps: List of async callables to execute
+            step_descriptions: List of descriptions for each step
+            title: Title for the progress bar
+            show_spinner: Whether to show a spinner
+            
+        Returns:
+            Boolean indicating success
+        """
+        if len(steps) != len(step_descriptions):
+            log.error("Steps and descriptions must have the same length")
+            return False
+            
+        progress_columns = []
+        if show_spinner:
+            progress_columns.append(SpinnerColumn())
+        
+        progress_columns.extend([
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[cyan]{task.completed}/{task.total}"),
+            TaskProgressColumn()
+        ])
+        
+        with Progress(*progress_columns, console=console) as progress:
+            task = progress.add_task(title, total=len(steps))
+            
+            for i, (step, description) in enumerate(zip(steps, step_descriptions)):
+                try:
+                    progress.update(task, description=description)
+                    await step()
+                    progress.update(task, advance=1)
+                except Exception as e:
+                    log.error(f"Error in step {i+1}: {e}")
+                    progress.update(task, description=f"{STATUS_EMOJI['error']} {description} failed: {e}")
+                    return False
+            
+            progress.update(task, description=f"{STATUS_EMOJI['success']} Complete")
+            return True
+
+# Define Typer CLI commands
+@app.command()
+def run(
+    query: Annotated[str, typer.Option("--query", "-q", help="Single query to process")] = None,
+    model: Annotated[str, typer.Option("--model", "-m", help="Model to use for query")] = None,
+    server: Annotated[List[str], typer.Option("--server", "-s", help="Connect to specific server(s)")] = None,
+    dashboard: Annotated[bool, typer.Option("--dashboard", "-d", help="Show dashboard")] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose logging")] = False,
+    interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Run in interactive mode")] = False,
+):
+    """Run the MCP client in various modes"""
+    # Configure logging based on verbosity
+    if verbose:
+        logging.getLogger("mcpclient").setLevel(logging.DEBUG)
+    
+    # Run the main async function
+    asyncio.run(main_async(query, model, server, dashboard, interactive, verbose))
+
+@app.command()
+def servers(
+    search: Annotated[bool, typer.Option("--search", "-s", help="Search for servers to add")] = False,
+    list_all: Annotated[bool, typer.Option("--list", "-l", help="List all configured servers")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Output as JSON")] = False,
+):
+    """Manage MCP servers"""
+    # Run the server management function
+    asyncio.run(servers_async(search, list_all, json_output))
+
+@app.command()
+def config(
+    show: Annotated[bool, typer.Option("--show", "-s", help="Show current configuration")] = False,
+    edit: Annotated[bool, typer.Option("--edit", "-e", help="Edit configuration in text editor")] = False,
+    reset: Annotated[bool, typer.Option("--reset", "-r", help="Reset to default configuration")] = False,
+):
+    """Manage client configuration"""
+    # Run the config management function
+    asyncio.run(config_async(show, edit, reset))
+
+async def main_async(query, model, server, dashboard, interactive, verbose_logging):
+    """Main async entry point"""
+    # Initialize client
+    client = MCPClient()
+    
+    try:
+        # Set up client and connect to servers
+        await client.setup()
+        
+        # Connect to specific server(s) if provided
+        if server:
+            for s in server:
+                if s in client.config.servers:
+                    await client.connect_server(s)
+                else:
+                    console.print(f"[yellow]Server not found: {s}[/]")
+        
+        # Launch dashboard if requested
+        if dashboard:
+            # Ensure monitor is running for dashboard data
+            if client.config.enable_metrics and not client.server_monitor.monitoring:
+                 await client.server_monitor.start_monitoring()
+            await client.cmd_dashboard("") # Call the command method
+            # Dashboard is blocking, exit after it's closed
+            # We need to ensure cleanup happens, maybe move setup/close logic
+            await client.close() # Ensure cleanup after dashboard closes
+            return
+        
+        # Process single query if provided
+        if query:
+            result = await client.process_query(query, model=model)
+            console.print()
+            console.print(Panel.fit(
+                Markdown(result),
+                title=f"Claude ({client.current_model})",
+                border_style="green"
+            ))
+        elif interactive or not query:
+            # Run interactive loop
+            await client.interactive_loop()
+            
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted[/]")
+        # Ensure cleanup happens if main loop interrupted
+        if 'client' in locals() and client: 
+             await client.close()
+    
+    except Exception as e:
+        console.print(f"[bold red]Error:[/] {str(e)}")
+        if verbose_logging:
+            import traceback
+            console.print(traceback.format_exc())
+    
+    finally:
+        # Clean up (already handled in KeyboardInterrupt and normal exit paths)
+        # Ensure close is called if setup succeeded but something else failed
+        if 'client' in locals() and client and hasattr(client, 'server_manager'): # Check if client partially initialized
+            # Check if already closed (e.g. after dashboard)
+            # This logic might need refinement depending on exact exit paths
+            pass # await client.close() # Re-closing might cause issues
+        pass # Final cleanup logic might be needed here
+
+async def servers_async(search, list_all, json_output):
+    """Server management async function"""
+    client = MCPClient()
+    
+    try:
+        if search:
+            # Discover servers
+            with console.status("[cyan]Searching for servers...[/]"):
+                await client.server_manager.discover_servers()
+        
+        if list_all or not search:
+            # List servers
+            if json_output:
+                # Output as JSON
+                server_data = {}
+                for name, server in client.config.servers.items():
+                    server_data[name] = {
+                        "type": server.type.value,
+                        "path": server.path,
+                        "enabled": server.enabled,
+                        "auto_start": server.auto_start,
+                        "description": server.description,
+                        "categories": server.categories
+                    }
+                console.print(json.dumps(server_data, indent=2))
+            else:
+                # Normal output
+                await client.list_servers()
+    
+    finally:
+        await client.close()
+
+async def config_async(show, edit, reset):
+    """Config management async function"""
+    # client = MCPClient() # Instantiation might be better outside if used elsewhere
+    # For simplicity here, assuming it's needed within this command scope
+    client = None # Initialize to None
+    try:
+        client = MCPClient() # Instantiate client within the main try
+
+        if reset:
+            if Confirm.ask("[yellow]Are you sure you want to reset the configuration?[/]"):
+                # Create a new default config
+                new_config = Config()
+                # Save it
+                new_config.save()
+                console.print("[green]Configuration reset to defaults[/]")
+
+        elif edit:
+            # Open config file in editor
+            editor = os.environ.get("EDITOR", "vim")
+            try: # --- Inner try for editor subprocess ---
+                # Ensure CONFIG_FILE exists before editing
+                CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                CONFIG_FILE.touch() # Create if doesn't exist
+
+                process = subprocess.run([editor, str(CONFIG_FILE)]) # Use run instead of call
+                if process.returncode != 0:
+                     console.print(f"[yellow]Editor exited with code {process.returncode}[/]")
+                else:
+                    console.print(f"[green]Configuration file potentially edited: {CONFIG_FILE}[/]")
+            except FileNotFoundError:
+                 console.print(f"[red]Editor command not found: '{editor}'. Set EDITOR environment variable.[/]")
+            except OSError as e:
+                 console.print(f"[red]Error running editor '{editor}': {e}[/]")
+            # Keep broad exception for unexpected editor issues
+            except Exception as e:
+                 console.print(f"[red]Unexpected error trying to edit config: {e}")
+            # --- End inner try for editor ---
+
+            # Reload config (Needs client object)
+            if client:
+                 client.config.load()
+                 console.print("[green]Configuration reloaded[/]")
+            else:
+                 log.warning("Client not initialized, cannot reload config.")
+
+
+        elif show or not (reset or edit):
+            # Show current config (Needs client object)
+            if not client:
+                 log.warning("Client not initialized, cannot show config.")
+                 return # Exit if client isn't ready
+
+            config_data = {}
+            for key, value in client.config.__dict__.items():
+                if key != "servers":
+                    config_data[key] = value
+                else:
+                    config_data["servers"] = {
+                        name: {
+                            "type": server.type.value,
+                            "path": server.path,
+                            "enabled": server.enabled,
+                            "auto_start": server.auto_start,
+                            "description": server.description
+                        }
+                        for name, server in value.items()
+                    }
+
+            console.print(Panel(
+                Syntax(yaml.safe_dump(config_data, default_flow_style=False), "yaml", theme="monokai"),
+                title="Current Configuration",
+                border_style="blue"
+            ))
+
+    # --- Top-level exceptions for config_async itself ---
+    # These should catch errors during MCPClient() init or file operations if needed,
+    # NOT the misplaced blocks from before.
+    except (IOError, yaml.YAMLError, json.JSONDecodeError) as e:
+         console.print(f"[bold red]Configuration/File Error during config command:[/] {str(str(e))}")
+         # Decide if sys.exit is appropriate here or just log
+    except Exception as e:
+        console.print(f"[bold red]Unexpected Error during config command:[/] {str(e)}")
+        # Log detailed error if needed
+
+    finally:
+        # Ensure client resources are cleaned up if it was initialized
+        if client and hasattr(client, 'close'):
+             try:
+                 await client.close()
+             except Exception as close_err:
+                 log.error(f"Error during config_async client cleanup: {close_err}")
+
+
+async def main():
+    """Main entry point"""
+    try:
+        app()
+    except McpError as e:
+        # Correct indentation (aligned with try)
+        console.print(f"[bold red]MCP Error:[/] {str(e)}")
+        sys.exit(1)
+    except httpx.RequestError as e:
+        # Correct indentation
+        console.print(f"[bold red]Network Error:[/] {str(e)}")
+        sys.exit(1)
+    except anthropic.APIError as e:
+        # Correct indentation
+        console.print(f"[bold red]Anthropic API Error:[/] {str(e)}")
+        sys.exit(1)
+    except (OSError, yaml.YAMLError, json.JSONDecodeError) as e:
+        # Correct indentation
+        console.print(f"[bold red]Configuration/File Error:[/] {str(e)}")
+        sys.exit(1)
+    except Exception as e: # Keep broad exception for top-level unexpected errors
+        # Correct indentation
+        console.print(f"[bold red]Unexpected Error:[/] {str(e)}")
+        if os.environ.get("MCP_CLIENT_DEBUG"): # Show traceback if debug env var is set
+             import traceback
+             traceback.print_exc()
+        sys.exit(1)
+
 if __name__ == "__main__":
     # Initialize colorama for Windows terminals
     if platform.system() == "Windows":
-        try:
-            import colorama
-            colorama.init(convert=True)
-        except ImportError:
-            log.warning("Colorama not found, colors might not work correctly on Windows.")
-        except Exception as e:
-            log.error(f"Error initializing colorama: {e}")
-    
+        colorama.init(convert=True)
+        
     # Run the app
     app()
-

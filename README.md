@@ -42,11 +42,13 @@ A comprehensive command-line client for the **Model Context Protocol (MCP)** tha
 
 > Requires Python 3.13+
 
-Firs, install uv if you don't have it already:
+First, install uv if you don't have it already:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+Then clone, setup a virtual environment, and install packages using uv:
 
 ```bash
 git clone https://github.com/Dicklesworthstone/ultimate_mcp_client
@@ -54,6 +56,13 @@ cd ultimate_mcp_client
 uv venv --python 3.13 && source .venv/bin/activate
 uv sync --all-extras
 ```
+
+Or, you can run it using uv's self-contained script functionality:
+
+```bash
+uv run mcp_client.py
+```
+
 
 ### Run Interactive Mode
 
