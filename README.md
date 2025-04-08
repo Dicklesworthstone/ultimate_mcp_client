@@ -25,6 +25,7 @@ A comprehensive command-line client for the **Model Context Protocol (MCP)** tha
   - Per-branch model tracking
   - Dynamic contextual prompt injection
   - Automatic context optimization through summarization
+  - Import/export conversations to portable JSON files
 
 - **Observability**  
   - OpenTelemetry metrics and spans  
@@ -118,6 +119,19 @@ mcpclient run --query "What's the weather in New York?"
 mcpclient run --dashboard
 ```
 
+### Import and Export Conversations
+
+```bash
+# Export current conversation
+mcpclient export --output my_conversation.json
+
+# Export specific conversation by ID
+mcpclient export --id 12345678-abcd-1234-5678-abcdef123456 --output my_conversation.json
+
+# Import a conversation
+mcpclient import-conv my_conversation.json
+```
+
 ---
 
 ## ⚙️ Commands
@@ -141,6 +155,8 @@ mcpclient run --help
 /model        Change Claude model  
 /fork         Create a conversation branch  
 /branch       List or switch between branches  
+/export       Export conversation to a file
+/import       Import conversation from a file
 /cache        Manage tool result cache and dependencies  (list, clear, clean, dependencies)
 /dashboard    Open real-time monitoring dashboard  
 /optimize     Optimize conversation context through summarization

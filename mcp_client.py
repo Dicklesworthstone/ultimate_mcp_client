@@ -39,6 +39,7 @@ Key Features:
 - Streaming: Real-time streaming responses with tool execution
 - Caching: Smart caching of tool results with configurable TTLs
 - Conversation Branches: Create and manage conversation forks and branches
+- Conversation Import/Export: Save and share conversations with easy portable JSON format
 - Health Dashboard: Real-time monitoring of servers and tool performance
 - Observability: Comprehensive metrics and tracing
 - Registry Integration: Connect to remote registries to discover servers
@@ -63,6 +64,10 @@ python mcpclient.py run --dashboard
 python mcpclient.py servers --search
 python mcpclient.py servers --list
 
+# Conversation import/export
+python mcpclient.py export --id [CONVERSATION_ID] --output [FILE_PATH]
+python mcpclient.py import-conv [FILE_PATH]
+
 # Configuration
 python mcpclient.py config --show
 
@@ -83,6 +88,8 @@ Interactive mode commands:
 - /model - Change AI model
 - /fork - Create a conversation branch
 - /branch - Manage conversation branches
+- /export - Export conversation to a file
+- /import - Import conversation from a file
 - /cache - Manage tool caching
 - /dashboard - Open health monitoring dashboard
 - /monitor - Control server monitoring
@@ -2081,6 +2088,8 @@ class MCPClient:
             'optimize': self.cmd_optimize, # Add optimize command
             'tool': self.cmd_tool, # Add tool playground command
             'prompt': self.cmd_prompt, # Add prompt command for dynamic injection
+            'export': self.cmd_export, # Add export command
+            'import': self.cmd_import, # Add import command
         }
         
         # Set up readline for command history in interactive mode
@@ -2864,7 +2873,9 @@ class MCPClient:
             Text(f"{STATUS_EMOJI['scroll']} /history", style="bold"), Text(" - View conversation history"),
             Text(f"{STATUS_EMOJI['trident_emblem']} /fork [NAME]", style="bold"), Text(" - Create a conversation branch"),
             Text(f"{STATUS_EMOJI['trident_emblem']} /branch", style="bold"), Text(" - Manage conversation branches (list, checkout ID)"),
-            Text(f"{STATUS_EMOJI['package']} /optimize", style="bold"), Text(" - Optimize conversation through summarization")
+            Text(f"{STATUS_EMOJI['package']} /optimize", style="bold"), Text(" - Optimize conversation through summarization"),
+            Text(f"{STATUS_EMOJI['scroll']} /export", style="bold"), Text(" - Export conversation to a file"),
+            Text(f"{STATUS_EMOJI['scroll']} /import", style="bold"), Text(" - Import conversation from a file")
         ]
         
         monitoring_commands = [
@@ -4324,6 +4335,145 @@ class MCPClient:
             log.error("Invalid JSON in Claude desktop config file")
         except Exception as e:
             log.error(f"Error processing Claude desktop config: {e}")
+
+    async def cmd_export(self, args):
+        """Export the current conversation or a specific branch"""
+        # Parse args for ID and output path
+        conversation_id = self.conversation_graph.current_node.id  # Default to current
+        output_path = None
+        
+        if args:
+            parts = args.split()
+            for i, part in enumerate(parts):
+                if part in ["--id", "-i"] and i < len(parts) - 1:
+                    conversation_id = parts[i+1]
+                elif part in ["--output", "-o"] and i < len(parts) - 1:
+                    output_path = parts[i+1]
+        
+        # Default filename if not provided
+        if not output_path:
+            output_path = f"conversation_{conversation_id[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        # Call the export method
+        with Status(f"{STATUS_EMOJI['scroll']} Exporting conversation...", spinner="dots") as status:
+            success = await self.export_conversation(conversation_id, output_path)
+            if success:
+                status.update(f"{STATUS_EMOJI['success']} Conversation exported successfully")
+                console.print(f"[green]Conversation exported to: {output_path}[/]")
+            else:
+                status.update(f"{STATUS_EMOJI['failure']} Export failed")
+                console.print(f"[red]Failed to export conversation[/]")
+
+    async def import_conversation(self, file_path: str) -> bool:
+        """Import a conversation from a file
+        
+        Args:
+            file_path: Path to the exported conversation JSON file
+            
+        Returns:
+            True if import was successful, False otherwise
+        """
+        try:
+            # Read the file
+            async with aiofiles.open(file_path, 'r') as f:
+                content = await f.read()
+                data = json.loads(content)
+            
+            # Create a new node
+            new_node = ConversationNode(
+                id=str(uuid.uuid4()),  # Generate new ID to avoid conflicts
+                name=f"Imported: {data.get('name', 'Unknown')}",
+                messages=data.get('messages', []),
+                model=data.get('model', '')
+            )
+            
+            # Add to graph
+            self.conversation_graph.add_node(new_node)
+            
+            # Make it a child of current node
+            new_node.parent = self.conversation_graph.current_node
+            self.conversation_graph.current_node.add_child(new_node)
+            
+            # Switch to the new node
+            self.conversation_graph.set_current_node(new_node.id)
+            
+            # Save the updated conversation graph
+            self.conversation_graph.save(str(self.conversation_graph_file))
+            
+            return True
+        except FileNotFoundError:
+            log.error(f"Import file not found: {file_path}")
+            return False
+        except json.JSONDecodeError:
+            log.error(f"Invalid JSON in import file: {file_path}")
+            return False
+        except Exception as e:
+            log.error(f"Error importing conversation: {e}")
+            return False
+
+    async def cmd_import(self, args):
+        """Import a conversation from a file"""
+        if not args:
+            console.print("[yellow]Usage: /import FILEPATH[/]")
+            return
+        
+        file_path = args.strip()
+        
+        with Status(f"{STATUS_EMOJI['scroll']} Importing conversation from {file_path}...", spinner="dots") as status:
+            success = await self.import_conversation(file_path)
+            if success:
+                status.update(f"{STATUS_EMOJI['success']} Conversation imported successfully")
+                console.print(f"[green]Conversation imported and set as current conversation[/]")
+            else:
+                status.update(f"{STATUS_EMOJI['failure']} Import failed")
+                console.print(f"[red]Failed to import conversation from {file_path}[/]")
+
+@app.command()
+def export(
+    conversation_id: Annotated[str, typer.Option("--id", "-i", help="Conversation ID to export")] = None,
+    output: Annotated[str, typer.Option("--output", "-o", help="Output file path")] = None,
+):
+    """Export a conversation to a file"""
+    asyncio.run(export_async(conversation_id, output))
+
+async def export_async(conversation_id: str = None, output: str = None):
+    """Async implementation of the export command"""
+    client = MCPClient()
+    try:
+        # Get current conversation if not specified
+        if not conversation_id:
+            conversation_id = client.conversation_graph.current_node.id
+            
+        # Default filename if not provided
+        if not output:
+            output = f"conversation_{conversation_id[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            
+        success = await client.export_conversation(conversation_id, output)
+        if success:
+            console.print(f"[green]Conversation exported to: {output}[/]")
+        else:
+            console.print(f"[red]Failed to export conversation.[/]")
+    finally:
+        await client.close()
+
+@app.command()
+def import_conv(
+    file_path: Annotated[str, typer.Argument(help="Path to the exported conversation file")],
+):
+    """Import a conversation from a file"""
+    asyncio.run(import_async(file_path))
+
+async def import_async(file_path: str):
+    """Async implementation of the import command"""
+    client = MCPClient()
+    try:
+        success = await client.import_conversation(file_path)
+        if success:
+            console.print(f"[green]Conversation imported successfully from: {file_path}[/]")
+        else:
+            console.print(f"[red]Failed to import conversation.[/]")
+    finally:
+        await client.close()
 
 # Define Typer CLI commands
 @app.command()
