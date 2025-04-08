@@ -391,7 +391,7 @@ signal.signal(signal.SIGINT, sigint_handler)
 # Register with atexit to ensure cleanup on normal exit
 atexit.register(lambda: force_exit_handler(is_force=False))
 
-# Helper function to adapt paths for different platforms, used for processing Claude Desktop JSON config file 
+# Helper function to adapt paths for different platforms, used for processing Claude Desktop JSON config file
 def adapt_path_for_platform(command: str, args: List[str]) -> Tuple[str, List[str]]:
     """
     ALWAYS assumes running on Linux/WSL.
@@ -400,44 +400,82 @@ def adapt_path_for_platform(command: str, args: List[str]) -> Tuple[str, List[st
     (e.g., '/mnt/c/Users/...').
     """
 
+    # --- Added Debug Logging ---
+    log.debug(f"adapt_path_for_platform: Initial input - command='{command}', args={args}")
+    # --- End Added Debug Logging ---
+
     def convert_windows_path_to_linux(path_str: str) -> str:
         """
         Directly converts 'DRIVE:\\path' or 'DRIVE:/path' to '/mnt/drive/path'.
         Handles drive letters C-Z, case-insensitive.
         Replaces backslashes (represented as '\\' in Python strings) with forward slashes.
         """
+        # --- Added Debug Logging ---
+        log.debug(f"convert_windows_path_to_linux: Checking path string: {repr(path_str)}")
+        # --- End Added Debug Logging ---
+
         # Check for DRIVE:\ or DRIVE:/ pattern (case-insensitive)
         # Note: It checks the actual string value, which might be 'C:\\Users\\...'
         if isinstance(path_str, str) and len(path_str) > 2 and path_str[1] == ':' and path_str[2] in ['\\', '/'] and path_str[0].isalpha():
-            drive_letter = path_str[0].lower()
-            # path_str[2:] correctly gets the part after 'C:'
-            # .replace("\\", "/") correctly handles the single literal backslash in the Python string
-            rest_of_path = path_str[2:].replace("\\", "/")
-            # Ensure rest_of_path doesn't start with / after C:
-            if rest_of_path.startswith('/'):
-                rest_of_path = rest_of_path[1:]
-            linux_path = f"/mnt/{drive_letter}/{rest_of_path}"
-            # Use logger configured elsewhere in your script
-            log.info(f"Converted Windows path '{path_str}' to Linux path '{linux_path}'")
-            return linux_path
+            try: # Added try-except for robustness during conversion
+                drive_letter = path_str[0].lower()
+                # path_str[2:] correctly gets the part after 'C:'
+                # .replace("\\", "/") correctly handles the single literal backslash in the Python string
+                rest_of_path = path_str[3:].replace("\\", "/") # Use index 3 to skip ':\' or ':/'
+                # Ensure rest_of_path doesn't start with / after C: (redundant if using index 3, but safe)
+                # if rest_of_path.startswith('/'):
+                #     rest_of_path = rest_of_path[1:]
+                linux_path = f"/mnt/{drive_letter}/{rest_of_path}"
+                # Use logger configured elsewhere in your script
+                # --- Changed log level to DEBUG for successful conversion ---
+                log.debug(f"Converted Windows path '{path_str}' to Linux path '{linux_path}'")
+                # --- End Changed log level ---
+                return linux_path
+            except Exception as e:
+                # --- Added Error Logging ---
+                log.error(f"Error during path conversion for '{path_str}': {e}", exc_info=True)
+                # Return original path on conversion error
+                return path_str
+                # --- End Added Error Logging ---
         # If it doesn't look like a Windows path, return it unchanged
+        # --- Added Debug Logging ---
+        log.debug(f"convert_windows_path_to_linux: Path '{path_str}' did not match Windows pattern or wasn't converted.")
+        # --- End Added Debug Logging ---
         return path_str
 
-    # Apply conversion to the command string itself
-    adapted_command = convert_windows_path_to_linux(command)
+    # Apply conversion to the command string itself only if it looks like a path
+    # Check if the command itself looks like a potential path that needs conversion
+    # (e.g., "C:\path\to\executable.exe" vs just "npx")
+    # A simple check: does it contain ':' and '\' or '/'? More robust checks could be added.
+    adapted_command = command # Default to original command
+    if isinstance(command, str) and ':' in command and ('\\' in command or '/' in command):
+         log.debug(f"Attempting conversion for command part: '{command}'")
+         adapted_command = convert_windows_path_to_linux(command)
+    else:
+         log.debug(f"Command part '{command}' likely not a path, skipping conversion.")
+
 
     # Apply conversion to each argument if it's a string
     adapted_args = []
-    for arg in args:
+    for i, arg in enumerate(args):
         # Make sure we only try to convert strings
         if isinstance(arg, str):
-            adapted_args.append(convert_windows_path_to_linux(arg))
+            # --- Added Debug Logging for Arg ---
+            log.debug(f"adapt_path_for_platform: Processing arg {i}: {repr(arg)}")
+            # --- End Added Debug Logging ---
+            converted_arg = convert_windows_path_to_linux(arg)
+            adapted_args.append(converted_arg)
         else:
+            # --- Added Debug Logging for Non-String Arg ---
+            log.debug(f"adapt_path_for_platform: Skipping non-string arg {i}: {repr(arg)}")
+            # --- End Added Debug Logging ---
             adapted_args.append(arg) # Keep non-string args (like numbers, bools) as is
 
-    # Log if changes were made
+    # Log if changes were made (using DEBUG level)
     if adapted_command != command or adapted_args != args:
-        log.debug(f"Path adaptation result: command='{adapted_command}', args={adapted_args}")
+        log.debug(f"Path adaptation final result: command='{adapted_command}', args={adapted_args}")
+    else:
+        log.debug("Path adaptation: No changes made to command or arguments.")
 
     return adapted_command, adapted_args
 
@@ -490,13 +528,13 @@ def safe_stdout():
     else:
         yield
 
-
+# Around Line 490
 def get_safe_console():
     """Get the appropriate console based on whether we're using stdio servers.
-    
+
     CRITICAL: This function ensures all user output goes to stderr when any stdout-based
     MCP server is active, preventing protocol corruption and server crashes.
-    
+
     Returns stderr_console if there are any active stdio servers to prevent
     interfering with stdio communication channels.
     """
@@ -508,21 +546,38 @@ def get_safe_console():
             for name, server in app.mcp_client.server_manager.config.servers.items():
                 if server.type == ServerType.STDIO and name in app.mcp_client.server_manager.active_sessions:
                     has_stdio_servers = True
-                    
-                    # Add debug info to help identify unsafe console usage
+
+                    # --- MODIFIED WARNING LOGIC ---
+                    # Check the caller frame, but be less aggressive about warnings for simple assignments
+                    # This aims to reduce noise for patterns like `x = get_safe_console()` or `console=get_safe_console()`
                     caller_frame = inspect.currentframe().f_back
                     if caller_frame:
                         caller_info = inspect.getframeinfo(caller_frame)
-                        # Check if this is being called by something other than safe_print
-                        if not (caller_info.function == "safe_print" or "safe_print" in caller_info.code_context[0]):
-                            log.warning(f"Potential unsafe console usage detected at: {caller_info.filename}:{caller_info.lineno}")
-                            log.warning(f"Always use MCPClient.safe_print() or get_safe_console().print() to prevent stdio corruption")
-                            log.warning(f"Stack: {caller_info.function} - {caller_info.code_context[0].strip()}")
-                    
-                    break
+                        caller_line = caller_info.code_context[0].strip() if caller_info.code_context else ""
+
+                        # More specific check: Warn if it looks like `.print()` is called *directly* on the result,
+                        # OR if the caller isn't a known safe method/pattern.
+                        # This check is heuristic and might need refinement.
+                        is_direct_print = ".print(" in caller_line and "get_safe_console().print(" in caller_line.replace(" ", "")
+                        is_known_safe_caller = caller_info.function in ["safe_print", "_run_with_progress", "_run_with_simple_progress"] \
+                                               or "self.safe_print(" in caller_line \
+                                               or "_safe_printer(" in caller_line # Added _safe_printer check for ServerManager
+
+                        # Avoid warning for assignments like `console = get_safe_console()` or `console=get_safe_console()`
+                        # These are necessary patterns in setup, interactive_loop, etc.
+                        is_assignment_pattern = "=" in caller_line and "get_safe_console()" in caller_line
+
+                        if not is_known_safe_caller and not is_assignment_pattern and is_direct_print:
+                             # Only log warning if it's NOT a known safe caller/pattern AND looks like a direct print attempt
+                             log.warning(f"Potential unsafe console usage detected at: {caller_info.filename}:{caller_info.lineno}")
+                             log.warning(f"Always use MCPClient.safe_print() or store get_safe_console() result first.")
+                             log.warning(f"Stack: {caller_info.function} - {caller_line}")
+                    # --- END MODIFIED WARNING LOGIC ---
+
+                    break # Found an active stdio server, no need to check further
     except (NameError, AttributeError):
-        pass
-    
+        pass # Ignore errors if client isn't fully initialized
+
     # If we have active stdio servers, use stderr to avoid interfering with stdio communication
     return stderr_console if has_stdio_servers else console
 
@@ -619,9 +674,11 @@ REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
 
 # Initialize OpenTelemetry
 trace_provider = TracerProvider()
-console_exporter = ConsoleSpanExporter()
-span_processor = BatchSpanProcessor(console_exporter)
-trace_provider.add_span_processor(span_processor)
+use_console_exporter = False # Set to True to enable console exporter (recommended to set to False)
+if use_console_exporter:
+    console_exporter = ConsoleSpanExporter()
+    span_processor = BatchSpanProcessor(console_exporter)
+    trace_provider.add_span_processor(span_processor)
 trace.set_tracer_provider(trace_provider)
 
 # Initialize metrics with the current API
@@ -629,9 +686,11 @@ try:
     # Try the newer API first
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
-    
-    reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
-    meter_provider = MeterProvider(metric_readers=[reader])
+    if use_console_exporter:
+        reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
+        meter_provider = MeterProvider(metric_readers=[reader])
+    else:
+        meter_provider = MeterProvider()
     metrics.set_meter_provider(meter_provider)
 except (ImportError, AttributeError):
     # Fallback to older API or handle gracefully
@@ -2272,16 +2331,17 @@ class ServerManager:
         server_name = server_config.name
         retry_count = 0
         max_retries = server_config.retry_count
-        
-        # Ensure we're using the safe console during connection to avoid stdio interference
-        safe_console = get_safe_console()
-        
+
+        # Note: We use self._safe_printer for output within this method,
+        # which is initialized in ServerManager.__init__ and uses get_safe_console internally.
+
         # Use safe_stdout context manager to protect against stdout pollution during the entire connection process
         with safe_stdout():
             while retry_count <= max_retries:
                 # Track metrics for this connection attempt
                 start_time = time.time()
-                
+                session: Optional[ClientSession] = None # Initialize session for clarity
+
                 try:
                     # Start span for observability if available
                     span_ctx = None
@@ -2299,8 +2359,8 @@ class ServerManager:
                         except Exception as e:
                             log.warning(f"Failed to create trace span: {e}")
                             span_ctx = None
-                    
-                    # Log connection info using safe_console
+
+                    # Log connection info using the safe printer
                     self._safe_printer(f"[cyan]Attempting to connect to server {server_name}...[/]")
 
                     if server_config.type == ServerType.STDIO:
@@ -2309,16 +2369,17 @@ class ServerManager:
                             # Check if a process is already running for this server
                             existing_process = self.processes.get(server_config.name)
                             restart_process = False
-                            
+
                             if existing_process:
                                 # Check if the process is still alive
                                 if existing_process.poll() is None:
                                     # Process is running, but if we've hit an error before, we might want to restart
                                     if retry_count > 0:
                                         log.warning(f"Restarting process for {server_name} on retry {retry_count}")
-                                        safe_console.print(f"[yellow]Restarting process for {server_name} on retry {retry_count}[/]")
+                                        # Use safe printer
+                                        self._safe_printer(f"[yellow]Restarting process for {server_name} on retry {retry_count}[/]")
                                         restart_process = True
-                                        
+
                                         # Try to terminate gracefully
                                         try:
                                             existing_process.terminate()
@@ -2328,48 +2389,60 @@ class ServerManager:
                                             except asyncio.TimeoutError:
                                                 # Force kill if necessary
                                                 log.warning(f"Process for {server_name} not responding to terminate, killing")
-                                                safe_console.print(f"[red]Process for {server_name} not responding, forcing kill[/]")
+                                                # Use safe printer
+                                                self._safe_printer(f"[red]Process for {server_name} not responding, forcing kill[/]")
                                                 existing_process.kill()
-                                                await existing_process.wait()
+                                                await existing_process.wait() # Wait for kill to complete
                                         except Exception as e:
                                             log.error(f"Error terminating process for {server_name}: {e}")
-                                            safe_console.print(f"[red]Error terminating process: {e}[/]")
+                                            # Use safe printer
+                                            self._safe_printer(f"[red]Error terminating process: {e}[/]")
                                 else:
                                     # Process has exited
-                                    log.warning(f"Process for {server_name} has exited with code {existing_process.returncode}")
-                                    safe_console.print(f"[yellow]Process for {server_name} has exited with code {existing_process.returncode}[/]")
-                                    
+                                    exit_code = existing_process.returncode
+                                    log.warning(f"Process for {server_name} has exited with code {exit_code}")
+                                    # Use safe printer
+                                    self._safe_printer(f"[yellow]Process for {server_name} has exited with code {exit_code}[/]")
+
                                     # Try to get stderr output for diagnostics if process has terminated
                                     try:
                                         if existing_process.stderr:
                                             stderr_data = await existing_process.stderr.read()
                                             if stderr_data:
-                                                log.error(f"Process stderr: {stderr_data.decode('utf-8', errors='replace')}")
+                                                stderr_output = stderr_data.decode('utf-8', errors='replace').strip()
+                                                if stderr_output: # Only log if there's actual stderr content
+                                                     log.error(f"Process stderr for {server_name}: {stderr_output}")
                                     except Exception as e:
-                                        log.warning(f"Couldn't read stderr: {e}")
-                                    
+                                        log.warning(f"Couldn't read stderr for {server_name}: {e}")
+
                                     restart_process = True
                             else:
                                 # No existing process
                                 restart_process = True
-                            
+
                             # Start or restart the process if needed
                             if restart_process:
                                 # Start the process
                                 cmd = [server_config.path] + server_config.args
-                                
+
                                 # Detect if it's a Python file
                                 if server_config.path.endswith('.py'):
                                     python_cmd = sys.executable
                                     cmd = [python_cmd] + cmd
                                 # Detect if it's a JS file
                                 elif server_config.path.endswith('.js'):
-                                    node_cmd = 'node'
-                                    cmd = [node_cmd] + cmd
-                                
+                                    node_cmd = 'node' # Assumes node is in PATH
+                                    # Check if npx is being used explicitly
+                                    if server_config.path == 'npx':
+                                        # Keep cmd as is if 'npx' is the command
+                                        pass
+                                    else:
+                                         cmd = [node_cmd] + cmd
+
                                 log.info(f"Starting server process: {' '.join(cmd)}")
-                                safe_console.print(f"[cyan]Starting server process: {' '.join(cmd)}[/]")
-                                
+                                # Use safe printer
+                                self._safe_printer(f"[cyan]Starting server process: {' '.join(cmd)}[/]")
+
                                 # Create process with pipes and set resource limits
                                 # Add a unique identifier to each process to prevent interference
                                 env = os.environ.copy()
@@ -2379,83 +2452,124 @@ class ServerManager:
                                 # - MCP_CLIENT_ID: Unique ID for this client instance to prevent cross-talk
                                 env["MCP_SERVER_ID"] = server_name
                                 env["MCP_CLIENT_ID"] = str(uuid.uuid4())
-                                
+
                                 process = await asyncio.create_subprocess_exec(
                                     *cmd,
                                     stdin=asyncio.subprocess.PIPE,
                                     stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE, # Keep stderr piped
                                     env=env
                                 )
-                                
+
                                 self.processes[server_config.name] = process
-                                
+
                                 # Register the server with zeroconf if local discovery is enabled
                                 if self.config.enable_local_discovery and self.registry:
                                     await self.register_local_server(server_config)
-                        
+
                         # Set up parameters with timeout - include existing process if available
+                        current_process = self.processes.get(server_name) # Get potentially newly created process
                         params = StdioServerParameters(
-                            command=server_config.path, 
+                            command=server_config.path, # Command/path used for logging/config, not necessarily for execution if process exists
                             args=server_config.args,
                             timeout=server_config.timeout,
-                            process=self.processes.get(server_name)  # Pass existing process if available
+                            process=current_process # Pass potentially existing/new process
                         )
-                        
+
+                        # Check if process exists before trying to connect via stdio
+                        if not current_process:
+                            raise McpError(f"Process for STDIO server {server_name} not found or failed to start.")
+
                         # Create client with context manager to ensure proper cleanup
-                        # FIX: Remove the extra await before stdio_client
+                        # FIX: Removed extra await before stdio_client
                         session = await self.exit_stack.enter_async_context(stdio_client(params))
-                        
+
+                        # --- FIX: Add explicit session validation ---
+                        if not session or not hasattr(session, 'list_tools') or not callable(session.list_tools):
+                             log.error(f"Failed to obtain a valid session object for {server_name} after connection attempt.")
+                             self._safe_printer(f"[red]Failed to initialize session for {server_name}. Check server logs/startup.[/]")
+                             # Attempt to clean up the potentially running process
+                             if current_process and current_process.poll() is None:
+                                  try:
+                                      log.warning(f"Terminating process for {server_name} due to invalid session.")
+                                      current_process.terminate()
+                                      await asyncio.wait_for(current_process.wait(), timeout=1.0)
+                                  except Exception:
+                                      log.error(f"Failed to terminate process for {server_name} after invalid session.")
+                                      try: current_process.kill() # Force kill as last resort
+                                      except Exception: pass
+                             # Raise error to trigger retry or final failure
+                             raise McpError(f"Invalid session object obtained for {server_name}")
+                        # --- End FIX ---
+
                     elif server_config.type == ServerType.SSE:
                         # Connect to SSE server using direct parameters
-                        # FIX: Remove the extra await before sse_client
+                        # FIX: Removed extra await before sse_client
                         session = await self.exit_stack.enter_async_context(
                             sse_client(
                                 url=server_config.path,
                                 timeout=server_config.timeout,
-                                sse_read_timeout=server_config.timeout * 12  # Set longer timeout for events
+                                sse_read_timeout=server_config.timeout * 12 # Set longer timeout for events
                             )
                         )
+                        # --- FIX: Add explicit session validation ---
+                        if not session or not hasattr(session, 'list_tools') or not callable(session.list_tools):
+                             log.error(f"Failed to obtain a valid SSE session object for {server_name}.")
+                             self._safe_printer(f"[red]Failed to initialize SSE session for {server_name}.[/]")
+                             # Raise error to trigger retry or final failure
+                             raise McpError(f"Invalid SSE session object obtained for {server_name}")
+                        # --- End FIX ---
+
                     else:
+                        # This part remains the same, but use safe_printer
                         if span_ctx and hasattr(span_ctx, 'set_status'):
                             span_ctx.set_status(trace.StatusCode.ERROR, f"Unknown server type: {server_config.type}")
                         log.error(f"Unknown server type: {server_config.type}")
-                        safe_console.print(f"[red]Unknown server type: {server_config.type}[/]")
-                        return None
-                    
-                    # Calculate connection time
-                    connection_time = (time.time() - start_time) * 1000  # ms
-                    
+                        # Use safe printer
+                        self._safe_printer(f"[red]Unknown server type: {server_config.type}[/]")
+                        # No valid session possible, return None after cleanup (handled by exit_stack)
+                        return None # Explicitly return None here
+
+                    # --- Success Path ---
+                    # If we reached here, session is considered valid
+                    connection_time = (time.time() - start_time) * 1000 # ms
+
                     # Update metrics
                     server_config.metrics.request_count += 1
                     server_config.metrics.update_response_time(connection_time)
                     server_config.metrics.update_status()
-                    
+
                     # Record metrics if available
                     if latency_histogram:
-                        latency_histogram.record(
-                            connection_time,
-                            {
-                                "operation": "connect",
-                                "server": server_name,
-                                "server_type": server_config.type.value
-                            }
-                        )
-                    
+                        try:
+                            latency_histogram.record(
+                                connection_time,
+                                {
+                                    "operation": "connect",
+                                    "server": server_name,
+                                    "server_type": server_config.type.value
+                                }
+                            )
+                        except Exception as metric_error:
+                            log.warning(f"Failed to record latency metric: {metric_error}")
+
                     # Mark span as successful
                     if span_ctx and hasattr(span_ctx, 'set_status'):
                         try:
                             span_ctx.set_status(trace.StatusCode.OK)
                             if hasattr(span_ctx, 'end'):
-                                span_ctx.end()
+                                span_ctx.end() # End span on success
                         except Exception as e:
                             log.warning(f"Error updating span status: {e}")
-                    
+
                     log.info(f"Connected to server {server_name} in {connection_time:.2f}ms")
+                    # Use safe printer
                     self._safe_printer(f"[green]Connected to server {server_name} in {connection_time:.2f}ms[/]")
-                    return session
-                    
-                except McpError as e: # Catch MCP client errors
+                    return session # Return the valid session object
+
+                # --- Exception Handling Block ---
+                # (This block catches errors during the connection attempt within the 'try')
+                except McpError as e: # Catch MCP client errors (including our raised validation error)
                     connection_error = e
                 except httpx.RequestError as e: # Network errors for SSE
                     connection_error = e
@@ -2464,57 +2578,68 @@ class ServerManager:
                     # Check if the process terminated unexpectedly
                     if server_config.name in self.processes:
                         proc = self.processes[server_config.name]
-                        if proc.poll() is not None:
+                        if proc and proc.poll() is not None: # Check if proc exists and exited
                             try:
-                                stderr_data = await proc.stderr.read() if proc.stderr else b"stderr not captured"
-                                stderr_output = stderr_data.decode('utf-8', errors='replace')
-                                log.error(f"STDIO server process for '{server_config.name}' exited with code {proc.returncode}. Stderr: {stderr_output}")
-                                safe_console.print(f"[red]STDIO server process for '{server_config.name}' exited with code {proc.returncode}[/]")
+                                stderr_data = await proc.stderr.read() if proc.stderr else b""
+                                stderr_output = stderr_data.decode('utf-8', errors='replace').strip()
+                                log.error(f"STDIO server process for '{server_config.name}' exited with code {proc.returncode}. Stderr: {stderr_output if stderr_output else '<no stderr>'}")
+                                # Use safe printer
+                                self._safe_printer(f"[red]STDIO server process for '{server_config.name}' exited unexpectedly (code {proc.returncode}).[/]")
                             except Exception as err:
-                                log.error(f"Error reading stderr: {err}")
+                                log.error(f"Error reading stderr after process exit for {server_name}: {err}")
                 except OSError as e: # OS level errors (e.g., command not found)
                     connection_error = e
                 # Keep broad exception for truly unexpected connection issues
-                except Exception as e: 
+                except Exception as e:
+                    log.exception(f"Unexpected error during connection attempt for {server_name}") # Log with traceback
                     connection_error = e
 
-                # Shared error handling for caught exceptions
+                # --- Shared Error Handling & Retry Logic ---
+                # (This code runs if any exception occurred in the 'try' block above)
                 retry_count += 1
-                server_config.metrics.error_count += 1
-                server_config.metrics.update_status()
+                server_config.metrics.error_count += 1 # Increment error count for this server
+                server_config.metrics.update_status() # Update status based on new error count
 
                 if span_ctx and hasattr(span_ctx, 'set_status'):
                     try:
                         span_ctx.set_status(trace.StatusCode.ERROR, str(connection_error))
-                        # Don't end yet, we might retry
+                        # Don't end the span yet, we might retry
                     except Exception as e:
                         log.warning(f"Error updating span error status: {e}")
 
-                connection_time = (time.time() - start_time) * 1000
-                    
+                connection_time = (time.time() - start_time) * 1000 # Time for this failed attempt
+
                 if retry_count <= max_retries:
-                    delay = min(1 * (2 ** (retry_count - 1)) + random.random(), 10)
+                    # Calculate delay using exponential backoff with jitter
+                    delay = min(server_config.retry_policy.get("backoff_factor", 0.5) * (2 ** (retry_count - 1)) + random.random(), 10) # Max 10 sec delay
                     log.warning(f"Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}")
+                    # Use safe printer
                     self._safe_printer(f"[yellow]Error connecting to server {server_name} (attempt {retry_count}/{max_retries}): {connection_error}[/]")
                     log.info(f"Retrying in {delay:.2f} seconds...")
+                    # Use safe printer
                     self._safe_printer(f"[cyan]Retrying in {delay:.2f} seconds...[/]")
                     await asyncio.sleep(delay)
                 else:
+                    # Max retries exceeded
                     log.error(f"Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}")
+                    # Use safe printer
                     self._safe_printer(f"[red]Failed to connect to server {server_name} after {max_retries} attempts: {connection_error}[/]")
-                    if span_ctx and hasattr(span_ctx, 'end'): 
+                    if span_ctx and hasattr(span_ctx, 'end'):
                         try:
                             span_ctx.end() # End span after final failure
                         except Exception as e:
-                            log.warning(f"Error ending span: {e}")
-                    return None
+                            log.warning(f"Error ending span after final failure: {e}")
+                    return None # Explicitly return None after final failure
 
-            if span_ctx and hasattr(span_ctx, 'end'): 
+            # End of while loop (should only be reached if retries are exhausted)
+            # If loop finishes unexpectedly (shouldn't happen with return None above), end span.
+            if span_ctx and hasattr(span_ctx, 'end'):
                 try:
-                    span_ctx.end() # End span if loop finishes unexpectedly
+                    span_ctx.end()
                 except Exception as e:
-                    log.warning(f"Error ending span: {e}")
-            return None
+                    log.warning(f"Error ending span outside loop: {e}")
+            return None # Return None if loop completes without success
+
 
     async def register_local_server(self, server_config: ServerConfig):
         """Register a locally started MCP server with zeroconf so other clients can discover it"""
@@ -3160,86 +3285,73 @@ class MCPClient:
         return None
         
     async def print_simple_status(self):
-        """Print a simplified status without using Progress widgets"""
-        safe_console = get_safe_console()
-        
-        # Count connected servers, available tools/resources
-        connected_servers = len(self.server_manager.active_sessions)
-        total_servers = len(self.config.servers)
-        total_tools = len(self.server_manager.tools)
-        total_resources = len(self.server_manager.resources)
-        total_prompts = len(self.server_manager.prompts)
-        
-        # Print basic info table
-        status_table = Table(title="MCP Client Status")
-        status_table.add_column("Item")
-        status_table.add_column("Status", justify="right")
-        
-        status_table.add_row(
-            f"{STATUS_EMOJI['model']} Model",
-            self.current_model
-        )
-        status_table.add_row(
-            f"{STATUS_EMOJI['server']} Servers",
-            f"{connected_servers}/{total_servers} connected"
-        )
-        status_table.add_row(
-            f"{STATUS_EMOJI['tool']} Tools",
-            str(total_tools)
-        )
-        status_table.add_row(
-            f"{STATUS_EMOJI['resource']} Resources",
-            str(total_resources)
-        )
-        status_table.add_row(
-            f"{STATUS_EMOJI['prompt']} Prompts",
-            str(total_prompts)
-        )
-        
-        safe_console.print(status_table)
-        
-        # Show connected server info
-        if connected_servers > 0:
-            self.safe_print("\n[bold]Connected Servers:[/]")
-            for name, server in self.config.servers.items():
-                if name in self.server_manager.active_sessions:
-                    # Get number of tools for this server
-                    server_tools = sum(1 for t in self.server_manager.tools.values() 
-                                if t.server_name == name)
-                    self.safe_print(f"[green]✓[/] {name} ({server.type.value}) - {server_tools} tools")
-        
-        self.safe_print("[green]Ready to process queries![/green]")
+            """Print a simplified status without using Progress widgets"""
+            # Count connected servers, available tools/resources
+            connected_servers = len(self.server_manager.active_sessions)
+            total_servers = len(self.config.servers)
+            total_tools = len(self.server_manager.tools)
+            total_resources = len(self.server_manager.resources)
+            total_prompts = len(self.server_manager.prompts)
+            # Print basic info table
+            status_table = Table(title="MCP Client Status")
+            status_table.add_column("Item")
+            status_table.add_column("Status", justify="right")
+            status_table.add_row(f"{STATUS_EMOJI['model']} Model", self.current_model)
+            status_table.add_row(f"{STATUS_EMOJI['server']} Servers", f"{connected_servers}/{total_servers} connected")
+            status_table.add_row(f"{STATUS_EMOJI['tool']} Tools", str(total_tools))
+            status_table.add_row(f"{STATUS_EMOJI['resource']} Resources", str(total_resources))
+            status_table.add_row(f"{STATUS_EMOJI['prompt']} Prompts", str(total_prompts))
+            self.safe_print(status_table)
+            # Show connected server info
+            if connected_servers > 0:
+                self.safe_print("\n[bold]Connected Servers:[/]")
+                for name, server in self.config.servers.items():
+                    if name in self.server_manager.active_sessions:
+                        # Get number of tools for this server
+                        server_tools = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
+                        self.safe_print(f"[green]✓[/] {name} ({server.type.value}) - {server_tools} tools")
+            self.safe_print("[green]Ready to process queries![/green]")
                 
     async def setup(self, interactive_mode=False):
         """Set up the client, connect to servers, and load capabilities"""
+        # This instance will be passed to widgets requiring an explicit console.
+        safe_console_instance = get_safe_console()
+
         # Ensure API key is set
         if not self.config.api_key:
-            self.safe_print("[bold red]ERROR: Anthropic API key not found[/]")
-            self.safe_print("Please set your API key using one of these methods:")
-            self.safe_print("1. Set the ANTHROPIC_API_KEY environment variable")
-            self.safe_print("2. Run 'python mcp_client.py run --interactive' and then use '/config api-key YOUR_API_KEY'")
-            
+            self.safe_print("[bold red]ERROR: Anthropic API key not found[/]") # Uses self.safe_print
+            self.safe_print("Please set your API key using one of these methods:") # Uses self.safe_print
+            self.safe_print("1. Set the ANTHROPIC_API_KEY environment variable") # Uses self.safe_print
+            self.safe_print("2. Run 'python mcp_client.py run --interactive' and then use '/config api-key YOUR_API_KEY'") # Uses self.safe_print
+
             # Only exit if not in interactive mode
             if not interactive_mode:
                 sys.exit(1)
             else:
-                self.safe_print("[yellow]Running in interactive mode without API key.[/]")
-                self.safe_print("[yellow]Please set your API key using '/config api-key YOUR_API_KEY'[/]")
+                self.safe_print("[yellow]Running in interactive mode without API key.[/]") # Uses self.safe_print
+                self.safe_print("[yellow]Please set your API key using '/config api-key YOUR_API_KEY'[/]") # Uses self.safe_print
                 # Continue setup without API features
                 self.anthropic = None  # Set to None until API key is provided
-                
+
         # Load conversation graph if it exists
         if self.conversation_graph_file.exists():
             try:
-                self.conversation_graph = await ConversationGraph.load(str(self.conversation_graph_file))
-                log.info(f"Loaded conversation graph from {self.conversation_graph_file}")
+                # Use Progress for potentially slow file loading
+                # --- MODIFIED: Pass the console instance variable ---
+                with Status(f"{STATUS_EMOJI['scroll']} Loading conversation graph...",
+                            console=safe_console_instance) as status: # Pass variable
+                # --- END MODIFICATION ---
+                    self.conversation_graph = await ConversationGraph.load(str(self.conversation_graph_file))
+                    log.info(f"Loaded conversation graph from {self.conversation_graph_file}")
+                    status.update(f"{STATUS_EMOJI['success']} Conversation graph loaded")
             except Exception as e:
                 log.warning(f"Could not load conversation graph ({type(e).__name__}: {e}), using new graph.")
+                self.safe_print(f"[yellow]Could not load conversation graph: {e}. Using a new one.[/yellow]") # Uses self.safe_print
                 # Keep the default graph we created in __init__
 
         # Check for and load Claude desktop config if it exists
-        await self.load_claude_desktop_config()
-        
+        await self.load_claude_desktop_config() # Assumes this uses safe logging/printing
+
         # Verify no stdout pollution before connecting to servers
         if os.environ.get("MCP_VERIFY_STDOUT", "1") == "1":
             # Use safe_stdout context manager to prevent the verification itself from polluting
@@ -3247,47 +3359,55 @@ class MCPClient:
                 # Only log this, don't print directly to avoid any risk of stdout pollution
                 log.info("Verifying no stdout pollution before connecting to servers...")
                 verify_no_stdout_pollution()
-        
-        # Discover servers if enabled - use a simple status instead of Progress
+
+        # Discover servers if enabled - Nested Live fix already applied
         if self.config.auto_discover:
-            with Status(f"{STATUS_EMOJI['search']} Discovering MCP servers...", 
-                    spinner="dots", console=get_safe_console()) as status:
-                await self.server_manager.discover_servers()
-                status.update(f"{STATUS_EMOJI['success']} Server discovery complete")
-        
+            self.safe_print(f"{STATUS_EMOJI['search']} Discovering MCP servers...") # Uses self.safe_print
+            try:
+                await self.server_manager.discover_servers() # Uses _run_with_progress internally
+            except Exception as discover_error:
+                # Log the error and inform the user discovery failed
+                log.error("Error during server discovery process", exc_info=True)
+                self.safe_print(f"[red]Error during server discovery: {discover_error}[/red]") # Uses self.safe_print
+
         # Start continuous local discovery if enabled
         if self.config.enable_local_discovery and self.server_manager.registry:
-            await self.start_local_discovery_monitoring()
-        
+            await self.start_local_discovery_monitoring() # Assumes this uses safe logging/printing
+
         # Connect to all enabled servers without using Progress widget
         enabled_servers = [s for s in self.config.servers.values() if s.enabled]
         if enabled_servers:
-            # Don't use _run_with_progress here to avoid potential display nesting
-            self.safe_print(f"[bold blue]Connecting to {len(enabled_servers)} servers...[/]")
-            
+            self.safe_print(f"[bold blue]Connecting to {len(enabled_servers)} servers...[/]") # Uses self.safe_print
+            connection_results = {}
             for name, server_config in self.config.servers.items():
-                if not server_config.enabled:
-                    continue
-                    
+                if not server_config.enabled: continue
+                self.safe_print(f"[cyan]Connecting to {name}...[/]") # Uses self.safe_print
                 try:
-                    self.safe_print(f"[cyan]Connecting to server {name}...[/]")
-                    # Connect and load server
-                    result = await self._connect_and_load_server(name, server_config)
+                    result = await self._connect_and_load_server(name, server_config) # Calls connect_to_server which uses _safe_printer
+                    connection_results[name] = result
                     if result:
-                        self.safe_print(f"[green]Connected to server {name}[/]")
+                        self.safe_print(f"  [green]✓ Connected to {name}[/]") # Uses self.safe_print
                     else:
-                        self.safe_print(f"[yellow]Failed to connect to server {name}[/]")
+                        log.warning(f"Failed to connect and load server: {name}")
+                        self.safe_print(f"  [yellow]✗ Failed to connect to {name}[/]") # Uses self.safe_print
                 except Exception as e:
-                    self.safe_print(f"[red]Error connecting to server {name}: {e}[/]")
-        
+                    log.error(f"Exception connecting to {name}", exc_info=True)
+                    self.safe_print(f"  [red]✗ Error connecting to {name}: {e}[/]") # Uses self.safe_print
+                    connection_results[name] = False
+                    
         # Start server monitoring
-        with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", 
-                spinner="dots", console=get_safe_console()) as status:
-            await self.server_monitor.start_monitoring()
-            status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
-        
-        # Display status without Progress widgets
-        await self.print_simple_status()
+        # This Status widget is fine as it doesn't overlap with Progress calls
+        try:
+            with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...",
+                    spinner="dots", console=safe_console_instance) as status: # Pass variable
+                await self.server_monitor.start_monitoring() # Assumes this uses safe logging
+                status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
+        except Exception as monitor_error:
+            log.error("Failed to start server monitoring", exc_info=True)
+            self.safe_print(f"[red]Error starting server monitoring: {monitor_error}[/red]") # Uses self.safe_print
+
+        # Display status without Progress widgets (uses print_simple_status)
+        await self.print_simple_status() # Assumes print_simple_status uses self.safe_print
         
     async def _connect_and_load_server(self, server_name, server_config):
         """Connect to a server and load its capabilities (for use with _run_with_progress)"""
