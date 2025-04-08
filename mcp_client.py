@@ -106,6 +106,7 @@ Version: 1.0.0
 import asyncio
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -280,6 +281,8 @@ log = logging.getLogger("mcpclient")
 #   - self.safe_print() for class instance methods
 #   - safe_console = get_safe_console() for local variables
 # =============================================================================
+
+
 def get_safe_console():
     """Get the appropriate console based on whether we're using stdio servers.
     
@@ -297,6 +300,17 @@ def get_safe_console():
             for name, server in app.mcp_client.server_manager.config.servers.items():
                 if server.type == ServerType.STDIO and name in app.mcp_client.server_manager.active_sessions:
                     has_stdio_servers = True
+                    
+                    # Add debug info to help identify unsafe console usage
+                    caller_frame = inspect.currentframe().f_back
+                    if caller_frame:
+                        caller_info = inspect.getframeinfo(caller_frame)
+                        # Check if this is being called by something other than safe_print
+                        if not (caller_info.function == "safe_print" or "safe_print" in caller_info.code_context[0]):
+                            log.warning(f"Potential unsafe console usage detected at: {caller_info.filename}:{caller_info.lineno}")
+                            log.warning(f"Always use MCPClient.safe_print() or get_safe_console().print() to prevent stdio corruption")
+                            log.warning(f"Stack: {caller_info.function} - {caller_info.code_context[0].strip()}")
+                    
                     break
     except (NameError, AttributeError):
         pass
@@ -1846,49 +1860,50 @@ class ServerManager:
         # Show discoveries to user with clear categorization
         total_discovered = len(discovered_local) + len(discovered_remote) + len(discovered_mdns)
         if total_discovered > 0:
-            console.print(f"\n[bold green]Discovered {total_discovered} potential MCP servers:[/]")
+            safe_console = get_safe_console()
+            safe_console.print(f"\n[bold green]Discovered {total_discovered} potential MCP servers:[/]")
             
             if discovered_local:
-                console.print("\n[bold blue]Local File System:[/]")
+                safe_console.print("\n[bold blue]Local File System:[/]")
                 for i, (name, path, server_type) in enumerate(discovered_local, 1):
-                    console.print(f"{i}. [bold]{name}[/] ({server_type}) - {path}")
+                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {path}")
             
             if discovered_remote:
-                console.print("\n[bold magenta]Remote Registry:[/]")
+                safe_console.print("\n[bold magenta]Remote Registry:[/]")
                 for i, (name, url, server_type, version, categories, rating) in enumerate(discovered_remote, 1):
                     version_str = f"v{version}" if version else "unknown version"
                     categories_str = ", ".join(categories) if categories else "no categories"
-                    console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - Rating: {rating:.1f}/5.0 - {categories_str}")
+                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - Rating: {rating:.1f}/5.0 - {categories_str}")
             
             if discovered_mdns:
-                console.print("\n[bold cyan]Local Network (mDNS):[/]")
+                safe_console.print("\n[bold cyan]Local Network (mDNS):[/]")
                 for i, (name, url, server_type, version, categories, description) in enumerate(discovered_mdns, 1):
                     version_str = f"v{version}" if version else "unknown version"
                     categories_str = ", ".join(categories) if categories else "no categories"
                     desc_str = f" - {description}" if description else ""
-                    console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - {categories_str}{desc_str}")
+                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - {categories_str}{desc_str}")
             
             # Ask user which ones to add
-            if Confirm.ask("\nAdd discovered servers to configuration?"):
+            if Confirm.ask("\nAdd discovered servers to configuration?", console=safe_console):
                 # Create selection interface
                 selections = []
                 
                 if discovered_local:
-                    console.print("\n[bold blue]Local File System Servers:[/]")
+                    safe_console.print("\n[bold blue]Local File System Servers:[/]")
                     for i, (name, path, server_type) in enumerate(discovered_local, 1):
-                        if Confirm.ask(f"Add {name} ({path})?"):
+                        if Confirm.ask(f"Add {name} ({path})?", console=safe_console):
                             selections.append(("local", i-1))
                 
                 if discovered_remote:
-                    console.print("\n[bold magenta]Remote Registry Servers:[/]")
+                    safe_console.print("\n[bold magenta]Remote Registry Servers:[/]")
                     for i, (name, url, server_type, version, categories, rating) in enumerate(discovered_remote, 1):
-                        if Confirm.ask(f"Add {name} ({url})?"):
+                        if Confirm.ask(f"Add {name} ({url})?", console=safe_console):
                             selections.append(("remote", i-1))
                 
                 if discovered_mdns:
-                    console.print("\n[bold cyan]Local Network Servers:[/]")
+                    safe_console.print("\n[bold cyan]Local Network Servers:[/]")
                     for i, (name, url, server_type, version, categories, description) in enumerate(discovered_mdns, 1):
-                        if Confirm.ask(f"Add {name} ({url})?"):
+                        if Confirm.ask(f"Add {name} ({url})?", console=safe_console):
                             selections.append(("mdns", i-1))
                 
                 # Process selections
@@ -1933,9 +1948,10 @@ class ServerManager:
                         )
                 
                 self.config.save()
-                console.print("[green]Selected servers added to configuration[/]")
+                safe_console.print("[green]Selected servers added to configuration[/]")
         else:
-            console.print("[yellow]No new servers discovered.[/]")
+            safe_console = get_safe_console()
+            safe_console.print("[yellow]No new servers discovered.[/]")
 
     async def discover_servers(self):
         """Auto-discover MCP servers in configured paths and from registry"""
@@ -3729,13 +3745,13 @@ class MCPClient:
         """Handle configuration commands"""
         if not args:
             # Show current config
-            console.print("\n[bold]Current Configuration:[/]")
-            console.print(f"API Key: {'*' * 8 + self.config.api_key[-4:] if self.config.api_key else 'Not set'}")
-            console.print(f"Default Model: {self.config.default_model}")
-            console.print(f"Max Tokens: {self.config.default_max_tokens}")
-            console.print(f"History Size: {self.config.history_size}")
-            console.print(f"Auto-Discovery: {'Enabled' if self.config.auto_discover else 'Disabled'}")
-            console.print(f"Discovery Paths: {', '.join(self.config.discovery_paths)}")
+            self.safe_print("\n[bold]Current Configuration:[/]")
+            self.safe_print(f"API Key: {'*' * 8 + self.config.api_key[-4:] if self.config.api_key else 'Not set'}")
+            self.safe_print(f"Default Model: {self.config.default_model}")
+            self.safe_print(f"Max Tokens: {self.config.default_max_tokens}")
+            self.safe_print(f"History Size: {self.config.history_size}")
+            self.safe_print(f"Auto-Discovery: {'Enabled' if self.config.auto_discover else 'Disabled'}")
+            self.safe_print(f"Discovery Paths: {', '.join(self.config.discovery_paths)}")
             return
         
         parts = args.split(maxsplit=1)
@@ -3869,7 +3885,6 @@ class MCPClient:
     
     async def list_servers(self):
         """List all configured servers"""
-        safe_console = get_safe_console()
         
         if not self.config.servers:
             self.safe_print(f"{STATUS_EMOJI['warning']} [yellow]No servers configured[/]")
@@ -4103,7 +4118,6 @@ class MCPClient:
     
     async def server_status(self, name):
         """Show detailed status for a server"""
-        safe_console = get_safe_console()
         if not name:
             self.safe_print("[yellow]Usage: /servers status SERVER_NAME[/]")
             return
@@ -4280,7 +4294,7 @@ class MCPClient:
     async def cmd_history(self, args):
         """View conversation history"""
         if not self.history.entries:
-            console.print("[yellow]No conversation history[/]")
+            self.safe_print("[yellow]No conversation history[/]")
             return
             
         # Parse args for count limit
@@ -4301,7 +4315,7 @@ class MCPClient:
             BarColumn(bar_width=40),
             TextColumn("[cyan]{task.completed}/{task.total}"),
             TextColumn("[cyan]{task.percentage:>3.0f}%"),
-            console=console,
+            console=get_safe_console(),
             transient=True
         ) as progress:
             task = progress.add_task(f"{STATUS_EMOJI['history']} Loading conversation history...", total=entries_to_show)
@@ -4316,25 +4330,25 @@ class MCPClient:
             
             progress.update(task, description=f"{STATUS_EMOJI['success']} History loaded")
         
-        console.print(f"\n[bold]Recent Conversations (last {entries_to_show}):[/]")
+        self.safe_print(f"\n[bold]Recent Conversations (last {entries_to_show}):[/]")
         
         for i, entry in enumerate(recent_entries, 1):
-            console.print(f"\n[bold cyan]{i}. {entry.timestamp}[/] - Model: {entry.model}")
-            console.print(f"Servers: {', '.join(entry.server_names) if entry.server_names else 'None'}")
-            console.print(f"Tools: {', '.join(entry.tools_used) if entry.tools_used else 'None'}")
-            console.print(f"[bold blue]Q:[/] {entry.query[:100]}..." if len(entry.query) > 100 else f"[bold blue]Q:[/] {entry.query}")
-            console.print(f"[bold green]A:[/] {entry.response[:100]}..." if len(entry.response) > 100 else f"[bold green]A:[/] {entry.response}")
+            self.safe_print(f"\n[bold cyan]{i}. {entry.timestamp}[/] - Model: {entry.model}")
+            self.safe_print(f"Servers: {', '.join(entry.server_names) if entry.server_names else 'None'}")
+            self.safe_print(f"Tools: {', '.join(entry.tools_used) if entry.tools_used else 'None'}")
+            self.safe_print(f"[bold blue]Q:[/] {entry.query[:100]}..." if len(entry.query) > 100 else f"[bold blue]Q:[/] {entry.query}")
+            self.safe_print(f"[bold green]A:[/] {entry.response[:100]}..." if len(entry.response) > 100 else f"[bold green]A:[/] {entry.response}")
     
     async def cmd_model(self, args):
         """Change the current model"""
         if not args:
-            console.print(f"Current model: [cyan]{self.current_model}[/]")
-            console.print("Usage: /model MODEL_NAME")
-            console.print("Example models: claude-3-7-sonnet-20250219, claude-3-5-sonnet-latest")
+            self.safe_print(f"Current model: [cyan]{self.current_model}[/]")
+            self.safe_print("Usage: /model MODEL_NAME")
+            self.safe_print("Example models: claude-3-7-sonnet-20250219, claude-3-5-sonnet-latest")
             return
             
         self.current_model = args
-        console.print(f"[green]Model changed to: {args}[/]")
+        self.safe_print(f"[green]Model changed to: {args}[/]")
     
     async def cmd_clear(self, args):
         """Clear the conversation context"""
@@ -5301,19 +5315,19 @@ class MCPClient:
     async def cmd_import(self, args):
         """Import a conversation from a file"""
         if not args:
-            console.print("[yellow]Usage: /import FILEPATH[/]")
+            self.safe_print("[yellow]Usage: /import FILEPATH[/]")
             return
         
         file_path = args.strip()
         
-        with Status(f"{STATUS_EMOJI['scroll']} Importing conversation from {file_path}...", spinner="dots") as status:
+        with Status(f"{STATUS_EMOJI['scroll']} Importing conversation from {file_path}...", spinner="dots", console=get_safe_console()) as status:
             success = await self.import_conversation(file_path)
             if success:
                 status.update(f"{STATUS_EMOJI['success']} Conversation imported successfully")
-                console.print(f"[green]Conversation imported and set as current conversation[/]")
+                self.safe_print(f"[green]Conversation imported and set as current conversation[/]")
             else:
                 status.update(f"{STATUS_EMOJI['failure']} Import failed")
-                console.print(f"[red]Failed to import conversation from {file_path}[/]")
+                self.safe_print(f"[red]Failed to import conversation from {file_path}[/]")
 
 @app.command()
 def export(
@@ -5326,6 +5340,7 @@ def export(
 async def export_async(conversation_id: str = None, output: str = None):
     """Async implementation of the export command"""
     client = MCPClient()
+    safe_console = get_safe_console()
     try:
         # Get current conversation if not specified
         if not conversation_id:
@@ -5337,9 +5352,9 @@ async def export_async(conversation_id: str = None, output: str = None):
             
         success = await client.export_conversation(conversation_id, output)
         if success:
-            console.print(f"[green]Conversation exported to: {output}[/]")
+            safe_console.print(f"[green]Conversation exported to: {output}[/]")
         else:
-            console.print(f"[red]Failed to export conversation.[/]")
+            safe_console.print(f"[red]Failed to export conversation.[/]")
     finally:
         await client.close()
 
@@ -5353,12 +5368,13 @@ def import_conv(
 async def import_async(file_path: str):
     """Async implementation of the import command"""
     client = MCPClient()
+    safe_console = get_safe_console()
     try:
         success = await client.import_conversation(file_path)
         if success:
-            console.print(f"[green]Conversation imported successfully from: {file_path}[/]")
+            safe_console.print(f"[green]Conversation imported successfully from: {file_path}[/]")
         else:
-            console.print(f"[red]Failed to import conversation.[/]")
+            safe_console.print(f"[red]Failed to import conversation.[/]")
     finally:
         await client.close()
 
@@ -5412,11 +5428,11 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             await client.setup(interactive_mode=interactive)
         except Exception as setup_error:
             if verbose_logging:
-                console.print(f"[bold red]Error during setup:[/] {str(setup_error)}")
+                safe_console.print(f"[bold red]Error during setup:[/] {str(setup_error)}")
                 import traceback
-                console.print(traceback.format_exc())
+                safe_console.print(traceback.format_exc())
             else:
-                console.print(f"[bold red]Error during setup:[/] {str(setup_error)}")
+                safe_console.print(f"[bold red]Error during setup:[/] {str(setup_error)}")
             # Continue anyway for interactive mode
             if not interactive:
                 raise  # Re-raise for non-interactive mode
@@ -5427,13 +5443,13 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             for s in server:
                 if s in client.config.servers:
                     try:
-                        with console.status(f"[cyan]Connecting to server {s}...[/]"):
+                        with Status(f"[cyan]Connecting to server {s}...[/]", console=safe_console):
                             await client.connect_server(s)
                     except Exception as e:
                         connection_errors.append((s, str(e)))
-                        console.print(f"[red]Error connecting to server {s}: {e}[/]")
+                        safe_console.print(f"[red]Error connecting to server {s}: {e}[/]")
                 else:
-                    console.print(f"[yellow]Server not found: {s}[/]")
+                    safe_console.print(f"[yellow]Server not found: {s}[/]")
             
             if connection_errors and not interactive and not query:
                 # Only exit for errors in non-interactive mode with no query
@@ -5453,17 +5469,17 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
         if query:
             try:
                 result = await client.process_query(query, model=model)
-                console.print()
-                console.print(Panel.fit(
+                safe_console.print()
+                safe_console.print(Panel.fit(
                     Markdown(result),
                     title=f"Claude ({client.current_model})",
                     border_style="green"
                 ))
             except Exception as query_error:
-                console.print(f"[bold red]Error processing query:[/] {str(query_error)}")
+                safe_console.print(f"[bold red]Error processing query:[/] {str(query_error)}")
                 if verbose_logging:
                     import traceback
-                    console.print(traceback.format_exc())
+                    safe_console.print(traceback.format_exc())
         
         # Run interactive loop if requested or if no query
         elif interactive or not query:
@@ -5490,16 +5506,16 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             await client.interactive_loop()
             
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted[/]")
+        safe_console.print("\n[yellow]Interrupted[/]")
         # Ensure cleanup happens if main loop interrupted
         if 'client' in locals() and client: 
              await client.close()
     
     except Exception as e:
-        console.print(f"[bold red]Error:[/] {str(e)}")
+        safe_console.print(f"[bold red]Error:[/] {str(e)}")
         if verbose_logging:
             import traceback
-            console.print(traceback.format_exc())
+            safe_console.print(traceback.format_exc())
         
         # For unhandled exceptions in non-interactive mode, still try to clean up
         if 'client' in locals() and client and hasattr(client, 'server_manager'):
@@ -5522,11 +5538,12 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 async def servers_async(search, list_all, json_output):
     """Server management async function"""
     client = MCPClient()
+    safe_console = get_safe_console()
     
     try:
         if search:
             # Discover servers
-            with console.status("[cyan]Searching for servers...[/]"):
+            with Status("[cyan]Searching for servers...[/]", console=safe_console):
                 await client.server_manager.discover_servers()
         
         if list_all or not search:
@@ -5543,7 +5560,7 @@ async def servers_async(search, list_all, json_output):
                         "description": server.description,
                         "categories": server.categories
                     }
-                console.print(json.dumps(server_data, indent=2))
+                safe_console.print(json.dumps(server_data, indent=2))
             else:
                 # Normal output
                 await client.list_servers()
