@@ -9,7 +9,6 @@
 #     "httpx>=0.25.0",
 #     "pyyaml>=6.0.1",
 #     "python-dotenv>=1.0.0",
-#     "orjson>=3.9.0",
 #     "colorama>=0.4.6",
 #     "psutil>=5.9.5",
 #     "zeroconf>=0.39.0",
@@ -110,6 +109,7 @@ import functools
 import hashlib
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import platform
@@ -142,7 +142,6 @@ import diskcache
 import httpx
 
 # Third-party imports
-import orjson as json
 import psutil
 
 # Token counting
@@ -212,7 +211,7 @@ from rich.tree import Tree
 from typing_extensions import Annotated
 from zeroconf import NonUniqueNameException, ServiceInfo
 
-USE_VERBOSE_SESSION_LOGGING = True # Set to True for debugging, False for normal operation
+USE_VERBOSE_SESSION_LOGGING = False # Set to True for debugging, False for normal operation
 
 # Set up Typer app
 app = typer.Typer(help="🔌 Ultimate MCP Client for Anthropic API")
@@ -816,7 +815,7 @@ class ServerConfig:
     version: Optional[ServerVersion] = None
     rating: float = 5.0  # 1-5 star rating
     retry_count: int = 3  # Number of retries on failure
-    timeout: float = 30.0  # Timeout in seconds
+    timeout: float = 90.0  # Timeout in seconds
     metrics: ServerMetrics = field(default_factory=ServerMetrics)
     registry_url: Optional[str] = None  # URL of registry where found
     last_updated: datetime = field(default_factory=datetime.now)
@@ -1211,18 +1210,9 @@ class ToolCache:
     
     def generate_key(self, tool_name, params):
         """Generate a cache key for the tool and parameters"""
-        # Sort the dictionary recursively to get consistent ordering
-        def sort_dict_recursively(d):
-            if isinstance(d, dict):
-                return {k: sort_dict_recursively(d[k]) for k in sorted(d.keys())}
-            elif isinstance(d, list):
-                return [sort_dict_recursively(i) for i in d]
-            else:
-                return d
-        # Apply sorting and then serialize with orjson
-        sorted_params = sort_dict_recursively(params)
-        params_str = json.dumps(sorted_params).decode('utf-8')
-        params_hash = hashlib.md5(params_str.encode()).hexdigest()
+        # Hash the parameters to create a unique key
+        params_str = json.dumps(params, sort_keys=True)
+        params_hash = hashlib.sha256(params_str.encode()).hexdigest()
         return f"{tool_name}:{params_hash}"
     
     def get(self, tool_name, params):
@@ -1400,7 +1390,7 @@ class ConversationGraph:
         
         try:
             async with aiofiles.open(file_path, 'w') as f:
-                await f.write(json.dumps(data).decode('utf-8'))
+                await f.write(json.dumps(data, indent=2))
         except IOError as e:
              log.error(f"Could not write conversation graph to {file_path}: {e}")
         except TypeError as e: # Handle potential issues with non-serializable data
@@ -1863,7 +1853,7 @@ class History:
                 })
             
             with open(HISTORY_FILE, 'w') as f:
-                f.write(json.dumps(history_data).decode('utf-8'))
+                f.write(json.dumps(history_data, indent=2))
                 
         except IOError as e:
             log.error(f"Error writing history file {HISTORY_FILE}: {e}")
@@ -1930,7 +1920,7 @@ class History:
                 })
             
             async with aiofiles.open(HISTORY_FILE, 'w') as f:
-                await f.write(json.dumps(history_data).decode('utf-8'))
+                await f.write(json.dumps(history_data, indent=2))
                 
         except IOError as e:
             log.error(f"Error writing history file {HISTORY_FILE}: {e}")
@@ -2132,8 +2122,8 @@ class RobustStdioSession(ClientSession):
             return
         notification = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
         try:
-            # Use orjson directly for dumps (returns bytes)
-            notification_bytes = json.dumps(notification) + b'\n'
+            notification_str = json.dumps(notification) + '\n'
+            notification_bytes = notification_str.encode('utf-8')
             log.info(f"[{self._server_name}] Sending initialized notification...")
             if self._stdin is None or self._stdin.is_closing(): raise ConnectionAbortedError("Stdin closed")
             self._stdin.write(notification_bytes)
@@ -2143,7 +2133,6 @@ class RobustStdioSession(ClientSession):
             log.error(f"[{self._server_name}] Conn error sending initialized: {e}")
             await self._close_internal_state(e)
         except Exception as e: log.error(f"[{self._server_name}] Error sending initialized: {e}", exc_info=True)
-
 
     # --- Renamed Wrapper for Combined Reader/Processor ---
     async def _run_reader_processor_wrapper(self):
@@ -2278,10 +2267,6 @@ class RobustStdioSession(ClientSession):
             log.error(f"[{self._server_name}] Unhandled error in reader/processor loop: {loop_err}", exc_info=True)
             raise
 
-
-    # --- REMOVED _get_next_message() ---
-    # --- REMOVED _process_incoming_messages() ---
-
     async def _send_request(self, method: str, params: Dict[str, Any], response_timeout: float) -> Any:
         """
         Sends a JSON-RPC request and waits for the response Future to be set
@@ -2305,7 +2290,8 @@ class RobustStdioSession(ClientSession):
 
         # --- Sending logic (unchanged) ---
         try:
-            request_bytes = json.dumps(request) + b'\n'
+            request_str = json.dumps(request) + '\n'
+            request_bytes = request_str.encode('utf-8')
             log.debug(f"[{self._server_name}] SEND: ID {request_id} ({method}): {request_bytes.decode('utf-8', errors='replace')[:100]}...")
             if self._stdin is None or self._stdin.is_closing(): raise ConnectionAbortedError("Stdin closed")
             if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{self._server_name}] RAW >>> {repr(request_bytes)}")
@@ -2986,7 +2972,7 @@ class ServerManager:
         backoff_factor = server_config.retry_policy.get("backoff_factor", 0.5)
 
         # Define buffer limit
-        BUFFER_LIMIT = 2**18 # 256 KiB
+        BUFFER_LIMIT = 2**22     # 4 MiB
 
         # Use safe_stdout context manager to protect client's output
         with safe_stdout():
@@ -3916,52 +3902,55 @@ class MCPClient:
     @retry_with_circuit_breaker
     @with_tool_error_handling
     async def execute_tool(self, server_name, tool_name, tool_args, request_timeout=None):
-        """Execute a tool with retry and circuit breaker logic
-        
+        """Execute a tool with retry and circuit breaker logic.
+        Passes a longer default timeout for tool execution compared to standard config timeout.
+
         Args:
             server_name: Name of the server to execute the tool on
             tool_name: Name of the tool to execute
             tool_args: Arguments for the tool
-            request_timeout: Optional timeout override in seconds
-            
+            request_timeout: Optional timeout override in seconds (used by retry logic)
+
         Returns:
             The tool execution result
         """
         session = self.server_manager.active_sessions.get(server_name)
         if not session:
             raise RuntimeError(f"Server {server_name} not connected")
-            
-        # Get the tool from the server_manager
+
         tool = self.server_manager.tools.get(tool_name)
         if not tool:
             raise RuntimeError(f"Tool {tool_name} not found")
-            
-        # Set timeout if provided
-        original_timeout = None
-        if request_timeout and hasattr(session, 'timeout'):
-            # Some session types might have configurable timeouts
-            original_timeout = session.timeout
-            session.timeout = request_timeout
-            
+
+        # Use the timeout provided by the retry decorator if available, otherwise use a longer default for tool calls (e.g., 120s),
+        # falling back to server config timeout if others are None.
+        server_config = self.config.servers.get(server_name)
+        base_timeout = server_config.timeout if server_config else 30.0
+        # Give potentially long-running tools more time by default
+        tool_execution_default_timeout = 120.0
+        # Prioritize explicit timeout from retry logic, then tool default, then server default
+        final_timeout = request_timeout if request_timeout is not None else tool_execution_default_timeout
+        log.debug(f"Using timeout {final_timeout:.1f}s for tool call {tool_name} (RetryTO: {request_timeout}, DefaultToolTO: {tool_execution_default_timeout}, ServerTO: {base_timeout})")
+
         try:
-            # Use the tool_execution_context context manager for metrics and tracing
-            # Wrap with safe_stdout to protect against stdout pollution during tool execution
             with safe_stdout():
                 async with self.tool_execution_context(tool_name, tool_args, server_name):
-                    # Call the tool - this is unchanged from the original implementation
-                    result = await session.call_tool(tool.original_tool.name, tool_args)
-                    
-                    # Check dependencies - unchanged from original implementation
+                    # Pass the calculated final_timeout to the underlying session call
+                    result = await session.call_tool(
+                        tool.original_tool.name,
+                        tool_args,
+                        response_timeout=final_timeout # Pass timeout here
+                    )
+
+                    # Dependency check (unchanged)
                     if self.tool_cache:
                         dependencies = self.tool_cache.dependency_graph.get(tool_name, set())
                         if dependencies:
                             log.debug(f"Tool {tool_name} has dependencies: {dependencies}")
-                    
+
                     return result
         finally:
-            # Restore original timeout if it was changed - unchanged from original implementation
-            if original_timeout is not None and hasattr(session, 'timeout'):
-                session.timeout = original_timeout
+            pass
 
     def completer(self, text, state):
         """Tab completion for commands"""
@@ -4430,7 +4419,65 @@ class MCPClient:
             # Start with user message
             current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
             user_message: MessageParam = {"role": "user", "content": query}
-            messages: List[MessageParam] = current_messages + [user_message]
+            # Combine initial messages (consider putting user_message at the end after filtering if needed)
+            combined_messages: List[MessageParam] = current_messages + [user_message]
+
+            # --- NEW: Filter out client-side tool execution parse failures ---
+            messages_to_send: List[MessageParam] = []
+            i = 0
+            client_error_signature = "Client failed to parse JSON input" # More general check
+            skipped_indices = set() # To track indices of messages to skip
+
+            log.debug(f"Filtering history ({len(combined_messages)} messages) for known client errors...")
+
+            # First pass: identify indices of faulty interactions to skip
+            assistant_tool_uses_to_check: Dict[int, Set[str]] = {} # index -> set of tool_use_ids
+
+            for idx, msg in enumerate(combined_messages):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        tool_use_ids = {
+                            block.get("id") for block in content
+                            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
+                        }
+                        if tool_use_ids:
+                            assistant_tool_uses_to_check[idx] = tool_use_ids
+
+                elif msg.get("role") == "user":
+                    # Check if this user message corresponds to a preceding assistant tool use
+                    prev_idx = idx - 1
+                    if prev_idx in assistant_tool_uses_to_check:
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            corresponding_ids = assistant_tool_uses_to_check[prev_idx]
+                            found_faulty_result = False
+                            for block in content:
+                                if (isinstance(block, dict) and
+                                    block.get("type") == "tool_result" and
+                                    block.get("tool_use_id") in corresponding_ids):
+                                    result_content = block.get("content")
+                                    # Check if the content contains our specific client error signature
+                                    if isinstance(result_content, str) and client_error_signature in result_content:
+                                        found_faulty_result = True
+                                        log.warning(f"Found faulty client tool result for ID {block.get('tool_use_id')} at history index {idx}. Marking for filtering.")
+                                        break # Found one faulty result for this user message turn
+
+                            if found_faulty_result:
+                                # Mark both the assistant request and the user result for skipping
+                                skipped_indices.add(prev_idx)
+                                skipped_indices.add(idx)
+
+            # Second pass: build the filtered list
+            for idx, msg in enumerate(combined_messages):
+                if idx not in skipped_indices:
+                    messages_to_send.append(msg)
+                else:
+                    log.debug(f"Skipping message at index {idx} during API call preparation.")
+
+            # Now use 'messages_to_send' for the API call
+            messages = messages_to_send # Replace the original list
+            log.debug(f"Proceeding with {len(messages)} filtered messages for API call.")
 
         # --- OpenTelemetry Span Handling (Unchanged) ---
         span = None
@@ -4475,7 +4522,6 @@ class MCPClient:
                 if not available_tools and is_first_turn:
                     log.info("No tools available from connected servers. Proceeding LLM-only.")
 
-                # --- Optional Debug Logging Block (Corrected & Safer) ---
                 use_debug_logging = log.isEnabledFor(logging.DEBUG)
                 if use_debug_logging:
                     log.debug(f"--- Preparing Anthropic API Call ---")
@@ -4483,7 +4529,7 @@ class MCPClient:
                     log.debug(f"Messages ({len(messages)}):")
                     for i, msg in enumerate(messages):
                         try:
-                            content_repr = json.dumps(msg.get('content').decode('utf-8'))
+                            content_repr = json.dumps(msg.get('content'), ensure_ascii=False, indent=2)
                             log.debug(f"  [{i}] Role: {msg.get('role')} Content: {content_repr[:150]}{'...' if len(content_repr) > 150 else ''}")
                         except Exception: log.debug(f"  [{i}] Role: {msg.get('role')} Content: (Could not dump)") # Handle non-serializable content
 
@@ -4497,127 +4543,145 @@ class MCPClient:
                          ]
                          if tools_to_log_in_detail:
                              log.debug("--- Detailed Schema for Selected Tools ---")
-                             log.debug(json.dumps(tools_to_log_in_detail).decode('utf-8'))
+                             log.debug(json.dumps(tools_to_log_in_detail, indent=2))
                              log.debug("--- End Detailed Schema ---")
-                         # Optionally log the full list only for intense debugging
-                         # log.debug(f"Full 'tools' list:\n{std_json.dumps(available_tools).decode('utf-8')}")
                     except Exception as json_err:
                         log.error(f"Could not serialize tools for logging: {json_err}")
                         log.debug(f"Tools raw list (repr): {repr(available_tools)}")
                     log.debug(f"--- End API Call Preparation ---")
-                # --- End Debug Logging Block ---
 
                 # Make the API call
-                async with self.anthropic.messages.stream(
-                    model=model,
-                    max_tokens=max_tokens,
-                    messages=messages,
-                    tools=available_tools if available_tools else None,
-                    temperature=self.config.temperature,
-                ) as stream:
-                    async for event in stream:
-                        event_type = event.type
+                try:
+                    # Add a generous timeout for the entire stream processing
+                    async with asyncio.timeout(300): # 5 minutes timeout for the whole stream
+                        async with self.anthropic.messages.stream(
+                            model=model,
+                            max_tokens=max_tokens,
+                            messages=messages,
+                            tools=available_tools if available_tools else None,
+                            temperature=self.config.temperature,
+                        ) as stream:
+                            async for event in stream:
+                                event_type = event.type
 
-                        if use_debug_logging:
-                            log.debug(f"--- Stream Event Received --- Type: {event_type}")
-                            if event_type == "message_delta":
-                                 log.debug(f"  Delta Content: {repr(event.delta)}") # Safe: No '.type' access needed
-                            elif hasattr(event, 'delta') and event.delta:
-                                 delta_type_str = getattr(event.delta, 'type', 'N/A') # Safely get type if exists
-                                 log.debug(f"  Delta: type={delta_type_str}, content={repr(event.delta)}")
-                                 if delta_type_str == "input_json_delta":
-                                      log.debug(f"  >>>> Received input_json_delta: partial_json='{event.delta.partial_json}'")
-                            elif hasattr(event, 'content_block') and event.content_block:
-                                 log.debug(f"  Content Block: type={event.content_block.type}, name={getattr(event.content_block, 'name', None)}, input={repr(getattr(event.content_block, 'input', None))}")
-                                 if event_type == "content_block_start" and event.content_block.type == "tool_use":
-                                     log.debug(f"  >>>> Initial 'input' at content_block_start: {repr(event.content_block.input)}")
-                            elif hasattr(event, 'message'):
-                                 log.debug(f"  Message: {repr(event.message)}")
-                            else:
-                                 log.debug(f"  Event Details: {repr(event)}")
+                                if use_debug_logging:
+                                    log.debug(f"--- Stream Event Received --- Type: {event_type}")
+                                    if event_type == "message_delta":
+                                        log.debug(f"  Delta Content: {repr(event.delta)}") # Safe: No '.type' access needed
+                                    elif hasattr(event, 'delta') and event.delta:
+                                        delta_type_str = getattr(event.delta, 'type', 'N/A') # Safely get type if exists
+                                        log.debug(f"  Delta: type={delta_type_str}, content={repr(event.delta)}")
+                                        if delta_type_str == "input_json_delta":
+                                            log.debug(f"  >>>> Received input_json_delta: partial_json='{event.delta.partial_json}'")
+                                    elif hasattr(event, 'content_block') and event.content_block:
+                                        log.debug(f"  Content Block: type={event.content_block.type}, name={getattr(event.content_block, 'name', None)}, input={repr(getattr(event.content_block, 'input', None))}")
+                                        if event_type == "content_block_start" and event.content_block.type == "tool_use":
+                                            log.debug(f"  >>>> Initial 'input' at content_block_start: {repr(event.content_block.input)}")
+                                    elif hasattr(event, 'message'):
+                                        log.debug(f"  Message: {repr(event.message)}")
+                                    else:
+                                        log.debug(f"  Event Details: {repr(event)}")
 
-                        # --- Process stream events with state tracking & input accumulation ---
-                        if event_type == "message_start":
-                            current_assistant_content = [] # Reset content for this assistant message
+                                # --- Process stream events with state tracking & input accumulation ---
+                                if event_type == "message_start":
+                                    current_assistant_content = [] # Reset content for this assistant message
 
-                        elif event_type == "content_block_start":
-                            block_type = event.content_block.type
-                            if block_type == "text":
-                                current_text_block = {"type": "text", "text": ""}
-                            elif block_type == "tool_use":
-                                current_tool_use_block = {
-                                    "type": "tool_use",
-                                    "id": event.content_block.id,
-                                    "name": event.content_block.name,
-                                    "input": {} # Initialize input
-                                }
-                                current_tool_input_json_accumulator = "" # Reset accumulator
+                                elif event_type == "content_block_start":
+                                    block_type = event.content_block.type
+                                    if block_type == "text":
+                                        current_text_block = {"type": "text", "text": ""}
+                                    elif block_type == "tool_use":
+                                        current_tool_use_block = {
+                                            "type": "tool_use",
+                                            "id": event.content_block.id,
+                                            "name": event.content_block.name,
+                                            "input": {} # Initialize input
+                                        }
+                                        current_tool_input_json_accumulator = "" # Reset accumulator
 
-                        elif event_type == "content_block_delta":
-                            delta = event.delta
-                            if hasattr(delta, 'type'): # Check if delta has a type
-                                if delta.type == "text_delta":
-                                    if current_text_block is not None: # Ensure we are tracking a text block
-                                        text_chunk = delta.text
-                                        current_text_block["text"] += text_chunk
-                                        yield text_chunk # Yield for live display
-                                elif delta.type == "input_json_delta":
-                                    if current_tool_use_block is not None: # Ensure we are tracking a tool block
-                                        current_tool_input_json_accumulator += delta.partial_json
+                                elif event_type == "content_block_delta":
+                                    delta = event.delta
+                                    if hasattr(delta, 'type'): # Check if delta has a type
+                                        if delta.type == "text_delta":
+                                            if current_text_block is not None: # Ensure we are tracking a text block
+                                                text_chunk = delta.text
+                                                current_text_block["text"] += text_chunk
+                                                yield text_chunk # Yield for live display
+                                        elif delta.type == "input_json_delta":
+                                            if current_tool_use_block is not None: # Ensure we are tracking a tool block
+                                                current_tool_input_json_accumulator += delta.partial_json
 
-                        elif event_type == "content_block_stop":
-                            # Finalize the completed block
-                            if current_text_block is not None:
-                                # Finalize and store the text block
-                                current_assistant_content.append(current_text_block)
-                                final_response_text += current_text_block["text"]
-                                current_text_block = None # Reset state
-                            elif current_tool_use_block is not None:
-                                # Finalize and store the tool use block
-                                parsed_input = {} # Default to empty dict
-                                # Only attempt to parse if the accumulator is not empty
-                                if current_tool_input_json_accumulator:
-                                    try:
-                                        # Parse accumulated JSON
-                                        parsed_input = json.loads(current_tool_input_json_accumulator)
-                                        log.debug(f"Final parsed input for tool {current_tool_use_block['name']}: {parsed_input}")
-                                    except json.JSONDecodeError as e:
-                                        log.error(f"Failed to parse accumulated JSON for tool {current_tool_use_block['name']}: {e}. JSON='{current_tool_input_json_accumulator}'")
-                                        # Store error indication instead of empty dict or partial json
-                                        parsed_input = {"_tool_input_parse_error": f"Failed to parse JSON: {e}", "_raw_json": current_tool_input_json_accumulator}
-                                else:
-                                    # If accumulator is empty, it means no input args were streamed,
-                                    # which is correct for tools with no input schema. Input is {}.
-                                    log.debug(f"Tool {current_tool_use_block['name']} received empty input stream (expected for no-arg tools). Final input: {{}}")
-                                    parsed_input = {} # Explicitly set to empty dict
+                                elif event_type == "content_block_stop":
+                                    # Finalize the completed block
+                                    if current_text_block is not None:
+                                        # Finalize and store the text block
+                                        current_assistant_content.append(current_text_block)
+                                        final_response_text += current_text_block["text"]
+                                        current_text_block = None # Reset state
+                                    elif current_tool_use_block is not None:
+                                        # Finalize and store the tool use block
+                                        parsed_input = {} # Default to empty dict
+                                        # Only attempt to parse if the accumulator is not empty
+                                        if current_tool_input_json_accumulator:
+                                            try:
+                                                log.debug(f"Attempting to parse JSON for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}). Accumulated JSON string:")
+                                                log.debug(f"RAW_ACCUMULATED_JSON>>>\n{current_tool_input_json_accumulator}\n<<<END_RAW_ACCUMULATED_JSON")
+                                                try:
+                                                    parsed_input = json.loads(current_tool_input_json_accumulator)
+                                                    log.debug(f"Successfully parsed input: {parsed_input}")
+                                                except json.JSONDecodeError as e:
+                                                    log.error(f"JSON PARSE FAILED for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}): {e}")
+                                                    log.error(f"Failed JSON content was:\n{current_tool_input_json_accumulator}") # Log again on error
+                                                    parsed_input = {"_tool_input_parse_error": f"Failed to parse JSON: {e}", "_raw_json": current_tool_input_json_accumulator}
+                                                # Parse accumulated JSON
+                                                parsed_input = json.loads(current_tool_input_json_accumulator)
+                                                log.debug(f"Final parsed input for tool {current_tool_use_block['name']}: {parsed_input}")
+                                            except json.JSONDecodeError as e:
+                                                log.error(f"Failed to parse accumulated JSON for tool {current_tool_use_block['name']}: {e}. JSON='{current_tool_input_json_accumulator}'")
+                                                # Store error indication instead of empty dict or partial json
+                                                parsed_input = {"_tool_input_parse_error": f"Failed to parse JSON: {e}", "_raw_json": current_tool_input_json_accumulator}
+                                        else:
+                                            # If accumulator is empty, it means no input args were streamed,
+                                            # which is correct for tools with no input schema. Input is {}.
+                                            log.debug(f"Tool {current_tool_use_block['name']} received empty input stream (expected for no-arg tools). Final input: {{}}")
+                                            parsed_input = {} # Explicitly set to empty dict
 
-                                current_tool_use_block["input"] = parsed_input # Assign the parsed (or empty) dict
+                                        current_tool_use_block["input"] = parsed_input # Assign the parsed (or empty) dict
 
-                                # Add the completed block to the assistant's content for this turn
-                                current_assistant_content.append(current_tool_use_block)
-                                # Add it to the list of tools that need execution *after* this stream finishes
-                                tool_calls_this_turn.append(current_tool_use_block)
+                                        # Add the completed block to the assistant's content for this turn
+                                        current_assistant_content.append(current_tool_use_block)
+                                        # Add it to the list of tools that need execution *after* this stream finishes
+                                        tool_calls_this_turn.append(current_tool_use_block)
 
-                                # Yield message for UI
-                                original_tool_name = self.server_manager.sanitized_to_original.get(current_tool_use_block['name'], current_tool_use_block['name'])
-                                yield f"\n[{STATUS_EMOJI['tool']}] Preparing tool: {original_tool_name}..."
+                                        # Yield message for UI
+                                        original_tool_name = self.server_manager.sanitized_to_original.get(current_tool_use_block['name'], current_tool_use_block['name'])
+                                        yield f"@@STATUS@@\n{STATUS_EMOJI['tool']} Preparing tool: {original_tool_name}...\n"
 
-                                current_tool_use_block = None # Reset state
-                                current_tool_input_json_accumulator = "" # Reset accumulator here
+                                        current_tool_use_block = None # Reset state
+                                        current_tool_input_json_accumulator = "" # Reset accumulator here
 
-                        elif event_type == "message_delta":
-                            if hasattr(event.delta, 'stop_reason') and event.delta.stop_reason:
-                                stop_reason = event.delta.stop_reason
+                                elif event_type == "message_delta":
+                                    if hasattr(event.delta, 'stop_reason') and event.delta.stop_reason:
+                                        stop_reason = event.delta.stop_reason
 
-                        elif event_type == "message_stop":
-                            if hasattr(event, 'message') and hasattr(event.message, 'stop_reason'):
-                                 stop_reason = event.message.stop_reason
-                            # Finalize any trailing text block
-                            if current_text_block is not None:
-                                 current_assistant_content.append(current_text_block)
-                                 final_response_text += current_text_block["text"]
-                                 current_text_block = None
-                    # --- End of inner stream processing loop ---
+                                elif event_type == "message_stop":
+                                    if hasattr(event, 'message') and hasattr(event.message, 'stop_reason'):
+                                        stop_reason = event.message.stop_reason
+                                    # Finalize any trailing text block
+                                    if current_text_block is not None:
+                                        current_assistant_content.append(current_text_block)
+                                        final_response_text += current_text_block["text"]
+                                        current_text_block = None
+                                # --- End of inner stream processing loop ---
+                except TimeoutError:
+                    log.error("Timeout waiting for or processing message stream from Anthropic API.")
+                    yield "\n[Error: Timed out waiting for Claude's final response after tool use]"
+                    # Need to handle cleanup/state reset if timeout occurs mid-stream
+                    # Potentially update conversation graph with partial data or error state
+                except Exception as stream_err:
+                    # Handle other stream errors
+                    log.error(f"Error processing Anthropic message stream: {stream_err}", exc_info=True)
+                    yield f"\n[Error: {stream_err}]"
 
                 # --- Post-Stream Processing ---
                 # Add the assistant message (potentially containing text and/or completed tool_use blocks) to the history
@@ -4650,7 +4714,7 @@ class MCPClient:
                              api_content_for_claude = f"Error: {error_text}"
                              log_content_for_history = {"error": error_text, "raw_json": tool_args.get('_raw_json')}
                              is_error = True
-                             yield f"\n[{STATUS_EMOJI['failure']}] Input Error: {error_text}"
+                             yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Input Error: {error_text}\n"
                              log.error(error_text)
                         else:
                             # Proceed if input was valid
@@ -4661,7 +4725,7 @@ class MCPClient:
                                 api_content_for_claude = f"Error: {error_text}"
                                 log_content_for_history = {"error": error_text}
                                 is_error = True
-                                yield f"\n[{STATUS_EMOJI['failure']}] Tool Error: {error_text}"
+                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: {error_text}\n"
                                 log.warning(f"Tool mapping/not found. Sanitized: '{tool_name_sanitized}', Original: '{original_tool_name}'")
                             else:
                                 servers_used.add(tool.server_name)
@@ -4673,7 +4737,7 @@ class MCPClient:
                                     api_content_for_claude = f"Error: {error_text}"
                                     log_content_for_history = {"error": error_text}
                                     is_error = True
-                                    yield f"\n[{STATUS_EMOJI['failure']}] Server Error: {error_text}"
+                                    yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: {error_text}\n"
                                 else:
                                     # Check cache
                                     cached_result = None
@@ -4694,12 +4758,12 @@ class MCPClient:
                                             else:
                                                 cache_used = True
                                                 cache_hits_during_query += 1
-                                                yield f"\n[{STATUS_EMOJI['cached']}] Using cached result for {original_tool_name}"
+                                                yield f"@@STATUS@@\n{STATUS_EMOJI['cached']} Using cached result for {original_tool_name}\n"
                                                 log.info(f"Using cached result for {original_tool_name}")
 
                                     # Execute if not cached
                                     if not cache_used:
-                                        yield f"\n[{STATUS_EMOJI['tool']}] Executing {original_tool_name}..."
+                                        yield f"@@STATUS@@\n{STATUS_EMOJI['tool']} Executing {original_tool_name}...\n"
                                         try:
                                             with safe_stdout():
                                                 tool_call_outcome: Optional[CallToolResult] = await self.execute_tool(
@@ -4711,7 +4775,7 @@ class MCPClient:
                                                 api_content_for_claude = f"Error: {error_text}"
                                                 log_content_for_history = {"error": error_text}
                                                 is_error = True
-                                                yield f"\n[{STATUS_EMOJI['failure']}] Tool Execution Error: {error_text}"
+                                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Tool Execution Error: {error_text}\n"
 
                                             elif tool_call_outcome.isError:
                                                 error_text = "Tool execution failed."
@@ -4733,7 +4797,7 @@ class MCPClient:
                                                 api_content_for_claude = f"Error: {error_text}"
                                                 log_content_for_history = {"error": error_text, "raw_content": tool_call_outcome.content}
                                                 is_error = True
-                                                yield f"\n[{STATUS_EMOJI['failure']}] Tool Execution Error: {error_text[:100]}..." # Truncate long errors
+                                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Tool Execution Error: {error_text[:100]}...\n" # Truncate long errors
 
                                             else: # Success case
                                                 # Process success content into a string for API
@@ -4752,14 +4816,14 @@ class MCPClient:
                                                     else: # No text parts, serialize
                                                         try:
                                                              serializable_content = [ getattr(b, 'model_dump', lambda b=b: b)() for b in tool_call_outcome.content ]
-                                                             api_content_for_claude = json.dumps(serializable_content).decode('utf-8')
+                                                             api_content_for_claude = json.dumps(serializable_content, indent=2)
                                                         except Exception: api_content_for_claude = str(tool_call_outcome.content) # Fallback
                                                 else: # Fallback
                                                     api_content_for_claude = str(tool_call_outcome.content)
 
                                                 log_content_for_history = tool_call_outcome.content # Log original success content
                                                 is_error = False
-                                                yield f"\n[{STATUS_EMOJI['success']}] Tool result received."
+                                                yield f"@@STATUS@@\n{STATUS_EMOJI['success']} Tool result received.\n"
 
                                             # Cache result if successful and cache enabled
                                             if self.tool_cache and not is_error:
@@ -4776,7 +4840,7 @@ class MCPClient:
                                             api_content_for_claude = f"Error: {error_text}"
                                             log_content_for_history = {"error": error_text}
                                             is_error = True
-                                            yield f"\n[{STATUS_EMOJI['failure']}] Tool Execution Client Error: {str(exec_err)}"
+                                            yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Tool Execution Client Error: {str(exec_err)}\n"
 
                         # Append result (or error) for the *next* API call
                         tool_results_for_api.append({
@@ -4833,7 +4897,7 @@ class MCPClient:
             if span:
                 span.set_status(trace.StatusCode.ERROR, description=error_msg)
                 span.record_exception(e)
-            yield f"\n[Error: {error_msg}]" # Yield error to user
+            yield f"@@STATUS@@\n[Error: {error_msg}]\n" # Yield error to user
 
         finally:
             # Finalize Span
@@ -4890,7 +4954,65 @@ class MCPClient:
         # Start with user message
         current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
         user_message: MessageParam = {"role": "user", "content": query}
-        messages: List[MessageParam] = current_messages + [user_message]
+        # Combine initial messages (consider putting user_message at the end after filtering if needed)
+        combined_messages: List[MessageParam] = current_messages + [user_message]
+
+        # --- NEW: Filter out client-side tool execution parse failures ---
+        messages_to_send: List[MessageParam] = []
+        i = 0
+        client_error_signature = "Client failed to parse JSON input" # More general check
+        skipped_indices = set() # To track indices of messages to skip
+
+        log.debug(f"Filtering history ({len(combined_messages)} messages) for known client errors...")
+
+        # First pass: identify indices of faulty interactions to skip
+        assistant_tool_uses_to_check: Dict[int, Set[str]] = {} # index -> set of tool_use_ids
+
+        for idx, msg in enumerate(combined_messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    tool_use_ids = {
+                        block.get("id") for block in content
+                        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
+                    }
+                    if tool_use_ids:
+                        assistant_tool_uses_to_check[idx] = tool_use_ids
+
+            elif msg.get("role") == "user":
+                # Check if this user message corresponds to a preceding assistant tool use
+                prev_idx = idx - 1
+                if prev_idx in assistant_tool_uses_to_check:
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        corresponding_ids = assistant_tool_uses_to_check[prev_idx]
+                        found_faulty_result = False
+                        for block in content:
+                            if (isinstance(block, dict) and
+                                block.get("type") == "tool_result" and
+                                block.get("tool_use_id") in corresponding_ids):
+                                result_content = block.get("content")
+                                # Check if the content contains our specific client error signature
+                                if isinstance(result_content, str) and client_error_signature in result_content:
+                                    found_faulty_result = True
+                                    log.warning(f"Found faulty client tool result for ID {block.get('tool_use_id')} at history index {idx}. Marking for filtering.")
+                                    break # Found one faulty result for this user message turn
+
+                        if found_faulty_result:
+                            # Mark both the assistant request and the user result for skipping
+                            skipped_indices.add(prev_idx)
+                            skipped_indices.add(idx)
+
+        # Second pass: build the filtered list
+        for idx, msg in enumerate(combined_messages):
+            if idx not in skipped_indices:
+                messages_to_send.append(msg)
+            else:
+                log.debug(f"Skipping message at index {idx} during API call preparation.")
+
+        # Now use 'messages_to_send' for the API call
+        messages = messages_to_send # Replace the original list
+        log.debug(f"Proceeding with {len(messages)} filtered messages for API call.")
 
         # --- Corrected OpenTelemetry Span Handling ---
         span = None
@@ -5044,7 +5166,7 @@ class MCPClient:
                                                 else:
                                                     try:
                                                         serializable_content = [ getattr(b, 'model_dump', lambda b=b: b)() for b in tool_call_outcome.content ]
-                                                        extracted_content_str = json.dumps(serializable_content).decode('utf-8')
+                                                        extracted_content_str = json.dumps(serializable_content, indent=2)
                                                     except Exception as serialize_err:
                                                         log.warning(f"Could not serialize tool result content, falling back to str(): {serialize_err}")
                                                         extracted_content_str = str(tool_call_outcome.content)
@@ -5214,48 +5336,72 @@ class MCPClient:
 
                 # --- Process as a query to Claude with smoother live streaming output ---
                 else:
-                    current_markdown_content = ""
-                    # Initialize the Panel content for Live display
-                    # Start with an empty panel initially to avoid rendering "..."
-                    initial_panel = Panel("", title="Claude", border_style="green")
+                    claude_text_content = ""
+                    # Keep track of the last few status messages
+                    status_lines = deque(maxlen=5) # Adjust maxlen as needed
 
-                    # Create the Live display context manager
-                    # Refresh rate (e.g., 3 times per second) controls how often Rich redraws
-                    REFRESH_RATE = 3.0
+                    initial_panel = Panel("", title="Claude", border_style="green")
+                    REFRESH_RATE = 4.0 # Increased slightly
                     live_display = Live(
-                        initial_panel, # Start with the initial panel
+                        initial_panel,
                         console=interactive_console,
-                        refresh_per_second=REFRESH_RATE, # Let Live handle refresh rate
-                        transient=False, # Keep the final output visible
+                        refresh_per_second=REFRESH_RATE,
+                        transient=False,
                         vertical_overflow="visible"
                     )
-                    live_display.start() # Start the Live display
+                    live_display.start()
 
-                    # Stream the response using process_streaming_query
-                    async for chunk in self.process_streaming_query(user_input):
-                        # Append new chunk to the content
-                        current_markdown_content += chunk
-                        # Create Markdown object from accumulated content
-                        md = Markdown(current_markdown_content)
-                        # Create Panel
-                        panel = Panel(md, title="Claude", border_style="green")
-                        # Update the Live display's renderable *without* forcing an immediate refresh
-                        # Live will pick up the change and redraw based on its refresh_per_second setting
-                        live_display.update(panel, refresh=False)
-                        # Small sleep to allow other tasks (like UI updates) to run smoothly
-                        # Adjust if needed, but 0 helps yield control briefly.
-                        await asyncio.sleep(0.01)
+                    try: # Add try block specifically around streaming
+                        async for chunk in self.process_streaming_query(user_input):
+                            if chunk.startswith("@@STATUS@@"):
+                                status_message = chunk[len("@@STATUS@@"):].strip()
+                                # Add styling based on content (simple example)
+                                style = "yellow"
+                                if "Error" in status_message or "failed" in status_message or "💥" in status_message:
+                                    style = "red"
+                                elif "success" in status_message or "received" in status_message or "🎉" in status_message or "✓" in status_message:
+                                    style = "green"
+                                elif "cached" in status_message or "package" in status_message:
+                                     style = "cyan"
+                                # Append new status message as a Text object
+                                status_lines.append(Text(status_message, style=style))
+                            else:
+                                # It's a regular text chunk from Claude
+                                claude_text_content += chunk
+                            md = Markdown(claude_text_content)
+                            # Create a renderable group for status lines
+                            status_group = Group(*list(status_lines))
+                            # Combine markdown and status lines vertically
+                            renderable_group = Group(md, status_group)
+                            panel = Panel(renderable_group, title="Claude", border_style="green")
+                            live_display.update(panel, refresh=False)
+                            await asyncio.sleep(0.01)
 
-                    # --- After the loop ---
-                    # Ensure the final state is definitely rendered
-                    if live_display.is_started:
-                        # Perform one last update with the final content
-                        final_md = Markdown(current_markdown_content)
-                        final_panel = Panel(final_md, title="Claude", border_style="green")
-                        # Force a final refresh to ensure everything is displayed
-                        live_display.update(final_panel, refresh=True)
-                        live_display.stop()
-                    live_display = None # Clear reference
+                        # --- After the loop ---
+                        if live_display.is_started:
+                            # Perform one last update with the final content and status
+                            final_md = Markdown(claude_text_content)
+                            final_status_group = Group(*list(status_lines))
+                            final_renderable_group = Group(final_md, final_status_group)
+                            final_panel = Panel(final_renderable_group, title="Claude", border_style="green")
+                            live_display.update(final_panel, refresh=True)
+
+                    # Catch potential errors during streaming itself if needed
+                    except Exception as stream_err:
+                         log.error(f"Error during stream processing in interactive loop: {stream_err}", exc_info=True)
+                         # Add an error message to status lines
+                         status_lines.append(Text(f"[bold red]Stream Error: {stream_err}[/]", style="red"))
+                         # Update the display one last time with the error
+                         md = Markdown(claude_text_content)
+                         status_group = Group(*list(status_lines))
+                         renderable_group = Group(md, status_group)
+                         panel = Panel(renderable_group, title="Claude - ERROR", border_style="red")
+                         if live_display.is_started:
+                             live_display.update(panel, refresh=True)
+                    finally: # Ensure live display is stopped
+                         if live_display.is_started:
+                              live_display.stop()
+                         live_display = None # Clear reference
 
             except KeyboardInterrupt:
                 if live_display and live_display.is_started: 
@@ -5872,7 +6018,7 @@ class MCPClient:
                 # Use Group to combine the title and schema
                 schema_display = Group(
                     Text(f"Schema for {tool_name}:", style="bold"),
-                    Syntax(json.dumps(tool.input_schema).decode('utf-8'), "json", theme="monokai")
+                    Syntax(json.dumps(tool.input_schema, indent=2), "json", theme="monokai")
                 )
                 
                 self.safe_print(Panel(
@@ -6537,7 +6683,7 @@ class MCPClient:
                 progress.update(export_task, description=f"{STATUS_EMOJI['scroll']} Writing to file...")
                 
                 async with aiofiles.open(file_path, 'w') as f:
-                    await f.write(json.dumps(export_data).decode('utf-8'))
+                    await f.write(json.dumps(export_data, indent=2))
                 
                 progress.update(export_task, description=f"{STATUS_EMOJI['success']} Export complete")
                 return True
@@ -6668,7 +6814,7 @@ class MCPClient:
                 
                 # Show result
                 safe_console.print(Panel.fit(
-                    Syntax(json.dumps(result).decode('utf-8'), "json", theme="monokai"),
+                    Syntax(json.dumps(result, indent=2), "json", theme="monokai"),
                     title=f"Tool Result: {tool_name} (executed in {latency:.2f}s)",
                     border_style="magenta"
                 ))
@@ -6718,7 +6864,6 @@ class MCPClient:
 
             # Attempt to parse JSON
             try:
-                # Use the 'json' alias which points to orjson
                 desktop_config = json.loads(content)
                 log.debug(f"Claude desktop config keys: {list(desktop_config.keys())}")
             except json.JSONDecodeError as json_error:
@@ -7492,7 +7637,7 @@ async def servers_async(search, list_all, json_output):
                         "description": server.description,
                         "categories": server.categories
                     }
-                safe_console.print(json.dumps(server_data).decode('utf-8'))
+                safe_console.print(json.dumps(server_data, indent=2))
             else:
                 # Normal output
                 await client.list_servers()

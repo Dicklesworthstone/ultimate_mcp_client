@@ -34,7 +34,6 @@ dependencies = [
     "typer",
     "rich",
     "httpx",
-    "orjson",
     "pyyaml",
     "python-dotenv",
     "colorama",

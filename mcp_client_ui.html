@@ -1,0 +1,1091 @@
+Okay, creating a fully functional single-file UI that perfectly replicates every dynamic aspect and backend interaction of your complex Python script directly in HTML/Alpine.js (without a backend API/WebSocket connection to the Python script) is impossible. The browser cannot directly execute Python, manage processes, handle network connections for MCP servers, or run the Anthropic SDK like your script does.
+
+However, I can create a comprehensive UI structure and visual representation using the specified libraries (Tailwind, Alpine.js, DaisyUI, FontAwesome, etc.) that mirrors the features and layout concepts of your Python client. This UI will use Alpine.js for managing its internal state and simulating interactions. You would need to connect this frontend to a backend (like a Flask/FastAPI server wrapping your Python client's logic) via APIs or WebSockets to make it fully functional.
+
+This HTML file will:
+
+Load all the requested CDN libraries.
+
+Use Tailwind and DaisyUI for layout and styling.
+
+Use Alpine.js (x-data, x-show, x-for, @click, x-text, x-html, etc.) to manage UI state and handle user interactions locally.
+
+Structure the UI with a sidebar for controls (Servers, Tools, Conversations, Config) and a main area for the chat interface.
+
+Visually represent features like server lists, tool lists, conversation history, branching, chat messages, etc.
+
+Include placeholder logic in Alpine functions (e.g., addServer(), sendMessage()) to demonstrate where backend calls would be needed.
+
+Use FontAwesome for icons.
+
+Integrate Tippy.js for tooltips.
+
+Use FileSaver.js stub for export functionality.
+
+Use Marked.js (added dependency, essential for Markdown) to render chat messages.
+
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ultimate MCP Client UI</title>
+
+    <!-- Load FontAwesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <!-- Load Animate.css for animations -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
+    <!-- Load Tippy.js CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/animations/scale.css" />
+    <!-- Load DaisyUI (includes Tailwind) -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/daisyui/4.4.19/full.min.css" rel="stylesheet" type="text/css" />
+    <!-- Tailwind CSS (via DaisyUI's dependency, but can load explicitly if needed) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Load Tone.js for audio synthesis (optional use) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <!-- Load SortableJS for drag-and-drop (optional use) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+    <!-- Load FileSaver.js for exporting files -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <!-- Load Tonal.js for music theory utilities (optional use) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tonaljs/tonal/browser/tonal.min.js"></script>
+    <!-- Load Popperjs (Tippy dependency) -->
+    <script src="https://unpkg.com/@popperjs/core@2"></script>
+    <!-- Load Tippy.js for tooltips -->
+    <script src="https://unpkg.com/tippy.js@6"></script>
+    <!-- Load Marked.js for Markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- Load Alpine.js (defer ensures it runs after DOM is ready) -->
+    <script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.13.3/cdn.min.js"></script>
+
+    <style>
+        /* Custom scrollbar for chat */
+        .chat-messages::-webkit-scrollbar {
+            width: 8px;
+        }
+        .chat-messages::-webkit-scrollbar-track {
+            background: hsl(var(--b2) / var(--tw-bg-opacity, 1)); /* DaisyUI background-2 color */
+        }
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: hsl(var(--bc) / var(--tw-bg-opacity, 1)); /* DaisyUI base-content color */
+            border-radius: 4px;
+        }
+        .chat-messages::-webkit-scrollbar-thumb:hover {
+            background: hsl(var(--p) / var(--tw-bg-opacity, 1)); /* DaisyUI primary color */
+        }
+        /* Ensure modals are on top */
+        dialog { z-index: 50; }
+        /* Fix Tippy arrow color */
+        .tippy-box[data-theme^='light'] .tippy-arrow { color: #333; }
+        .tippy-box[data-theme^='dark'] .tippy-arrow { color: #eee; }
+        /* Ensure icons size correctly */
+         .fa-fw { width: 1.25em; }
+    </style>
+</head>
+<body class="h-screen flex flex-col bg-base-200" x-data="mcpClientUI">
+
+    <!-- Header -->
+    <header class="bg-base-100 shadow-md p-2 flex justify-between items-center">
+        <h1 class="text-xl font-bold flex items-center gap-2">
+             <i class="fas fa-plug text-primary"></i> Ultimate MCP Client UI
+        </h1>
+        <div class="flex items-center gap-4">
+            <!-- Simplified Status Indicators -->
+            <div class="tooltip tooltip-bottom" data-tip="Servers">
+                <span class="indicator-item badge badge-primary" x-text="connectedServersCount"></span>
+                 <i class="fas fa-server"></i> <span x-text="`${connectedServersCount}/${servers.length}`"></span>
+            </div>
+             <div class="tooltip tooltip-bottom" data-tip="Tools">
+                 <i class="fas fa-tools"></i> <span x-text="tools.length"></span>
+            </div>
+            <div class="dropdown dropdown-end">
+                <label tabindex="0" class="btn btn-sm btn-ghost flex items-center gap-1">
+                    <i class="fas fa-robot"></i>
+                    <span x-text="currentModelShort"></span>
+                    <i class="fas fa-chevron-down text-xs"></i>
+                </label>
+                <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
+                    <template x-for="model in availableModels" :key="model">
+                        <li><a @click="setModel(model)" x-text="model"></a></li>
+                    </template>
+                     <li><input type="text" placeholder="Custom model..." class="input input-sm input-bordered" @change="setCustomModel($event.target.value)"></li>
+                </ul>
+            </div>
+            <label class="swap swap-rotate">
+              <input type="checkbox" class="theme-controller" value="dark" @change="toggleTheme($event.target.checked)" />
+              <i class="swap-on fill-current fas fa-moon text-lg"></i>
+              <i class="swap-off fill-current fas fa-sun text-lg"></i>
+            </label>
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <div class="flex flex-1 overflow-hidden">
+
+        <!-- Sidebar -->
+        <aside class="w-80 bg-base-100 flex flex-col h-full border-r border-base-300 shadow-lg">
+            <!-- Tabs -->
+            <div role="tablist" class="tabs tabs-bordered tabs-lg flex-shrink-0">
+                <a role="tab" class="tab" :class="{ 'tab-active': activeTab === 'servers' }" @click="activeTab = 'servers'" data-tippy-content="Manage Servers"><i class="fas fa-server fa-fw"></i></a>
+                <a role="tab" class="tab" :class="{ 'tab-active': activeTab === 'tools' }" @click="activeTab = 'tools'" data-tippy-content="Browse Tools & Resources"><i class="fas fa-tools fa-fw"></i></a>
+                <a role="tab" class="tab" :class="{ 'tab-active': activeTab === 'conversation' }" @click="activeTab = 'conversation'" data-tippy-content="Conversation Management"><i class="fas fa-comments fa-fw"></i></a>
+                <a role="tab" class="tab" :class="{ 'tab-active': activeTab === 'config' }" @click="activeTab = 'config'" data-tippy-content="Configuration"><i class="fas fa-cog fa-fw"></i></a>
+            </div>
+
+            <!-- Tab Content -->
+            <div class="flex-1 p-4 overflow-y-auto">
+                <!-- Servers Tab -->
+                <div x-show="activeTab === 'servers'" x-transition>
+                    <h2 class="text-lg font-semibold mb-3 flex justify-between items-center">
+                        <span><i class="fas fa-server mr-2"></i>Servers</span>
+                        <button class="btn btn-xs btn-primary" @click="showAddServerModal = true"><i class="fas fa-plus mr-1"></i> Add</button>
+                    </h2>
+                    <div class="space-y-2">
+                        <template x-for="server in servers" :key="server.name">
+                            <div class="card card-compact bg-base-200 shadow-sm p-3">
+                                <div class="flex justify-between items-center mb-1">
+                                    <span class="font-bold flex items-center gap-2">
+                                        <i :class="server.type === 'stdio' ? 'fas fa-terminal' : 'fas fa-network-wired'"></i>
+                                        <span x-text="server.name"></span>
+                                    </span>
+                                    <div class="flex items-center gap-2">
+                                         <span class="tooltip tooltip-left" :data-tip="server.statusText">
+                                            <i :class="serverStatusIcon(server)" class="text-lg" :style="{ color: serverStatusColor(server) }"></i>
+                                        </span>
+                                        <input type="checkbox" class="toggle toggle-sm toggle-success" :checked="server.isConnected" @change="toggleServerConnection(server)" data-tippy-content="Connect/Disconnect"/>
+                                    </div>
+                                </div>
+                                <p class="text-xs text-base-content/70 mb-2" x-text="server.path"></p>
+                                <div class="flex justify-between items-center text-xs">
+                                    <div class="flex items-center gap-2">
+                                        <span data-tippy-content="Enable/Disable">
+                                            <input type="checkbox" class="toggle toggle-xs" :checked="server.enabled" @change="toggleServerEnabled(server)"/>
+                                        </span>
+                                        <button class="btn btn-xs btn-ghost text-error" @click="removeServer(server.name)" data-tippy-content="Remove Server">
+                                            <i class="fas fa-trash-alt"></i>
+                                        </button>
+                                    </div>
+                                    <span class="badge badge-ghost badge-sm" x-text="`${server.tools?.length || 0} tools`"></span>
+                                </div>
+                            </div>
+                        </template>
+                        <div x-show="servers.length === 0" class="text-center text-base-content/50 py-4">No servers configured.</div>
+                    </div>
+
+                    <!-- Discovery Section -->
+                    <h3 class="text-md font-semibold mt-6 mb-2"><i class="fas fa-search-location mr-2"></i>Discovery</h3>
+                    <div class="flex gap-2 mb-3">
+                       <button class="btn btn-sm btn-outline" @click="discoverServers('local')" :disabled="isLoading"><i class="fas fa-folder-open mr-1"></i> Local</button>
+                       <button class="btn btn-sm btn-outline" @click="discoverServers('registry')" :disabled="isLoading"><i class="fas fa-cloud mr-1"></i> Registry</button>
+                       <button class="btn btn-sm btn-outline" @click="discoverServers('mdns')" :disabled="isLoading"><i class="fas fa-wifi mr-1"></i> mDNS</button>
+                    </div>
+                     <div x-show="discoveredServers.length > 0" class="space-y-1">
+                        <p class="text-sm font-medium mb-1">Discovered:</p>
+                        <template x-for="dServer in discoveredServers" :key="dServer.id || dServer.name">
+                             <div class="flex justify-between items-center p-2 bg-base-200 rounded text-sm">
+                                 <span>
+                                     <i class="fas fa-network-wired mr-1" x-show="dServer.type !== 'stdio'"></i>
+                                     <i class="fas fa-terminal mr-1" x-show="dServer.type === 'stdio'"></i>
+                                     <span x-text="dServer.name"></span>
+                                     <span class="text-xs text-base-content/50 ml-1" x-text="dServer.path || dServer.url"></span>
+                                 </span>
+                                 <button class="btn btn-xs btn-success" @click="addDiscoveredServer(dServer)" :disabled="serverExists(dServer)">
+                                     <i class="fas fa-plus"></i> Add
+                                 </button>
+                             </div>
+                        </template>
+                    </div>
+                     <div x-show="discoveredServers.length === 0 && !isLoading" class="text-center text-base-content/50 text-sm py-2">Click discovery buttons.</div>
+                </div>
+
+                <!-- Tools Tab -->
+                <div x-show="activeTab === 'tools'" x-transition>
+                    <h2 class="text-lg font-semibold mb-3"><i class="fas fa-tools mr-2"></i>Tools & Resources</h2>
+                     <!-- Tool List -->
+                     <h3 class="text-md font-semibold mb-2"><i class="fas fa-hammer mr-1"></i> Available Tools (<span x-text="tools.length"></span>)</h3>
+                     <div class="max-h-60 overflow-y-auto space-y-1 mb-4 pr-1">
+                         <template x-for="tool in tools" :key="tool.name">
+                             <div class="p-2 bg-base-200 rounded text-sm hover:bg-base-300 cursor-pointer" @click="showToolDetails(tool)">
+                                 <div class="flex justify-between items-center">
+                                     <span class="font-medium" x-text="tool.name"></span>
+                                     <span class="badge badge-ghost badge-xs" x-text="tool.serverName"></span>
+                                 </div>
+                                 <p class="text-xs text-base-content/70 truncate" x-text="tool.description" data-tippy-content="View Schema"></p>
+                             </div>
+                         </template>
+                         <div x-show="tools.length === 0" class="text-center text-base-content/50 py-4">No tools available.</div>
+                     </div>
+
+                    <!-- Resource List -->
+                    <h3 class="text-md font-semibold mb-2"><i class="fas fa-book mr-1"></i> Available Resources (<span x-text="resources.length"></span>)</h3>
+                     <div class="max-h-40 overflow-y-auto space-y-1 mb-4 pr-1">
+                         <template x-for="resource in resources" :key="resource.name">
+                             <div class="p-2 bg-base-200 rounded text-sm">
+                                 <div class="flex justify-between items-center">
+                                     <span class="font-medium" x-text="resource.name"></span>
+                                     <span class="badge badge-ghost badge-xs" x-text="resource.serverName"></span>
+                                 </div>
+                                 <p class="text-xs text-base-content/70 truncate" x-text="resource.description"></p>
+                                 <!-- Add action to view/use resource if applicable -->
+                             </div>
+                         </template>
+                         <div x-show="resources.length === 0" class="text-center text-base-content/50 py-4">No resources available.</div>
+                     </div>
+
+                    <!-- Prompt List -->
+                    <h3 class="text-md font-semibold mb-2"><i class="fas fa-lightbulb mr-1"></i> Available Prompts (<span x-text="prompts.length"></span>)</h3>
+                     <div class="max-h-40 overflow-y-auto space-y-1 pr-1">
+                         <template x-for="prompt in prompts" :key="prompt.name">
+                            <div class="p-2 bg-base-200 rounded text-sm hover:bg-base-300 cursor-pointer" @click="applyPrompt(prompt.name)">
+                                 <div class="flex justify-between items-center">
+                                     <span class="font-medium" x-text="prompt.name"></span>
+                                     <span class="badge badge-ghost badge-xs" x-text="prompt.serverName"></span>
+                                 </div>
+                                 <p class="text-xs text-base-content/70 truncate" x-text="prompt.description" data-tippy-content="Apply Prompt"></p>
+                             </div>
+                         </template>
+                         <div x-show="prompts.length === 0" class="text-center text-base-content/50 py-4">No prompts available.</div>
+                     </div>
+                </div>
+
+                <!-- Conversation Tab -->
+                <div x-show="activeTab === 'conversation'" x-transition>
+                    <h2 class="text-lg font-semibold mb-3"><i class="fas fa-comments mr-2"></i>Conversation</h2>
+                    <div class="space-y-3">
+                        <button class="btn btn-sm btn-block btn-outline" @click="forkConversation"><i class="fas fa-code-branch mr-1"></i> Fork Branch</button>
+                        <button class="btn btn-sm btn-block btn-outline" @click="optimizeConversation" :disabled="isLoading"><i class="fas fa-magic mr-1"></i> Optimize Context</button>
+                        <button class="btn btn-sm btn-block btn-outline btn-warning" @click="clearConversation"><i class="fas fa-eraser mr-1"></i> Clear Context</button>
+                        <div class="flex gap-2">
+                            <button class="btn btn-sm flex-1 btn-outline btn-info" @click="exportConversation"><i class="fas fa-file-export mr-1"></i> Export</button>
+                            <label class="btn btn-sm flex-1 btn-outline btn-accent">
+                                <i class="fas fa-file-import mr-1"></i> Import
+                                <input type="file" class="hidden" accept=".json" @change="importConversation($event.target.files[0])">
+                            </label>
+                        </div>
+
+                         <!-- Branch Management -->
+                         <h3 class="text-md font-semibold pt-3 mb-1"><i class="fas fa-list-ul mr-1"></i> Branches</h3>
+                         <div class="max-h-60 overflow-y-auto p-2 bg-base-200 rounded text-sm">
+                            <!-- Simple List Representation (Tree view is complex without libraries) -->
+                            <ul class="list-disc list-inside space-y-1">
+                                <template x-for="node in conversationNodes" :key="node.id">
+                                    <li :class="{ 'font-bold text-primary': node.id === currentNodeId }" class="cursor-pointer hover:underline" @click="checkoutBranch(node.id)">
+                                        <span x-text="node.name || 'Unnamed'"></span>
+                                        <span class="text-xs text-base-content/50" x-text="' (...' + node.id.slice(-6) + ')'"></span>
+                                        <span x-show="node.id === currentNodeId"> <i class="fas fa-check text-success"></i></span>
+                                    </li>
+                                </template>
+                                <div x-show="conversationNodes.length <= 1" class="text-center text-base-content/50 py-2">No branches yet.</div>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Config Tab -->
+                <div x-show="activeTab === 'config'" x-transition>
+                    <h2 class="text-lg font-semibold mb-3"><i class="fas fa-cog mr-2"></i>Configuration</h2>
+                    <div class="space-y-4">
+                        <div class="form-control">
+                            <label class="label"><span class="label-text">Anthropic API Key</span></label>
+                            <input type="password" placeholder="sk-ant-..." class="input input-bordered input-sm" x-model="config.apiKey" @change="saveConfig">
+                        </div>
+                        <div class="form-control">
+                            <label class="label"><span class="label-text">Default Model</span></label>
+                            <input type="text" placeholder="claude-3-opus-..." class="input input-bordered input-sm" x-model="config.defaultModel" @change="saveConfig">
+                        </div>
+                         <div class="form-control">
+                            <label class="label"><span class="label-text">Max Tokens</span></label>
+                            <input type="number" class="input input-bordered input-sm" x-model.number="config.maxTokens" @change="saveConfig">
+                        </div>
+                         <div class="form-control">
+                            <label class="label"><span class="label-text">Temperature</span></label>
+                            <input type="range" min="0" max="1" step="0.1" class="range range-xs range-primary" x-model.number="config.temperature" @change="saveConfig"/>
+                            <div class="w-full flex justify-between text-xs px-2">
+                                <span>0</span><span>0.5</span><span>1</span>
+                            </div>
+                        </div>
+                         <div class="form-control">
+                            <label class="cursor-pointer label"><span class="label-text">Enable Streaming</span><input type="checkbox" class="toggle toggle-primary" x-model="config.enableStreaming" @change="saveConfig"></label>
+                        </div>
+                        <div class="form-control">
+                            <label class="cursor-pointer label"><span class="label-text">Enable Caching</span><input type="checkbox" class="toggle toggle-primary" x-model="config.enableCaching" @change="saveConfig"></label>
+                        </div>
+                        <div class="form-control">
+                            <label class="cursor-pointer label"><span class="label-text">Enable Auto Discovery</span><input type="checkbox" class="toggle toggle-primary" x-model="config.autoDiscover" @change="saveConfig"></label>
+                        </div>
+                         <div class="form-control">
+                            <label class="label"><span class="label-text">Dashboard Refresh (s)</span></label>
+                            <input type="number" class="input input-bordered input-sm" x-model.number="config.dashboardRefreshRate" @change="saveConfig" min="0.5" step="0.1">
+                        </div>
+                         <!-- Add other config options as needed -->
+                         <button class="btn btn-sm btn-outline btn-error" @click="resetConfig">Reset Config</button>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Chat Area -->
+        <main class="flex-1 flex flex-col h-full bg-base-200">
+            <!-- Messages Display -->
+            <div class="flex-1 p-4 overflow-y-auto chat-messages" x-ref="chatbox">
+                <template x-for="(message, index) in currentConversation" :key="index">
+                    <div class="chat" :class="message.role === 'user' ? 'chat-end' : 'chat-start'">
+                        <div class="chat-header text-xs opacity-50 mb-1" x-text="message.role === 'assistant' ? currentModelShort : message.role"></div>
+                        <div class="chat-bubble prose prose-sm max-w-none"
+                             :class="{
+                                'chat-bubble-primary': message.role === 'user',
+                                'chat-bubble-secondary': message.role === 'assistant',
+                                'chat-bubble-accent': message.role === 'system' || message.role === 'tool_result',
+                                'animate__animated animate__fadeInUp animate__faster': shouldAnimate(index)
+                             }"
+                             x-html="renderMessageContent(message)">
+                        </div>
+                         <!-- Display Tool Call Info Separately (Optional) -->
+                        <div x-show="message.role === 'assistant' && message.tool_calls?.length > 0" class="mt-1 space-y-1">
+                            <template x-for="toolCall in message.tool_calls" :key="toolCall.id">
+                                <div class="text-xs p-2 rounded bg-base-100 shadow-sm opacity-80">
+                                    <i class="fas fa-terminal mr-1 text-info"></i>
+                                    <span>Tool Call: <strong x-text="toolCall.name"></strong></span>
+                                    <pre class="text-xs overflow-x-auto whitespace-pre-wrap" x-text="JSON.stringify(toolCall.input, null, 2)"></pre>
+                                </div>
+                            </template>
+                        </div>
+                        <!-- Display Tool Result Info Separately (if role isn't tool_result) -->
+                        <div x-show="message.role === 'user' && message.content_type === 'tool_result'" class="mt-1 space-y-1">
+                             <div class="text-xs p-2 rounded bg-base-100 shadow-sm opacity-80">
+                                <i class="fas fa-check-circle mr-1 text-success" x-show="!message.is_error"></i>
+                                <i class="fas fa-exclamation-circle mr-1 text-error" x-show="message.is_error"></i>
+                                <span>Tool Result (<strong x-text="message.tool_name || 'unknown'"></strong>)</span>
+                                <pre class="text-xs overflow-x-auto whitespace-pre-wrap" x-text="renderToolResultContent(message.content)"></pre>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+                 <div x-show="isLoading" class="chat chat-start">
+                     <div class="chat-bubble chat-bubble-secondary animate-pulse">
+                         <i class="fas fa-spinner fa-spin mr-2"></i> Thinking...
+                     </div>
+                 </div>
+            </div>
+
+            <!-- Input Area -->
+            <div class="p-4 border-t border-base-300 bg-base-100">
+                <div class="flex items-center gap-2">
+                    <textarea
+                        class="textarea textarea-bordered w-full resize-none"
+                        placeholder="Type your message or /command..."
+                        rows="1"
+                        x-model="userInput"
+                        @keydown.enter.prevent.stop="sendMessage"
+                        @input="adjustTextareaHeight($event.target)"
+                        x-ref="inputarea"
+                    ></textarea>
+                    <button class="btn btn-primary" @click="sendMessage" :disabled="isLoading || !userInput.trim()">
+                        <i class="fas fa-paper-plane"></i>
+                    </button>
+                </div>
+            </div>
+        </main>
+
+    </div>
+
+    <!-- Modals -->
+    <!-- Add Server Modal -->
+    <dialog id="addServerModal" class="modal" :class="{ 'modal-open': showAddServerModal }">
+      <div class="modal-box">
+        <h3 class="font-bold text-lg mb-4">Add New MCP Server</h3>
+        <form @submit.prevent="addServer">
+            <div class="form-control mb-2">
+                <label class="label"><span class="label-text">Name</span></label>
+                <input type="text" placeholder="e.g., my-server" class="input input-bordered" x-model="newServer.name" required>
+            </div>
+            <div class="form-control mb-2">
+                <label class="label"><span class="label-text">Type</span></label>
+                <select class="select select-bordered" x-model="newServer.type" required>
+                    <option value="stdio">STDIO</option>
+                    <option value="sse">SSE</option>
+                </select>
+            </div>
+            <div class="form-control mb-2">
+                <label class="label"><span class="label-text" x-text="newServer.type === 'stdio' ? 'Command/Path' : 'URL'"></span></label>
+                <input type="text" placeholder="/path/to/server.py or http://host:port" class="input input-bordered" x-model="newServer.path" required>
+            </div>
+             <div class="form-control mb-4" x-show="newServer.type === 'stdio'">
+                <label class="label"><span class="label-text">Arguments (optional, space-separated)</span></label>
+                <input type="text" placeholder="--port 8080 --debug" class="input input-bordered" x-model="newServer.argsString">
+            </div>
+            <div class="modal-action">
+              <button type="button" class="btn" @click="showAddServerModal = false">Cancel</button>
+              <button type="submit" class="btn btn-primary">Add Server</button>
+            </div>
+        </form>
+      </div>
+       <form method="dialog" class="modal-backdrop">
+            <button @click="showAddServerModal = false">close</button>
+       </form>
+    </dialog>
+
+    <!-- Tool Details Modal -->
+    <dialog id="toolDetailsModal" class="modal" :class="{ 'modal-open': showToolDetailsModal }">
+      <div class="modal-box w-11/12 max-w-2xl">
+        <h3 class="font-bold text-lg mb-2" x-text="selectedTool?.name || 'Tool Details'"></h3>
+        <p class="text-sm mb-1">Server: <span class="badge badge-ghost" x-text="selectedTool?.serverName"></span></p>
+        <p class="text-sm mb-4" x-text="selectedTool?.description"></p>
+        <h4 class="font-semibold mb-2">Input Schema:</h4>
+        <div class="bg-base-200 p-2 rounded max-h-96 overflow-y-auto">
+            <pre><code x-text="JSON.stringify(selectedTool?.input_schema || {}, null, 2)"></code></pre>
+        </div>
+         <!-- Optional: Add a form here to execute the tool directly -->
+         <!-- <form @submit.prevent="executeToolDirectly"> ... </form> -->
+        <div class="modal-action">
+          <button class="btn" @click="showToolDetailsModal = false">Close</button>
+        </div>
+      </div>
+       <form method="dialog" class="modal-backdrop">
+         <button @click="showToolDetailsModal = false">close</button>
+       </form>
+    </dialog>
+
+     <!-- Notifications Area -->
+     <div class="toast toast-top toast-end z-50">
+         <template x-for="(notification, index) in notifications" :key="index">
+             <div :class="['alert', `alert-${notification.type || 'info'}`]"
+                  x-show="notification.visible"
+                  x-transition:enter="animate__animated animate__fadeInRight"
+                  x-transition:leave="animate__animated animate__fadeOutRight">
+                 <i :class="notificationIcon(notification.type)"></i>
+                 <span x-text="notification.message"></span>
+             </div>
+         </template>
+     </div>
+
+
+    <script>
+        document.addEventListener('alpine:init', () => {
+            Alpine.data('mcpClientUI', () => ({
+                // --- STATE ---
+                servers: [ // Placeholder data
+                    { name: 'filesystem', type: 'stdio', path: '/path/to/fs_server.py', args: [], enabled: true, isConnected: false, status: 'disconnected', tools: [], health: 85, statusText: 'Ready' },
+                    { name: 'web-search', type: 'sse', path: 'http://localhost:8081', args: [], enabled: true, isConnected: false, status: 'healthy', tools: [], health: 95, statusText: 'Healthy' },
+                    { name: 'calculator', type: 'stdio', path: '/path/to/calc.js', args: [], enabled: false, isConnected: false, status: 'unknown', tools: [], health: 50, statusText: 'Disabled' },
+                ],
+                discoveredServers: [],
+                tools: [ // Placeholder
+                    { name: 'filesystem:readFile', serverName: 'filesystem', description: 'Reads a file content.', input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+                    { name: 'filesystem:writeFile', serverName: 'filesystem', description: 'Writes content to a file.', input_schema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string'} }, required: ['path', 'content'] } },
+                    { name: 'web-search:search', serverName: 'web-search', description: 'Performs a web search.', input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
+                ],
+                resources: [], // Placeholder
+                prompts: [], // Placeholder
+                currentConversation: [ // Placeholder conversation
+                    { role: 'user', content: 'Hello Claude!' },
+                    { role: 'assistant', content: 'Hello! How can I help you today?' },
+                ],
+                // Simple graph representation for UI purposes
+                conversationNodes: [
+                    { id: 'root', name: 'Root', parentId: null, childrenIds: ['fork1'] },
+                    { id: 'fork1', name: 'Fork 1', parentId: 'root', childrenIds: [] }
+                ],
+                currentNodeId: 'root',
+                config: { // Placeholder config
+                    apiKey: '',
+                    defaultModel: 'claude-3-5-sonnet-latest',
+                    maxTokens: 1024,
+                    temperature: 0.7,
+                    enableStreaming: true,
+                    enableCaching: true,
+                    autoDiscover: true,
+                    dashboardRefreshRate: 2.0,
+                    // Add other config fields from Python script
+                },
+                availableModels: ['claude-3-opus-20240229', 'claude-3-5-sonnet-20240620', 'claude-3-haiku-20240307'],
+                currentModel: 'claude-3-5-sonnet-20240620',
+                userInput: '',
+                isLoading: false, // For global loading states
+                isSendingMessage: false, // Specific for chat send
+                activeTab: 'servers', // Default sidebar tab
+                showAddServerModal: false,
+                showToolDetailsModal: false,
+                selectedTool: null,
+                newServer: { name: '', type: 'stdio', path: '', argsString: '' },
+                notifications: [], // { message: '', type: 'success|error|info', visible: true, id: uniqueId }
+
+                // --- COMPUTED PROPERTIES ---
+                get connectedServersCount() {
+                    return this.servers.filter(s => s.isConnected).length;
+                },
+                get currentModelShort() {
+                    // Basic shortening, adapt as needed
+                    return this.currentModel.split('-').slice(0, 3).join('-').replace('-latest', '');
+                },
+
+                // --- LIFECYCLE & INITIALIZATION ---
+                init() {
+                    console.log('MCP Client UI Initializing...');
+                    this.loadConfigFromLocalStorage(); // Load saved config
+                    this.currentModel = this.config.defaultModel || 'claude-3-5-sonnet-latest';
+
+                    // Initialize Tippy tooltips
+                    this.$nextTick(() => {
+                       tippy('[data-tippy-content]', {
+                           animation: 'scale',
+                           theme: document.documentElement.getAttribute('data-theme') === 'dark' ? 'light-border' : 'dark-border' // Basic theme adaptation
+                       });
+                    });
+
+                     // Connect auto-start servers (simulation)
+                    this.servers.forEach(server => {
+                        if (server.enabled && false) { // Replace 'false' with actual auto-start logic if possible
+                            // this.connectServer(server); // Simulate connection
+                        }
+                    });
+
+                    this.addNotification('UI Initialized. Backend connection needed for full functionality.', 'info');
+
+                    // Scroll chat to bottom initially
+                    this.scrollToBottom();
+
+                    // Add dummy message to show functionality
+                     setTimeout(() => {
+                       this.addMessageToConversation('assistant', 'Welcome! This is the UI shell. Connect to a backend to enable MCP features.');
+                    }, 500);
+                },
+
+                // --- METHODS ---
+
+                // Theme
+                toggleTheme(isDark) {
+                     document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+                     localStorage.setItem('mcp_client_theme', isDark ? 'dark' : 'light');
+                     // Re-init tippy themes maybe?
+                },
+
+                // Config Management
+                loadConfigFromLocalStorage() {
+                    const savedConfig = localStorage.getItem('mcp_client_config');
+                    if (savedConfig) {
+                        try {
+                            const parsed = JSON.parse(savedConfig);
+                            // Merge saved config with defaults carefully
+                            this.config = { ...this.config, ...parsed };
+                        } catch (e) {
+                            console.error("Failed to parse saved config:", e);
+                            localStorage.removeItem('mcp_client_config'); // Clear corrupted data
+                        }
+                    }
+                     const savedTheme = localStorage.getItem('mcp_client_theme');
+                     if (savedTheme) {
+                        document.documentElement.setAttribute('data-theme', savedTheme);
+                     }
+                },
+                saveConfig() {
+                    console.log('Saving config (placeholder)...', this.config);
+                    try {
+                        localStorage.setItem('mcp_client_config', JSON.stringify(this.config));
+                        this.addNotification('Configuration saved locally.', 'success');
+                    } catch (e) {
+                        console.error("Failed to save config:", e);
+                        this.addNotification('Failed to save configuration.', 'error');
+                    }
+                },
+                resetConfig() {
+                    if(confirm('Are you sure you want to reset configuration to defaults?')) {
+                        localStorage.removeItem('mcp_client_config');
+                        // Re-init with defaults (might need reload or better state reset)
+                        Object.assign(this.config, { /* Default values here */
+                            apiKey: '', defaultModel: 'claude-3-5-sonnet-latest', maxTokens: 1024, temperature: 0.7, enableStreaming: true, enableCaching: true, autoDiscover: true, dashboardRefreshRate: 2.0 });
+                        this.currentModel = this.config.defaultModel;
+                        this.addNotification('Configuration reset to defaults.', 'warning');
+                    }
+                },
+
+                 // Model Selection
+                setModel(modelName) {
+                    this.currentModel = modelName;
+                    this.config.defaultModel = modelName; // Optionally update default too
+                    this.saveConfig();
+                     this.addNotification(`Model set to ${modelName}`, 'info');
+                },
+                 setCustomModel(modelName) {
+                     if (modelName.trim()) {
+                         this.setModel(modelName.trim());
+                     }
+                 },
+
+                // Server Management
+                serverStatusIcon(server) {
+                    if (!server.enabled) return 'fas fa-ban text-base-content/30';
+                    if (server.isLoading) return 'fas fa-spinner fa-spin';
+                    if (server.isConnected) return 'fas fa-check-circle text-success';
+                    return 'fas fa-times-circle text-error';
+                },
+                 serverStatusColor(server) {
+                     if (!server.enabled) return 'currentColor'; // Use default text color or grey
+                     if (server.isLoading) return 'hsl(var(--p))'; // primary
+                     if (server.isConnected) return 'hsl(var(--su))'; // success
+                     return 'hsl(var(--er))'; // error
+                 },
+                toggleServerConnection(server) {
+                    if (server.isConnected) {
+                        this.disconnectServer(server);
+                    } else {
+                        this.connectServer(server);
+                    }
+                },
+                connectServer(server) {
+                    console.log(`CONNECTING to server ${server.name} (placeholder)...`);
+                    server.isLoading = true;
+                    server.statusText = 'Connecting...';
+                     this.addNotification(`Connecting to ${server.name}...`, 'info');
+                    // --- Placeholder: Simulate connection ---
+                    setTimeout(() => {
+                        server.isConnected = true;
+                        server.isLoading = false;
+                        server.status = 'healthy'; // Assume healthy on connect
+                        server.health = 95;
+                        server.statusText = 'Connected & Healthy';
+                         this.addNotification(`${server.name} connected.`, 'success');
+                        this.fetchServerCapabilities(server); // Fetch tools etc.
+                    }, 1500);
+                     // --- Needs actual backend call ---
+                },
+                disconnectServer(server) {
+                    console.log(`DISCONNECTING from server ${server.name} (placeholder)...`);
+                    server.isLoading = true;
+                    server.statusText = 'Disconnecting...';
+                     this.addNotification(`Disconnecting from ${server.name}...`, 'info');
+                    // --- Placeholder: Simulate disconnection ---
+                    setTimeout(() => {
+                        server.isConnected = false;
+                        server.isLoading = false;
+                        server.status = 'disconnected';
+                        server.health = 0;
+                        server.statusText = 'Disconnected';
+                        this.tools = this.tools.filter(t => t.serverName !== server.name); // Remove tools
+                        this.resources = this.resources.filter(r => r.serverName !== server.name);
+                        this.prompts = this.prompts.filter(p => p.serverName !== server.name);
+                         this.addNotification(`${server.name} disconnected.`, 'warning');
+                    }, 1000);
+                     // --- Needs actual backend call ---
+                },
+                fetchServerCapabilities(server) {
+                     console.log(`Fetching capabilities for ${server.name} (placeholder)...`);
+                    // --- Placeholder: Add dummy tools ---
+                     setTimeout(() => {
+                        const dummyTools = [
+                             { name: `${server.name}:dummyTool1`, serverName: server.name, description: `Dummy tool 1 from ${server.name}.`, input_schema: { type: 'object', properties: { param: { type: 'string' } } } },
+                             { name: `${server.name}:dummyTool2`, serverName: server.name, description: `Dummy tool 2.`, input_schema: { type: 'object' } }
+                         ];
+                        // Avoid duplicates
+                         dummyTools.forEach(newTool => {
+                             if (!this.tools.some(t => t.name === newTool.name)) {
+                                 this.tools.push(newTool);
+                             }
+                         });
+                         server.tools = dummyTools; // Store on server object too maybe
+                         console.log(`Added dummy tools for ${server.name}.`);
+                     }, 500);
+                    // --- Needs actual backend call ---
+                },
+                toggleServerEnabled(server) {
+                    server.enabled = !server.enabled;
+                    console.log(`Server ${server.name} enabled set to ${server.enabled} (placeholder)...`);
+                    // --- Needs backend call to update config and potentially connect/disconnect ---
+                     this.saveConfig(); // Save local representation
+                     this.addNotification(`${server.name} ${server.enabled ? 'enabled' : 'disabled'}.`, 'info');
+                     if (!server.enabled && server.isConnected) {
+                         this.disconnectServer(server);
+                     }
+                },
+                 removeServer(serverName) {
+                     if (confirm(`Are you sure you want to remove server "${serverName}"?`)) {
+                        console.log(`Removing server ${serverName} (placeholder)...`);
+                        const server = this.servers.find(s => s.name === serverName);
+                        if (server?.isConnected) {
+                            this.disconnectServer(server); // Disconnect first
+                        }
+                        this.servers = this.servers.filter(s => s.name !== serverName);
+                        // --- Needs backend call to update config ---
+                         this.saveConfig(); // Save local representation
+                         this.addNotification(`Server ${serverName} removed.`, 'warning');
+                    }
+                },
+                addServer() {
+                    console.log('Adding server (placeholder)...', this.newServer);
+                    if (!this.newServer.name || !this.newServer.type || !this.newServer.path) {
+                         this.addNotification('Server name, type, and path/URL are required.', 'error');
+                        return;
+                    }
+                     if (this.servers.some(s => s.name === this.newServer.name)) {
+                         this.addNotification(`Server name "${this.newServer.name}" already exists.`, 'error');
+                         return;
+                     }
+
+                    const serverToAdd = {
+                        name: this.newServer.name,
+                        type: this.newServer.type,
+                        path: this.newServer.path,
+                        args: this.newServer.argsString.split(' ').filter(Boolean),
+                        enabled: true,
+                        isConnected: false,
+                        status: 'unknown',
+                        tools: [],
+                        health: 50,
+                        statusText: 'Newly Added',
+                        isLoading: false
+                    };
+                    this.servers.push(serverToAdd);
+                    this.showAddServerModal = false;
+                    this.newServer = { name: '', type: 'stdio', path: '', argsString: '' }; // Reset form
+                    // --- Needs backend call to update config ---
+                     this.saveConfig(); // Save local representation
+                     this.addNotification(`Server ${serverToAdd.name} added.`, 'success');
+                     // Optionally connect right away
+                     // if (confirm(`Connect to ${serverToAdd.name} now?`)) {
+                     //    this.connectServer(serverToAdd);
+                     // }
+                },
+
+                // Discovery
+                discoverServers(type) {
+                    console.log(`Discovering servers (${type})... (placeholder)`);
+                    this.isLoading = true;
+                    this.discoveredServers = []; // Clear previous
+                     this.addNotification(`Starting ${type} discovery...`, 'info');
+                    // --- Simulate discovery ---
+                    setTimeout(() => {
+                        let results = [];
+                        if (type === 'local' || type === 'mdns') {
+                            results.push({ name: `discovered-${type}-1`, type: 'stdio', path: `/tmp/server-${type}.py`, id: `d-${type}-1` });
+                        }
+                        if (type === 'registry' || type === 'mdns') {
+                            results.push({ name: `discovered-${type}-2`, type: 'sse', url: `http://mcp.${type}:8088`, id: `d-${type}-2` });
+                        }
+                        this.discoveredServers = results;
+                        this.isLoading = false;
+                         this.addNotification(`${type} discovery finished. Found ${results.length}.`, 'success');
+                    }, 2000);
+                    // --- Needs actual backend call ---
+                },
+                 serverExists(discoveredServer) {
+                     return this.servers.some(s => s.path === (discoveredServer.path || discoveredServer.url));
+                 },
+                 addDiscoveredServer(discoveredServer) {
+                     // Use the logic from addServer modal, pre-filling fields
+                     this.newServer = {
+                         name: discoveredServer.name,
+                         type: discoveredServer.type || 'sse',
+                         path: discoveredServer.path || discoveredServer.url || '',
+                         argsString: discoveredServer.args ? discoveredServer.args.join(' ') : ''
+                     };
+                     this.addServer(); // This will handle checks and add to main list
+                 },
+
+                // Tools/Resources/Prompts
+                showToolDetails(tool) {
+                    this.selectedTool = tool;
+                    this.showToolDetailsModal = true;
+                },
+                 applyPrompt(promptName) {
+                     console.log(`Applying prompt ${promptName} (placeholder)...`);
+                     const prompt = this.prompts.find(p => p.name === promptName);
+                     if (prompt) {
+                         // Add to start of conversation (simulation)
+                         this.addMessageToConversation('system', `Applied Prompt: ${prompt.name}\n---\n${prompt.template || 'Prompt template unavailable.'}`);
+                         this.addNotification(`Prompt "${promptName}" applied.`, 'info');
+                     }
+                     // --- Needs backend call to actually fetch and prepend ---
+                 },
+
+                // Chat
+                sendMessage() {
+                    if (!this.userInput.trim() || this.isSendingMessage) return;
+
+                    const text = this.userInput;
+                    this.userInput = ''; // Clear input immediately
+                    this.adjustTextareaHeight(this.$refs.inputarea); // Reset height
+
+                    this.addMessageToConversation('user', text);
+
+                    console.log('Sending message to backend (placeholder)...', text);
+                    this.isSendingMessage = true;
+                    this.isLoading = true;
+
+                    // --- Simulate backend call and streaming response ---
+                    setTimeout(() => {
+                        this.simulateAssistantResponse(text);
+                    }, 500);
+                },
+                addMessageToConversation(role, content, metadata = {}) {
+                     const newMessage = {
+                         role: role,
+                         content: content,
+                         timestamp: new Date().toISOString(),
+                         // Store additional info if needed (e.g., tool calls/results for rendering)
+                         ...metadata
+                     };
+                     this.currentConversation.push(newMessage);
+                     this.scrollToBottom(); // Scroll after adding
+                 },
+                shouldAnimate(index) {
+                    // Only animate the last message maybe? Adjust logic as needed.
+                    return index === this.currentConversation.length - 1;
+                },
+                renderMessageContent(message) {
+                    if (message.role === 'user' && message.content_type === 'tool_result') {
+                         return `Tool Result Received: ${message.tool_name || ''}`; // Simplified display
+                    }
+                    if (typeof message.content === 'string') {
+                        // Basic check for potential status messages from streaming demo
+                        if(message.content.startsWith('@@STATUS@@')) {
+                            return `<span class="text-xs italic opacity-70">${message.content.substring(10).trim()}</span>`;
+                        }
+                        try {
+                            // Render markdown
+                            return marked.parse(message.content);
+                        } catch (e) {
+                            console.error("Markdown parsing error", e);
+                            return `<pre>${message.content}</pre>`; // Fallback to preformatted text
+                        }
+                    } else if (Array.isArray(message.content)) {
+                         // Handle complex content blocks (like tool use requests in assistant msg)
+                         return message.content.map(block => {
+                             if (block.type === 'text') return marked.parse(block.text);
+                             if (block.type === 'tool_use') return `<div class="my-1 p-1 bg-base-300/50 rounded text-xs">Requesting tool: <strong>${block.name}</strong></div>`;
+                             return JSON.stringify(block);
+                         }).join('');
+                    }
+                    return JSON.stringify(message.content); // Fallback
+                },
+                renderToolResultContent(content) {
+                     // Provide a more readable string representation of tool results for display
+                    if (typeof content === 'string') return content;
+                    try { return JSON.stringify(content, null, 2); }
+                    catch { return String(content); }
+                },
+                simulateAssistantResponse(userText) {
+                    let response = "This is a simulated response. ";
+                    let toolUsed = false;
+
+                    if (userText.toLowerCase().includes("file") || userText.toLowerCase().includes("read")) {
+                        response += "I see you mentioned files. ";
+                        // Simulate tool call structure
+                         const toolCallId = `call_${Date.now()}`;
+                         this.addMessageToConversation('assistant', `Thinking about reading a file...`, {
+                             tool_calls: [{ type: 'tool_use', id: toolCallId, name: 'filesystem:readFile', input: { path: 'simulated/path.txt' } }]
+                         });
+                        // Simulate tool result
+                         setTimeout(() => {
+                             this.addMessageToConversation('user', `Simulated content of path.txt`, {
+                                 content_type: 'tool_result', // Flag for rendering
+                                 tool_use_id: toolCallId,
+                                 tool_name: 'filesystem:readFile',
+                                 is_error: false
+                             });
+                             // Simulate final response after tool use
+                             setTimeout(() => {
+                                this.addMessageToConversation('assistant', 'I have read the simulated file content.');
+                                this.isSendingMessage = false;
+                                this.isLoading = false;
+                            }, 700);
+                        }, 1200);
+                        toolUsed = true; // Prevent default response path
+
+                    } else if (userText.toLowerCase().includes("search") || userText.toLowerCase().includes("look up")) {
+                        response += "Okay, I can simulate a search. ";
+                         // Simulate streaming chunks
+                        const chunks = ["Searching the web... ", "Found some results... ", "Here is a summary."];
+                        let currentResponse = '';
+                        let chunkIndex = 0;
+                        const intervalId = setInterval(() => {
+                            if (chunkIndex < chunks.length) {
+                                currentResponse += chunks[chunkIndex];
+                                // Update the *last* message if streaming
+                                if (this.currentConversation[this.currentConversation.length-1]?.role === 'assistant') {
+                                    this.currentConversation[this.currentConversation.length-1].content = currentResponse;
+                                } else {
+                                     this.addMessageToConversation('assistant', currentResponse);
+                                }
+                                this.scrollToBottom();
+                                chunkIndex++;
+                            } else {
+                                clearInterval(intervalId);
+                                this.isSendingMessage = false;
+                                this.isLoading = false;
+                            }
+                        }, 400);
+                         toolUsed = true; // Prevent default response path
+
+                    } else {
+                        response += "To get a real response, connect this UI to the Python backend.";
+                    }
+
+                    if (!toolUsed) {
+                        // Simulate simple response if no tool path taken
+                         setTimeout(() => {
+                            this.addMessageToConversation('assistant', response);
+                            this.isSendingMessage = false;
+                            this.isLoading = false;
+                        }, 800);
+                    }
+                },
+                scrollToBottom() {
+                    this.$nextTick(() => {
+                        this.$refs.chatbox.scrollTop = this.$refs.chatbox.scrollHeight;
+                    });
+                },
+                 adjustTextareaHeight(el) {
+                     el.style.height = 'auto'; // Reset height
+                     el.style.height = (el.scrollHeight) + 'px'; // Set to content height
+                 },
+
+
+                // Conversation Management
+                forkConversation() {
+                    console.log('Forking conversation (placeholder)...');
+                    const parentNodeId = this.currentNodeId;
+                    const newId = `node_${Date.now()}`;
+                    const newNode = { id: newId, name: `Fork from ${parentNodeId.slice(0,4)}`, parentId: parentNodeId, childrenIds: [] };
+                    this.conversationNodes.push(newNode);
+                    // Add to parent's children
+                    const parentNode = this.conversationNodes.find(n => n.id === parentNodeId);
+                    if (parentNode) parentNode.childrenIds.push(newId);
+
+                    this.currentNodeId = newId;
+                    this.currentConversation = [ // Start new branch with system message
+                        { role: 'system', content: `Branched from conversation ${parentNodeId}.` }
+                    ];
+                    this.addNotification(`Created and switched to branch ${newNode.name}.`, 'info');
+                     // --- Needs backend call to update graph ---
+                },
+                checkoutBranch(nodeId) {
+                    console.log(`Checking out branch ${nodeId} (placeholder)...`);
+                    if (nodeId === this.currentNodeId) return;
+
+                    const node = this.conversationNodes.find(n => n.id === nodeId);
+                    if (node) {
+                        this.currentNodeId = nodeId;
+                        // --- Simulate loading conversation history ---
+                        this.isLoading = true;
+                         this.addNotification(`Loading branch ${node.name || nodeId}...`, 'info');
+                        setTimeout(() => {
+                            this.currentConversation = [
+                                { role: 'system', content: `Switched to branch: ${node.name || nodeId}` },
+                                { role: 'user', content: `Placeholder message from branch ${nodeId}` },
+                                { role: 'assistant', content: `Placeholder response from branch ${nodeId}` }
+                            ];
+                             this.isLoading = false;
+                             this.addNotification(`Switched to branch ${node.name || nodeId}.`, 'success');
+                        }, 800);
+                        // --- Needs backend call to get actual messages ---
+                    }
+                },
+                optimizeConversation() {
+                    console.log('Optimizing conversation (placeholder)...');
+                    this.isLoading = true;
+                     this.addNotification(`Optimizing context...`, 'info');
+                    // --- Simulate optimization ---
+                    setTimeout(() => {
+                         const summary = "This is a simulated summary of the previous conversation.";
+                         this.currentConversation = [
+                            { role: 'system', content: `Conversation Summary: ${summary}` },
+                             { role: 'assistant', content: 'The conversation history has been summarized.' }
+                         ];
+                         this.isLoading = false;
+                         this.addNotification(`Context optimized.`, 'success');
+                    }, 1500);
+                     // --- Needs actual backend call ---
+                },
+                clearConversation() {
+                     if(confirm('Are you sure you want to clear the current conversation context (messages)?')) {
+                        console.log('Clearing conversation (placeholder)...');
+                        this.currentConversation = [];
+                         // Optionally switch back to root or keep current node empty
+                         // this.currentNodeId = 'root';
+                         this.addNotification(`Conversation cleared.`, 'warning');
+                         // --- Needs backend call to clear state ---
+                    }
+                },
+                exportConversation() {
+                    console.log('Exporting conversation (placeholder)...');
+                    try {
+                        const dataToExport = {
+                            nodeId: this.currentNodeId,
+                            conversation: this.currentConversation,
+                            // Include graph structure if needed
+                        };
+                        const blob = new Blob([JSON.stringify(dataToExport, null, 2)], { type: "application/json;charset=utf-8" });
+                        const filename = `mcp-conversation-${this.currentNodeId}-${Date.now()}.json`;
+                        saveAs(blob, filename); // Use FileSaver.js
+                        this.addNotification(`Conversation exported as ${filename}.`, 'success');
+                    } catch (e) {
+                        console.error("Export failed:", e);
+                        this.addNotification('Failed to export conversation.', 'error');
+                    }
+                     // --- Needs backend call for full graph export ---
+                },
+                 importConversation(file) {
+                     if (!file) return;
+                     console.log('Importing conversation (placeholder)...', file.name);
+                     const reader = new FileReader();
+                     reader.onload = (e) => {
+                         try {
+                             const importedData = JSON.parse(e.target.result);
+                             // --- Simulate adding as a new branch ---
+                             const newId = `imported_${Date.now()}`;
+                             const newNode = { id: newId, name: `Imported ${file.name.split('.')[0]}`, parentId: this.currentNodeId, childrenIds: [] };
+                             this.conversationNodes.push(newNode);
+                              const parentNode = this.conversationNodes.find(n => n.id === this.currentNodeId);
+                             if (parentNode) parentNode.childrenIds.push(newId);
+
+                             this.currentNodeId = newId;
+                             this.currentConversation = importedData.conversation || [{ role: 'system', content: `Imported from ${file.name}` }];
+                             this.addNotification(`Conversation imported from ${file.name}.`, 'success');
+                             this.scrollToBottom();
+                         } catch (error) {
+                             console.error("Import failed:", error);
+                             this.addNotification('Failed to import conversation: Invalid JSON.', 'error');
+                         }
+                     };
+                     reader.onerror = (e) => {
+                         console.error("File reading error:", e);
+                         this.addNotification('Failed to read import file.', 'error');
+                     };
+                     reader.readAsText(file);
+                     // --- Needs backend call to update graph ---
+                 },
+
+                 // Notifications
+                 addNotification(message, type = 'info', duration = 3000) {
+                     const id = Date.now() + Math.random();
+                     const notification = { id, message, type, visible: true };
+                     this.notifications.push(notification);
+
+                     setTimeout(() => {
+                         const index = this.notifications.findIndex(n => n.id === id);
+                         if (index !== -1) {
+                             this.notifications[index].visible = false;
+                             // Optional: Remove from array after fade out
+                             setTimeout(() => {
+                                 this.notifications.splice(index, 1);
+                             }, 500); // Match animation duration
+                         }
+                     }, duration);
+                 },
+                 notificationIcon(type) {
+                    switch (type) {
+                        case 'success': return 'fas fa-check-circle';
+                        case 'error': return 'fas fa-exclamation-circle';
+                        case 'warning': return 'fas fa-exclamation-triangle';
+                        default: return 'fas fa-info-circle';
+                    }
+                }
+
+            }));
+        });
+    </script>
+
+</body>
+</html>
+
