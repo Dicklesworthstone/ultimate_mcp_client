@@ -47,6 +47,10 @@ dependencies = [
     "tiktoken",
     "ruff", # Linter and formatter
     "mypy", # Static type checker
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
+    "python-multipart"    
 ]
 
 # Defines the command-line script entry point
@@ -72,6 +76,7 @@ ignore = [
     "W291",
     "E402",
     "B007",
+    "B008",
     "E701",
     "F541",
 ]
