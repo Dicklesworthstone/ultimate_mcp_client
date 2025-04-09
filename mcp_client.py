@@ -114,6 +114,7 @@ import logging
 import os
 import platform
 import random
+import re
 import readline
 import signal
 import socket
@@ -221,7 +222,7 @@ from rich.tree import Tree
 from typing_extensions import Annotated
 from zeroconf import NonUniqueNameException, ServiceInfo
 
-USE_VERBOSE_SESSION_LOGGING = True # Set to True for debugging, False for normal operation
+USE_VERBOSE_SESSION_LOGGING = False # Set to True for debugging, False for normal operation
 
 # Set up Typer app
 app = typer.Typer(help="🔌 Ultimate MCP Client for Anthropic API")
@@ -1220,8 +1221,17 @@ class ToolCache:
     
     def generate_key(self, tool_name, params):
         """Generate a cache key for the tool and parameters"""
-        # Hash the parameters to create a unique key
-        params_str = json.dumps(params, sort_keys=True).decode('utf-8')
+        # Sort the dictionary recursively to get consistent ordering
+        def sort_dict_recursively(d):
+            if isinstance(d, dict):
+                return {k: sort_dict_recursively(d[k]) for k in sorted(d.keys())}
+            elif isinstance(d, list):
+                return [sort_dict_recursively(i) for i in d]
+            else:
+                return d
+        # Apply sorting and then serialize with orjson
+        sorted_params = sort_dict_recursively(params)
+        params_str = json.dumps(sorted_params).decode('utf-8')
         params_hash = hashlib.md5(params_str.encode()).hexdigest()
         return f"{tool_name}:{params_hash}"
     
@@ -1810,7 +1820,11 @@ class History:
         
         try:
             with open(HISTORY_FILE, 'r') as f:
-                history_data = json.load(f)
+                file_data = f.read()
+                if file_data:
+                    history_data = json.loads(file_data)
+                else:
+                    history_data = []
             
             self.entries.clear()
             for entry_data in history_data:
@@ -1859,7 +1873,7 @@ class History:
                 })
             
             with open(HISTORY_FILE, 'w') as f:
-                json.dump(history_data, f)
+                f.write(json.dumps(history_data).decode('utf-8'))
                 
         except IOError as e:
             log.error(f"Error writing history file {HISTORY_FILE}: {e}")
@@ -2477,6 +2491,17 @@ class ServerManager:
         self.registry = ServerRegistry() if config.enable_registry else None
         self.registered_services: Dict[str, ServiceInfo] = {} # Store zeroconf info
         self._session_tasks: Dict[str, List[asyncio.Task]] = {} # Store tasks per session        
+        self.sanitized_to_original = {}  # Maps sanitized name -> original name
+
+    @property
+    def tools_by_server(self) -> Dict[str, List[MCPTool]]:
+        """Group tools by server name for easier lookup."""
+        result = {}
+        for tool in self.tools.values():
+            if tool.server_name not in result:
+                result[tool.server_name] = []
+            result[tool.server_name].append(tool)
+        return result
     
     @asynccontextmanager
     async def connect_server_session(self, server_config: ServerConfig):
@@ -3516,7 +3541,8 @@ class ServerManager:
         # Start server monitoring
         with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...", spinner="dots", console=get_safe_console()) as status:
             await self.server_monitor.start_monitoring()
-            status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
+            if hasattr(status, 'update'):
+                status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
         
         # Display status
         await self.print_status()
@@ -3570,13 +3596,6 @@ class ServerManager:
                         except Exception as kill_error:
                             log.error(f"Error killing process {name}: {kill_error}")
                             
-            # Close cache
-            if self.tool_cache:
-                try:
-                    self.tool_cache.close()
-                except Exception as e:
-                    log.error(f"Error closing tool cache: {e}")
-                    
         except Exception as e:
             log.error(f"Unexpected error during cleanup: {e}")
             
@@ -3585,17 +3604,38 @@ class ServerManager:
             self._safe_printer("[yellow]Shutdown complete[/]")
 
     def format_tools_for_anthropic(self) -> List[ToolParam]:
-        """Format MCP tools for Anthropic API"""
-        tool_params: List[ToolParam] = []
-        
-        for tool in self.tools.values():
-            tool_params.append({
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema
-            })
-            
-        return tool_params
+       """Format MCP tools for Anthropic API"""
+       tool_params: List[ToolParam] = []
+       
+       # Clear existing mapping
+       self.sanitized_to_original.clear()
+       
+       for tool in self.tools.values():
+           original_name = tool.name
+           
+           # Sanitize tool name to match Anthropic's requirements
+           sanitized_name = re.sub(r'[^a-zA-Z0-9_]', '_', original_name)
+           
+           # Ensure name is not longer than 64 characters
+           if len(sanitized_name) > 64:
+               sanitized_name = sanitized_name[:64]
+               
+           # Ensure name is not empty
+           if not sanitized_name:
+               sanitized_name = "tool_" + str(hash(original_name) % 1000)
+           
+           # Store the mapping
+           self.sanitized_to_original[sanitized_name] = original_name
+           
+           # Add to list for Anthropic
+           tool_params.append({
+               "type": "custom",  # Specify this is a custom tool type
+               "name": sanitized_name,
+               "description": tool.description,
+               "input_schema": tool.input_schema
+           })
+           
+       return tool_params
 
     async def run_multi_step_task(self, 
                                 steps: List[Callable], 
@@ -3680,9 +3720,9 @@ class ServerManager:
                         token_count += len(encoding.encode(block["text"]))
                     elif isinstance(block, str):
                         token_count += len(encoding.encode(block))
-                else:
-                    # Simple string content
-                    token_count += len(encoding.encode(str(content)))
+            else:
+                # Simple string content
+                token_count += len(encoding.encode(str(content)))
             
             # Add a small overhead for message formatting
             token_count += 4  # Approximate overhead per message
@@ -3927,33 +3967,60 @@ class MCPClient:
             return options[state]
         return None
         
+    @asynccontextmanager
+    async def tool_execution_context(self, tool_name, tool_args, server_name):
+        """Context manager for tool execution metrics and tracing.
+        
+        Args:
+            tool_name: The name of the tool being executed
+            tool_args: The arguments passed to the tool
+            server_name: The name of the server handling the tool
+        """
+        start_time = time.time()
+        tool = None
+        
+        # Find the tool in our registry
+        if server_name in self.server_manager.tools_by_server:
+            for t in self.server_manager.tools_by_server[server_name]:
+                if t.name == tool_name:
+                    tool = t
+                    break
+        
+        try:
+            yield
+        finally:
+            # Update metrics if we found the tool
+            if tool and isinstance(tool, MCPTool):
+                execution_time = (time.time() - start_time) * 1000  # Convert to ms
+                tool.update_execution_time(execution_time)
+                        
     async def print_simple_status(self):
-            """Print a simplified status without using Progress widgets"""
-            # Count connected servers, available tools/resources
-            connected_servers = len(self.server_manager.active_sessions)
-            total_servers = len(self.config.servers)
-            total_tools = len(self.server_manager.tools)
-            total_resources = len(self.server_manager.resources)
-            total_prompts = len(self.server_manager.prompts)
-            # Print basic info table
-            status_table = Table(title="MCP Client Status")
-            status_table.add_column("Item")
-            status_table.add_column("Status", justify="right")
-            status_table.add_row(f"{STATUS_EMOJI['model']} Model", self.current_model)
-            status_table.add_row(f"{STATUS_EMOJI['server']} Servers", f"{connected_servers}/{total_servers} connected")
-            status_table.add_row(f"{STATUS_EMOJI['tool']} Tools", str(total_tools))
-            status_table.add_row(f"{STATUS_EMOJI['resource']} Resources", str(total_resources))
-            status_table.add_row(f"{STATUS_EMOJI['prompt']} Prompts", str(total_prompts))
-            self.safe_print(status_table)
-            # Show connected server info
-            if connected_servers > 0:
-                self.safe_print("\n[bold]Connected Servers:[/]")
-                for name, server in self.config.servers.items():
-                    if name in self.server_manager.active_sessions:
-                        # Get number of tools for this server
-                        server_tools = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
-                        self.safe_print(f"[green]✓[/] {name} ({server.type.value}) - {server_tools} tools")
-            self.safe_print("[green]Ready to process queries![/green]")
+        """Print a simplified status without using Progress widgets"""
+        # Count connected servers, available tools/resources
+        connected_servers = len(self.server_manager.active_sessions)
+        total_servers = len(self.config.servers)
+        total_tools = len(self.server_manager.tools)
+        total_resources = len(self.server_manager.resources)
+        total_prompts = len(self.server_manager.prompts)
+        # Print basic info table
+        status_table = Table(title="MCP Client Status")
+        status_table.add_column("Item")
+        status_table.add_column("Status", justify="right")
+        status_table.add_row(f"{STATUS_EMOJI['model']} Model", self.current_model)
+        status_table.add_row(f"{STATUS_EMOJI['server']} Servers", f"{connected_servers}/{total_servers} connected")
+        status_table.add_row(f"{STATUS_EMOJI['tool']} Tools", str(total_tools))
+        status_table.add_row(f"{STATUS_EMOJI['resource']} Resources", str(total_resources))
+        status_table.add_row(f"{STATUS_EMOJI['prompt']} Prompts", str(total_prompts))
+        self.safe_print(status_table)
+        # Show connected server info
+        if connected_servers > 0:
+            self.safe_print("\n[bold]Connected Servers:[/]")
+            for name, server in self.config.servers.items():
+                if name in self.server_manager.active_sessions:
+                    # Get number of tools for this server
+                    server_tools = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
+                    self.safe_print(f"[green]✓[/] {name} ({server.type.value}) - {server_tools} tools")
+        self.safe_print("[green]Ready to process queries![/green]")
                 
     async def setup(self, interactive_mode=False):
         """Set up the client, connect to servers, and load capabilities"""
@@ -4330,525 +4397,736 @@ class MCPClient:
         # Close server connections and processes
         if hasattr(self, 'server_manager'):
              await self.server_manager.close()
-        # Close cache
-        if self.tool_cache:
-            self.tool_cache.close()
     
-    async def process_streaming_query(self, query: str, model: Optional[str] = None, 
-                               max_tokens: Optional[int] = None) -> AsyncIterator[str]:
-        """Process a query using Claude and available tools with streaming"""
+    async def process_streaming_query(self, query: str, model: Optional[str] = None,
+                                    max_tokens: Optional[int] = None) -> AsyncIterator[str]:
+        """Process a query using Claude and available tools with streaming.
+        Correctly handles OpenTelemetry spans."""
         # Wrap the entire function in safe_stdout to prevent any accidental stdout pollution
         # during the streaming interaction with stdio servers
         with safe_stdout():
             # Get core parameters
             if not model:
                 model = self.current_model
-                
+
             if not max_tokens:
                 max_tokens = self.config.default_max_tokens
-                
+
             # Check if we have any servers connected
             if not self.server_manager.active_sessions:
                 yield "No MCP servers connected. Use 'servers connect' to connect to servers."
                 return
-            
+
             # Get tools from all connected servers
             available_tools = self.server_manager.format_tools_for_anthropic()
-            
+
             if not available_tools:
                 yield "No tools available from connected servers."
                 return
-                
+
             # Start timing for metrics
             start_time = time.time()
-            
+
             # Keep track of servers and tools used
             servers_used = set()
             tools_used = []
-            
+            tool_results_for_history = [] # Store tool results for history logging
+
             # Start with user message
             current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
             user_message: MessageParam = {"role": "user", "content": query}
             messages: List[MessageParam] = current_messages + [user_message]
-        
-        # Start span for tracing if available
-        span_ctx = None
+
+        # --- Corrected OpenTelemetry Span Handling ---
+        span = None
+        span_context_manager = None
         if tracer:
-            span_ctx = tracer.start_as_current_span(
-                "process_query",
-                attributes={
-                    "model": model,
-                    "query_length": len(query),
-                    "conversation_length": len(messages)
-                }
-            )
-            
+            try:
+                span_context_manager = tracer.start_as_current_span(
+                    "process_streaming_query",
+                    attributes={
+                        "model": model,
+                        "query_length": len(query),
+                        "conversation_length": len(messages),
+                        "streaming": True
+                    }
+                )
+                if span_context_manager:
+                    span = span_context_manager.__enter__() # Get the actual span object
+            except Exception as e:
+                log.warning(f"Failed to start trace span: {e}")
+                span = None
+                span_context_manager = None
+        # --- End Span Handling Setup ---
+
         try:
             # Initialize variables for streaming
             chunks = []
-            assistant_message: List[MessageParam] = []
-            current_text = ""
-            
-            # Create stream
-            async with self.anthropic.messages.stream(
-                model=model,
-                max_tokens=max_tokens,
-                messages=messages,
-                tools=available_tools,
-                temperature=self.config.temperature,
-            ) as stream:
-                # Process the streaming response
-                async for message_delta in stream:
-                    # Process event using helper method
-                    event: MessageStreamEvent = message_delta
-                    
-                    if event.type == "content_block_delta":
-                        # Process text delta using helper
-                        current_text, delta_text = self._process_text_delta(event, current_text)
-                        if delta_text:
-                            chunks.append(delta_text)
-                            yield delta_text
-                            
-                    elif event.type == "message_start":
-                        # Message started, initialize containers
-                        pass
-                        
-                    elif event.type == "content_block_start":
-                        # Content block started
-                        block = event.content_block
-                        if block.type == "text":
-                            current_text = ""
-                        elif block.type == "tool_use":
-                            yield f"\n[{STATUS_EMOJI['tool']}] Using tool: {block.name}..."
-                            
-                    elif event.type == "content_block_stop":
-                        # Content block finished
-                        block = event.content_block
-                        if block.type == "text":
-                            assistant_message.append({"type": "text", "text": current_text})
-                        elif block.type == "tool_use":
-                            # Process tool call
-                            tool_name = block.name
-                            tool_args = block.input
-                            
-                            # Find the server for this tool
-                            tool = self.server_manager.tools.get(tool_name)
-                            if not tool:
-                                yield f"\n[Tool Error: '{tool_name}' not found]"
-                                continue
-                            
-                            # Keep track of this server
-                            servers_used.add(tool.server_name)
-                            tools_used.append(tool_name)
-                            
-                            # Get server session
-                            session = self.server_manager.active_sessions.get(tool.server_name)
-                            if not session:
-                                yield f"\n[Server Error: '{tool.server_name}' not connected]"
-                                continue
-                                
-                            # Check tool cache if enabled
-                            tool_result = None
-                            cache_used = False
-                            if self.tool_cache: # Check if cache is enabled and instantiated
-                                tool_result = self.tool_cache.get(tool_name, tool_args)
-                                if tool_result is not None:
-                                    cache_used = True
-                                    yield f"\n[{STATUS_EMOJI['cached']} Using cached result for {tool_name}]"
-                            
-                            # Execute the tool if not cached
-                            if not cache_used:
-                                yield f"\n[{STATUS_EMOJI['tool']}] Executing {tool_name}..."
-                                
-                                try:
-                                    # Use the new execute_tool method with retry and circuit breaker
-                                    tool_result = await self.execute_tool(tool.server_name, tool_name, tool_args)
-                                    
-                                    # Cache the result if enabled
-                                    if self.tool_cache:
-                                        self.tool_cache.set(tool_name, tool_args, tool_result)
-                                        
-                                except Exception as e:
-                                    log.error(f"Error executing tool {tool_name}: {e}")
-                                    yield f"\n[{STATUS_EMOJI['failure']}] Tool Execution Error: {str(e)}"
-                                    
-                                    # Skip this tool call
-                                    continue
-                            
-                            # Add tool result to messages for context
-                            assistant_message.append({"type": "tool_use", "id": block.id, "name": tool_name, "input": tool_args})
-                            messages.append({"role": "assistant", "content": assistant_message})
-                            messages.append({"role": "tool", "tool_use_id": block.id, "content": tool_result})
-                            
-                            # Reset for next content
-                            assistant_message = []
-                            current_text = ""
-                            
-                            # Continue the stream with new context
-                            yield f"\n[{STATUS_EMOJI['success']}] Tool result received, continuing..."
-                            
-                            # Create new stream with updated context
-                            async with self.anthropic.messages.stream(
-                                model=model,
-                                max_tokens=max_tokens,
-                                messages=messages,
-                                tools=available_tools,
-                                temperature=self.config.temperature,
-                            ) as continuation_stream:
-                                async for continued_delta in continuation_stream:
-                                    # Process event using helper method
-                                    continued_event: MessageStreamEvent = continued_delta
-                                    
-                                    # Use the stream event processing helper
-                                    current_text, text_to_yield = self._process_stream_event(continued_event, current_text)
-                                    if text_to_yield:
-                                        chunks.append(text_to_yield)
-                                        yield text_to_yield
-                                        
-                                    # Handle content block stop specially
-                                    if continued_event.type == "content_block_stop" and continued_event.content_block.type == "text":
-                                        assistant_message.append({"type": "text", "text": current_text})
-                    
-                    elif event.type == "message_stop":
-                        # Message complete
-                        pass
-            
-            # Update conversation messages for future continuations
-            self.conversation_graph.current_node.add_message(user_message)
-            self.conversation_graph.current_node.add_message({"role": "assistant", "content": assistant_message})
-            self.conversation_graph.current_node.model = model # Store model used for this node
-            
-            # Create a complete response for history
-            complete_response = "".join(chunks)
-            
-            # Calculate metrics
-            end_time = time.time()
-            latency_ms = (end_time - start_time) * 1000
-            
-            # Add to history
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.history.add(ChatHistory(
-                query=query,
-                response=complete_response,
-                model=model,
-                timestamp=timestamp,
-                server_names=list(servers_used),
-                tools_used=tools_used,
-                conversation_id=self.conversation_graph.current_node.id, # Add conversation ID
-                latency_ms=latency_ms,
-                streamed=True
-            ))
-            
-            # End trace span
-            if span_ctx:
-                span_ctx.set_status(trace.StatusCode.OK)
-                span_ctx.add_event("query_complete", {
-                    "latency_ms": latency_ms,
-                    "tools_used": len(tools_used),
-                    "servers_used": len(servers_used)
-                })
-                span_ctx.end()
-                
-        except Exception as e:
-            error_msg = f"Error processing query: {str(e)}"
-            log.error(error_msg)
-            yield f"\n[Error: {error_msg}]"
-            
-            # End trace span with error
-            if span_ctx:
-                span_ctx.set_status(trace.StatusCode.ERROR, error_msg)
-                span_ctx.end()
+            current_assistant_content: List[Dict[str, Any]] = [] # Store list of content blocks (text or tool_use)
+            current_text = "" # For accumulating text within a text block
 
-    async def process_query(self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
-        """Process a query using Claude and available tools (non-streaming version)"""
-        if not model:
-            model = self.current_model
-            
-        if not max_tokens:
-            max_tokens = self.config.default_max_tokens
-        
-        # Check if context needs pruning before processing
-        await self.auto_prune_context()
-        
-        # Use streaming if enabled, but collect all results
-        if self.config.enable_streaming:
-            chunks = []
-            async for chunk in self.process_streaming_query(query, model, max_tokens):
-                chunks.append(chunk)
-            return "".join(chunks)
-        
-        # Non-streaming implementation for backwards compatibility
-        start_time = time.time()
-        
-        # Check if we have any servers connected
-        if not self.server_manager.active_sessions:
-            return "No MCP servers connected. Use 'servers connect' to connect to servers."
-        
-        # Get tools from all connected servers
-        available_tools = self.server_manager.format_tools_for_anthropic()
-        
-        if not available_tools:
-            return "No tools available from connected servers."
-            
-        # Keep track of servers and tools used
-        servers_used = set()
-        tools_used = []
-        
-        # Start with user message
-        current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
-        user_message: MessageParam = {"role": "user", "content": query}
-        messages: List[MessageParam] = current_messages + [user_message]
-        
-        # Create span for tracing if available
-        span_ctx = None
-        if tracer:
-            span_ctx = tracer.start_as_current_span(
-                "process_query",
-                attributes={
-                    "model": model,
-                    "query_length": len(query),
-                    "conversation_length": len(messages),
-                    "streaming": False
-                }
-            )
-        
-        with Status(f"{STATUS_EMOJI['speech_balloon']} Claude is thinking...", spinner="dots", console=get_safe_console()) as status:
-            try:
-                # Make initial API call
-                status.update(f"{STATUS_EMOJI['speech_balloon']} Sending query to Claude ({model})...")
-                response = await self.anthropic.messages.create(
+            # --- Main Streaming Loop ---
+            while True: # Loop until non-tool_use stop reason
+                stop_reason = None
+                async with self.anthropic.messages.stream(
                     model=model,
                     max_tokens=max_tokens,
                     messages=messages,
                     tools=available_tools,
                     temperature=self.config.temperature,
-                )
-                
-                status.update(f"{STATUS_EMOJI['success']} Received response from Claude")
-                
-                # Process response and handle tool calls
-                final_text = []
-                assistant_message: List[MessageParam] = []
-                
-                for content in response.content:
-                    if content.type == 'text':
-                        final_text.append(content.text)
-                        assistant_message.append(content)
-                        
-                    elif content.type == 'tool_use':
-                        tool_name = content.name
-                        tool_args = content.input
-                        
-                        # Find the server for this tool
-                        tool = self.server_manager.tools.get(tool_name)
-                        if not tool:
-                            final_text.append(f"\n[Tool Error: '{tool_name}' not found]")
-                            continue
-                        
-                        # Keep track of this server
-                        servers_used.add(tool.server_name)
-                        tools_used.append(tool_name)
-                        
-                        # Get server session
-                        session = self.server_manager.active_sessions.get(tool.server_name)
-                        if not session:
-                            final_text.append(f"\n[Server Error: '{tool.server_name}' not connected]")
-                            continue
-                        
-                        # Check tool cache if enabled
-                        tool_result = None
+                ) as stream:
+                    # Process the streaming response
+                    async for event in stream:
+                        event_type = event.type
+
+                        if event_type == "message_start":
+                            # Get the role ('assistant')
+                            role = event.message.role  # noqa: F841
+                            current_assistant_content = [] # Reset for this assistant message turn
+
+                        elif event_type == "content_block_start":
+                            block_type = event.content_block.type
+                            if block_type == "text":
+                                current_text = "" # Reset text accumulator
+                            elif block_type == "tool_use":
+                                tool_name_sanitized = event.content_block.name
+                                # Map back to original name for logging/display if possible
+                                original_tool_name = self.server_manager.sanitized_to_original.get(tool_name_sanitized, tool_name_sanitized)
+                                yield f"\n[{STATUS_EMOJI['tool']}] Using tool: {original_tool_name}..."
+                                # Add the tool_use block immediately to track its structure
+                                current_assistant_content.append({
+                                    "type": "tool_use",
+                                    "id": event.content_block.id,
+                                    "name": tool_name_sanitized, # Use sanitized name for Anthropic
+                                    "input": event.content_block.input # Input is available here
+                                })
+
+
+                        elif event_type == "content_block_delta":
+                            delta = event.delta
+                            if delta.type == "text_delta":
+                                delta_text = delta.text
+                                current_text += delta_text
+                                chunks.append(delta_text)
+                                yield delta_text
+
+                        elif event_type == "content_block_stop":
+                            block = event.content_block
+                            if block.type == "text":
+                                # Finalize the text block
+                                current_assistant_content.append({"type": "text", "text": current_text})
+                                current_text = "" # Reset for safety
+                            # Tool use block stop doesn't need special handling here, info captured at start
+
+                        elif event_type == "message_delta":
+                            # Capture the stop reason here
+                            if event.delta.stop_reason:
+                                stop_reason = event.delta.stop_reason
+
+                        elif event_type == "message_stop":
+                            # This signals the end of this stream response.
+                            # The loop condition below will check stop_reason.
+                            pass
+
+                    # --- End of inner stream processing ---
+
+                # --- Process Tool Calls if necessary ---
+                if stop_reason == "tool_use":
+                    # Add the assistant message that led to the tool use
+                    if current_assistant_content:
+                        messages.append({"role": "assistant", "content": current_assistant_content})
+
+                    # Prepare tool results message
+                    tool_results_for_api: List[MessageParam] = []
+                    tool_calls_to_process = [block for block in current_assistant_content if block.get("type") == "tool_use"]
+
+                    for tool_call_block in tool_calls_to_process:
+                        tool_name_sanitized = tool_call_block["name"]
+                        tool_args = tool_call_block["input"]
+                        tool_use_id = tool_call_block["id"]
+
+                        original_tool_name = self.server_manager.sanitized_to_original.get(tool_name_sanitized, tool_name_sanitized)
+                        tool = self.server_manager.tools.get(original_tool_name)
+
+                        tool_result_content: Any = None
+                        is_error = False
                         cache_used = False
-                        if self.tool_cache: # Check if cache is enabled and instantiated
-                            tool_result = self.tool_cache.get(tool_name, tool_args)
-                            if tool_result is not None:
-                                cache_used = True
-                                status.update(f"{STATUS_EMOJI['package']} Using cached result for {tool_name}")
-                                log.info(f"Using cached result for {tool_name}")
-                        
-                        # Execute the tool if not cached
-                        if not cache_used:
-                            # Execute the tool
-                            status.update(f"{STATUS_EMOJI['tool']} Executing tool: {tool_name}...")
-                            
-                            try:
-                                # Use safe_stdout to prevent stdout pollution during tool execution
-                                with safe_stdout():
-                                    # Use the new execute_tool method with retry and circuit breaker
-                                    tool_result = await self.execute_tool(tool.server_name, tool_name, tool_args)
-                                
-                                # Update progress
-                                status.update(f"{STATUS_EMOJI['success']} Tool {tool_name} execution complete")
-                                
-                                # Cache the result if enabled
+
+                        if not tool:
+                            log.warning(f"Tool mapping issue or tool not found. Sanitized: '{tool_name_sanitized}', Original attempted: '{original_tool_name}'")
+                            tool_result_content = f"Error: Tool '{original_tool_name}' (requested as '{tool_name_sanitized}') not found by client."
+                            is_error = True
+                            yield f"\n[{STATUS_EMOJI['failure']}] Tool Error: {tool_result_content}"
+                        else:
+                            servers_used.add(tool.server_name)
+                            tools_used.append(original_tool_name)
+                            session = self.server_manager.active_sessions.get(tool.server_name)
+
+                            if not session:
+                                tool_result_content = f"Error: Server '{tool.server_name}' for tool '{original_tool_name}' is not connected."
+                                is_error = True
+                                yield f"\n[{STATUS_EMOJI['failure']}] Server Error: {tool_result_content}"
+                            else:
+                                # Check cache
                                 if self.tool_cache:
-                                    self.tool_cache.set(tool_name, tool_args, tool_result)
-                                
-                            except Exception as e:
-                                log.error(f"Error executing tool {tool_name}: {e}")
-                                status.update(f"{STATUS_EMOJI['failure']} Tool {tool_name} execution failed: {e}")
-                                final_text.append(f"\n[Tool Execution Error: {str(e)}]")
-                                
-                                # Skip this tool call
-                                continue
-                        
-                        # Add tool result to messages list
-                        messages.append({"role": "assistant", "content": assistant_message})
-                        messages.append({"role": "tool", "tool_use_id": content.id, "content": tool_result})
-                        
-                        # Update assistant message for next potential tool call
-                        assistant_message = []
-                        
-                        # Make another API call with the tool result
-                        status.update(f"{STATUS_EMOJI['speech_balloon']} Claude is processing tool result...")
-                        
-                        response = await self.anthropic.messages.create(
-                            model=model,
-                            max_tokens=max_tokens,
-                            messages=messages,
-                            tools=available_tools,
-                            temperature=self.config.temperature,
-                        )
-                        
-                        status.update(f"{STATUS_EMOJI['success']} Received response from Claude")
-                        
-                        # Reset final_text to capture only the latest response
-                        final_text = []
-                        
-                        # Process the new response
-                        for content in response.content:
-                            if content.type == 'text':
-                                final_text.append(content.text)
-                                assistant_message.append(content)
-                
-                # Update conversation messages for future continuations
-                self.conversation_graph.current_node.messages = messages # Store full history leading to this response
-                self.conversation_graph.current_node.add_message({"role": "assistant", "content": assistant_message}) # Add final assistant response
-                self.conversation_graph.current_node.model = model # Store model used for this node
-                
-                # Create a single string from all text pieces
-                result = "".join(final_text)
-                
-                # Calculate metrics
-                end_time = time.time()
-                latency_ms = (end_time - start_time) * 1000
-                
-                # Add to history
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.history.add(ChatHistory(
-                    query=query,
-                    response=result,
-                    model=model,
-                    timestamp=timestamp,
-                    server_names=list(servers_used),
-                    tools_used=tools_used,
-                    conversation_id=self.conversation_graph.current_node.id, # Add conversation ID
-                    latency_ms=latency_ms,
-                    streamed=False
-                ))
-                
-                # End trace span
-                if span_ctx:
-                    span_ctx.set_status(trace.StatusCode.OK)
-                    span_ctx.add_event("query_complete", {
-                        "latency_ms": latency_ms,
-                        "tools_used": len(tools_used),
-                        "servers_used": len(servers_used),
-                        "response_length": len(result)
-                    })
-                    span_ctx.end()
-                
-                return result
-                
+                                    cached_result = self.tool_cache.get(original_tool_name, tool_args)
+                                    if cached_result is not None:
+                                        tool_result_content = cached_result
+                                        cache_used = True
+                                        yield f"\n[{STATUS_EMOJI['cached']} Using cached result for {original_tool_name}]"
+                                        log.info(f"Using cached result for {original_tool_name}")
+
+                                # Execute if not cached
+                                if not cache_used:
+                                    yield f"\n[{STATUS_EMOJI['tool']}] Executing {original_tool_name}..."
+                                    try:
+                                        with safe_stdout(): # Protect stdout during execution
+                                            tool_result_content = await self.execute_tool(tool.server_name, original_tool_name, tool_args)
+                                        # Cache result
+                                        if self.tool_cache:
+                                            self.tool_cache.set(original_tool_name, tool_args, tool_result_content)
+                                        yield f"\n[{STATUS_EMOJI['success']}] Tool result received."
+                                    except Exception as e:
+                                        log.error(f"Error executing tool {original_tool_name}: {e}", exc_info=True)
+                                        tool_result_content = f"Error executing tool '{original_tool_name}': {str(e)}"
+                                        is_error = True
+                                        yield f"\n[{STATUS_EMOJI['failure']}] Tool Execution Error: {str(e)}"
+
+
+                        # Append result for the *next* API call
+                        tool_results_for_api.append({
+                            "role": "user",
+                            "tool_use_id": tool_use_id,
+                            "content": tool_result_content,
+                        })
+                        # Also store for final history logging
+                        tool_results_for_history.append({
+                            "role": "user",
+                            "tool_use_id": tool_use_id,
+                            "content": tool_result_content,
+                            "is_error": is_error # Keep track internally
+                        })
+
+
+                    # Add tool results to messages and continue the outer loop
+                    messages.extend(tool_results_for_api)
+                    current_assistant_content = [] # Reset for next iteration
+                    continue # Go back to start of while loop to call Claude again
+
+                else:
+                    # Stop reason was not 'tool_use', break the main loop
+                    # Add the final assistant message content to messages list
+                    if current_assistant_content:
+                        messages.append({"role": "assistant", "content": current_assistant_content})
+                    break # Exit the while True loop
+
+            # --- End of Streaming / Tool Call Loop ---
+
+            # Update conversation graph node
+            self.conversation_graph.current_node.add_message(user_message)
+            # Add all assistant turns and tool results collected during the process
+            for msg in messages[len(current_messages) + 1:]: # Add messages added *after* the initial user message
+                self.conversation_graph.current_node.add_message(msg)
+            self.conversation_graph.current_node.model = model # Store model used
+
+            # Create a complete response string from chunks
+            complete_response = "".join(chunks)
+
+            # Calculate metrics
+            end_time = time.time()
+            latency_ms = (end_time - start_time) * 1000
+
+            # Add to history (using the collected tool results)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            await self.history.add_async(ChatHistory(
+                query=query,
+                response=complete_response,
+                model=model,
+                timestamp=timestamp,
+                server_names=list(servers_used),
+                tools_used=tools_used, # Already original names
+                conversation_id=self.conversation_graph.current_node.id,
+                latency_ms=latency_ms,
+                streamed=True,
+                # Indicate if cache was hit in *any* tool call during the process
+                cached=any(res.get("_cache_hit", False) for res in tool_results_for_history) # Simplistic, requires adding _cache_hit
+            ))
+
+            # --- Finalize Span ---
+            if span:
+                span.set_status(trace.StatusCode.OK)
+                span.add_event("query_complete", {
+                    "latency_ms": latency_ms,
+                    "tools_used": len(tools_used),
+                    "servers_used": len(servers_used),
+                    "response_length": len(complete_response),
+                    "final_stop_reason": stop_reason # Log the final reason
+                })
+            # --- End Span ---
+
+        except Exception as e:
+            error_msg = f"Error processing query: {str(e)}"
+            log.error(error_msg, exc_info=True) # Log with traceback
+            yield f"\n[Error: {error_msg}]" # Yield error to the stream
+
+            # --- Finalize Span with Error ---
+            if span:
+                span.set_status(trace.StatusCode.ERROR, description=error_msg)
+            # --- End Span ---
+
+        finally:
+            # --- Ensure Span Context is Exited ---
+            if span_context_manager:
+                try:
+                    exc_type, exc_value, tb = sys.exc_info()
+                    span_context_manager.__exit__(exc_type, exc_value, tb)
+                except Exception as exit_err:
+                    log.warning(f"Error exiting span context manager: {exit_err}")
+            # --- End Span Exit ---
+
+    async def process_query(self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
+        """
+        Process a query using Claude and available tools (non-streaming version).
+        Handles OpenTelemetry span lifecycle correctly.
+        """
+        if not model:
+            model = self.current_model
+
+        if not max_tokens:
+            max_tokens = self.config.default_max_tokens
+
+        # Check if context needs pruning before processing
+        await self.auto_prune_context()
+
+        # Use streaming if enabled, but collect all results
+        if self.config.enable_streaming:
+            chunks = []
+            # Note: process_streaming_query needs the same span fix internally
+            async for chunk in self.process_streaming_query(query, model, max_tokens):
+                chunks.append(chunk)
+            return "".join(chunks)
+
+        # --- Non-streaming implementation ---
+        start_time = time.time()
+
+        # Check if we have any servers connected
+        if not self.server_manager.active_sessions:
+            return "No MCP servers connected. Use 'servers connect' to connect to servers."
+
+        # Get tools from all connected servers
+        available_tools = self.server_manager.format_tools_for_anthropic()
+
+        if not available_tools:
+            return "No tools available from connected servers."
+
+        # Keep track of servers and tools used
+        servers_used = set()
+        tools_used = []
+
+        # Start with user message
+        current_messages: List[MessageParam] = self.conversation_graph.current_node.messages.copy()
+        user_message: MessageParam = {"role": "user", "content": query}
+        messages: List[MessageParam] = current_messages + [user_message]
+
+        # --- Corrected OpenTelemetry Span Handling ---
+        span = None
+        span_context_manager = None
+        if tracer:
+            try:
+                span_context_manager = tracer.start_as_current_span(
+                    "process_query_non_streaming", # More specific name
+                    attributes={
+                        "model": model,
+                        "query_length": len(query),
+                        "conversation_length": len(messages),
+                        "streaming": False
+                    }
+                )
+                if span_context_manager:
+                    span = span_context_manager.__enter__() # Get the actual span object
             except Exception as e:
-                error_msg = f"Error processing query: {str(e)}"
-                log.error(error_msg)
-                
-                # End trace span with error
-                if span_ctx:
-                    span_ctx.set_status(trace.StatusCode.ERROR, error_msg)
-                    span_ctx.end()
-                
-                return f"[Error: {error_msg}]"
+                log.warning(f"Failed to start trace span: {e}")
+                span = None
+                span_context_manager = None
+        # --- End Span Handling Setup ---
+
+        # Use a manually controlled status instead of context manager
+        safe_console = get_safe_console()
+        status = Status(f"{STATUS_EMOJI['speech_balloon']} Claude is thinking...", spinner="dots", console=safe_console)
+        status.start()
+
+        try:
+            # Make initial API call
+            status.update(f"{STATUS_EMOJI['speech_balloon']} Sending query to Claude ({model})...")
+            response = await self.anthropic.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=messages,
+                tools=available_tools,
+                temperature=self.config.temperature,
+            )
+
+            status.update(f"{STATUS_EMOJI['success']} Received response from Claude")
+
+            # Process response and handle tool calls
+            final_text = []
+            assistant_message_content: List[Dict[str, Any]] = [] # Store content blocks for the message
+
+            while response.stop_reason == "tool_use":
+                tool_calls_this_round = []
+                new_assistant_content = [] # Content leading up to this tool use
+                tool_results = []
+
+                for content_block in response.content:
+                    if content_block.type == 'text':
+                        final_text.append(content_block.text)
+                        new_assistant_content.append({"type": "text", "text": content_block.text})
+                    elif content_block.type == 'tool_use':
+                        tool_calls_this_round.append(content_block)
+                        # Also add the tool_use block to the assistant's message content
+                        new_assistant_content.append({"type": "tool_use", "id": content_block.id, "name": content_block.name, "input": content_block.input})
+
+
+                # Add the assistant message that *led* to the tool use
+                if new_assistant_content:
+                    messages.append({"role": "assistant", "content": new_assistant_content})
+                    assistant_message_content.extend(new_assistant_content) # Keep track for final message
+
+
+                # Process all tool calls detected in this round
+                for tool_call in tool_calls_this_round:
+                    tool_name = tool_call.name
+                    tool_args = tool_call.input
+                    tool_use_id = tool_call.id
+
+                    # Find the server for this tool
+                    original_tool_name = self.server_manager.sanitized_to_original.get(tool_name, tool_name)
+                    tool = self.server_manager.tools.get(original_tool_name)
+
+                    if not tool:
+                        log.warning(f"Tool mapping issue or tool not found. Sanitized: '{tool_name}', Original attempted: '{original_tool_name}'")
+                        # Append an error message as tool result
+                        tool_results.append({
+                            "role": "user",
+                            "tool_use_id": tool_use_id,
+                            "content": f"Error: Tool '{original_tool_name}' (requested as '{tool_name}') not found by client.",
+                            "is_error": True
+                        })
+                        continue # Skip execution for this tool
+
+                    servers_used.add(tool.server_name)
+                    tools_used.append(original_tool_name)
+
+                    session = self.server_manager.active_sessions.get(tool.server_name)
+                    if not session:
+                        tool_results.append({
+                            "role": "user",
+                            "tool_use_id": tool_use_id,
+                            "content": f"Error: Server '{tool.server_name}' for tool '{original_tool_name}' is not connected.",
+                            "is_error": True
+                        })
+                        continue
+
+                    # Check cache
+                    tool_result_content = None
+                    cache_used = False
+                    if self.tool_cache:
+                        cached_result = self.tool_cache.get(original_tool_name, tool_args)
+                        if cached_result is not None:
+                            tool_result_content = cached_result
+                            cache_used = True
+                            status.update(f"{STATUS_EMOJI['package']} Using cached result for {original_tool_name}")
+                            log.info(f"Using cached result for {original_tool_name}")
+
+                    # Execute if not cached
+                    if not cache_used:
+                        status.update(f"{STATUS_EMOJI['tool']} Executing tool: {original_tool_name}...")
+                        try:
+                            # Wrap execution in safe_stdout context
+                            with safe_stdout():
+                                tool_result_content = await self.execute_tool(tool.server_name, original_tool_name, tool_args)
+
+                            # Cache the result if successful
+                            if self.tool_cache:
+                                self.tool_cache.set(original_tool_name, tool_args, tool_result_content)
+
+                            status.update(f"{STATUS_EMOJI['success']} Tool {original_tool_name} execution complete")
+                        except Exception as e:
+                            log.error(f"Error executing tool {original_tool_name}: {e}", exc_info=True)
+                            status.update(f"{STATUS_EMOJI['failure']} Tool {original_tool_name} execution failed")
+                            tool_results.append({
+                                "role": "user",
+                                "tool_use_id": tool_use_id,
+                                "content": f"Error executing tool '{original_tool_name}': {str(e)}",
+                                "is_error": True
+                            })
+                            continue # Skip adding successful result
+
+                    # Add successful tool result
+                    tool_results.append({
+                        "role": "user",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_result_content # Can be complex JSON, keep as is
+                    })
+
+
+                # Add all tool results to messages
+                messages.extend(tool_results)
+
+                # Reset final_text and assistant_message for the next turn
+                final_text = []
+                # assistant_message_content is built cumulatively
+
+                # Make another API call with the tool results
+                status.update(f"{STATUS_EMOJI['speech_balloon']} Claude is processing tool results...")
+                response = await self.anthropic.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                    tools=available_tools, # Resend tools in case Claude needs them again
+                    temperature=self.config.temperature,
+                )
+                status.update(f"{STATUS_EMOJI['success']} Received final response from Claude")
+
+            # Process the final response (which should not be tool_use)
+            final_assistant_content = []
+            for content_block in response.content:
+                if content_block.type == 'text':
+                    final_text.append(content_block.text)
+                    final_assistant_content.append({"type": "text", "text": content_block.text})
+                # Handle other final content types if necessary
+
+            # Add the final assistant message
+            if final_assistant_content:
+                messages.append({"role": "assistant", "content": final_assistant_content})
+                assistant_message_content.extend(final_assistant_content)
+
+            # --- Update Conversation Graph ---
+            # Add the initial user message
+            self.conversation_graph.current_node.add_message(user_message)
+            # Add the complete assistant message (including text and tool uses)
+            if assistant_message_content:
+                self.conversation_graph.current_node.add_message({"role": "assistant", "content": assistant_message_content})
+            # Add all the tool result messages
+            for tool_msg in tool_results:
+                self.conversation_graph.current_node.add_message(tool_msg)
+            # Store the model used
+            self.conversation_graph.current_node.model = model
+
+            # Create a single string from the final text pieces
+            result = "".join(final_text)
+
+            # Calculate metrics
+            end_time = time.time()
+            latency_ms = (end_time - start_time) * 1000
+
+            # Add to history
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Ensure history uses the original tool names
+            await self.history.add_async(ChatHistory(
+                query=query,
+                response=result,
+                model=model,
+                timestamp=timestamp,
+                server_names=list(servers_used),
+                tools_used=tools_used, # Already using original names here
+                conversation_id=self.conversation_graph.current_node.id,
+                latency_ms=latency_ms,
+                streamed=False, # Explicitly mark as non-streamed
+                cached=cache_used # Indicate if cache was hit in the *last* tool call
+            ))
+
+            # --- Finalize Span ---
+            if span:
+                span.set_status(trace.StatusCode.OK)
+                span.add_event("query_complete", {
+                    "latency_ms": latency_ms,
+                    "tools_used": len(tools_used),
+                    "servers_used": len(servers_used),
+                    "response_length": len(result),
+                    "stop_reason": response.stop_reason
+                })
+            # --- End Span ---
+
+            return result
+
+        except Exception as e:
+            error_msg = f"Error processing query: {str(e)}"
+            log.error(error_msg, exc_info=True) # Log with traceback
+
+            # --- Finalize Span with Error ---
+            if span:
+                span.set_status(trace.StatusCode.ERROR, description=error_msg)
+            # --- End Span ---
+
+            return f"Unexpected Error: {error_msg}"
+
+        finally:
+            # --- Ensure Span Context is Exited ---
+            if span_context_manager:
+                try:
+                    exc_type, exc_value, tb = sys.exc_info()
+                    span_context_manager.__exit__(exc_type, exc_value, tb)
+                except Exception as exit_err:
+                    log.warning(f"Error exiting span context manager: {exit_err}")
+            # --- End Span Exit ---
+
+            # Stop the status display if it was started and is running
+            if 'status' in locals() and hasattr(status, 'is_running') and status.is_running:
+                status.stop()
         
     async def interactive_loop(self):
-        """Run interactive command loop"""
-        # Always use get_safe_console for interactive mode to avoid interference with stdio servers
+        """Run interactive command loop with smoother live streaming output."""
+        # Always use get_safe_console for interactive mode
         interactive_console = get_safe_console()
-        
+
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print("Type your query to Claude, or a command (type 'help' for available commands)")
         self.safe_print("[italic]Press Ctrl+C twice in quick succession to force exit if unresponsive[/italic]")
-        
+
         # Track Ctrl+C attempts for force exit
         ctrl_c_count = 0
         last_ctrl_c_time = 0
-        
+
         while True:
+            live_display: Optional[Live] = None # To manage the Live instance
             try:
                 user_input = Prompt.ask("\n[bold blue]>>[/]", console=interactive_console)
-                
+
                 # Reset Ctrl+C counter on successful input
                 ctrl_c_count = 0
-                
+
                 # Check if it's a command
                 if user_input.startswith('/'):
                     cmd_parts = user_input[1:].split(maxsplit=1)
                     cmd = cmd_parts[0].lower()
                     args = cmd_parts[1] if len(cmd_parts) > 1 else ""
-                    
+
                     if cmd in self.commands:
+                        # Ensure Live display is stopped before running a command
+                        if live_display and live_display.is_started:
+                            live_display.stop()
+                            live_display = None
                         await self.commands[cmd](args)
                     else:
                         interactive_console.print(f"[yellow]Unknown command: {cmd}[/]")
                         interactive_console.print("Type '/help' for available commands")
-                
+
                 # Empty input
                 elif not user_input.strip():
                     continue
-                
-                # Process as a query to Claude
+
+                # --- Process as a query to Claude with smoother live streaming output ---
                 else:
-                    result = await self.process_query(user_input)
-                    interactive_console.print()
-                    interactive_console.print(Panel.fit(
-                        Markdown(result),
-                        title="Claude",
-                        border_style="green"
-                    ))
-                    
+                    current_markdown_content = ""
+                    # Initialize the Panel content for Live display
+                    # Start with an empty panel initially to avoid rendering "..."
+                    initial_panel = Panel("", title="Claude", border_style="green")
+
+                    # Create the Live display context manager
+                    # Refresh rate (e.g., 3 times per second) controls how often Rich redraws
+                    REFRESH_RATE = 3.0
+                    live_display = Live(
+                        initial_panel, # Start with the initial panel
+                        console=interactive_console,
+                        refresh_per_second=REFRESH_RATE, # Let Live handle refresh rate
+                        transient=False, # Keep the final output visible
+                        vertical_overflow="visible"
+                    )
+                    live_display.start() # Start the Live display
+
+                    # Stream the response using process_streaming_query
+                    async for chunk in self.process_streaming_query(user_input):
+                        # Append new chunk to the content
+                        current_markdown_content += chunk
+                        # Create Markdown object from accumulated content
+                        md = Markdown(current_markdown_content)
+                        # Create Panel
+                        panel = Panel(md, title="Claude", border_style="green")
+                        # Update the Live display's renderable *without* forcing an immediate refresh
+                        # Live will pick up the change and redraw based on its refresh_per_second setting
+                        live_display.update(panel, refresh=False)
+                        # Small sleep to allow other tasks (like UI updates) to run smoothly
+                        # Adjust if needed, but 0 helps yield control briefly.
+                        await asyncio.sleep(0.01)
+
+                    # --- After the loop ---
+                    # Ensure the final state is definitely rendered
+                    if live_display.is_started:
+                        # Perform one last update with the final content
+                        final_md = Markdown(current_markdown_content)
+                        final_panel = Panel(final_md, title="Claude", border_style="green")
+                        # Force a final refresh to ensure everything is displayed
+                        live_display.update(final_panel, refresh=True)
+                        live_display.stop()
+                    live_display = None # Clear reference
+
             except KeyboardInterrupt:
-                # Track Ctrl+C for double-press detection
+                if live_display and live_display.is_started: 
+                    live_display.stop()
+                    live_display = None
                 current_time = time.time()
-                if current_time - last_ctrl_c_time < 2:  # Within 2 seconds
-                    ctrl_c_count += 1
-                else:
-                    ctrl_c_count = 1
+                if current_time - last_ctrl_c_time < 2: ctrl_c_count += 1
+                else: ctrl_c_count = 1
                 last_ctrl_c_time = current_time
-                
                 if ctrl_c_count >= 2:
                     self.safe_print("\n[bold red]Force exiting...[/]")
-                    # Terminate any active processes immediately
-                    for name, process in self.server_manager.processes.items():
-                        try:
-                            if process and process.returncode is None:
-                                self.safe_print(f"[yellow]Force killing process: {name}[/]")
-                                process.kill()
-                        except Exception as e:
-                            self.safe_print(f"[red]Error killing process {name}: {e}[/]")
+                    if hasattr(self, 'server_manager') and hasattr(self.server_manager, 'processes'):
+                        for name, process in self.server_manager.processes.items():
+                            try:
+                                if process and process.returncode is None:
+                                    self.safe_print(f"[yellow]Force killing process: {name}[/]")
+                                    process.kill()
+                            except Exception as e: self.safe_print(f"[red]Error killing process {name}: {e}")
                     break
-                
                 self.safe_print("\n[yellow]Interrupted. Press Ctrl+C again to force exit.[/]")
                 continue
-            # Catch specific errors related to command execution or query processing
-            except (anthropic.APIError, McpError, httpx.RequestError) as e: 
+
+            except (anthropic.APIError, McpError, httpx.RequestError) as e:
+                if live_display and live_display.is_started:
+                    live_display.stop()
+                    live_display = None
                 self.safe_print(f"[bold red]Error ({type(e).__name__}):[/] {str(e)}")
-            # Keep broad exception for unexpected loop issues
-            except Exception as e: 
+
+            except Exception as e:
+                if live_display and live_display.is_started: 
+                    live_display.stop()
+                    live_display = None
                 self.safe_print(f"[bold red]Unexpected Error:[/] {str(e)}")
-        
+                # import traceback; traceback.print_exc() # Uncomment for debugging
+
+            finally:
+                if live_display and live_display.is_started: 
+                    live_display.stop()
+                    live_display = None
+
     async def count_tokens(self, messages=None) -> int:
-        """Delegate token counting to the server_manager"""
-        return await self.server_manager.count_tokens(messages)
+        """Count the number of tokens in the current conversation context"""
+        if messages is None:
+            messages = self.conversation_graph.current_node.messages
+            
+        # Use cl100k_base encoding which is used by Claude
+        encoding = tiktoken.get_encoding("cl100k_base")
+        token_count = 0
+        
+        for message in messages:
+            # Get the message content
+            content = message.get("content", "")
+            
+            # Handle content that might be a list of blocks (text/image blocks)
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "text" in block:
+                        token_count += len(encoding.encode(block["text"]))
+                    elif isinstance(block, str):
+                        token_count += len(encoding.encode(block))
+            else:
+                # Simple string content
+                token_count += len(encoding.encode(str(content)))
+            
+            # Add a small overhead for message formatting
+            token_count += 4  # Approximate overhead per message
+        return token_count
                                                               
     async def cmd_exit(self, args):
         """Exit the client"""
@@ -5099,6 +5377,7 @@ class MCPClient:
             )
             
         self.safe_print(server_table)
+    
     
     async def add_server(self, args):
         """Add a new server to configuration"""
@@ -6418,8 +6697,7 @@ class MCPClient:
                     log.error("Error saving config after importing servers", exc_info=True)
                     self.safe_print(f"[red]Error saving imported server config: {save_error}[/]")
             else:
-                # Inform user if no new servers were actually imported
-                self.safe_print(f"{STATUS_EMOJI['warning']} No new servers were imported from Claude desktop config (they might already exist or failed processing).")
+                self.safe_print(f"{STATUS_EMOJI['warning']}  No new servers were imported from Claude desktop config (they might already exist or failed processing).")
 
             # Report skipped servers, if any
             if skipped_servers:
@@ -7160,3 +7438,4 @@ if __name__ == "__main__":
         
     # Run the app
     app()
+
