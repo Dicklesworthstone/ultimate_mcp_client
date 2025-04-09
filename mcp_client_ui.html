@@ -27,7 +27,19 @@
     <link href="https://cdnjs.cloudflare.com/ajax/libs/daisyui/4.4.19/full.min.css" rel="stylesheet" type="text/css" />
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-
+    <script>
+        // Extend Tailwind theme to include Montserrat globally
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Montserrat', 'sans-serif'], // Make Montserrat the default sans-serif font
+                        // You could add serif/mono here too if needed
+                    },
+                }
+            }
+        }
+    </script>
     <!-- JS Libraries -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
@@ -41,15 +53,15 @@
     <!-- Alpine.js -->
     <script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.13.3/cdn.min.js"></script>
 
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,100..900;1,100..900&display=swap"
+        rel="stylesheet">
 
     <style>
         :root {
             --sidebar-width: 20rem;
             /* 320px */
-        }
-
-        body {
-            font-family: sans-serif;
         }
 
         .sidebar {
@@ -736,13 +748,11 @@
                         </div>
                         <!-- Main Chat Bubble -->
                         <!-- We apply highlight.js classes manually within renderMessageContent -->
-                        <div class="chat-bubble prose prose-sm max-w-3xl" :class="{
+                        <div class="chat-bubble max-w-3xl" :class="{
                             'chat-bubble-primary text-primary-content': message.role === 'user' && message.content_type !== 'tool_result',
-                            // Use direct neutral colors instead of relying on chat-bubble-secondary override
                             'bg-neutral text-neutral-content': message.role === 'assistant' && !message.current_status && message.content_type !== 'tool_result',
-                            'chat-bubble-info text-info-content': message.role === 'system' || (message.role === 'assistant' && message.current_status), // Keep info for system/status-only
-                            'chat-bubble-warning text-warning-content': message.content_type === 'tool_result' && message.is_error, // Keep warning for errors
-                            // Use direct info colors instead of relying on chat-bubble-accent override
+                            'chat-bubble-info text-info-content': message.role === 'system' || (message.role === 'assistant' && message.current_status),
+                            'chat-bubble-warning text-warning-content': message.content_type === 'tool_result' && message.is_error,
                             'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error,
                             'animate__animated animate__fadeInUp animate__faster': shouldAnimate(message.id || index)
                          }" x-html="renderMessageContent(message)">
@@ -1738,219 +1748,969 @@
                         this.isSendingMessage = false; this.isLoading = false; this.currentStatusMessage = "Generation stopped by user."; this.currentAssistantMessageId = null;
                     }
                 },
+                toggleDataView(messageId) {
+                    const msgIndex = this.currentConversation.findIndex(m => m.id === messageId);
+                    if (msgIndex !== -1) {
+                        const currentMode = this.currentConversation[msgIndex]._displayMode || 'raw'; // Default to raw if unset
+                        this.currentConversation[msgIndex]._displayMode = currentMode === 'raw' ? 'structured' : 'raw';
+                        // Force reactivity if needed, though modifying the property should be enough
+                        // this.currentConversation = [...this.currentConversation];
+                        // Re-initialize highlighting/tippy if the new view needs it
+                        this.$nextTick(() => {
+                            this.initHighlighting(this.$refs.chatbox);
+                            this.initTippy(); // Tooltips might be added in structured view
+                        });
+                    } else {
+                        console.warn("Could not find message to toggle view:", messageId);
+                    }
+                },
                 addMessageToConversation(role, content, metadata = {}) {
                     const tempId = `${role}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-                    const newMessage = { role: role, content: content, id: metadata.id || tempId, timestamp: metadata.timestamp || new Date().toISOString(), model: metadata.model || (role === 'assistant' ? this.currentModelShort : null), content_type: metadata.content_type || (role === 'user' && typeof content !== 'string' ? 'tool_result' : null), tool_name: metadata.tool_name, is_error: metadata.is_error, ...metadata };
-                    if (!this.currentConversation.some(m => m.id === newMessage.id)) { this.currentConversation.push(newMessage); this.scrollToBottom(); }
-                    else { const existingIndex = this.currentConversation.findIndex(m => m.id === newMessage.id); if (existingIndex > -1) { this.currentConversation[existingIndex] = { ...this.currentConversation[existingIndex], ...newMessage }; this.currentConversation = [...this.currentConversation]; } }
+                    let displayMode = undefined; // Default: let renderer decide or handle non-structured
+
+                    // Check if content itself is structured or a JSON string
+                    let isStructured = false;
+                    if (typeof content === 'object' && content !== null) {
+                        isStructured = true;
+                    } else if (typeof content === 'string' && this.isProbablyJsonString(content)) {
+                        isStructured = true;
+                    }
+
+                    if (isStructured) {
+                        displayMode = 'raw'; // Default view for structured data
+                    }
+
+                    const newMessage = {
+                        role: role,
+                        content: content,
+                        id: metadata.id || tempId,
+                        timestamp: metadata.timestamp || new Date().toISOString(),
+                        model: metadata.model || (role === 'assistant' ? this.currentModelShort : null),
+                        content_type: metadata.content_type || (role === 'user' && typeof content !== 'string' ? 'tool_result' : null),
+                        tool_name: metadata.tool_name,
+                        is_error: metadata.is_error,
+                        _displayMode: displayMode, // Add the display mode state
+                        ...metadata
+                    };
+
+                    if (!this.currentConversation.some(m => m.id === newMessage.id)) {
+                        this.currentConversation.push(newMessage);
+                        this.scrollToBottom();
+                    } else {
+                        const existingIndex = this.currentConversation.findIndex(m => m.id === newMessage.id);
+                        if (existingIndex > -1) {
+                            // Preserve existing display mode if updating message
+                            newMessage._displayMode = this.currentConversation[existingIndex]._displayMode || displayMode;
+                            this.currentConversation[existingIndex] = { ...this.currentConversation[existingIndex], ...newMessage };
+                            this.currentConversation = [...this.currentConversation];
+                        }
+                    }
                 },
                 shouldAnimate(messageId) { const lastMsg = this.currentConversation[this.currentConversation.length - 1]; return lastMsg && lastMsg.id === messageId; },
                 // --- UTILITY / RENDERING HELPERS ---
+
+                // ======================================================
+                // IMPROVED MESSAGE RENDERING SYSTEM
+                // ======================================================
+
+                // Main function to render message content
+                // Add this utility function to properly inspect object structure
                 isProbablyJsonString(str) {
                     if (typeof str !== 'string') return false;
                     const trimmed = str.trim();
-                    if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))) {
-                        return false; // Quick check for brackets
-                    }
-                    try {
-                        return JSON.parse(trimmed); // Try parsing, return the object/array if valid
-                    } catch (e) {
-                        return false; // Parsing failed
-                    }
-                }, // Added comma
-
-                isProbablyTableData(data) {
-                    // Check if it's an array with at least one object element
-                    if (!Array.isArray(data) || data.length === 0 || typeof data[0] !== 'object' || data[0] === null || Array.isArray(data[0])) {
+                    // Check if it looks like JSON (starts with { or [ and ends with } or ])
+                    if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+                        (trimmed.startsWith('[') && trimmed.endsWith(']')))) {
                         return false;
                     }
-                    // Optional: Add more checks like consistent keys across rows if needed for stricter detection
-                    // For now, assume an array of objects is likely tabular.
-                    return true;
-                }, // Added comma
+                    try {
+                        return JSON.parse(trimmed);
+                    } catch (e) {
+                        return false;
+                    }
+                },
 
-                renderTable(data) {
-                    if (!this.isProbablyTableData(data)) return '<!-- Data not suitable for table -->'; // Safety check
+                // Utility to inspect object properties and structure - helpful for debugging
+                debugObjectStructure(obj, maxDepth = 2, depth = 0) {
+                    if (depth > maxDepth) return "...";
+                    if (obj === null) return "null";
+                    if (obj === undefined) return "undefined";
+                    if (typeof obj !== 'object') return String(obj);
 
-                    const headers = Object.keys(data[0]);
-                    if (headers.length === 0) return '<!-- Table has no columns -->';
+                    if (Array.isArray(obj)) {
+                        if (obj.length === 0) return "[]";
+                        return "[" + obj.slice(0, 3).map(item => this.debugObjectStructure(item, maxDepth, depth + 1)).join(", ") +
+                            (obj.length > 3 ? ", ..." : "") + "]";
+                    }
 
-                    // Use Set to get unique headers across all rows (handles inconsistent objects)
-                    const uniqueHeaders = new Set();
-                    data.forEach(row => {
-                        if (typeof row === 'object' && row !== null) {
-                            Object.keys(row).forEach(key => uniqueHeaders.add(key));
+                    const keys = Object.keys(obj);
+                    if (keys.length === 0) return "{}";
+                    const keyValues = keys.slice(0, 5).map(key =>
+                        `${key}: ${this.debugObjectStructure(obj[key], maxDepth, depth + 1)}`
+                    );
+                    return "{" + keyValues.join(", ") + (keys.length > 5 ? ", ..." : "") + "}";
+                },
+
+                renderMixedMessageContent(content) {
+                    let html = '<div class="space-y-3">';
+
+                    // Process each block in the mixed content
+                    content.forEach(block => {
+                        if (!block) return;
+
+                        if (typeof block === 'string') {
+                            // Simple string content
+                            html += this.renderMarkdown(block);
+                        }
+                        else if (block.type === 'text' && typeof block.text === 'string') {
+                            // Text block
+                            html += this.renderMarkdown(block.text);
+                        }
+                        else if (block.type === 'tool_use') {
+                            // Tool call/use block
+                            html += this.renderToolCall(block);
+                        }
+                        else if (block.type === 'tool_result') {
+                            // Tool result block
+                            html += this.renderToolResultBlock(block);
+                        }
+                        else {
+                            // Unknown block type - render as JSON
+                            html += `
+                <div class="bg-base-200 p-2 rounded my-2">
+                    <div class="font-medium text-sm opacity-70 mb-1">Unknown Content Block:</div>
+                    ${this.renderJson(block)}
+                </div>
+            `;
                         }
                     });
-                    const sortedHeaders = Array.from(uniqueHeaders).sort(); // Sort for consistent column order
 
-                    let tableHtml = `<div class="overflow-x-auto my-2 bg-base-100/50 p-1 rounded-md shadow-sm border border-base-300/50 max-w-full">
-                                <table class="table table-zebra table-sm w-full">
-                                    <thead class="bg-base-300/20">
-                                        <tr>`;
-                    sortedHeaders.forEach(header => {
-                        tableHtml += `<th class="sticky top-0 z-10 bg-inherit">${DOMPurify.sanitize(header)}</th>`; // Sticky header
-                    });
-                    tableHtml += `         </tr>
-                                    </thead>
-                                    <tbody>`;
-                    data.forEach((row, rowIndex) => {
-                        if (typeof row === 'object' && row !== null) {
-                            tableHtml += `<tr class="hover:bg-base-content/10">`;
-                            sortedHeaders.forEach(header => {
-                                const cellValue = row[header];
-                                // Format cell content (simple string conversion, could be enhanced)
-                                let cellContent = '';
-                                if (cellValue === null || typeof cellValue === 'undefined') {
-                                    cellContent = '<span class="italic opacity-50">null</span>';
-                                } else if (typeof cellValue === 'object') {
-                                    // Display nested objects/arrays as compact JSON
-                                    cellContent = `<pre class="text-xs !p-0 !bg-transparent !whitespace-pre-wrap">${DOMPurify.sanitize(JSON.stringify(cellValue))}</pre>`;
-                                } else {
-                                    cellContent = DOMPurify.sanitize(String(cellValue));
+                    html += '</div>';
+                    return html;
+                },
+
+                renderToolCall(toolCall) {
+                    // Extract information from the tool call object
+                    const toolName = toolCall.name || toolCall.tool_name || "Unknown Tool";
+                    const toolId = toolCall.id || toolCall.tool_use_id || "";
+                    const shortId = toolId.slice(-6);
+                    const toolInput = toolCall.input || toolCall.parameters || toolCall.params || {};
+
+                    // Create prettier JSON for the input
+                    const inputJson = JSON.stringify(toolInput, null, 2);
+                    const copyBtn = this.createCopyButton(inputJson);
+
+                    try {
+                        const highlightedJson = hljs.highlight(inputJson, { language: 'json', ignoreIllegals: true }).value;
+
+                        return `
+            <div class="my-2 p-3 bg-blue-100/20 dark:bg-blue-900/20 rounded-md border border-blue-200/30 dark:border-blue-800/30">
+                <div class="flex items-center gap-2 text-info font-medium mb-1.5">
+                    <i class="fas fa-terminal fa-fw"></i>
+                    <span>Using Tool: <span class="font-mono">${DOMPurify.sanitize(toolName)}</span></span>
+                    ${toolId ? `<span class="opacity-60 text-xs">(ID: ...${DOMPurify.sanitize(shortId)})</span>` : ''}
+                </div>
+                <div class="relative group bg-base-100/80 dark:bg-base-300/30 rounded-md p-2">
+                    <details>
+                        <summary class="cursor-pointer text-xs opacity-70 hover:opacity-100">View Input Parameters</summary>
+                        <div class="mt-2">
+                            <pre class="overflow-auto max-h-60"><code class="language-json hljs">${highlightedJson}</code></pre>
+                            ${copyBtn}
+                        </div>
+                    </details>
+                </div>
+            </div>
+        `;
+                    } catch (e) {
+                        // Fallback rendering if highlighting fails
+                        console.error("Error rendering tool call:", e);
+                        return `
+            <div class="my-2 p-3 bg-blue-100/20 dark:bg-blue-900/20 rounded-md">
+                <div class="flex items-center gap-2 text-info">
+                    <i class="fas fa-terminal fa-fw"></i>
+                    <span>Using Tool: ${DOMPurify.sanitize(toolName)}</span>
+                </div>
+                <div class="text-xs opacity-80 mt-1">Input parameters available (rendering error)</div>
+            </div>
+        `;
+                    }
+                },
+
+                // Improved tool result rendering
+                renderToolResult(result, message) {
+                    // Extract information
+                    const isError = result.is_error || result.error || message?.is_error || false;
+                    const toolName = message?.tool_name || result.tool_name || result.name || "Tool Result";
+
+                    // Get the actual content (handle nested content structure)
+                    let resultContent = result;
+                    if (result.content !== undefined) {
+                        resultContent = result.content;
+                    }
+
+                    // Convert to formatted string representation
+                    const contentStr = this.renderToolResultContent(resultContent);
+                    const statusClass = isError ? 'text-error' : 'text-success';
+                    const statusIcon = isError ? 'fa-exclamation-circle' : 'fa-check-circle';
+
+                    try {
+                        const highlightedContent = hljs.highlight(contentStr, { language: 'json', ignoreIllegals: true }).value;
+
+                        return `
+            <div class="my-2 p-3 ${isError ? 'bg-error/10' : 'bg-success/10'} rounded-md border ${isError ? 'border-error/20' : 'border-success/20'}">
+                <div class="flex items-center gap-2 ${statusClass} font-medium">
+                    <i class="fas ${statusIcon} fa-fw"></i>
+                    <span>${isError ? 'Tool Error' : 'Tool Result'}: ${DOMPurify.sanitize(toolName)}</span>
+                </div>
+                <div class="relative group mt-2 bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md">
+                    <pre class="overflow-auto max-h-60"><code class="language-json hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
+                    ${this.createCopyButton(contentStr)}
+                </div>
+            </div>
+        `;
+                    } catch (e) {
+                        console.error("Error rendering tool result:", e);
+                        return `<div class="p-3 ${isError ? 'bg-error/10' : 'bg-success/10'} rounded-md">
+            <div class="${statusClass} font-medium mb-1">
+                <i class="fas ${statusIcon} fa-fw mr-1"></i>
+                ${isError ? 'Tool Error' : 'Tool Result'}: ${DOMPurify.sanitize(toolName)}
+            </div>
+            <pre class="text-xs whitespace-pre-wrap break-all">${DOMPurify.sanitize(contentStr)}</pre>
+        </div>`;
+                    }
+                },
+
+                // Helper for rendering tool result blocks in mixed content
+                renderToolResultBlock(block) {
+                    const isError = block.is_error || block.error || false;
+                    const toolUseId = block.tool_use_id || "";
+                    const shortId = toolUseId.slice(-6);
+                    const resultContent = this.renderToolResultContent(block.content || block);
+
+                    const statusClass = isError ? 'text-error' : 'text-success';
+                    const statusIcon = isError ? 'fa-exclamation-circle' : 'fa-check-circle';
+
+                    try {
+                        const highlightedContent = hljs.highlight(resultContent, { language: 'json', ignoreIllegals: true }).value;
+
+                        return `
+            <div class="my-2 p-3 ${isError ? 'bg-error/10' : 'bg-success/10'} rounded-md border ${isError ? 'border-error/20' : 'border-success/20'}">
+                <div class="flex items-center gap-2 ${statusClass} font-medium">
+                    <i class="fas ${statusIcon} fa-fw"></i>
+                    <span>${isError ? 'Tool Error' : 'Tool Result'}</span>
+                    ${toolUseId ? `<span class="opacity-60 text-xs">(for tool call ...${DOMPurify.sanitize(shortId)})</span>` : ''}
+                </div>
+                <div class="relative group mt-2 bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md">
+                    <pre class="overflow-auto max-h-60"><code class="language-json hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
+                    ${this.createCopyButton(resultContent)}
+                </div>
+            </div>
+        `;
+                    } catch (e) {
+                        console.error("Error rendering tool result block:", e);
+                        return `<div class="p-3 ${isError ? 'bg-error/10' : 'bg-success/10'} rounded-md">
+            <div class="${statusClass} font-medium mb-1">
+                <i class="fas ${statusIcon} fa-fw mr-1"></i>
+                ${isError ? 'Tool Error' : 'Tool Result'}
+                ${toolUseId ? `<span class="opacity-60 text-xs ml-1">(for ...${shortId})</span>` : ''}
+            </div>
+            <pre class="text-xs whitespace-pre-wrap break-all">${DOMPurify.sanitize(resultContent)}</pre>
+        </div>`;
+                    }
+                },
+
+                // Process tool result content to handle different formats
+                renderToolResultContent(content) {
+                    if (content === null || content === undefined) return '[No Content]';
+
+                    // Handle string content that might be JSON
+                    if (typeof content === 'string') {
+                        try {
+                            if ((content.startsWith('{') && content.endsWith('}')) ||
+                                (content.startsWith('[') && content.endsWith(']'))) {
+                                return JSON.stringify(JSON.parse(content), null, 2);
+                            }
+                            return content;
+                        } catch {
+                            return content;
+                        }
+                    }
+
+                    // Handle objects and arrays
+                    try {
+                        return JSON.stringify(content, null, 2);
+                    } catch (e) {
+                        console.error("Error stringifying tool result:", e);
+                        return String(content);
+                    }
+                },
+
+                // Add this custom renderer for structured reports
+                renderStructuredReport(content) {
+                    // Handle case where content is already a string
+                    if (typeof content === 'string') {
+                        return this.renderMarkdown(content);
+                    }
+
+                    // Handle array of mixed content
+                    if (Array.isArray(content)) {
+                        // Extract text content from the array
+                        let combinedText = '';
+
+                        // Go through each item in the array
+                        content.forEach(item => {
+                            if (typeof item === 'string') {
+                                combinedText += item + '\n\n';
+                            }
+                            else if (item && typeof item === 'object') {
+                                // Handle text blocks
+                                if (item.type === 'text' && item.text) {
+                                    combinedText += item.text + '\n\n';
                                 }
-                                tableHtml += `<td class="whitespace-normal break-words max-w-xs">${cellContent}</td>`; // Allow wrapping
-                            });
-                            tableHtml += `</tr>`;
-                        } else {
-                            // Handle rows that are not objects (e.g., array of strings/numbers) - render differently?
-                            tableHtml += `<tr><td colspan="${sortedHeaders.length}" class="italic opacity-70">[Invalid row data: ${DOMPurify.sanitize(String(row))}]</td></tr>`;
+                                // Handle other formats - extract any text properties
+                                else {
+                                    Object.entries(item).forEach(([key, value]) => {
+                                        if (typeof value === 'string' && key !== 'type') {
+                                            combinedText += value + '\n\n';
+                                        }
+                                    });
+                                }
+                            }
+                        });
+
+                        // Render the combined text
+                        return this.renderMarkdown(combinedText);
+                    }
+
+                    // Handle single objects
+                    if (content && typeof content === 'object') {
+                        // For structured report objects
+                        if (content.sections || content.content || content.text) {
+                            let reportText = '';
+
+                            // Add title if present
+                            if (content.title || content.heading) {
+                                reportText += `# ${content.title || content.heading}\n\n`;
+                            }
+
+                            // Add main content if present
+                            if (content.content || content.text) {
+                                reportText += (content.content || content.text) + '\n\n';
+                            }
+
+                            // Process sections if present
+                            if (Array.isArray(content.sections)) {
+                                content.sections.forEach(section => {
+                                    if (typeof section === 'string') {
+                                        reportText += section + '\n\n';
+                                    }
+                                    else if (section && typeof section === 'object') {
+                                        // Section with title
+                                        if (section.title || section.heading) {
+                                            reportText += `## ${section.title || section.heading}\n\n`;
+                                        }
+
+                                        // Section content
+                                        if (section.content || section.text) {
+                                            reportText += (section.content || section.text) + '\n\n';
+                                        }
+
+                                        // Handle subsections
+                                        if (Array.isArray(section.subsections)) {
+                                            section.subsections.forEach(subsection => {
+                                                if (typeof subsection === 'string') {
+                                                    reportText += subsection + '\n\n';
+                                                }
+                                                else if (subsection && typeof subsection === 'object') {
+                                                    if (subsection.title || subsection.heading) {
+                                                        reportText += `### ${subsection.title || subsection.heading}\n\n`;
+                                                    }
+                                                    if (subsection.content || subsection.text) {
+                                                        reportText += (subsection.content || subsection.text) + '\n\n';
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+
+                            return this.renderMarkdown(reportText);
+                        }
+                    }
+
+                    // Fallback - convert to JSON and render as structured data
+                    return this.renderJson(content);
+                },
+
+                // Completely rewritten message content renderer
+                renderMessageContent(message) {
+                    try {
+                        // Handle empty content case
+                        if (message.content === null || message.content === undefined) {
+                            return message.current_status
+                                ? `<span class="italic opacity-80">${DOMPurify.sanitize(message.current_status)}</span>`
+                                : '<span class="opacity-50 italic">[No Content]</span>';
+                        }
+
+                        console.debug("Rendering message:", {
+                            role: message.role,
+                            content_type: message.content_type,
+                            contentType: typeof message.content,
+                            isArray: Array.isArray(message.content),
+                            structure: typeof message.content === 'object' ?
+                                this.debugObjectStructure(message.content) : String(message.content).substring(0, 100)
+                        });
+
+                        // Special handling for structured reports (check if content looks like a report)
+                        if (typeof message.content === 'object') {
+                            const isReport = Array.isArray(message.content) &&
+                                message.content.some(item =>
+                                    item && typeof item === 'object' &&
+                                    item.type === 'text' &&
+                                    item.text &&
+                                    (item.text.includes('# ') ||
+                                        item.text.includes('## ') ||
+                                        item.text.includes('\nDefinitions of') ||
+                                        item.text.includes('\nIndustry Applications')));
+
+                            if (isReport) {
+                                return this.renderStructuredReport(message.content);
+                            }
+                        }
+
+                        // Special handling for tool calls and tool results
+                        if (message.content && typeof message.content === 'object') {
+                            // Handle mixed content arrays (with tool_use objects)
+                            if (Array.isArray(message.content)) {
+                                // Check if this is a multi-part message with tool calls
+                                const hasMixedContent = message.content.some(item =>
+                                    item && typeof item === 'object' &&
+                                    (item.type === 'tool_use' || item.type === 'tool_result' || item.type === 'text')
+                                );
+
+                                if (hasMixedContent) {
+                                    return this.renderMixedMessageContent(message.content);
+                                }
+                            }
+
+                            // Handle single tool use/call
+                            if (message.content.type === 'tool_use' || message.content.tool_use_id ||
+                                message.content.name || message.content.tool_name) {
+                                return this.renderToolCall(message.content);
+                            }
+
+                            // Handle tool results
+                            if (message.content_type === 'tool_result' ||
+                                (message.content.content && (message.content.is_error !== undefined || message.content.error !== undefined))) {
+                                return this.renderToolResult(message.content, message);
+                            }
+                        }
+
+                        // Standard content type handling
+                        if (typeof message.content === 'string') {
+                            // Check if content is a JSON string
+                            const parsedJson = this.tryParseJson(message.content);
+                            if (parsedJson !== null) {
+                                return this.renderJsonWithToggle(parsedJson, message.id);
+                            }
+
+                            // Regular markdown text
+                            return this.renderMarkdown(message.content);
+                        }
+                        else if (Array.isArray(message.content)) {
+                            // Simple arrays of text (text blocks)
+                            if (message.content.every(item => typeof item === 'string')) {
+                                return this.renderMarkdown(message.content.join("\n\n"));
+                            }
+
+                            // Arrays that should be displayed as tables
+                            if (this.isProbablyTableData(message.content)) {
+                                return this.renderTable(message.content);
+                            }
+
+                            // Default array handling
+                            return this.renderJsonWithToggle(message.content, message.id);
+                        }
+                        else if (typeof message.content === 'object') {
+                            // Render objects as syntax-highlighted JSON
+                            return this.renderJsonWithToggle(message.content, message.id);
+                        }
+                        else {
+                            // Fallback for other types
+                            return `<div class="prose prose-sm max-w-none">${DOMPurify.sanitize(String(message.content))}</div>`;
+                        }
+                    } catch (error) {
+                        console.error("Error rendering message:", error, message);
+                        return `<div class="text-error p-2 bg-error/10 rounded">Error rendering message: ${error.message}</div>`;
+                    }
+                },
+
+                // Render text content (handle markdown and potential JSON strings)
+                renderTextContent(content, message) {
+                    // Check if content is a JSON string
+                    const parsedJson = this.tryParseJson(content);
+                    if (parsedJson !== null) {
+                        // If it's a tool result, render it as tool result
+                        if (message.content_type === 'tool_result') {
+                            return this.renderToolResult(parsedJson, message);
+                        }
+
+                        // Otherwise render as JSON with toggle capability
+                        return this.renderJsonWithToggle(parsedJson, message.id);
+                    }
+
+                    // If not JSON, render as markdown
+                    return this.renderMarkdown(content);
+                },
+
+                // Render array content (mixed blocks or data)
+                renderArrayContent(content, message) {
+                    // Special case for arrays with a single text block (common in your app)
+                    if (Array.isArray(content) && content.length === 1 &&
+                        content[0] && typeof content[0] === 'object' &&
+                        content[0].type === 'text' && typeof content[0].text === 'string') {
+
+                        // This is the critical fix - directly extract the text content from 
+                        // the single object in the array and render it as markdown
+                        console.log("Found single text block, rendering text directly");
+                        return this.renderMarkdown(content[0].text);
+                    }
+
+                    // Handle mixed content (text blocks + tool calls/results)
+                    const hasMixedContent = content.some(item =>
+                        item && typeof item === 'object' &&
+                        (item.type === 'tool_use' || item.type === 'tool_result')
+                    );
+
+                    if (hasMixedContent) {
+                        return this.renderMixedContent(content, message);
+                    }
+
+                    // If it's an array of data objects that looks like a table
+                    if (this.isProbablyTableData(content)) {
+                        return this.renderTable(content);
+                    }
+
+                    // Default handling for arrays - render as JSON
+                    console.log("Falling back to JSON rendering for array");
+                    return this.renderJson(content);
+                },
+
+                // Render object content
+                renderObjectContent(content, message) {
+                    // Special handling for tool results from user
+                    if (message.role === 'user' && message.content_type === 'tool_result') {
+                        return this.renderToolResult(content, message);
+                    }
+
+                    // Check if content is just being stringified to [object Object]
+                    if (Object.prototype.toString.call(content) === '[object Object]') {
+                        // Add better handling for section-based content
+                        if (content.title || content.heading) {
+                            return `<div class="prose prose-sm max-w-none">
+                <h3 class="font-medium text-base">${DOMPurify.sanitize(content.title || content.heading)}</h3>
+                ${content.content ? this.renderMarkdown(content.content) : ''}
+                ${content.sections ? this.renderSections(content.sections) : ''}
+            </div>`;
+                        }
+
+                        // If it's just a simple object with no special structure, show it as JSON
+                        return this.renderJsonWithToggle(content, message.id);
+                    }
+
+                    // Default handling for objects - render as JSON with toggle
+                    return this.renderJsonWithToggle(content, message.id);
+                },
+
+                // Add a helper function to render sections
+                renderSections(sections) {
+                    if (!Array.isArray(sections)) return '';
+
+                    let html = '<div class="space-y-3">';
+                    sections.forEach(section => {
+                        if (typeof section === 'string') {
+                            html += `<p>${DOMPurify.sanitize(section)}</p>`;
+                        } else if (section && typeof section === 'object') {
+                            if (section.title || section.heading) {
+                                html += `<h4 class="font-medium mt-2">${DOMPurify.sanitize(section.title || section.heading)}</h4>`;
+                            }
+                            if (section.content) {
+                                html += this.renderMarkdown(section.content);
+                            } else if (Object.keys(section).length > 0) {
+                                // Handle other properties as content
+                                const content = Object.entries(section)
+                                    .filter(([k]) => k !== 'title' && k !== 'heading')
+                                    .map(([k, v]) => {
+                                        if (typeof v === 'string') return v;
+                                        if (typeof v === 'object') return JSON.stringify(v);
+                                        return String(v);
+                                    })
+                                    .join('\n\n');
+                                html += this.renderMarkdown(content);
+                            }
                         }
                     });
-                    tableHtml += `     </tbody>
-                                </table>
-                             </div>`;
-                    return tableHtml; // Let DOMPurify sanitize the whole thing later if needed, or assume helper is safe
-                }, // Added comma
+                    html += '</div>';
+                    return html;
+                },
 
+                // Render mixed content blocks (text, tool calls, results)
+                renderMixedContent(blocks, message) {
+                    let html = '<div class="prose prose-sm max-w-none space-y-4">';
+
+                    blocks.forEach(block => {
+                        if (!block) return;
+
+                        if (block.type === 'text') {
+                            html += DOMPurify.sanitize(marked.parse(block.text || ''), { USE_PROFILES: { html: true } });
+                        }
+                        else if (block.type === 'tool_use') {
+                            const inputJson = JSON.stringify(block.input || {}, null, 2);
+                            const copyBtn = this.createCopyButton(inputJson);
+                            try {
+                                const highlightedJson = hljs.highlight(inputJson, { language: 'json', ignoreIllegals: true }).value;
+                                html += `
+                    <div class="not-prose my-3 p-3 bg-base-200 rounded-md text-sm">
+                        <div class="flex items-center gap-2 font-medium text-info mb-1">
+                            <i class="fas fa-terminal fa-fw"></i>
+                            <span>Using Tool: <strong class="font-mono">${DOMPurify.sanitize(block.name)}</strong></span>
+                            <span class="opacity-60 text-xs">(ID: ...${DOMPurify.sanitize((block.id || '').slice(-4))})</span>
+                        </div>
+                        <div class="relative group">
+                            <details>
+                                <summary class="cursor-pointer text-xs opacity-70 hover:opacity-100 mb-1">View Input Parameters</summary>
+                                <div class="p-2 bg-base-300/50 rounded">
+                                    <pre><code class="language-json hljs">${highlightedJson}</code></pre>
+                                    ${copyBtn}
+                                </div>
+                            </details>
+                        </div>
+                    </div>
+                `;
+                            } catch (e) {
+                                html += `<div class="not-prose my-3 p-3 bg-base-200 rounded-md">Tool: ${DOMPurify.sanitize(block.name)}</div>`;
+                            }
+                        }
+                        else if (block.type === 'tool_result') {
+                            html += this.renderToolResultBlock(block);
+                        }
+                        else {
+                            // For any other type of block, render as JSON
+                            html += `<div class="not-prose my-3">${this.renderJson(block)}</div>`;
+                        }
+                    });
+
+                    html += '</div>';
+                    return html;
+                },
+
+                // Render markdown content
+                renderMarkdown(content) {
+                    try {
+                        const parsed = marked.parse(content || '');
+                        return `<div class="prose prose-sm max-w-none">${DOMPurify.sanitize(parsed, { USE_PROFILES: { html: true } })}</div>`;
+                    } catch (e) {
+                        console.error("Markdown parsing error:", e);
+                        return `<div class="prose prose-sm max-w-none">${DOMPurify.sanitize(content)}</div>`;
+                    }
+                },
+
+                // Render tool result in a clean format
+                renderToolResult(content, message) {
+                    const isError = message.is_error || false;
+                    const statusClass = isError ? 'text-error' : 'text-success';
+                    const statusIcon = isError ? 'fa-exclamation-circle' : 'fa-check-circle';
+                    const resultContent = this.renderToolResultContent(content);
+
+                    try {
+                        const highlightedContent = hljs.highlight(resultContent, { language: 'json', ignoreIllegals: true }).value;
+                        return `
+            <div class="not-prose my-1 space-y-2">
+                <div class="flex items-center gap-2 ${statusClass} font-medium">
+                    <i class="fas ${statusIcon} fa-fw"></i>
+                    <span>${isError ? 'Tool Error' : 'Tool Result'}: ${DOMPurify.sanitize(message.tool_name || '')}</span>
+                </div>
+                <div class="relative group bg-base-200 p-3 rounded-md">
+                    <pre><code class="language-json hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
+                    ${this.createCopyButton(resultContent)}
+                </div>
+            </div>
+        `;
+                    } catch (e) {
+                        return `<div class="not-prose my-1 p-3 bg-base-200 rounded-md">${DOMPurify.sanitize(resultContent)}</div>`;
+                    }
+                },
+
+                // Helper for rendering tool result blocks inside mixed content
+                renderToolResultBlock(block) {
+                    const isError = block.is_error || false;
+                    const statusClass = isError ? 'text-error' : 'text-success';
+                    const statusIcon = isError ? 'fa-exclamation-circle' : 'fa-check-circle';
+                    const resultContent = this.renderToolResultContent(block.content || {});
+
+                    try {
+                        const highlightedContent = hljs.highlight(resultContent, { language: 'json', ignoreIllegals: true }).value;
+                        return `
+            <div class="not-prose my-3 p-3 bg-base-200 rounded-md text-sm">
+                <div class="flex items-center gap-2 ${statusClass} font-medium mb-1">
+                    <i class="fas ${statusIcon} fa-fw"></i>
+                    <span>${isError ? 'Tool Error' : 'Tool Result'}</span>
+                    <span class="opacity-60 text-xs">(for tool call ...${DOMPurify.sanitize((block.tool_use_id || '').slice(-4))})</span>
+                </div>
+                <div class="relative group mt-2">
+                    <pre><code class="language-json hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
+                    ${this.createCopyButton(resultContent)}
+                </div>
+            </div>
+        `;
+                    } catch (e) {
+                        return `<div class="not-prose my-3 p-3 bg-base-200 rounded-md">${DOMPurify.sanitize(resultContent)}</div>`;
+                    }
+                },
+
+                // Render JSON with toggle between raw and structured views
+                renderJsonWithToggle(data, messageId) {
+                    const isTable = this.isProbablyTableData(data);
+
+                    return `
+        <div class="not-prose space-y-2">
+            <div class="flex justify-between">
+                <span class="text-sm font-medium opacity-80">${isTable ? 'Data Table' : 'JSON Data'}</span>
+                <button @click="toggleDataView('${messageId}')" class="btn btn-xs btn-ghost opacity-60 hover:opacity-100">
+                    <i class="fas ${isTable ? 'fa-table' : 'fa-code'} fa-fw"></i> 
+                    <span x-text="'${messageId}_displayMode' in window ? (window['${messageId}_displayMode'] === 'raw' ? 'View Structured' : 'View Raw') : 'Toggle View'">Toggle View</span>
+                </button>
+            </div>
+            <div x-show="!'${messageId}_displayMode' in window || window['${messageId}_displayMode'] !== 'structured'">
+                ${this.renderJson(data)}
+            </div>
+            <div x-show="'${messageId}_displayMode' in window && window['${messageId}_displayMode'] === 'structured'">
+                ${isTable ? this.renderTable(data) : this.renderStructuredData(data)}
+            </div>
+        </div>
+    `;
+                },
+
+                // Simple JSON renderer with syntax highlighting
                 renderJson(data) {
                     try {
-                        const jsonString = JSON.stringify(data, null, 2); // Pretty print
-                        const copyButton = createCopyButton(jsonString); // Use stringified data for copy
+                        const jsonString = JSON.stringify(data, null, 2);
                         const highlightedJson = hljs.highlight(jsonString, { language: 'json', ignoreIllegals: true }).value;
-                        return `<div class="relative group my-1"><pre><code class="language-json hljs">${highlightedJson}</code></pre>${copyButton}</div>`;
+                        return `
+            <div class="relative group my-1">
+                <pre class="bg-base-200 rounded-md overflow-x-auto p-3"><code class="language-json hljs">${highlightedJson}</code></pre>
+                ${this.createCopyButton(jsonString)}
+            </div>
+        `;
                     } catch (e) {
-                        console.error("Error rendering JSON:", e);
-                        return `<pre class="text-error">Error rendering JSON: ${e.message}</pre>`;
+                        console.error("JSON rendering error:", e);
+                        return `<pre class="text-error p-2 bg-error/10 rounded-md">Error rendering JSON: ${e.message}</pre>`;
                     }
-                }, // Added comma
+                },
 
-                renderMessageContent(message) {
-                    const role = message.role;
-                    const contentType = message.content_type;
-                    const messageContent = message.content;
+                // Helper to create copy button for code blocks
+                createCopyButton(codeToCopy, type = 'code') {
+                    try {
+                        const encodedCode = btoa(encodeURIComponent(JSON.stringify(codeToCopy)));
+                        const buttonText = type === 'result' ? 'Copy Result' : 'Copy';
+                        return `
+            <button class="copy-code-btn" x-data="{ copied: false }" 
+                @click.stop="copyToClipboard('${encodedCode}'); copied = true; setTimeout(() => copied = false, 1500)">
+                <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i> 
+                <span x-text="copied ? 'Copied!' : '${buttonText}'"></span>
+            </button>
+        `;
+                    } catch (e) {
+                        console.error("Error creating copy button:", e);
+                        return '';
+                    }
+                },
+
+                // Helper to try parsing JSON strings safely
+                tryParseJson(str) {
+                    if (typeof str !== 'string') return null;
+                    const trimmed = str.trim();
+
+                    // Check if it looks like JSON
+                    if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+                        (trimmed.startsWith('[') && trimmed.endsWith(']')))) {
+                        return null;
+                    }
 
                     try {
-                        // 1. Handle null/undefined content explicitly
-                        if (messageContent === null || typeof messageContent === 'undefined') {
-                            return '<span class="opacity-50 italic">[Null/Undefined Content]</span>';
-                        }
-
-                        // 2. Handle Strings: Check for JSON first, then render Markdown
-                        if (typeof messageContent === 'string') {
-                            const parsedJson = this.isProbablyJsonString(messageContent);
-                            if (parsedJson !== false) {
-                                // String contained valid JSON
-                                // Now, check if the *parsed* JSON looks like table data
-                                if (this.isProbablyTableData(parsedJson)) {
-                                    return this.renderTable(parsedJson);
-                                } else {
-                                    // Render as standard highlighted JSON
-                                    return this.renderJson(parsedJson);
-                                }
-                            } else {
-                                // Not JSON string, render as Markdown
-                                const parsedMd = marked.parse(messageContent || '');
-                                // Sanitize *after* parsing, allowing known safe HTML from Markdown
-                                return DOMPurify.sanitize(parsedMd, { USE_PROFILES: { html: true } });
-                            }
-                        }
-
-                        // 3. Handle Arrays: Process block-by-block explicitly
-                        else if (Array.isArray(messageContent)) {
-                            return messageContent.map(block => {
-                                if (!block) return '<!-- Empty Block -->'; // Skip null/empty blocks
-
-                                // Explicitly handle 'text' type
-                                if (block.type === 'text') {
-                                    try {
-                                        // console.log("Parsing markdown for text block:", block.text); // Optional debug
-                                        const parsed = marked.parse(block.text || '');
-                                        return DOMPurify.sanitize(parsed, { USE_PROFILES: { html: true } });
-                                    } catch (e) {
-                                        console.error("Markdown/Purify error on text block:", block.text, e);
-                                        return `<pre class="text-error">Error rendering text block: ${e.message}</pre>`; // Show error inline
-                                    }
-                                }
-                                // Explicitly handle 'tool_use'
-                                else if (block.type === 'tool_use') {
-                                    const inputJson = JSON.stringify(block.input || {}, null, 2);
-                                    const copyButton = createCopyButton(inputJson);
-                                    try {
-                                        const highlightedInput = hljs.highlight(inputJson, { language: 'json', ignoreIllegals: true }).value;
-                                        return `<div class="my-1 p-1.5 bg-base-300/50 rounded text-xs space-y-1">
-                                    <div class="flex items-center gap-1.5 font-medium"><i class="fas fa-terminal text-info fa-fw"></i> Requesting Tool: <strong class="font-mono">${DOMPurify.sanitize(block.name)}</strong> (ID: ...${DOMPurify.sanitize((block.id || '').slice(-4))})</div>
-                                    <div class="relative group pl-2">
-                                        <details><summary class="cursor-pointer text-xs opacity-70 hover:opacity-100">Show Input</summary>
-                                        <pre><code class="language-json hljs">${highlightedInput}</code></pre>${copyButton}
-                                        </details>
-                                    </div>
-                                </div>`;
-                                    } catch (e) { console.error("Highlight error tool_use:", e); return `<div>Tool: ${DOMPurify.sanitize(block.name)} (Highlight error)</div>`; }
-                                }
-                                // Explicitly handle 'tool_result'
-                                else if (block.type === 'tool_result') {
-                                    const resultText = this.renderToolResultContent(block.content); // Handles string/object formatting
-                                    const isError = block.is_error || false;
-                                    const statusClass = isError ? 'text-error' : 'text-success';
-                                    const statusIcon = isError ? 'fa-exclamation-circle' : 'fa-check-circle';
-                                    const copyButton = createCopyButton(resultText, 'result');
-                                    try {
-                                        const highlightedResult = hljs.highlight(resultText, { language: 'json', ignoreIllegals: true }).value;
-                                        return `<div class="my-1 p-1.5 bg-base-300/60 rounded text-xs space-y-1">
-                                    <div class="flex items-center gap-1.5 font-medium ${statusClass}"><i class="fas ${statusIcon} fa-fw"></i> Tool Result Received (for ...${DOMPurify.sanitize((block.tool_use_id || '').slice(-4))})</div>
-                                    <div class="relative group pl-2">
-                                        <pre><code class="language-json hljs whitespace-pre-wrap break-all">${highlightedResult}</code></pre>${copyButton}
-                                    </div>
-                                </div>`;
-                                    } catch (e) { console.error("Highlight error tool_result:", e); return `<div>Tool Result (Highlight error)</div>`; }
-                                }
-                                // Fallback: Render ANY other block type as JSON
-                                else {
-                                    console.warn("Rendering non-standard block type within array as JSON:", block);
-                                    return this.renderJson(block); // Use the helper to render the object as JSON
-                                }
-                            }).join(''); // Join without extra newlines - let markdown/CSS handle spacing
-                        }
-
-                        // 4. Handle Plain Objects (Render as JSON)
-                        else if (typeof messageContent === 'object' && messageContent !== null) {
-                            // Added check to ensure it's not already handled (e.g. user tool result)
-                            if (role === 'user' && contentType === 'tool_result') {
-                                // This case is specifically for user submitting results, format differently
-                                const resultText = this.renderToolResultContent(messageContent); const isError = message.is_error || false; const statusClass = isError ? 'text-error' : 'text-warning-content'; const statusText = isError ? 'Error' : 'Success'; const copyButton = createCopyButton(resultText, 'result'); try { const highlightedResult = hljs.highlight(resultText, { language: 'json', ignoreIllegals: true }).value; return `<strong class="block mb-1 ${statusClass}">Tool Result Sent (${DOMPurify.sanitize(message.tool_name || 'unknown')}): ${statusText}</strong><div class="bg-base-100/50 p-2 mt-1 rounded max-h-60 overflow-auto text-xs relative group"><pre><code class="language-json hljs whitespace-pre-wrap break-all">${highlightedResult}</code></pre>${copyButton}</div>`; } catch (e) { console.error("Highlight error user tool_result:", e); return `<div>Tool Result Sent (Highlight error)</div>`; }
-                            } else {
-                                // Otherwise, render the plain object as JSON
-                                return this.renderJson(messageContent);
-                            }
-                        }
-
-                        // 5. Handle assistant message that ONLY has a status update
-                        else if (role === 'assistant' && message.current_status && !messageContent) {
-                            return `<span class="italic opacity-80">${DOMPurify.sanitize(message.current_status)}</span>`;
-                        }
-
-                        // 6. Final Fallback for truly unknown/empty types
-                        else {
-                            console.warn("Unhandled message content type:", message);
-                            return `<span class="opacity-50 italic">[Unsupported Content: ${DOMPurify.sanitize(String(messageContent))}]</span>`;
-                        }
-
-                    } catch (renderError) {
-                        console.error("Error during renderMessageContent:", renderError, "Message:", message);
-                        return `<div class="text-error p-2 bg-error/10 rounded">Error rendering message. See console.</div>`;
+                        return JSON.parse(trimmed);
+                    } catch (e) {
+                        return null;
                     }
-                }, // End renderMessageContent
+                },
+
+                isProbablyJsonString(str) {
+                    if (typeof str !== 'string') return false;
+                    const trimmed = str.trim();
+                    // Check if it looks like JSON (starts with { or [ and ends with } or ])
+                    if (!((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+                        (trimmed.startsWith('[') && trimmed.endsWith(']')))) {
+                        return false;
+                    }
+                    try {
+                        return JSON.parse(trimmed);
+                    } catch (e) {
+                        return false;
+                    }
+                },
+
+                // Utility to inspect object properties and structure - helpful for debugging
+                debugObjectStructure(obj, maxDepth = 2, depth = 0) {
+                    if (depth > maxDepth) return "...";
+                    if (obj === null) return "null";
+                    if (obj === undefined) return "undefined";
+                    if (typeof obj !== 'object') return String(obj);
+
+                    if (Array.isArray(obj)) {
+                        if (obj.length === 0) return "[]";
+                        return "[" + obj.slice(0, 3).map(item => this.debugObjectStructure(item, maxDepth, depth + 1)).join(", ") +
+                            (obj.length > 3 ? ", ..." : "") + "]";
+                    }
+
+                    const keys = Object.keys(obj);
+                    if (keys.length === 0) return "{}";
+                    const keyValues = keys.slice(0, 5).map(key =>
+                        `${key}: ${this.debugObjectStructure(obj[key], maxDepth, depth + 1)}`
+                    );
+                    return "{" + keyValues.join(", ") + (keys.length > 5 ? ", ..." : "") + "}";
+                },
+
+
+
+                // Helper to determine if data should be rendered as a table
+                isProbablyTableData(data) {
+                    if (!Array.isArray(data) || data.length === 0) return false;
+
+                    // Must be an array of objects with consistent keys
+                    return data.every(item => typeof item === 'object' && item !== null && !Array.isArray(item));
+                },
+
+                // Render structured data as a tree view
+                renderStructuredData(data, level = 0) {
+                    const maxDepth = 5;
+                    if (level > maxDepth) return '<span class="italic opacity-50">[Max depth reached]</span>';
+
+                    const indentStyle = `style="padding-left: ${level * 1}em;"`;
+
+                    if (Array.isArray(data)) {
+                        if (data.length === 0) return `<div ${indentStyle} class="opacity-50">[Empty Array]</div>`;
+
+                        let listHtml = `<ul class="list-disc list-inside space-y-1 my-1 bg-base-200/50 rounded-md p-2" ${indentStyle}>`;
+                        data.forEach(item => {
+                            listHtml += `<li class="break-words">${this.renderStructuredData(item, level + 1)}</li>`;
+                        });
+                        listHtml += `</ul>`;
+                        return listHtml;
+                    }
+                    else if (typeof data === 'object' && data !== null) {
+                        const keys = Object.keys(data);
+                        if (keys.length === 0) return `<div ${indentStyle} class="opacity-50">[Empty Object]</div>`;
+
+                        let objHtml = `<div class="space-y-1 my-1 ${level > 0 ? 'bg-base-200/30 rounded-md p-2' : ''}" ${indentStyle}>`;
+                        keys.forEach(key => {
+                            objHtml += `
+                <div class="flex flex-wrap gap-x-2">
+                    <strong class="font-medium text-base-content/80">${DOMPurify.sanitize(key)}:</strong>
+                    <div class="flex-1 min-w-0">${this.renderStructuredData(data[key], level + 1)}</div>
+                </div>
+            `;
+                        });
+                        objHtml += `</div>`;
+                        return objHtml;
+                    }
+                    else {
+                        // Render primitives
+                        if (data === null) return `<span ${indentStyle} class="italic opacity-60">null</span>`;
+                        if (typeof data === 'boolean') return `<span ${indentStyle} class="font-mono ${data ? 'text-success' : 'text-error'}">${data}</span>`;
+                        if (typeof data === 'number') return `<span ${indentStyle} class="font-mono text-accent">${data}</span>`;
+                        if (typeof data === 'string') {
+                            // Try to detect and render inline markdown for strings
+                            if (/[*#`[\]]/.test(data)) {
+                                try {
+                                    return `<span ${indentStyle}>${DOMPurify.sanitize(marked.parseInline(data || ''), { USE_PROFILES: { html: true } })}</span>`;
+                                } catch (e) {
+                                    return `<span ${indentStyle}>${DOMPurify.sanitize(data)}</span>`;
+                                }
+                            } else {
+                                return `<span ${indentStyle}>${DOMPurify.sanitize(data)}</span>`;
+                            }
+                        }
+                        return `<span ${indentStyle}>${DOMPurify.sanitize(String(data))}</span>`;
+                    }
+                },
+
+                // Render table data
+                renderTable(data) {
+                    if (!this.isProbablyTableData(data)) return '<!-- Not table data -->';
+
+                    // Collect all unique headers
+                    const uniqueHeaders = new Set();
+                    data.forEach(row => {
+                        Object.keys(row).forEach(key => uniqueHeaders.add(key));
+                    });
+
+                    const sortedHeaders = Array.from(uniqueHeaders).sort();
+                    if (sortedHeaders.length === 0) return '<!-- Empty table -->';
+
+                    let tableHtml = `
+        <div class="overflow-x-auto my-2 bg-base-100/50 rounded-md shadow-sm border border-base-300/30">
+            <table class="table table-zebra table-sm w-full">
+                <thead>
+                    <tr class="bg-base-300/20">
+    `;
+
+                    // Add headers
+                    sortedHeaders.forEach(header => {
+                        tableHtml += `<th class="sticky top-0 z-10 bg-inherit">${DOMPurify.sanitize(header)}</th>`;
+                    });
+
+                    tableHtml += `</tr></thead><tbody>`;
+
+                    // Add rows
+                    data.forEach(row => {
+                        tableHtml += `<tr class="hover:bg-base-content/5">`;
+                        sortedHeaders.forEach(header => {
+                            const cellValue = row[header];
+                            let cellContent = '';
+
+                            if (cellValue === null || typeof cellValue === 'undefined') {
+                                cellContent = '<span class="italic opacity-50">null</span>';
+                            }
+                            else if (typeof cellValue === 'object') {
+                                cellContent = `<pre class="text-xs !p-0 !bg-transparent !whitespace-pre-wrap">${DOMPurify.sanitize(JSON.stringify(cellValue))}</pre>`;
+                            }
+                            else {
+                                cellContent = DOMPurify.sanitize(String(cellValue));
+                            }
+
+                            tableHtml += `<td class="whitespace-normal break-words max-w-xs">${cellContent}</td>`;
+                        });
+                        tableHtml += `</tr>`;
+                    });
+
+                    tableHtml += `</tbody></table></div>`;
+                    return tableHtml;
+                },
+
+                // Helper to get appropriate content label based on message type
+                getContentLabel(message) {
+                    if (message.content_type === 'tool_result') {
+                        return message.is_error ? 'Tool Error' : 'Tool Result';
+                    }
+
+                    if (this.isProbablyTableData(message.content)) {
+                        return 'Data Table';
+                    }
+
+                    return 'Structured Data';
+                },
+
                 renderToolResultContent(content) { if (content === null || typeof content === 'undefined') return '[No Content]'; if (typeof content === 'string') { try { if ((content.startsWith('{') && content.endsWith('}')) || (content.startsWith('[') && content.endsWith(']'))) { return JSON.stringify(JSON.parse(content), null, 2); } return content; } catch { return content; } } try { return JSON.stringify(content, null, 2); } catch { return String(content); } },
                 messageRoleIcon(role, contentType = null) { if (contentType === 'tool_result') return 'fas fa-wrench'; switch (role) { case 'user': return 'fas fa-user'; case 'assistant': return 'fas fa-robot'; case 'system': return 'fas fa-info-circle'; default: return 'fas fa-question-circle'; } },
                 messageRoleDisplayName(role, contentType = null) { if (contentType === 'tool_result') return 'Tool Result'; switch (role) { case 'user': return 'User'; case 'assistant': return 'Claude'; case 'system': return 'System'; default: return role; } },
@@ -2048,6 +2808,7 @@
 
             })); // End Alpine.data
         }); // End alpine:init listener
+
     </script>
 
 </body>
