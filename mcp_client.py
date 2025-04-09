@@ -3954,7 +3954,7 @@ class MCPClient:
                         if dependencies:
                             log.debug(f"Tool {tool_name} has dependencies: {dependencies}")
                     
-                    return result.result
+                    return result
         finally:
             # Restore original timeout if it was changed - unchanged from original implementation
             if original_timeout is not None and hasattr(session, 'timeout'):
@@ -4592,12 +4592,19 @@ class MCPClient:
                                         is_error = True
                                         yield f"\n[{STATUS_EMOJI['failure']}] Tool Execution Error: {str(e)}"
 
-
                         # Append result for the *next* API call
+                        # Ensure tool result is a string or list of content blocks as required by Anthropic API
+                        if isinstance(tool_result_content, (dict, list)):
+                            tool_result_content = json.dumps(tool_result_content).decode('utf-8')
                         tool_results_for_api.append({
                             "role": "user",
-                            "tool_use_id": tool_use_id,
-                            "content": tool_result_content,
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": tool_result_content
+                                }
+                            ]
                         })
                         # Also store for final history logging
                         tool_results_for_history.append({
@@ -4805,12 +4812,18 @@ class MCPClient:
 
                     if not tool:
                         log.warning(f"Tool mapping issue or tool not found. Sanitized: '{tool_name}', Original attempted: '{original_tool_name}'")
+                        # Create an appropriate error message
+                        error_content = f"Error: Tool '{original_tool_name}' (requested as '{tool_name}') not found by client."
                         # Append an error message as tool result
                         tool_results.append({
                             "role": "user",
-                            "tool_use_id": tool_use_id,
-                            "content": f"Error: Tool '{original_tool_name}' (requested as '{tool_name}') not found by client.",
-                            "is_error": True
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": error_content
+                                }
+                            ]
                         })
                         continue # Skip execution for this tool
 
@@ -4821,9 +4834,13 @@ class MCPClient:
                     if not session:
                         tool_results.append({
                             "role": "user",
-                            "tool_use_id": tool_use_id,
-                            "content": f"Error: Server '{tool.server_name}' for tool '{original_tool_name}' is not connected.",
-                            "is_error": True
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": f"Error: Server '{tool.server_name}' for tool '{original_tool_name}' is not connected."
+                                }
+                            ]
                         })
                         continue
 
@@ -4856,19 +4873,30 @@ class MCPClient:
                             status.update(f"{STATUS_EMOJI['failure']} Tool {original_tool_name} execution failed")
                             tool_results.append({
                                 "role": "user",
-                                "tool_use_id": tool_use_id,
-                                "content": f"Error executing tool '{original_tool_name}': {str(e)}",
-                                "is_error": True
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_use_id,
+                                        "content": f"Error executing tool '{original_tool_name}': {str(e)}"
+                                    }
+                                ]
                             })
                             continue # Skip adding successful result
 
                     # Add successful tool result
+                    # Ensure tool result is a string or list of content blocks as required by Anthropic API
+                    if isinstance(tool_result_content, (dict, list)):
+                        tool_result_content = json.dumps(tool_result_content).decode('utf-8')
                     tool_results.append({
                         "role": "user",
-                        "tool_use_id": tool_use_id,
-                        "content": tool_result_content # Can be complex JSON, keep as is
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": tool_result_content
+                            }
+                        ]
                     })
-
 
                 # Add all tool results to messages
                 messages.extend(tool_results)
