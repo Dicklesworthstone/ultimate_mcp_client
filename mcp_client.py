@@ -2073,600 +2073,393 @@ class ServerMonitor:
 # Custom Stdio Client Logic with Noise Filtering
 # =============================================================================
 
-
 class RobustStdioSession(ClientSession):
     """
-    A ClientSession implementation that handles noisy server stdout
-    by buffering and filtering before parsing MCP messages, using TaskGroup.
-    Requires Python 3.11+.
+    A ClientSession implementation that reads stdout and directly resolves
+    response Futures, aiming for a balance between polling and queue-based processing.
     """
     def __init__(self, process: asyncio.subprocess.Process, server_name: str):
-        if sys.version_info < (3, 11):
-            raise RuntimeError("RobustStdioSession with TaskGroup requires Python 3.11+")
-
+        # Python 3.11+ check no longer needed for TaskGroup
         self._process = process
         self._server_name = server_name
         self._stdin = process.stdin
         self._stderr_reader_task: Optional[asyncio.Task] = None # Keep track of external stderr reader
-        self._message_queue = asyncio.Queue(maxsize=100)
-        self._response_futures: Dict[str, asyncio.Future] = {}
-        self._request_id_counter = 0
-        self._lock = asyncio.Lock()
-        self._is_active = True
-        self._background_task_runner: Optional[asyncio.Task] = None # Task that runs the TaskGroup
 
-        log.debug(f"[{self._server_name}] Initializing RobustStdioSession")
-        # Start the main background task runner which manages the TaskGroup
+        # --- REMOVED QUEUE ---
+        # self._message_queue = asyncio.Queue(maxsize=100)
+
+        # --- KEPT FUTURES DICT ---
+        self._response_futures: Dict[str, asyncio.Future] = {}
+
+        self._request_id_counter = 0
+        self._lock = asyncio.Lock() # Lock still useful for ID generation and maybe future dict access
+        self._is_active = True
+        self._background_task_runner: Optional[asyncio.Task] = None # Task to run the reader
+
+        log.debug(f"[{self._server_name}] Initializing RobustStdioSession (Direct Future Resolution Version)")
+        # Start the background task runner for the combined reader/processor loop
         self._background_task_runner = asyncio.create_task(
-            self._run_background_tasks_wrapper(), # Wrap the TaskGroup runner for error handling
-            name=f"session-tasks-{server_name}"
+            self._run_reader_processor_wrapper(), # Renamed wrapper
+            name=f"session-reader-processor-{server_name}"
         )
 
+    # --- Methods initialize() and send_initialized_notification() remain the same ---
     async def initialize(self, capabilities: Optional[Dict[str, Any]] = None, response_timeout: float = 10.0) -> Any:
             """Sends the MCP initialize request and waits for the response."""
             log.info(f"[{self._server_name}] Sending initialize request...")
-            # Define client capabilities (can be expanded later if needed)
-            client_capabilities = capabilities if capabilities is not None else {
-                # Add client capabilities here if any, e.g., related to resource subscriptions
-            }
+            client_capabilities = capabilities if capabilities is not None else {}
             params = {
-                "processId": os.getpid(), # Client's process ID
-                "clientInfo": { # Optional, but good practice
-                    "name": "ultimate-mcp-client",
-                    "version": "1.0.0", # TODO: Make this dynamic?
-                },
-                "rootUri": None, # Or workspace root if applicable, e.g., f"file://{PROJECT_ROOT.as_uri()}"
+                "processId": os.getpid(),
+                "clientInfo": {"name": "ultimate-mcp-client", "version": "1.0.0"},
+                "rootUri": None,
                 "capabilities": client_capabilities,
                 "protocolVersion": "2025-03-25",
-
             }
-            # Use a specific timeout for initialization, can be shorter than tool calls
             result = await self._send_request("initialize", params, response_timeout=response_timeout)
-            log.info(f"[{self._server_name}] Initialize request successful. Server capabilities received.")
-            self._server_capabilities = result.get("capabilities")
-            return result # Return the server's response (InitializeResult)        
+            log.info(f"[{self._server_name}] Initialize request successful.")
+            # You might still want to store capabilities if needed elsewhere
+            # self._server_capabilities = result.get("capabilities") if isinstance(result, dict) else None
+            return result # Return the raw result dict
 
     async def send_initialized_notification(self):
         """Sends the 'notifications/initialized' notification to the server."""
-        # Ensure session is active before attempting to send
-        if not self._is_active:
-            log.warning(f"[{self._server_name}] Session inactive, cannot send initialized notification.")
+        if not self._is_active: 
+            log.warning(f"[{self._server_name}] Session inactive, skip initialized.")
             return
-
-        # Construct the notification message according to the MCP schema
-        notification = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {} # The schema defines params as an empty object for this notification
-        }
-
+        notification = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
         try:
-            # Serialize using the 'json' alias (which is likely orjson in your setup)
-            # and append the required newline
-            notification_json_str = json.dumps(notification).decode('utf-8') + "\n"
-            notification_bytes = notification_json_str.encode('utf-8')
-
+            # Use orjson directly for dumps (returns bytes)
+            notification_bytes = json.dumps(notification) + b'\n'
             log.info(f"[{self._server_name}] Sending initialized notification...")
-
-            # Check if stdin is usable before writing
-            if self._stdin is None or self._stdin.is_closing():
-                raise ConnectionAbortedError("Stdin is closed or None, cannot send initialized notification")
-
-            # Write the notification bytes to the server's stdin
+            if self._stdin is None or self._stdin.is_closing(): raise ConnectionAbortedError("Stdin closed")
             self._stdin.write(notification_bytes)
-            # Ensure the data is flushed to the process
             await self._stdin.drain()
+            log.debug(f"[{self._server_name}] Initialized notification sent.")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+            log.error(f"[{self._server_name}] Conn error sending initialized: {e}")
+            await self._close_internal_state(e)
+        except Exception as e: log.error(f"[{self._server_name}] Error sending initialized: {e}", exc_info=True)
 
-            log.debug(f"[{self._server_name}] Initialized notification sent successfully.")
 
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as pipe_err:
-            # Handle cases where the connection is lost during the send operation
-            log.error(f"[{self._server_name}] Failed to send initialized notification due to connection error: {pipe_err}")
-            # Mark session as inactive if sending fails critically? Depends on desired robustness.
-            # For a notification, maybe just log and continue, but consider implications.
-            # Let's log and suppress for now, assuming it might not be fatal if JUST notification fails.
-            pass # Or await self._close_internal_state(pipe_err) if it should terminate session
-        except Exception as e:
-            # Catch any other unexpected errors during notification sending
-            log.error(f"[{self._server_name}] Unexpected error sending initialized notification: {e}", exc_info=True)
-            # Log and suppress for now
-
-    async def _run_background_tasks_wrapper(self):
-        """
-        Wraps the TaskGroup runner to handle its potential failure, catching
-        exceptions both from within the TaskGroup's tasks and from the await
-        of the TaskGroup runner itself. Correctly handles ExceptionGroups and single exceptions.
-        """
-        close_exception: Optional[BaseException | BaseExceptionGroup] = None
+    # --- Renamed Wrapper for Combined Reader/Processor ---
+    async def _run_reader_processor_wrapper(self):
+        """Wraps the combined reader/processor loop task."""
+        close_exception: Optional[BaseException] = None
         try:
-            log.debug(f"[{self._server_name}] Entering background task runner wrapper.")
-            try:
-                await self._run_background_tasks() # Runs the 'async with TaskGroup()'
-                log.info(f"[{self._server_name}] Background TaskGroup finished normally.")
-            except BaseExceptionGroup as eg:
-                log.error(f"[{self._server_name}] Background TaskGroup failed due to exception(s) in child tasks:", exc_info=eg)
-                close_exception = eg # Store the ExceptionGroup itself
-            log.debug(f"[{self._server_name}] TaskGroup section complete (may have failed internally).")
+            log.debug(f"[{self._server_name}] Entering reader/processor task wrapper.")
+            await self._read_and_process_stdout_loop() # Run the combined loop
+            log.info(f"[{self._server_name}] Reader/processor task finished normally.")
         except asyncio.CancelledError:
-            log.info(f"[{self._server_name}] Background task runner wrapper task cancelled.")
-            close_exception = asyncio.CancelledError("Wrapper task cancelled")
+            log.info(f"[{self._server_name}] Reader/processor task wrapper cancelled.")
+            close_exception = asyncio.CancelledError("Reader/processor task cancelled")
         except Exception as e:
-            log.error(f"[{self._server_name}] Background Task runner wrapper failed unexpectedly (outside TaskGroup tasks): {e}", exc_info=True)
-            close_exception = e # Store the single exception
+            log.error(f"[{self._server_name}] Reader/processor task wrapper failed: {e}", exc_info=True)
+            close_exception = e
         finally:
-            log.info(f"[{self._server_name}] Background Task runner wrapper exiting (finally block).")
-            # Check if the session is still considered active.
+            log.info(f"[{self._server_name}] Reader/processor task wrapper exiting.")
             if self._is_active:
-                log.warning(f"[{self._server_name}] Background task runner finished unexpectedly or normally while session active. Forcing session state closure.")
-                # Determine the exception to pass to the cleanup function.
-                final_exception = close_exception if close_exception is not None else ConnectionAbortedError("Background task runner finished unexpectedly")
-                # Ensure await is used here as _close_internal_state is async
+                log.warning(f"[{self._server_name}] Reader/processor finished unexpectedly. Forcing close.")
+                final_exception = close_exception if close_exception else ConnectionAbortedError("Reader/processor task finished unexpectedly")
                 await self._close_internal_state(final_exception)
 
-    async def _run_background_tasks(self):
-        """Runs the core background tasks within a TaskGroup."""
-        log.debug(f"[{self._server_name}] Starting background TaskGroup.")
-        # The TaskGroup ensures that if one task fails, others are cancelled.
-        async with asyncio.TaskGroup() as tg:
-            log.debug(f"[{self._server_name}] TaskGroup created.")
-            tg.create_task(
-                self._read_stdout_loop(),
-                name=f"stdout-reader-{self._server_name}"
-            )
-            tg.create_task(
-                self._process_incoming_messages(),
-                name=f"msg-processor-{self._server_name}"
-            )
-            log.info(f"[{self._server_name}] Stdout reader and message processor tasks started in group.")
+    # --- REMOVED _run_background_tasks() ---
 
-    async def _read_stdout_loop(self):
+    async def _read_and_process_stdout_loop(self):
         """
-        Reads stdout line-by-line using readline(), filters noise,
-        parses MCP JSON, puts valid messages in queue.
+        Reads stdout lines, parses JSON, and directly resolves corresponding Futures
+        for responses, or handles notifications/server requests.
         """
         handshake_complete = False
         stream_limit = getattr(self._process.stdout, '_limit', 'Unknown')
-        log.debug(f"[{self._server_name}] Starting stdout reader loop using readline() (Buffer limit: {stream_limit}).")
-
+        log.debug(f"[{self._server_name}] Starting combined reader/processor loop (Buffer limit: {stream_limit}).")
         try:
             while self._process.returncode is None:
-                if not self._is_active:
-                    log.info(f"[{self._server_name}] Session inactive, exiting readline loop.")
+                if not self._is_active: 
+                    log.info(f"[{self._server_name}] Session inactive, exiting loop.")
                     break
-
                 try:
-                    if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{self._server_name}] Attempting stdout.readline()...")
-                    # Use a timeout for readline itself to prevent indefinite blocking if server sends no newline
+                    # Use timeout for readline
                     line_bytes = await asyncio.wait_for(self._process.stdout.readline(), timeout=60.0)
-                    if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{self._server_name}] readline() returned {len(line_bytes)} bytes.")
                     if not line_bytes:
-                        # Check if EOF truly reached or just no data within timeout
-                        if self._process.stdout.at_eof():
-                            log.warning(f"[{self._server_name}] Stdout EOF reached via readline().")
-                            break # Exit loop on EOF
-                        else:
-                            # Timeout occurred, but not EOF, just continue loop
-                            log.debug(f"[{self._server_name}] readline() timeout, no data/newline received.")
-                            continue
-                    # Line received, process it directly (no need for buffer management here)
+                        if self._process.stdout.at_eof(): 
+                            log.warning(f"[{self._server_name}] Stdout EOF.")
+                            break
+                        else: log.debug(f"[{self._server_name}] readline() timeout.")
+                        continue
+
                     line_str_raw = line_bytes.decode('utf-8', errors='replace')
-                    if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{self._server_name}] Processing line: {repr(line_str_raw)}")
+                    if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{self._server_name}] READ/PROC RAW <<< {repr(line_str_raw)}")
                     line_str = line_str_raw.strip()
+                    if not line_str: continue
 
-                    if not line_str: continue # Skip empty lines
-
+                    # --- Parse and Process Immediately ---
                     try:
-                        message = json.loads(line_str) # Use 'json' alias
+                        message = json.loads(line_str)
                         is_valid_rpc = (
                             isinstance(message, dict) and message.get("jsonrpc") == "2.0" and
                             ('id' in message or 'method' in message)
                         )
-                        if is_valid_rpc:
-                            if USE_VERBOSE_SESSION_LOGGING: log.info(f"[{self._server_name}] Received VALID JSON-RPC 2.0: ID={message.get('id', 'N/A')}, Method={message.get('method', 'N/A')}")
-                            else: log.debug(f"[{self._server_name}] Received potential MCP message: ID={message.get('id', 'N/A')}, Method={message.get('method', 'N/A')}")
-                            if not handshake_complete:
-                                log.info(f"[{self._server_name}] First valid JSON-RPC 2.0 detected, MCP protocol started.")
-                                handshake_complete = True
-                            try: # Put message onto the queue
-                                await asyncio.wait_for(self._message_queue.put(message), timeout=5.0)
-                                log.debug(f"[{self._server_name}] Message put in queue. Queue size: {self._message_queue.qsize()}")
-                            except asyncio.TimeoutError: log.error(f"[{self._server_name}] Timeout putting message in queue (full?). Dropping: {line_str[:100]}...")
-                            except asyncio.QueueFull: log.error(f"[{self._server_name}] MCP message queue full! Dropping message: {line_str[:100]}...")
-                        elif isinstance(message, dict): log.debug(f"[{self._server_name}] Skipping non-MCP JSON object stdout line: {line_str[:100]}...")
-                        else: log.debug(f"[{self._server_name}] Skipping non-dict JSON stdout line: {line_str[:100]}...")
-                    except json.JSONDecodeError: log.debug(f"[{self._server_name}] Skipping noisy (non-JSON) stdout line: {line_str[:100]}...")
-                    except Exception as parse_err: log.error(f"[{self._server_name}] Error processing stdout line '{line_str[:100]}...': {parse_err}", exc_info=True)
 
-                except asyncio.TimeoutError:
-                    # Timeout waiting for readline, just loop again
-                    log.debug(f"[{self._server_name}] Outer timeout waiting for readline(). Loop continues.")
-                    continue
-                except (BrokenPipeError, ConnectionResetError):
-                    log.warning(f"[{self._server_name}] Stdout pipe broken during readline().")
-                    break
-                except ValueError as e: # Catch buffer limit error from readline()
-                    stream_limit = getattr(self._process.stdout, '_limit', 'Unknown')
-                    if "Separator is found, but chunk is longer than limit" in str(e) or "Line is too long" in str(e):
-                         log.error(f"[{self._server_name}] Buffer limit ({stream_limit} bytes) exceeded by readline()! Increase limit in process creation.", exc_info=True)
-                    else: log.error(f"[{self._server_name}] ValueError during readline(): {e}", exc_info=True)
-                    break
-                except Exception as read_err:
-                    log.error(f"[{self._server_name}] Error during readline(): {read_err}", exc_info=True)
-                    break
-            log.info(f"[{self._server_name}] Exiting stdout readline loop (Process exited: {self._process.returncode is not None}, Session active: {self._is_active}).")
-        except asyncio.CancelledError:
-            log.info(f"[{self._server_name}] Stdout readline loop cancelled.")
-            raise
-        except Exception as loop_err:
-            log.error(f"[{self._server_name}] Unhandled error in stdout readline loop: {loop_err}", exc_info=True)
-            raise
+                        if not is_valid_rpc:
+                            if isinstance(message, dict): log.debug(f"[{self._server_name}] Skipping non-MCP JSON object: {line_str[:100]}...")
+                            else: log.debug(f"[{self._server_name}] Skipping non-dict JSON: {line_str[:100]}...")
+                            continue # Skip non-rpc lines
 
-    async def _get_next_message(self, mcp_timeout: Optional[float] = 30.0) -> Dict[str, Any]:
-        """Gets the next valid MCP message from the queue."""
-        if not self._is_active:
-            raise ConnectionAbortedError("Session is closed")
-        try:
-            log.debug(f"[{self._server_name}] Waiting for message from queue (timeout={mcp_timeout})...")
-            # Use timeout=None for indefinite wait used by _process_incoming_messages
-            msg = await asyncio.wait_for(self._message_queue.get(), timeout=mcp_timeout)
-            self._message_queue.task_done()
-            log.debug(f"[{self._server_name}] Got message from queue: {msg.get('id', msg.get('method', 'Notification'))}")
-            return msg
-        except asyncio.TimeoutError as timeout_error:
-            # Check if session became inactive while waiting
-            if not self._is_active:
-                 raise ConnectionAbortedError("Session closed while waiting for message") from timeout_error
-            log.error(f"[{self._server_name}] Timeout waiting for message from server.")
-            raise RuntimeError("Timeout waiting for response from server") from timeout_error
-        except asyncio.CancelledError:
-            log.info(f"[{self._server_name}] _get_next_message cancelled.")
-            raise
-        except Exception as e:
-            log.error(f"[{self._server_name}] Error getting message from queue: {e}", exc_info=True)
-            raise RuntimeError(f"Error receiving message: {e}") from e
+                        if not handshake_complete: log.info(f"[{self._server_name}] First valid JSON-RPC detected.")
+                        handshake_complete = True
 
-    async def _process_incoming_messages(self):
-        """Task to continuously process messages from the queue and resolve futures."""
-        log.debug(f"[{self._server_name}] Starting incoming message processor.")
-        while True: # Loop until break/cancel/error
-            if not self._is_active:
-                log.info(f"[{self._server_name}] Session became inactive, exiting message processor.")
-                break
-            try:
-                if USE_VERBOSE_SESSION_LOGGING:
-                    log.debug(f"[{self._server_name}] Waiting indefinitely for message from queue (Current size: {self._message_queue.qsize()})...")
+                        msg_id = message.get("id")
 
-                # Wait indefinitely for the next message from the queue
-                message = await self._get_next_message(mcp_timeout=None)
+                        # --- Direct Future Resolution for Responses/Errors ---
+                        if msg_id is not None:
+                            str_msg_id = str(msg_id)
+                            # Use lock when accessing shared dictionary if needed, though maybe not
+                            # critical if only this task modifies it by popping.
+                            # async with self._lock:
+                            future = self._response_futures.pop(str_msg_id, None)
 
-                if USE_VERBOSE_SESSION_LOGGING:
-                    # Use repr for potentially complex data structures in verbose mode
-                    log.info(f"[{self._server_name}] Dequeued message: {repr(message)}")
-                else:
-                    # Standard logging level
-                    log.debug(f"[{self._server_name}] Dequeued message: ID={message.get('id', 'N/A')}, Method={message.get('method', 'N/A')}")
+                            if future and not future.done():
+                                if "result" in message:
+                                    log.debug(f"[{self._server_name}] READ/PROC: Resolving future ID {msg_id} with RESULT.")
+                                    future.set_result(message["result"])
+                                elif "error" in message:
+                                    err_data = message["error"]
+                                    err_msg = f"Server error ID {msg_id}: {err_data.get('message', 'Unknown')} (Code: {err_data.get('code', 'N/A')})"
+                                    if err_data.get('data'): err_msg += f" Data: {repr(err_data.get('data'))}"
+                                    log.warning(f"[{self._server_name}] READ/PROC: Resolving future ID {msg_id} with ERROR: {err_msg}")
+                                    server_exception = RuntimeError(err_msg)
+                                    future.set_exception(server_exception)
+                                else:
+                                    log.error(f"[{self._server_name}] READ/PROC: Invalid response format for ID {msg_id}.")
+                                    future.set_exception(RuntimeError(f"Invalid response format ID {msg_id}"))
+                            elif future:
+                                log.debug(f"[{self._server_name}] READ/PROC: Future for ID {msg_id} already done (timed out?).")
+                            else:
+                                log.warning(f"[{self._server_name}] READ/PROC: Received response for unknown/timed-out ID: {msg_id}.")
 
-
-                # Process based on message type (response/error vs. notification/request)
-                msg_id = message.get("id")
-
-                if msg_id is not None:
-                    # --- It's a Response or Error for a previous Request ---
-                    str_msg_id = str(msg_id) # Ensure key is string for dictionary lookup
-
-                    # Attempt to find the corresponding future for this response ID
-                    future = self._response_futures.pop(str_msg_id, None)
-
-                    if future and not future.done():
-                        # Found a pending future for this ID
-                        if "result" in message:
-                            # Success Response
-                            log.debug(f"[{self._server_name}] Resolving future for ID {msg_id} with RESULT.")
-                            future.set_result(message["result"])
-                        elif "error" in message:
-                            # Error Response
-                            err_data = message["error"]
-                            # Construct a meaningful error message from the JSON-RPC error object
-                            err_msg = f"Server error response for ID {msg_id}: {err_data.get('message', 'Unknown error')} (Code: {err_data.get('code', 'N/A')})"
-                            # Include data field if present, useful for debugging
-                            err_data_details = err_data.get('data')
-                            if err_data_details:
-                                 err_msg += f" Data: {repr(err_data_details)}" # Use repr for data
-
-                            log.warning(f"[{self._server_name}] Resolving future for ID {msg_id} with ERROR: {err_msg}")
-                            # Create a RuntimeError or a custom McpServerError exception
-                            server_exception = RuntimeError(err_msg)
-                            # Attach error details if helpful
-                            # setattr(server_exception, 'mcp_error_details', err_data)
-                            future.set_exception(server_exception)
+                        # --- Handle Notifications/Server Requests ---
+                        elif "method" in message:
+                            method_name = message['method']
+                            log.debug(f"[{self._server_name}] READ/PROC: Received server message: {method_name}")
+                            # Handle directly or dispatch (e.g., put on a *different* queue for complex handlers)
+                            if method_name == "notifications/progress": pass # Handle progress
+                            elif method_name == "notifications/message": pass # Handle log
+                            elif method_name == "sampling/createMessage": pass # Handle sampling
+                            else: log.warning(f"[{self._server_name}] READ/PROC: Unhandled server method: {method_name}")
                         else:
-                            # Invalid response format (has ID but no 'result' or 'error')
-                            log.error(f"[{self._server_name}] Received message with ID {msg_id} but no result or error field.")
-                            invalid_format_exception = RuntimeError(f"Invalid response format from server for ID {msg_id}: {message}")
-                            future.set_exception(invalid_format_exception)
-                    elif future:
-                        # Future found but already done (e.g., timed out previously)
-                        log.debug(f"[{self._server_name}] Future for ID {msg_id} was already done when response arrived (likely timed out).")
-                    else:
-                        # No future found for this ID (either timed out long ago and removed, or server sent unsolicited ID)
-                        log.warning(f"[{self._server_name}] Received response for unknown or timed-out request ID: {msg_id}. Discarding.")
+                            log.warning(f"[{self._server_name}] READ/PROC: Unknown message structure: {repr(message)}")
 
-                elif "method" in message:
-                    # --- It's a Notification or Request FROM the Server ---
-                    method_name = message['method']
-                    log.debug(f"[{self._server_name}] Received server-initiated message (Notification/Request): {method_name}")
-                    # TODO: Add specific handling for expected server notifications/requests here
-                    # e.g., progress updates, log messages, sampling requests
-                    if method_name == "notifications/progress":
-                         # Handle progress update
-                         pass
-                    elif method_name == "notifications/message":
-                         # Handle log message from server
-                         pass
-                    elif method_name == "sampling/createMessage":
-                         # Handle sampling request (needs callback mechanism)
-                         pass
-                    # Add handlers for other potential server-to-client messages as needed
-                    else:
-                         log.warning(f"[{self._server_name}] Received unhandled server method: {method_name}")
-                else:
-                    # --- Message has neither 'id' nor 'method' ---
-                    log.warning(f"[{self._server_name}] Received message with unknown structure (no id or method): {repr(message)}")
+                    except json.JSONDecodeError: log.debug(f"[{self._server_name}] Skipping noisy line: {line_str[:100]}...")
+                    except Exception as proc_err: log.error(f"[{self._server_name}] Error processing line '{line_str[:100]}...': {proc_err}", exc_info=True)
 
-            except ConnectionAbortedError:
-                # Handle case where _get_next_message raises due to session closing
-                log.info(f"[{self._server_name}] Incoming message processor stopping: Session closed.")
-                break # Exit loop cleanly
-            except McpError as e:
-                # Catch specific MCP errors potentially raised by _get_next_message
-                log.error(f"[{self._server_name}] MCPError in incoming message processor: {e}")
-                break # Exit loop on persistent errors
-            except asyncio.CancelledError:
-                # Handle task cancellation cleanly
-                log.info(f"[{self._server_name}] Incoming message processor cancelled.")
-                raise # Propagate cancellation
-            except Exception as e:
-                # Catch any other unexpected errors during message processing
-                log.error(f"[{self._server_name}] Unexpected error in incoming message processor: {e}", exc_info=True)
-                break # Stop processing on unexpected errors
+                # --- Exception Handling for readline() ---
+                except asyncio.TimeoutError: 
+                    log.debug(f"[{self._server_name}] Outer timeout reading stdout.")
+                    continue
+                except (BrokenPipeError, ConnectionResetError): 
+                    log.warning(f"[{self._server_name}] Stdout pipe broken.")
+                    break
+                except ValueError as e: # Buffer limits
+                     if "longer than limit" in str(e) or "too long" in str(e): log.error(f"[{self._server_name}] Buffer limit ({stream_limit}) exceeded!", exc_info=True)
+                     else: log.error(f"[{self._server_name}] ValueError reading stdout: {e}", exc_info=True)
+                     break
+                except Exception as read_err: 
+                    log.error(f"[{self._server_name}] Error reading stdout: {read_err}", exc_info=True)
+                    break
+            log.info(f"[{self._server_name}] Exiting combined reader/processor loop.")
+        except asyncio.CancelledError: 
+            log.info(f"[{self._server_name}] Reader/processor loop cancelled.")
+            raise
+        except Exception as loop_err: 
+            log.error(f"[{self._server_name}] Unhandled error in reader/processor loop: {loop_err}", exc_info=True)
+            raise
 
-        # Log loop exit
-        log.info(f"[{self._server_name}] Exiting incoming message processor.")
-        # Ensure state reflects closure if loop exits unexpectedly (e.g., MCPError break)
-        if self._is_active:
-            log.warning(f"[{self._server_name}] Incoming message processor loop exited while session active. Forcing close.")
-            # Use await here as _close_internal_state is async
-            await self._close_internal_state(ConnectionAbortedError("Message processor failed or loop exited unexpectedly"))
+
+    # --- REMOVED _get_next_message() ---
+    # --- REMOVED _process_incoming_messages() ---
 
     async def _send_request(self, method: str, params: Dict[str, Any], response_timeout: float) -> Any:
-        """Sends a JSON-RPC request and waits for the response."""
-        # Check if session is active and process is running
+        """
+        Sends a JSON-RPC request and waits for the response Future to be set
+        by the combined reader/processor loop.
+        (Largely unchanged from original, relies on future being set externally).
+        """
         if not self._is_active or (self._process and self._process.returncode is not None):
-            raise ConnectionAbortedError("Session is not active or process terminated")
+            raise ConnectionAbortedError("Session inactive or process terminated")
 
-        # Acquire lock for thread-safe request ID generation
-        async with self._lock:
+        async with self._lock: # Use lock for ID generation
             self._request_id_counter += 1
             request_id = str(self._request_id_counter)
 
-        # Construct the JSON-RPC request object
-        request = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": request_id,
-        }
+        request = {"jsonrpc": "2.0", "method": method, "params": params, "id": request_id}
 
-        # Create a future to wait for the response associated with this request ID
-        future = asyncio.get_running_loop().create_future()
+        # --- Create Future ---
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        # async with self._lock: # Lock if modifying shared dict
         self._response_futures[request_id] = future
 
+        # --- Sending logic (unchanged) ---
         try:
-            # Serialize request to JSON bytes, adding newline
             request_bytes = json.dumps(request) + b'\n'
-
-            log.debug(f"[{self._server_name}] Sending request ID {request_id} ({method}): {request_bytes.decode('utf-8', errors='replace')[:100]}...")
-
-            # Check if stdin stream is valid and open
-            if self._stdin is None or self._stdin.is_closing():
-                 raise ConnectionAbortedError("Stdin is closed or None")
-            if USE_VERBOSE_SESSION_LOGGING:
-                 log.debug(f"[{self._server_name}] RAW >>> {repr(request_bytes)}")
-            # Write request to process's stdin
+            log.debug(f"[{self._server_name}] SEND: ID {request_id} ({method}): {request_bytes.decode('utf-8', errors='replace')[:100]}...")
+            if self._stdin is None or self._stdin.is_closing(): raise ConnectionAbortedError("Stdin closed")
+            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{self._server_name}] RAW >>> {repr(request_bytes)}")
             self._stdin.write(request_bytes)
-            # Ensure data is flushed to the process
             await self._stdin.drain()
-            if USE_VERBOSE_SESSION_LOGGING:
-                log.info(f"[{self._server_name}] Successfully drained stdin for request ID {request_id} ({method}).")
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as pipe_err:
-            # Handle connection errors during send
-            log.error(f"[{self._server_name}] Failed to send request ID {request_id} ({method}): Pipe broken or closing: {pipe_err}")
-            # Clean up future for this request
+            if USE_VERBOSE_SESSION_LOGGING: log.info(f"[{self._server_name}] Drain complete for ID {request_id}.")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+            log.error(f"[{self._server_name}] SEND FAIL ID {request_id}: Pipe broken: {e}")
+            # Clean up future if send fails
+            # async with self._lock: # Lock if modifying shared dict
             self._response_futures.pop(request_id, None)
-            if future and not future.done(): future.set_exception(pipe_err)
-            raise ConnectionAbortedError(f"Connection lost while sending request ID {request_id}: {pipe_err}") from pipe_err
-        except Exception as send_err:
-            # Handle other unexpected errors during send
-            log.error(f"[{self._server_name}] Error sending request ID {request_id} ({method}): {send_err}", exc_info=True)
+            if not future.done(): future.set_exception(e)
+            raise ConnectionAbortedError(f"Conn lost sending ID {request_id}: {e}") from e
+        except Exception as e:
+            log.error(f"[{self._server_name}] SEND FAIL ID {request_id}: {e}", exc_info=True)
             # Clean up future
+            # async with self._lock: # Lock if modifying shared dict
             self._response_futures.pop(request_id, None)
-            if future and not future.done(): future.set_exception(send_err)
-            raise RuntimeError(f"Failed to send request ID {request_id}: {send_err}") from send_err
+            if not future.done(): future.set_exception(e)
+            raise RuntimeError(f"Failed to send ID {request_id}: {e}") from e
 
-        # Wait for the response future to be set by _process_incoming_messages
+        # --- Wait for Future (unchanged) ---
         try:
-            log.debug(f"[{self._server_name}] Waiting for response for ID {request_id} ({method}) (timeout={response_timeout}s)")
-            # Wait for the future with the specified timeout
+            log.debug(f"[{self._server_name}] WAIT: Waiting for future ID {request_id} ({method}) (timeout={response_timeout}s)")
             result = await asyncio.wait_for(future, timeout=response_timeout)
-            log.debug(f"[{self._server_name}] Received and processed response for ID {request_id} ({method})")
-            return result # Return the result part of the response
+            log.debug(f"[{self._server_name}] WAIT: Future resolved for ID {request_id}. Result received.")
+            return result
         except asyncio.TimeoutError as timeout_error:
-            # Handle timeout waiting for the response future
-            log.error(f"[{self._server_name}] Timeout waiting for response for request ID {request_id} ({method})")
-            # Clean up future from the dictionary as it won't be resolved
+            log.error(f"[{self._server_name}] WAIT: Timeout waiting for future ID {request_id} ({method})")
+            # Clean up future from dict on timeout
+            # async with self._lock: # Lock if modifying shared dict
             self._response_futures.pop(request_id, None)
-            # Raise a specific runtime error indicating the timeout
             raise RuntimeError(f"Timeout waiting for response to {method} request (ID: {request_id})") from timeout_error
         except asyncio.CancelledError:
-            # Handle cancellation of the waiting task
-            log.info(f"[{self._server_name}] Wait for request ID {request_id} ({method}) cancelled.")
-            # Clean up future
-            self._response_futures.pop(request_id, None)
-            raise # Propagate cancellation
+            log.info(f"[{self._server_name}] WAIT: Wait cancelled for ID {request_id} ({method}).")
+            # async with self._lock: # Lock if modifying shared dict
+            self._response_futures.pop(request_id, None) # Clean up future
+            raise
         except Exception as wait_err:
-             # Handle other exceptions that might occur during await_for or if future holds an error
-             # Check if the future was resolved with an exception by the message processor
+             # Handle case where future contains an exception set by the reader/processor
              if future.done() and future.exception():
                   server_error = future.exception()
-                  log.warning(f"[{self._server_name}] Request ID {request_id} ({method}) failed with server error: {server_error}")
-                  # Re-raise the original error received from the server
-                  raise server_error from wait_err # Chain the exceptions
+                  log.warning(f"[{self._server_name}] WAIT: Future ID {request_id} failed with server error: {server_error}")
+                  raise server_error from wait_err # Re-raise original error
              else:
-                  # Error likely happened during asyncio.wait_for itself, or future wasn't set correctly
-                  log.error(f"[{self._server_name}] Error waiting for/processing response for request ID {request_id} ({method}): {wait_err}", exc_info=True)
-                  # Clean up future just in case
-                  self._response_futures.pop(request_id, None)
-                  raise RuntimeError(f"Error processing response for {method} request (ID: {request_id}): {wait_err}") from wait_err
+                  log.error(f"[{self._server_name}] WAIT: Error waiting for future ID {request_id}: {wait_err}", exc_info=True)
+                  # async with self._lock: # Lock if modifying shared dict
+                  self._response_futures.pop(request_id, None) # Clean up future
+                  raise RuntimeError(f"Error processing response for {method} ID {request_id}: {wait_err}") from wait_err
 
-    # --- Implement ClientSession methods (Update parameter names) ---
 
+    # --- ClientSession Methods (list_tools, call_tool, etc.) remain the same ---
+    # They use the _send_request method which now relies on the combined reader/processor.
     async def list_tools(self, response_timeout: float = 10.0) -> ListToolsResult:
         log.debug(f"[{self._server_name}] Calling list_tools")
-        # Pass argument with the new name
-        result = await self._send_request("list_tools", {}, response_timeout=response_timeout)
-        try:
-            return ListToolsResult(**result)
-        except Exception as e:
-            log.error(f"[{self._server_name}] Error parsing list_tools response: {e}. Result: {result}")
-            raise RuntimeError(f"Invalid list_tools response format: {e}") from e
+        result = await self._send_request("tools/list", {}, response_timeout=response_timeout) # Correct method name
+        try: return ListToolsResult(**result)
+        except Exception as e: raise RuntimeError(f"Invalid list_tools response format: {e}") from e
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any], response_timeout: float = 30.0) -> CallToolResult:
         log.debug(f"[{self._server_name}] Calling call_tool: {tool_name}")
         params = {"name": tool_name, "arguments": arguments}
-        result = await self._send_request("call_tool", params, response_timeout=response_timeout)
-        try:
-            return CallToolResult(**result)
-        except Exception as e:
-            log.error(f"[{self._server_name}] Error parsing call_tool response for {tool_name}: {e}. Result: {result}")
-            raise RuntimeError(f"Invalid call_tool response format: {e}") from e
+        result = await self._send_request("tools/call", params, response_timeout=response_timeout) # Correct method name
+        try: return CallToolResult(**result)
+        except Exception as e: raise RuntimeError(f"Invalid call_tool response format: {e}") from e
 
     async def list_resources(self, response_timeout: float = 10.0) -> ListResourcesResult:
         log.debug(f"[{self._server_name}] Calling list_resources")
-        result = await self._send_request("list_resources", {}, response_timeout=response_timeout)
-        try:
-            return ListResourcesResult(**result)
-        except Exception as e:
-             log.error(f"[{self._server_name}] Error parsing list_resources response: {e}. Result: {result}")
-             raise RuntimeError(f"Invalid list_resources response format: {e}") from e
+        result = await self._send_request("resources/list", {}, response_timeout=response_timeout) # Correct method name
+        try: return ListResourcesResult(**result)
+        except Exception as e: raise RuntimeError(f"Invalid list_resources response format: {e}") from e
 
     async def read_resource(self, uri: AnyUrl, response_timeout: float = 30.0) -> ReadResourceResult:
         log.debug(f"[{self._server_name}] Calling read_resource: {uri}")
-        params = {"uri": str(uri)} # Match ReadResourceRequestParams
+        params = {"uri": str(uri)}
         result = await self._send_request("resources/read", params, response_timeout=response_timeout)
-        try:
-            return ReadResourceResult(**result)
-        except Exception as e:
-            log.error(f"[{self._server_name}] Error parsing read_resource response for {uri}: {e}. Result: {result}")
-            raise RuntimeError(f"Invalid read_resource response format: {e}") from e
+        try: return ReadResourceResult(**result)
+        except Exception as e: raise RuntimeError(f"Invalid read_resource response format: {e}") from e
 
     async def list_prompts(self, response_timeout: float = 10.0) -> ListPromptsResult:
         log.debug(f"[{self._server_name}] Calling list_prompts")
-        result = await self._send_request("list_prompts", {}, response_timeout=response_timeout)
-        try:
-            return ListPromptsResult(**result)
-        except Exception as e:
-            log.error(f"[{self._server_name}] Error parsing list_prompts response: {e}. Result: {result}")
-            raise RuntimeError(f"Invalid list_prompts response format: {e}") from e
+        result = await self._send_request("prompts/list", {}, response_timeout=response_timeout) # Correct method name
+        try: return ListPromptsResult(**result)
+        except Exception as e: raise RuntimeError(f"Invalid list_prompts response format: {e}") from e
 
-    async def get_prompt(self, prompt_name: str, variables: Dict[str, Any], response_timeout: float = 30.0) -> GetPromptResult: # Corrected hint
+    async def get_prompt(self, prompt_name: str, variables: Dict[str, Any], response_timeout: float = 30.0) -> GetPromptResult:
         log.debug(f"[{self._server_name}] Calling get_prompt: {prompt_name}")
-        params = {"name": prompt_name, "variables": variables}
+        params = {"name": prompt_name, "arguments": variables} # Schema uses 'arguments'
         result = await self._send_request("prompts/get", params, response_timeout=response_timeout)
-        try:
-            return GetPromptResult(**result) # Use the correct class
-        except Exception as e:
-            log.error(f"[{self._server_name}] Error parsing get_prompt response for {prompt_name}: {e}. Result: {result}")
-            raise RuntimeError(f"Invalid get_prompt response format: {e}") from e
+        try: return GetPromptResult(**result)
+        except Exception as e: raise RuntimeError(f"Invalid get_prompt response format: {e}") from e
+
 
     async def _close_internal_state(self, exception: Exception):
-        """Closes internal session state like queue and futures."""
-        if not self._is_active: return # Already closing/closed
-        self._is_active = False # Mark inactive first
-        log.debug(f"[{self._server_name}] Closing internal state due to: {exception}")
-        # Cancel pending futures
-        await self._cancel_pending_futures(exception)
-        # Potentially clear queue or add a sentinel? For now, setting _is_active=False
-        # should stop readers/processors from using it.
-
+        """Closes internal session state."""
+        if not self._is_active: return
+        self._is_active = False
+        log.debug(f"[{self._server_name}] Closing internal state (Direct Future) due to: {exception}")
+        await self._cancel_pending_futures(exception) # Cancel any remaining futures
 
     async def _cancel_pending_futures(self, exception: Exception):
-        """Cancel all outstanding response futures."""
-        # --- Logic remains the same ---
-        log.debug(f"[{self._server_name}] Cancelling {len(self._response_futures)} pending futures with exception: {exception}")
-        futures_to_cancel = list(self._response_futures.items()) # Iterate over copy
+        """Cancel all outstanding response futures. (Still needed for this version)."""
+        log.debug(f"[{self._server_name}] Cancelling {len(self._response_futures)} pending futures with: {exception}")
+        # async with self._lock: # Lock if modifying shared dict
+        futures_to_cancel = list(self._response_futures.items())
         self._response_futures.clear() # Clear immediately
+
         for future_id, future in futures_to_cancel:
             if future and not future.done():
-                try:
-                     future.set_exception(exception)
-                except asyncio.InvalidStateError:
-                     pass # Already cancelled/set perhaps
+                try: future.set_exception(exception)
+                except asyncio.InvalidStateError: pass # Already done/cancelled
 
     async def aclose(self):
         """Closes the session and cleans up resources."""
-        log.info(f"[{self._server_name}] Closing RobustStdioSession...")
-        if not self._is_active:
+        log.info(f"[{self._server_name}] Closing RobustStdioSession (Direct Future)...")
+        if not self._is_active: 
             log.debug(f"[{self._server_name}] Already closed.")
             return
 
-        # 1. Mark inactive and cancel futures immediately
+        # 1. Mark inactive & Cancel Futures
         await self._close_internal_state(ConnectionAbortedError("Session closed by client"))
 
-        # 2. Cancel the main background task runner (which cancels tasks in the TaskGroup)
+        # 2. Cancel the background reader/processor task runner
         if self._background_task_runner and not self._background_task_runner.done():
-            log.debug(f"[{self._server_name}] Cancelling background task runner...")
+            log.debug(f"[{self._server_name}] Cancelling reader/processor task runner...")
             self._background_task_runner.cancel()
-            # Wait for the runner task to finish cancellation
-            with suppress(asyncio.CancelledError): # Ignore cancellation of the await itself
-                 await self._background_task_runner
-            log.debug(f"[{self._server_name}] Background task runner finished cancellation.")
-        else:
-             log.debug(f"[{self._server_name}] Background task runner already done or None.")
+            with suppress(asyncio.CancelledError): await self._background_task_runner
+            log.debug(f"[{self._server_name}] Reader/processor task runner finished cancellation.")
+        else: log.debug(f"[{self._server_name}] Reader/processor task runner already done or None.")
 
-        # 3. Cancel the external stderr reader task if it exists and is active
+        # 3. Cancel external stderr reader (unchanged)
         if self._stderr_reader_task and not self._stderr_reader_task.done():
             log.debug(f"[{self._server_name}] Cancelling external stderr reader task...")
             self._stderr_reader_task.cancel()
-            with suppress(asyncio.CancelledError):
-                 await self._stderr_reader_task
+            with suppress(asyncio.CancelledError): await self._stderr_reader_task
             log.debug(f"[{self._server_name}] External stderr reader task finished cancellation.")
 
-        # 4. Terminate the process (gracefully first)
-        # Note: The TaskGroup tasks might have already terminated it if the pipe broke
+        # 4. Terminate process (unchanged)
         if self._process and self._process.returncode is None:
             log.info(f"[{self._server_name}] Terminating process PID {self._process.pid} during aclose...")
             try:
                 self._process.terminate()
-                # Wait briefly for termination
-                with suppress(asyncio.TimeoutError): # Don't let timeout stop cleanup
-                    await asyncio.wait_for(self._process.wait(), timeout=2.0)
-
-                if self._process.returncode is None: # If still running, kill
-                    log.warning(f"[{self._server_name}] Process did not terminate gracefully after 2s, killing.")
-                    try:
+                with suppress(asyncio.TimeoutError): await asyncio.wait_for(self._process.wait(), timeout=2.0)
+                if self._process.returncode is None:
+                    log.warning(f"[{self._server_name}] Process killing required.")
+                    try: 
                         self._process.kill()
-                        with suppress(asyncio.TimeoutError): # Short wait for kill
-                            await asyncio.wait_for(self._process.wait(), timeout=1.0)
-                    except ProcessLookupError:
-                        log.info(f"[{self._server_name}] Process already exited before kill.")
-                    except Exception as kill_err:
-                        log.error(f"[{self._server_name}] Error killing process: {kill_err}")
-            except ProcessLookupError:
-                 log.info(f"[{self._server_name}] Process already exited before termination attempt.")
-            except Exception as term_err:
-                 log.error(f"[{self._server_name}] Error terminating process: {term_err}")
+                        await asyncio.wait_for(self._process.wait(), timeout=1.0)
+                    except ProcessLookupError: 
+                        pass
+                    except Exception as e: 
+                        log.error(f"Kill error: {e}")
+            except ProcessLookupError: 
+                pass
+            except Exception as e: 
+                log.error(f"Terminate error: {e}")
 
-        log.info(f"[{self._server_name}] RobustStdioSession closed.")
+        log.info(f"[{self._server_name}] RobustStdioSession (Direct Future) closed.")
 
 
 class ServerManager:
@@ -3116,7 +2909,6 @@ class ServerManager:
 
         for item in result_list:
             try:
-                # --- More Robust Validation ---
                 # Check item type (should be an object/dict-like from JSON)
                 if not hasattr(item, 'name') or not isinstance(item.name, str) or not item.name:
                      log.warning(f"[{server_name}] Skipping {item_type_name} item lacking valid 'name': {item}")
@@ -3124,13 +2916,14 @@ class ServerManager:
                      continue
 
                 # Specific checks based on type
-                if item_class is MCPTool and (not hasattr(item, 'input_schema') or not isinstance(item.input_schema, dict)):
-                    log.warning(f"[{server_name}] Skipping tool '{item.name}' lacking valid 'input_schema'.")
-                    items_skipped += 1
-                    continue
-                # Add similar checks for MCPResource/MCPPrompt if they have required fields beyond name/description
-
-                # --- End Validation ---
+                if item_class is MCPTool:
+                    # Try getting 'inputSchema' first, fallback to 'input_schema'
+                    schema = getattr(item, 'inputSchema', getattr(item, 'input_schema', None))
+                    if schema is None or not isinstance(schema, dict):
+                        log.warning(f"[{server_name}] Skipping tool '{item.name}' lacking valid 'inputSchema' or 'input_schema'. Item data: {item}")
+                        items_skipped += 1
+                        continue
+                    correct_input_schema = schema
 
                 # Construct full name and add to dictionary
                 item_name_full = f"{server_name}:{item.name}" if ":" not in item.name else item.name
@@ -3144,7 +2937,7 @@ class ServerManager:
                 }
                 # Add type-specific data
                 if item_class is MCPTool:
-                    instance_data["input_schema"] = getattr(item, 'input_schema', {}) # Default to empty dict
+                    instance_data["input_schema"] = correct_input_schema
                     instance_data["original_tool"] = item # Store original object
                 elif item_class is MCPResource:
                     instance_data["template"] = getattr(item, 'uri', '') # Assuming template comes from uri in Resource
@@ -3178,7 +2971,7 @@ class ServerManager:
         backoff_factor = server_config.retry_policy.get("backoff_factor", 0.5)
 
         # Define buffer limit
-        BUFFER_LIMIT = 2**20 # 1 MiB
+        BUFFER_LIMIT = 2**18 # 256 KiB
 
         # Use safe_stdout context manager to protect client's output
         with safe_stdout():
@@ -3269,6 +3062,9 @@ class ServerManager:
                                 if is_shell_cmd:
                                     command_string = current_args[1] # Correctly use current_args
                                     log.info(f"Executing server '{server_name}' via shell '{executable}': {command_string}")
+                                    # Give the server more time to initialize
+                                    log.info(f"Waiting 2 seconds for {server_name} to initialize...")
+                                    await asyncio.sleep(2.0)
                                     self._safe_printer(f"[cyan]Starting server process (shell: {executable}): {command_string[:100]}...[/]")
                                     try:
                                         process = await asyncio.create_subprocess_shell(
@@ -3278,8 +3074,9 @@ class ServerManager:
                                     except FileNotFoundError: 
                                         log.error(f"Shell executable not found: '{executable}'.")
                                         raise
-                                    except Exception as e: log.error(f"Error starting shell '{executable}': {e}", exc_info=True)
-                                    raise
+                                    except Exception as e: 
+                                        log.error(f"Error starting shell '{executable}': {e}", exc_info=True)
+                                        raise
                                 else:
                                     final_cmd_list = [executable] + current_args
                                     log.info(f"Executing server '{server_name}' directly: {' '.join(map(str, final_cmd_list))}")
@@ -3460,7 +3257,7 @@ class ServerManager:
                                 if session and hasattr(session, 'aclose'):
                                      with suppress(Exception): await session.aclose()
                                 # Process termination handled in the outer except block
-                                raise connection_error from handshake_or_load_err # Re-raise to trigger outer handling/retry
+                                break  # Connection error already set, proceed to shared error handling
 
                             # ====================================================
                             # == END STDIO HANDSHAKE & LOADING ===================
@@ -3539,7 +3336,7 @@ class ServerManager:
                                 log.error(f"[{server_name}] Failed MCP handshake/loading (SSE) ({type(sse_handshake_err).__name__}): {sse_handshake_err}", exc_info=True)
                                 self._safe_printer(f"[red]Failed MCP handshake/setup with {server_name} (SSE).[/]")
                                 # SSE client cleanup is handled by AsyncExitStack on exception
-                                raise connection_error from sse_handshake_err # Re-raise to trigger outer handling/retry
+                                break  # Connection error already set, proceed to shared error handling
 
                             # ====================================================
                             # == END SSE HANDSHAKE & LOADING =====================
@@ -3682,6 +3479,7 @@ class ServerManager:
                 # This path indicates loop finished without returning session or None after retries - should be rare
                 log.error(f"Connection loop for {server_name} exited without explicit return.")
                 return None
+
                             
     async def connect_to_servers(self):
         """Connect to all enabled MCP servers"""
@@ -5048,6 +4846,10 @@ class MCPClient:
             except Exception as e: 
                 self.safe_print(f"[bold red]Unexpected Error:[/] {str(e)}")
         
+    async def count_tokens(self, messages=None) -> int:
+        """Delegate token counting to the server_manager"""
+        return await self.server_manager.count_tokens(messages)
+                                                              
     async def cmd_exit(self, args):
         """Exit the client"""
         self.safe_print("[yellow]Exiting...[/]")
