@@ -38,13 +38,16 @@ and other AI models.
 
 Key Features:
 ------------
+- Web UI: Modern reactive interface with DaisyUI/Tailwind styling
+- API Server: Full REST API for programmatic access with FastAPI
+- WebSocket Support: Real-time streaming AI responses in both CLI and Web UI
 - Server Management: Discover, connect to, and monitor MCP servers
 - Tool Integration: Execute tools from multiple servers with intelligent routing
 - Streaming: Real-time streaming responses with tool execution
 - Caching: Smart caching of tool results with configurable TTLs
 - Conversation Branches: Create and manage conversation forks and branches
 - Conversation Import/Export: Save and share conversations with easy portable JSON format
-- Health Dashboard: Real-time monitoring of servers and tool performance
+- Health Dashboard: Real-time monitoring of servers and tool performance in CLI and Web UI
 - Observability: Comprehensive metrics and tracing
 - Registry Integration: Connect to remote registries to discover servers
 - Local Discovery: Discover MCP servers on your local network via mDNS
@@ -52,11 +55,18 @@ Key Features:
 - Direct Tool Execution: Run specific tools directly with custom parameters
 - Dynamic Prompting: Apply pre-defined prompt templates to conversations
 - Claude Desktop Integration: Automatically import server configs from Claude desktop
+- Theme Customization: Multiple built-in themes with light/dark mode support in Web UI
 
 Usage:
 ------
-# Interactive mode
+# Interactive CLI mode
 python mcpclient.py run --interactive
+
+# Launch Web UI
+python mcpclient.py run --webui
+
+# Customize Web UI host/port
+python mcpclient.py run --webui --host 0.0.0.0 --port 8080
 
 # Single query
 python mcpclient.py run --query "What's the weather in New York?"
@@ -101,6 +111,27 @@ Interactive mode commands:
 - /discover - Discover and connect to MCP servers on local network
 - /optimize - Optimize conversation context through summarization
 - /clear - Clear the conversation context
+
+Web UI Features:
+--------------
+- Server Management: Add, remove, connect, and manage MCP servers
+- Conversation Interface: Chat with Claude with streaming responses
+- Tool Execution: View and interact with tool calls and results in real-time
+- Branch Management: Visual conversation tree with fork/switch capabilities
+- Settings Panel: Configure API keys, models, and parameters
+- Theme Customization: Multiple built-in themes with light/dark mode
+
+API Endpoints:
+------------
+- GET /api/status - Get client status
+- GET/PUT /api/config - Get or update configuration
+- GET/POST/DELETE /api/servers/... - Manage servers
+- GET /api/tools - List available tools
+- GET /api/resources - List available resources
+- GET /api/prompts - List available prompts
+- GET/POST /api/conversation/... - Manage conversation state
+- POST /api/tool/execute - Execute a tool directly
+- WS /ws/chat - WebSocket for chat communication
 
 Author: Jeffrey Emanuel
 License: MIT
