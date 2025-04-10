@@ -78,6 +78,8 @@ The Model Context Protocol (MCP) standardizes how AI models interact with extern
     -   Configurable Time-To-Live (TTL) per tool category (e.g., `weather`, `filesystem`).
     -   **Dependency Tracking:** Define relationships between tools. Invalidating one tool's cache (e.g., `stock:lookup`) can automatically invalidate dependent caches (e.g., `stock:analyze`). View the graph via `/cache dependencies`.
 
+---
+
 ## 📸 Screenshots
 
 A glimpse into the Ultimate MCP Client's interfaces:
@@ -87,37 +89,38 @@ A glimpse into the Ultimate MCP Client's interfaces:
 <table>
   <tbody>
     <tr>
-      <td align="center" valign="top" width="33%">
+      <td align="center" valign="top" width="50%">
         <img src="https://github.com/Dicklesworthstone/ultimate_mcp_client/blob/main/screenshots/terminal_example_01.webp?raw=true" alt="CLI Interactive Mode showing tool execution and streaming" width="95%">
         <br/>
         <p align="center"><small><em>Interactive CLI: Streaming response with tool call/result.</em></small></p>
       </td>
-      <td align="center" valign="top" width="33%">
+      <td align="center" valign="top" width="50%">
         <img src="https://github.com/Dicklesworthstone/ultimate_mcp_client/blob/main/screenshots/terminal_example_02.webp?raw=true" alt="CLI TUI Dashboard showing server status" width="95%">
         <br/>
         <p align="center"><small><em>Live TUI Dashboard: Real-time server & tool monitoring (<code>/dashboard</code>).</em></small></p>
       </td>
+    </tr>
+    <tr>
       <td align="center" valign="top" width="33%">
         <img src="https://github.com/Dicklesworthstone/ultimate_mcp_client/blob/main/screenshots/webui_example_01.webp?raw=true" alt="Web UI Chat Interface" width="95%">
         <br/>
         <p align="center"><small><em>Web UI: Main chat interface showing messages and tool interactions.</em></small></p>
       </td>
-    </tr>
-    <tr>
-      <td align="center" valign="top" width="50%"> <!-- Spanning two cells effectively -->
+      <td align="center" valign="top" width="33%">
         <img src="https://github.com/Dicklesworthstone/ultimate_mcp_client/blob/main/screenshots/webui_example_02.webp?raw=true" alt="Web UI Server Management Tab" width="95%">
         <br/>
         <p align="center"><small><em>Web UI: Server management tab with connection status and controls.</em></small></p>
       </td>
-      <td align="center" valign="top" width="50%"> <!-- Spanning two cells effectively -->
+      <td align="center" valign="top" width="33%">
         <img src="https://github.com/Dicklesworthstone/ultimate_mcp_client/blob/main/screenshots/webui_example_03.webp?raw=true" alt="Web UI Conversation Branching View" width="95%">
         <br/>
         <p align="center"><small><em>Web UI: Conversation tab showing the branching graph structure.</em></small></p>
       </td>
-       <!-- If you had a 6th screenshot, add another <td> here -->
     </tr>
   </tbody>
 </table>
+
+> **Note:** Some screenshots feature tools like `llm_gateway:generate_completion`. These are provided by the [LLM Gateway MCP Server](https://github.com/Dicklesworthstone/llm_gateway_mcp_server), another project by the same author. This server acts as an MCP-native gateway, enabling advanced agents (like Claude, used by *this* client) to intelligently delegate tasks to various other LLMs (e.g., Gemini, GPT-4o-mini), often optimizing for cost and performance.
 
 <br/>
 
