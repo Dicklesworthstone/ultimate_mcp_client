@@ -282,6 +282,21 @@
             background-color: hsl(var(--in));
             color: hsl(var(--inc));
         }
+
+        .chat-image .avatar .w-8 {
+            position: relative;
+            /* Needed for absolute positioning of child */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .chat-image .avatar .w-8 i {
+            line-height: 1;
+            /* Helps vertical alignment */
+            display: block;
+            /* Treat icon as a block */
+        }
     </style>
 </head>
 
@@ -748,11 +763,14 @@
                         <!-- Main Chat Bubble -->
                         <!-- We apply highlight.js classes manually within renderMessageContent -->
                         <div class="chat-bubble max-w-3xl" :class="{
-                            'chat-bubble-primary text-primary-content': message.role === 'user' && message.content_type !== 'tool_result',
-                            'bg-neutral text-neutral-content': message.role === 'assistant' && !message.current_status && message.content_type !== 'tool_result',
-                            'chat-bubble-info text-info-content': message.role === 'system' || (message.role === 'assistant' && message.current_status),
+                            'chat-bubble-primary text-primary-content': message.role === 'user' && message.content_type !== 'tool_result', // Standard User
+                            'bg-neutral text-neutral-content': message.role === 'assistant' && !message.current_status && message.content_type !== 'tool_result', // Standard Assistant
+                            'chat-bubble-info text-info-content': message.role === 'system', // Standard System
+                            'chat-bubble-info text-info-content': message.role === 'assistant' && message.current_status, // Streaming assistant uses info
+                            // Specific Tool Result Styles (These override base styles)
                             'chat-bubble-warning text-warning-content': message.content_type === 'tool_result' && message.is_error,
                             'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error,
+                            // Animation
                             'animate__animated animate__fadeInUp animate__faster': shouldAnimate(message.id || index)
                          }" x-html="debugRenderMessage(message)">
                         </div>
@@ -1440,9 +1458,30 @@
                         default:
                             console.warn('Received unknown WebSocket message type:', message.type, message);
                     }
+
+                    if (message.type === 'tool_result' ||
+                        (Array.isArray(message.payload) && message.payload.some(item => item?.type === 'tool_result'))) {
+
+                        // Only add this as assistant content, not as a new user message
+                        if (assistantMsg) {
+                            // Add to assistant message directly
+                            if (Array.isArray(assistantMsg.content)) {
+                                assistantMsg.content.push(...message.payload);
+                            } else if (typeof assistantMsg.content === 'string') {
+                                // If content was a string, convert to block format
+                                assistantMsg.content = [
+                                    { type: 'text', text: assistantMsg.content },
+                                    ...message.payload
+                                ];
+                            }
+                            this.currentConversation = [...this.currentConversation];
+                            return; // Skip adding as a separate message
+                        }
+                    }
+
                     // Ensure the list reference updates for Alpine's reactivity if modifying nested props
                     this.currentConversation = [...this.currentConversation];
-                }, // Added comma
+                },
 
                 // --- DATA FETCHING ---
                 async fetchInitialData() {
@@ -1755,20 +1794,9 @@
                     });
                 },
                 addMessageToConversation(role, content, metadata = {}) {
+                    // *** No filter needed here anymore ***
+
                     const tempId = `${role}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-                    let displayMode = undefined; // Default: let renderer decide or handle non-structured
-
-                    // Check if content itself is structured or a JSON string
-                    let isStructured = false;
-                    if (typeof content === 'object' && content !== null) {
-                        isStructured = true;
-                    } else if (typeof content === 'string' && this.isProbablyJsonString(content)) {
-                        isStructured = true;
-                    }
-
-                    if (isStructured) {
-                        displayMode = 'raw'; // Default view for structured data
-                    }
 
                     const newMessage = {
                         role: role,
@@ -1776,26 +1804,25 @@
                         id: metadata.id || tempId,
                         timestamp: metadata.timestamp || new Date().toISOString(),
                         model: metadata.model || (role === 'assistant' ? this.currentModelShort : null),
-                        content_type: metadata.content_type || (role === 'user' && typeof content !== 'string' ? 'tool_result' : null),
+                        content_type: metadata.content_type || null,
                         tool_name: metadata.tool_name,
                         is_error: metadata.is_error,
-                        _displayMode: displayMode, // Add the display mode state
+                        // Remove internal flags like _applyProse if they still exist
                         ...metadata
                     };
 
-                    if (!this.currentConversation.some(m => m.id === newMessage.id)) {
+                    // Add/Update message in conversation array
+                    const existingIndex = this.currentConversation.findIndex(m => m.id === newMessage.id);
+                    if (existingIndex === -1) {
                         this.currentConversation.push(newMessage);
-                        this.scrollToBottom();
                     } else {
-                        const existingIndex = this.currentConversation.findIndex(m => m.id === newMessage.id);
-                        if (existingIndex > -1) {
-                            // Preserve existing display mode if updating message
-                            newMessage._displayMode = this.currentConversation[existingIndex]._displayMode || displayMode;
-                            this.currentConversation[existingIndex] = { ...this.currentConversation[existingIndex], ...newMessage };
-                            this.currentConversation = [...this.currentConversation];
-                        }
+                        this.currentConversation[existingIndex] = { ...this.currentConversation[existingIndex], ...newMessage };
+                        this.currentConversation = [...this.currentConversation]; // Force reactivity
                     }
-                },
+                    this.scrollToBottom();
+
+                }, // End addMessageToConversation
+
                 shouldAnimate(messageId) { const lastMsg = this.currentConversation[this.currentConversation.length - 1]; return lastMsg && lastMsg.id === messageId; },
                 // --- UTILITY / RENDERING HELPERS ---
 
@@ -1817,8 +1844,8 @@
                     }
                     console.log('====== END FULL MESSAGE DEBUG ======');
                     const rendered = this.renderMessageContent(message);
-                    console.log('debugRenderMessage output type:', typeof rendered);
-                    console.log('debugRenderMessage output:', rendered);
+                    console.log('debugRenderMessage output type:', typeof rendered); // Optional: keep for deeper debugging
+                    console.log('debugRenderMessage output:', rendered); // Optional: keep for deeper debugging
                     return rendered;
                 },
 
@@ -1860,123 +1887,143 @@
                     return "{" + keyValues.join(", ") + (keys.length > 5 ? ", ..." : "") + "}";
                 },
 
-                renderMixedMessageContent(content) {
+                renderMixedMessageContent(content, message) {
                     if (!Array.isArray(content)) {
-                        // If not an array, stringify and render as text
+                        // If not an array, stringify and render as text (Existing logic)
+                        console.warn("renderMixedMessageContent called with non-array:", content);
                         return `<pre class="whitespace-pre-wrap">${DOMPurify.sanitize(JSON.stringify(content, null, 2))}</pre>`;
                     }
 
-                    let html = '<div class="space-y-3">';
+                    let html = '<div class="space-y-3">'; // Container for blocks
 
-
-                    // Process each block in the mixed content
+                    // Process each block in the mixed content array
                     content.forEach((block, index) => {
-                        if (index > 0 && block.type === 'tool_use') {
-                            html += `<div class="divider my-4 opacity-50"></div>`;
-                        }
-                        if (!block) return;
+                        if (!block) return; // Skip null/undefined blocks
 
-                        // Check the actual type of the block
-                        console.log("Processing block:", block.type);
-
-                        if (block.type === 'text' && typeof block.text !== 'string') {
-                            console.warn("Text block had non-string 'text' field:", block.text);
-                        }
-
-                        if (typeof block === 'string') {
-                            // Simple string content
-                            html += `<div>${DOMPurify.sanitize(marked.parse(block))}</div>`;
-                        }
-
-                        if (block.type === 'text') {
-                            let textContent = block.text; // Might be a proxy
-
-                            // Handle potential nested objects first (if needed)
-                            if (typeof textContent === 'object' && textContent !== null && textContent.content) {
-                                textContent = textContent.content; // Reassign, might still be a proxy
+                        // Add a divider between tool steps (usage/result pairs) for clarity
+                        // Placed before the block for better visual grouping
+                        if (index > 0 && (block.type === 'tool_use' || block.type === 'tool_result')) {
+                            const prevBlock = content[index - 1];
+                            if (prevBlock && ((prevBlock.type === 'tool_use' && block.type === 'tool_result') || (prevBlock.type === 'tool_result' && block.type === 'tool_use'))) {
+                                html += `<div class="divider my-3 text-xs opacity-50 font-sans">Tool Step</div>`;
+                            } else if (block.type === 'tool_use' && (!prevBlock || prevBlock.type !== 'text')) {
+                                html += `<div class="divider my-3 text-xs opacity-50 font-sans">Tool Step</div>`;
                             }
+                        }
 
-                            // Ensure textContent is not null/undefined before unwrapping
+                        // --- Text Block Rendering ---
+                        if (block.type === 'text') {
+                            let textContent = block.text;
+                            if (typeof textContent === 'object' && textContent !== null && textContent.content) {
+                                textContent = textContent.content;
+                            }
                             if (textContent === null || typeof textContent === 'undefined') {
                                 textContent = '';
                             }
-
-                            // *** Explicitly unwrap the proxy ***
-                            let unwrappedText = JSON.parse(JSON.stringify(textContent));
-
-                            // Ensure it's a string
-                            const stringToParse = String(unwrappedText);
-
-                            html += `<div class="prose prose-sm max-w-none">${DOMPurify.sanitize(marked.parse(stringToParse))}</div>`; // Use unwrapped string
+                            // Use a raw value to avoid [object Object] issues
+                            let rawText;
+                            if (typeof Alpine !== 'undefined' && Alpine.raw) {
+                                rawText = Alpine.raw(textContent);
+                            } else {
+                                rawText = JSON.parse(JSON.stringify(textContent));
+                            }
+                            const stringToParse = String(rawText);
+                            html += this.renderMarkdown(block);
                         }
 
+                        // The rest of the block types (tool_use, tool_result, etc.) remain unchanged
+                        // --- Tool Usage Block Rendering ---
                         else if (block.type === 'tool_use') {
-                            // Tool call/use block
                             const toolName = block.name || "Unknown Tool";
-                            const toolId = block.id || "";
-                            const inputJson = JSON.stringify(block.input || {}, null, 2);
+                            const inputData = block.input || {};
+                            const inputJson = JSON.stringify(inputData, null, 2);
+                            const showInputBox = inputJson !== '{}';
 
+                            // Build the HTML for the tool usage block
                             html += `
-            <div class="my-2 p-3 bg-blue-100/20 dark:bg-blue-900/20 rounded-md border border-blue-200/30">
-                <div class="flex items-center gap-2 text-info font-medium mb-1.5">
-                    <i class="fas fa-terminal fa-fw"></i>
-                    <span>Using Tool: <span class="font-mono">${DOMPurify.sanitize(toolName)}</span></span>
-                    ${toolId ? `<span class="opacity-60 text-xs">(ID: ...${DOMPurify.sanitize(toolId.slice(-6))})</span>` : ''}
+            <div class="my-2 p-3 bg-base-100/50 dark:bg-base-100/10 border border-base-300/20 rounded-lg shadow-sm">
+                <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-sm mb-1.5">
+                    <span class="flex items-center gap-1.5 text-base-content/80 font-medium">
+                        <i class="fas fa-terminal fa-fw text-info/80"></i>
+                        Using Tool:
+                    </span>
+                    <code class="text-sm font-semibold font-mono text-base-content bg-transparent px-1 py-0 rounded">
+                        ${DOMPurify.sanitize(toolName)}
+                    </code>
                 </div>
-                <div class="bg-base-100/80 dark:bg-base-300/30 rounded-md p-2">
-                    <pre class="overflow-auto max-h-60 relative"><code class="language-json">${DOMPurify.sanitize(inputJson)}</code></pre>
-                </div>
+                ${showInputBox ? `
+                <details class="bg-base-100 dark:bg-base-200/50 rounded group border border-base-300/20" open>
+                    <summary class="text-xs cursor-pointer select-none p-1.5 font-mono text-base-content/70 group-open:border-b group-open:border-base-300/40 hover:bg-base-200/30 transition-colors duration-150">Input Parameters</summary>
+                    <div class="p-2 max-h-60 overflow-y-auto relative">
+                         <pre><code class="language-json hljs">${hljs.highlight(inputJson, { language: 'json', ignoreIllegals: true }).value}</code></pre>
+                         ${this.createCopyButton(inputJson)}
+                    </div>
+                </details>
+                ` : `
+                <div class="text-xs italic text-base-content/60 mt-1 px-1">(No input parameters)</div>
+                `}
             </div>`;
                         }
+
+                        // --- Tool Result Block Rendering ---
                         else if (block.type === 'tool_result') {
-                            // Tool result block - this is what we see in user messages after tools run
                             const isError = block.is_error || false;
                             const statusClass = isError ? 'text-error' : 'text-success';
                             const statusIcon = isError ? 'fa-exclamation-circle' : 'fa-check-circle';
                             const toolUseId = block.tool_use_id || "";
+                            const relatedToolName = message?.content?.find(b => b.type === 'tool_use' && b.id === toolUseId)?.name;
 
-                            // Parse the content if it's a JSON string
-                            let resultContent;
+                            let rawResultContent = block.content;
+                            let displayContent = "";
+                            let language = 'plaintext';
+
                             try {
-                                if (typeof block.content === 'string') {
-                                    resultContent = JSON.stringify(JSON.parse(block.content), null, 2);
+                                if (typeof rawResultContent === 'string' && this.isProbablyJsonString(rawResultContent)) {
+                                    displayContent = JSON.stringify(JSON.parse(rawResultContent), null, 2);
+                                    language = 'json';
+                                } else if (typeof rawResultContent === 'string') {
+                                    displayContent = rawResultContent;
                                 } else {
-                                    resultContent = JSON.stringify(block.content, null, 2);
+                                    displayContent = JSON.stringify(rawResultContent, null, 2);
+                                    language = 'json';
                                 }
                             } catch (e) {
-                                resultContent = String(block.content || '');
+                                console.error("Error processing tool result content:", e);
+                                displayContent = String(rawResultContent || (isError ? '[Error Content Processing Failed]' : '[Result Content Processing Failed]'));
                             }
 
+                            const highlightedContent = hljs.highlight(displayContent, { language: language, ignoreIllegals: true }).value;
+
+                            // Build the HTML for the tool result block
                             html += `
-            <div class="my-2 p-3 ${isError ? 'bg-error/10' : 'bg-success/10'} rounded-md border ${isError ? 'border-error/20' : 'border-success/20'}">
-                <div class="flex items-center gap-2 ${statusClass} font-medium">
-                    <i class="fas ${statusIcon} fa-fw"></i>
-                    <span>${isError ? 'Tool Error' : 'Tool Result'}</span>
-                    ${toolUseId ? `<span class="opacity-60 text-xs">(for tool call ...${DOMPurify.sanitize(toolUseId.slice(-6))})</span>` : ''}
+            <div class="my-2 p-3 ${isError ? 'bg-error/10 border-error/20' : 'bg-success/10 border-success/20'} rounded-lg border">
+                <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 ${statusClass} font-medium text-sm mb-1.5">
+                    <span class="flex items-center gap-1.5"><i class="fas ${statusIcon} fa-fw"></i>${isError ? 'Tool Error' : 'Tool Result'}</span>
+                     ${relatedToolName ? `<span class="text-xs text-base-content/70">(from <code class="text-xs font-semibold font-mono">${DOMPurify.sanitize(relatedToolName)}</code>)</span>` : ''}
+                    ${toolUseId ? `<span class="text-xs text-base-content/70">(for call <code class="text-xs font-mono">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>` : ''}
                 </div>
-                <div class="mt-2 bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md relative">
-                    <pre class="overflow-auto max-h-60"><code class="language-json whitespace-pre-wrap break-all">${DOMPurify.sanitize(resultContent)}</code></pre>
+                <div class="mt-2 bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md relative group">
+                    <pre class="overflow-auto max-h-60"><code class="language-${language} hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
+                    ${this.createCopyButton(displayContent, 'result')}
                 </div>
             </div>`;
                         }
+
+                        // --- Unknown Block Type Handling ---
                         else {
-                            // Unknown block type - render as JSON
                             let unknownContent;
-                            try {
-                                unknownContent = JSON.stringify(block, null, 2);
-                            } catch (e) {
-                                unknownContent = '[Error stringifying unknown block]';
-                            }
+                            try { unknownContent = JSON.stringify(block, null, 2); }
+                            catch (e) { unknownContent = '[Error stringifying unknown block]'; }
 
                             html += `
-            <div class="bg-base-200 p-2 rounded my-2">
-                <div class="font-medium text-sm opacity-70 mb-1">Unknown Content Block:</div>
+            <div class="bg-warning/10 p-2 rounded-lg my-2 opacity-70 border border-warning/30">
+                <div class="font-medium text-xs mb-1 text-warning-content/80">Unknown Content Block Type: <code class="text-xs font-bold">${block.type || 'N/A'}</code></div>
                 <pre class="text-xs">${DOMPurify.sanitize(unknownContent)}</pre>
             </div>`;
                         }
-                    });
+                    }); // End forEach block loop
 
-                    html += '</div>';
+                    html += '</div>'; // Close the main space-y-3 container
                     return html;
                 },
 
@@ -2137,62 +2184,145 @@
                     return this.renderJson(content);
                 },
 
+                renderUserProvidedToolResult(block, message) {
+                    // block is message.content[0] which has { type: 'tool_result', content: 'JSON_STRING', ... }
+                    const toolUseId = block.tool_use_id || 'Unknown Tool Call';
+                    let contentData;
+                    // Start with Tool Result styling (e.g., blueish info background)
+                    let html = `<div class="not-prose my-2 p-3 bg-info text-info-content rounded-lg border border-info/20">`;
+                    html += `<div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 font-medium text-sm mb-1.5">
+                                <span class="flex items-center gap-1.5"><i class="fas fa-database fa-fw"></i>Tool Data Received</span>
+                                <span class="text-xs opacity-70">(for <code class="text-xs font-mono">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>
+                             </div>`;
+
+                    try {
+                        // *** THE KEY FIX: Parse the nested JSON string ***
+                        contentData = JSON.parse(block.content);
+
+                        // Now, format the PARSED data (contentData)
+                        // Example: Displaying Marqo results nicely
+                        if (contentData && Array.isArray(contentData.results)) {
+                            html += `<details class="bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md group mt-2" open>`;
+                            html += `<summary class="text-xs cursor-pointer select-none font-medium text-info-content/80 group-open:border-b group-open:border-info/40 pb-1 mb-1">Parsed Results (${contentData.results.length})</summary>`;
+                            html += `<div class="mt-1 space-y-2 max-h-72 overflow-y-auto text-xs">`; // Increased max-height slightly
+
+                            // Display a limited number of results to prevent huge bubbles
+                            contentData.results.slice(0, 5).forEach((hit, index) => {
+                                const score = hit.score ? ` (Score: ${hit.score.toFixed(4)})` : '';
+                                // Attempt to clean up the content string
+                                let hitContent = (hit.content || '[No content snippet]')
+                                    .replace(/^search_document:\s*/, '') // Remove prefix if present
+                                    .replace(/\\n/g, '\n'); // Replace escaped newlines
+                                // Sanitize the final snippet for display
+                                hitContent = DOMPurify.sanitize(hitContent);
+
+                                html += `<div class="p-1.5 bg-base-100/50 rounded shadow-sm">
+                                            <p class="font-semibold opacity-90 mb-0.5">Result ${index + 1}${score}:</p>
+                                            <pre class="text-xs whitespace-pre-wrap break-words font-sans">${hitContent}</pre> <!-- Use pre for formatting -->
+                                         </div>`;
+                            });
+
+                            if (contentData.results.length > 5) {
+                                html += `<p class="text-center text-xs opacity-70 mt-2">... and ${contentData.results.length - 5} more results.</p>`;
+                            }
+                            html += `</div></details>`; // Close details content and details tag
+
+                            // Optionally display aggregate stats if needed
+                            // if(contentData.aggregate_stats) { ... }
+
+                        } else {
+                            // Parsed OK, but not the expected Marqo structure. Show as formatted JSON.
+                            html += `<p class="text-xs font-semibold mt-1 mb-1">Parsed Data (JSON):</p>`;
+                            html += `<div class="mt-1 bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md relative group">
+                                          <pre class="overflow-auto max-h-60"><code class="language-json hljs whitespace-pre-wrap break-all">${hljs.highlight(JSON.stringify(contentData, null, 2), { language: 'json', ignoreIllegals: true }).value}</code></pre>
+                                          ${this.createCopyButton(JSON.stringify(contentData, null, 2), 'result')}
+                                      </div>`;
+                        }
+
+                    } catch (e) {
+                        console.error("Error parsing/rendering user tool result content string:", e, block.content);
+                        // Parsing failed. Display the original (problematic) string safely, styled as an error.
+                        html += `<div class="mt-2 bg-error/10 p-2 rounded-md text-error-content">
+                                     <p class="font-semibold text-xs mb-1"><i class="fas fa-exclamation-triangle mr-1"></i>Error parsing result data.</p>
+                                     <pre class="text-xs whitespace-pre-wrap break-all">${DOMPurify.sanitize(block.content)}</pre>
+                                 </div>`;
+                    }
+
+                    html += `</div>`; // Close the main container
+                    return html;
+                }, // End renderUserProvidedToolResult
+
                 renderMessageContent(message) {
                     try {
-                        if (message.content === null || message.content === undefined) {
-                            return message.current_status
-                                ? `<span class="italic opacity-80">${DOMPurify.sanitize(message.current_status)}</span>`
-                                : '<span class="opacity-50 italic">[No Content]</span>';
-                        }
+                        // --- Priority Handling ---
 
-                        // ✅ SPECIAL CASE: tool_result-only message in block-array form
-                        if (
+                        // 1. Handle the SPECIFIC user-role message containing a single tool_result with string content
+                        if (message.role === 'user' &&
                             Array.isArray(message.content) &&
                             message.content.length === 1 &&
-                            message.content[0]?.type === 'tool_result'
-                        ) {
-                            const block = message.content[0];
-                            let parsedContent = block.content;
+                            message.content[0]?.type === 'tool_result' &&
+                            typeof message.content[0]?.content === 'string') {
+                            console.log("Rendering specific user tool result structure...");
+                            return this.renderUserProvidedToolResult(message.content[0], message);
+                        }
 
-                            if (typeof parsedContent === 'string') {
-                                try {
-                                    parsedContent = JSON.parse(parsedContent);
-                                } catch (e) {
-                                    // leave as-is if not JSON
-                                }
+                        // 2. Handle explicit Assistant/System Tool Results (non-string content or explicit type)
+                        const isExplicitToolResult = message.content_type === 'tool_result';
+                        const isSingleBlockToolResult = Array.isArray(message.content) && message.content.length === 1 && message.content[0]?.type === 'tool_result';
+
+                        if (isExplicitToolResult || isSingleBlockToolResult) {
+                            let resultBlock = isSingleBlockToolResult ? message.content[0] : null;
+                            let resultData = isSingleBlockToolResult ? resultBlock.content : message.content; // Use block content or message content
+
+                            // Attempt to parse if the data is a JSON string
+                            if (typeof resultData === 'string' && this.isProbablyJsonString(resultData)) {
+                                try { resultData = JSON.parse(resultData); } catch (e) { /* Leave as string if parse fails */ }
                             }
 
-                            return this.renderToolResult(parsedContent, {
-                                ...message,
-                                ...block
-                            });
+                            // Pass combined message/block info to renderer
+                            return this.renderToolResult(resultData, { ...message, ...(resultBlock || {}) });
                         }
 
-                        // ✅ MIXED BLOCKS (text/tool_use/tool_result/etc)
-                        if (
-                            Array.isArray(message.content) &&
-                            message.content.some(b => typeof b === 'object' && b !== null && typeof b.type === 'string')
-                        ) {
-                            return this.renderMixedMessageContent(message.content);
+                        // --- Standard Content Handling ---
+
+                        // 3. Mixed Content Blocks (Assistant/System) - MUST contain at least one non-text block if it got here
+                        if (Array.isArray(message.content) && message.content.some(b => typeof b === 'object' && b !== null && b.type && b.type !== 'text')) {
+                            console.log("Rendering mixed content...");
+                            return this.renderMixedMessageContent(message.content, message);
+                        }
+                        // Check if it's an array of ONLY text blocks (should be caught by _applyProse now, but belt-and-suspenders)
+                        if (Array.isArray(message.content) && message.content.every(b => b && b.type === 'text')) {
+                            console.log("Rendering array of text blocks as single markdown...");
+                            const combinedText = message.content.map(b => b.text || '').join('\n\n');
+                            return this.renderMarkdown(combinedText); // renderMarkdown adds prose
                         }
 
-                        // ✅ RAW STRING — system messages, or top-level assistant/user text
+
+                        // 4. Simple String Content (User, Assistant, System)
                         if (typeof message.content === 'string') {
-                            return this.renderMarkdown(message.content);
+                            console.log("Rendering simple string as markdown...");
+                            return this.renderMarkdown(message.content); // renderMarkdown adds prose
                         }
 
-                        // ✅ RAW JSON OBJECT (non-array)
-                        if (typeof message.content === 'object' && !Array.isArray(message.content)) {
-                            return this.renderJson(message.content);
+                        // 5. Other Objects (Non-array, non-tool-result) -> Render as JSON
+                        if (typeof message.content === 'object' && message.content !== null && !Array.isArray(message.content)) {
+                            console.log("Rendering object as JSON...");
+                            return this.renderJson(message.content); // renderJson adds pre/code
                         }
 
-                        // ✅ FALLBACK — render anything else safely
-                        return `<div class="prose prose-sm max-w-none">${DOMPurify.sanitize(String(message.content))}</div>`;
+                        // --- FINAL FALLBACK ---
+                        console.warn("renderMessageContent: Fallback rendering for unknown structure:", message.content);
+                        if (message.content === null || message.content === undefined) {
+                            return '<span class="opacity-50 italic">[No Content]</span>'; // Handle null explicitly here too
+                        }
+                        // Render as string within prose paragraph
+                        return `<div class="prose prose-sm max-w-none"><p>${DOMPurify.sanitize(String(message.content))}</p></div>`;
+
                     } catch (err) {
-                        console.error('renderMessageContent() failed:', err, message);
+                        console.error('renderMessageContent() failed severely:', err, message);
                         return `<div class="text-error p-2 bg-error/10 rounded">Render error: ${DOMPurify.sanitize(err.message)}</div>`;
                     }
-                },
+                }, // End renderMessageContent
 
 
                 // Render text content (handle markdown and potential JSON strings)
@@ -2306,34 +2436,47 @@
 
                 renderMarkdown(content) {
                     try {
-                        const unwrapContent = (obj) => {
-                            // This recursive unwrap might still be useful if content can be nested
-                            if (typeof obj === 'string') return obj;
-                            if (obj?.text) return unwrapContent(obj.text);
-                            if (obj?.content) return unwrapContent(obj.content);
-                            // Ensure the final value isn't an object before stringifying
-                            if (typeof obj === 'object') return JSON.stringify(obj, null, 2);
-                            return String(obj); // Fallback for other primitives
-                        };
-                        let potentiallyProxiedValue = unwrapContent(content);
+                        // Extract the text content safely
+                        let textContent = '';
 
-                        // Method 2: Check if Alpine.raw exists and use it (potentially cleaner if available)
-                        if (typeof Alpine !== 'undefined' && Alpine.raw) {
-                            unwrappedValue = Alpine.raw(potentiallyProxiedValue);
+                        if (typeof content === 'string') {
+                            textContent = content;
+                        } else if (content && typeof content === 'object' && content.type === 'text' && typeof content.text === 'string') {
+                            textContent = content.text;
+                        } else if (content && typeof content === 'object') {
+                            if (content.text && typeof content.text === 'string') { // Check .text again
+                                textContent = content.text;
+                            } else if (content.content && typeof content.content === 'string') {
+                                textContent = content.content;
+                            } else if (content.message && typeof content.message === 'string') {
+                                textContent = content.message;
+                            } else {
+                                // Fallback stringification
+                                textContent = String(content);
+                            }
                         } else {
-                            unwrappedValue = JSON.parse(JSON.stringify(potentiallyProxiedValue));
+                            textContent = String(content);
                         }
 
-                        // Ensure it's definitely a string before parsing
-                        const stringToParse = String(unwrappedValue);
+                        if (typeof textContent !== 'string') { textContent = String(textContent); }
 
-                        const parsed = marked.parse(stringToParse); // Pass the unwrapped, stringified value
-                        return `<div class="prose prose-sm max-w-none">${DOMPurify.sanitize(parsed)}</div>`;
+                        const parsedContent = marked.parse(textContent);
+
+                        if (typeof parsedContent !== 'string') {
+                            console.error("Marked parser returned non-string content:", parsedContent);
+                            // Fallback: Sanitize the original text content
+                            return DOMPurify.sanitize(textContent);
+                        }
+
+                        // *** Return sanitized parsed content WITHOUT the prose wrapper ***
+                        return DOMPurify.sanitize(parsedContent);
+
                     } catch (e) {
-                        console.error("Markdown rendering failed:", e, "Original content:", content); // Log original content on error
-                        return `<pre class="text-error">Render error: ${DOMPurify.sanitize(e.message)}</pre>`;
+                        console.error("Markdown rendering failed:", e, "Original content:", content);
+                        // *** Return sanitized ORIGINAL content (as string) on error ***
+                        return DOMPurify.sanitize(String(content));
                     }
-                },
+                }, // End renderMarkdown
 
                 // Render tool result in a clean format
                 renderToolResult(content, message) {
