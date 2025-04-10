@@ -409,6 +409,11 @@ def force_exit_handler(is_force=False):
     # Normal exit via sys.exit
     sys.exit(1)
 
+def atexit_handler():
+    """Clean shutdown function for atexit that avoids sys.exit()"""
+    print("\nShutting down and cleaning resources...")
+    # Add any cleanup code here, but don't call sys.exit()
+
 # Add a signal handler for SIGINT (Ctrl+C)
 def sigint_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) by initiating clean shutdown."""
@@ -436,7 +441,7 @@ sigint_handler.counter = 0
 signal.signal(signal.SIGINT, sigint_handler)
 
 # Register with atexit to ensure cleanup on normal exit
-atexit.register(lambda: force_exit_handler(is_force=False))
+atexit.register(atexit_handler)
 
 
 # Used for WebSocket message structure
