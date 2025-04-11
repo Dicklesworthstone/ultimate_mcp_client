@@ -1116,6 +1116,26 @@
             opacity: 0.8;
         }
 
+        /* Tool Data Bubble Styling */
+        .tool-data-bubble {
+            background-color: hsl(var(--b2) / 0.4);
+            /* Lighter version of base-200 */
+        }
+
+        /* Raw Text within Tool Data */
+        .tool-data-raw-text {
+            color: hsl(var(--bc) / 0.75) !important;
+            /* Darker text color (adjust opacity as needed) */
+        }
+
+        /* Ensure sufficient contrast in dark themes for raw text */
+        [data-theme="dark"] .tool-data-raw-text,
+        [data-theme="nord"] .tool-data-raw-text,
+        [data-theme="slate"] .tool-data-raw-text {
+            color: hsl(var(--nc) / 0.85) !important;
+            /* Lighter text for dark backgrounds */
+        }
+
         [x-cloak] {
             display: none;
         }
@@ -1126,21 +1146,23 @@
     <div class="sidebar-overlay md:hidden" :class="{ 'open': isSidebarOpen }" @click="toggleSidebar(false)"></div>
 
     <!-- Header -->
-    <!-- Header -->
     <header
         class="bg-base-100 shadow-md p-2 flex justify-between items-center flex-shrink-0 border-b border-base-300/50 h-14 z-20">
-        <!-- Corrected class placement and added height/z-index -->
-        <div class="flex items-center"> <!-- Container for left side -->
+        <div class="flex items-center">
             <button class="btn btn-square btn-ghost btn-sm md:hidden mr-2" @click="toggleSidebar()">
-                <!-- Button MOVED inside -->
                 <i class="fas fa-bars"></i>
             </button>
             <h1 class="text-xl font-bold flex items-center gap-2 text-base-content">
                 <i class="fas fa-plug text-primary animate-pulse"></i> Ultimate MCP Client UI
             </h1>
         </div>
-        <div class="flex items-center gap-4 text-base-content/80"> <!-- Container for right side -->
-            <!-- Connection Status -->
+        <div class="flex items-center gap-2 text-base-content/80">
+            <div class="form-control flex-row items-center gap-1 mr-2"
+                data-tippy-content="Show/Hide Tool Result Messages">
+                <span class="label-text text-xs mr-1">Tool Data</span>
+                <input type="checkbox" class="toggle toggle-xs toggle-success" x-model="uiSettings.showToolDataMessages"
+                    @change="saveUiSetting('showToolDataMessages', $event.target.checked)">
+            </div>
             <div class="tooltip tooltip-bottom" :data-tip="wsStatus">
                 <i class="fas fa-circle text-xs transition-colors duration-500" :class="{
                      'text-success animate-pulse': wsConnected,
@@ -1148,15 +1170,12 @@
                      'text-error': !wsConnected && !wsConnecting
                      }"></i>
             </div>
-            <!-- Server Status -->
             <div class="tooltip tooltip-bottom" data-tip="Servers">
                 <i class="fas fa-server fa-fw"></i> <span x-text="`${connectedServersCount}/${servers.length}`"></span>
             </div>
-            <!-- Tool Status -->
             <div class="tooltip tooltip-bottom" data-tip="Tools">
                 <i class="fas fa-tools fa-fw"></i> <span x-text="tools.length"></span>
             </div>
-            <!-- Model Selector -->
             <div class="dropdown dropdown-end">
                 <label tabindex="0" class="btn btn-xs btn-ghost flex items-center gap-1 px-1">
                     <i class="fas fa-robot text-info"></i>
@@ -1176,7 +1195,6 @@
                             @keyup.enter="setCustomModel($event.target.value); $event.target.blur()"></li>
                 </ul>
             </div>
-            <!-- Theme Selector with Preview Thumbnails -->
             <div class="dropdown dropdown-end">
                 <label tabindex="0" class="btn btn-xs btn-ghost px-1" data-tippy-content="Change Theme">
                     <i class="fas fa-palette"></i>
@@ -1232,11 +1250,9 @@
                     </details>
                 </div>
             </div>
-            <!-- Settings button -->
             <button class="btn btn-xs btn-ghost px-1" @click="activeTab = 'config'" data-tippy-content="Settings">
                 <i class="fas fa-cog"></i>
             </button>
-            <!-- Help button (Keyboard Shortcuts) -->
             <button class="btn btn-xs btn-ghost px-1" @click="showKeyboardShortcutsModal = true"
                 data-tippy-content="Keyboard Shortcuts">
                 <i class="fas fa-keyboard"></i>
@@ -1905,265 +1921,209 @@
                                     @change="saveUiSetting('virtualScrolling', $event.target.checked)">
                                 <span class="label-text text-xs">Virtual Scrolling</span>
                             </label>
+                            <label class="cursor-pointer label justify-start gap-2 py-1"
+                                data-tippy-content="Send message on Enter (disable to require Ctrl+Enter)">
+                                <input type="checkbox" class="toggle toggle-primary toggle-sm"
+                                    x-model="uiSettings.sendOnEnter"
+                                    @change="saveUiSetting('sendOnEnter', $event.target.checked)">
+                                <span class="label-text text-xs">Send on Enter</span>
+                            </label>
                         </div>
-
-                        <div class="divider text-xs">Communication</div>
-
-                        <div class="grid grid-cols-2 gap-x-4">
-                            <label class="cursor-pointer label justify-start gap-2 py-1"
-                                data-tippy-content="Stream responses word by word"><input type="checkbox"
-                                    class="toggle toggle-primary toggle-sm" x-model="config.enableStreaming"
-                                    @change="saveConfigField('enableStreaming', $event.target.checked)"><span
-                                    class="label-text text-xs">Streaming</span></label>
-                            <label class="cursor-pointer label justify-start gap-2 py-1"
-                                data-tippy-content="Cache tool results locally"><input type="checkbox"
-                                    class="toggle toggle-primary toggle-sm" x-model="config.enableCaching"
-                                    @change="saveConfigField('enableCaching', $event.target.checked)"><span
-                                    class="label-text text-xs">Caching</span></label>
-                            <label class="cursor-pointer label justify-start gap-2 py-1"
-                                data-tippy-content="Automatically look for servers at startup"><input type="checkbox"
-                                    class="toggle toggle-primary toggle-sm" x-model="config.autoDiscover"
-                                    @change="saveConfigField('autoDiscover', $event.target.checked)"><span
-                                    class="label-text text-xs">Auto Discover</span></label>
-                            <label class="cursor-pointer label justify-start gap-2 py-1"
-                                data-tippy-content="Look for servers on local network via mDNS/Zeroconf"><input
-                                    type="checkbox" class="toggle toggle-primary toggle-sm"
-                                    x-model="config.enableLocalDiscovery"
-                                    @change="saveConfigField('enableLocalDiscovery', $event.target.checked)"><span
-                                    class="label-text text-xs">mDNS</span></label>
-                        </div>
-                        <div class="form-control">
-                            <label class="label py-1"><span class="label-text text-xs font-medium"
-                                    data-tippy-content="How often to refresh server status (seconds)">Dashboard
-                                    Refresh
-                                    (s)</span></label>
-                            <input type="number" class="input input-bordered input-sm w-24"
-                                x-model.number="config.dashboardRefreshRate"
-                                @input.debounce.500ms="saveConfigField('dashboardRefreshRate', $event.target.value)"
-                                min="0.5" step="0.1">
-                        </div>
-                        <button class="btn btn-xs btn-outline btn-error mt-4" @click="resetConfig"><i
-                                class="fas fa-undo mr-1"></i>
-                            Reset Settings</button>
                     </div>
 
-                    <div class="mt-6 border-t border-base-300/50 pt-4">
-                        <h2 class="text-base font-semibold mb-3 flex items-center"><i
-                                class="fas fa-database mr-2 text-primary"></i>Cache Management</h2>
+                    <div class="divider text-xs">Communication</div>
 
-                        <div class="flex flex-wrap gap-2 mb-4">
-                            <button class="btn btn-xs btn-outline" @click="fetchCacheData()" :disabled="isLoadingCache"
-                                :class="{'loading': isLoadingCache}">
-                                <i class="fas fa-sync mr-1" x-show="!isLoadingCache"></i> Refresh Cache Info
-                            </button>
-                            <button class="btn btn-xs btn-outline btn-warning" @click="cleanCacheAPI()"
-                                :disabled="isLoadingCache">
-                                <i class="fas fa-broom mr-1"></i> Clean Expired
-                            </button>
-                            <button class="btn btn-xs btn-outline btn-error" @click="clearAllCacheAPI()"
-                                :disabled="isLoadingCache">
-                                <i class="fas fa-trash-alt mr-1"></i> Clear All Cache
-                            </button>
-                        </div>
-
-                        <!-- Cache Entries Table -->
-                        <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-list-ul mr-1.5"></i>
-                            Cached
-                            Entries</h3>
-                        <div x-show="isLoadingCache && cacheEntries.length === 0" class="text-center p-4">
-                            <span class="loading loading-dots loading-sm"></span> Loading Cache...
-                        </div>
-                        <div id="cache-entries-table" class="text-xs border border-base-300/30 rounded mb-4"
-                            x-show="!isLoadingCache">
-                        </div>
-
-                        <!-- Cache Dependencies Table -->
-                        <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-project-diagram mr-1.5"></i>
-                            Tool Dependencies</h3>
-                        <div x-show="isLoadingCache && Object.keys(cacheDependencies).length === 0"
-                            class="text-center p-4">
-                            <span class="loading loading-dots loading-sm"></span> Loading
-                            Dependencies...
-                        </div>
-                        <div id="cache-dependencies-table" class="text-xs border border-base-300/30 rounded"
-                            x-show="!isLoadingCache">
-                        </div>
+                    <div class="grid grid-cols-2 gap-x-4">
+                        <label class="cursor-pointer label justify-start gap-2 py-1"
+                            data-tippy-content="Stream responses word by word"><input type="checkbox"
+                                class="toggle toggle-primary toggle-sm" x-model="config.enableStreaming"
+                                @change="saveConfigField('enableStreaming', $event.target.checked)"><span
+                                class="label-text text-xs">Streaming</span></label>
+                        <label class="cursor-pointer label justify-start gap-2 py-1"
+                            data-tippy-content="Cache tool results locally"><input type="checkbox"
+                                class="toggle toggle-primary toggle-sm" x-model="config.enableCaching"
+                                @change="saveConfigField('enableCaching', $event.target.checked)"><span
+                                class="label-text text-xs">Caching</span></label>
+                        <label class="cursor-pointer label justify-start gap-2 py-1"
+                            data-tippy-content="Automatically look for servers at startup"><input type="checkbox"
+                                class="toggle toggle-primary toggle-sm" x-model="config.autoDiscover"
+                                @change="saveConfigField('autoDiscover', $event.target.checked)"><span
+                                class="label-text text-xs">Auto Discover</span></label>
+                        <label class="cursor-pointer label justify-start gap-2 py-1"
+                            data-tippy-content="Look for servers on local network via mDNS/Zeroconf"><input
+                                type="checkbox" class="toggle toggle-primary toggle-sm"
+                                x-model="config.enableLocalDiscovery"
+                                @change="saveConfigField('enableLocalDiscovery', $event.target.checked)"><span
+                                class="label-text text-xs">mDNS</span></label>
                     </div>
+                    <div class="form-control">
+                        <label class="label py-1"><span class="label-text text-xs font-medium"
+                                data-tippy-content="How often to refresh server status (seconds)">Dashboard
+                                Refresh
+                                (s)</span></label>
+                        <input type="number" class="input input-bordered input-sm w-24"
+                            x-model.number="config.dashboardRefreshRate"
+                            @input.debounce.500ms="saveConfigField('dashboardRefreshRate', $event.target.value)"
+                            min="0.5" step="0.1">
+                    </div>
+                    <button class="btn btn-xs btn-outline btn-error mt-4" @click="resetConfig"><i
+                            class="fas fa-undo mr-1"></i>
+                        Reset Settings</button>
                 </div>
-                <!-- End Config Tab -->
 
-                <!-- NEW: Dashboard Tab -->
-                <div x-show="activeTab === 'dashboard'" x-transition.opacity>
-                    <div class="flex justify-between items-center mb-3">
-                        <h2 class="text-base font-semibold flex items-center">
-                            <i class="fas fa-chart-bar mr-2 text-primary"></i>Dashboard
-                        </h2>
-                        <button class="btn btn-xs btn-outline" @click="refreshDashboardData()"
-                            :disabled="isLoadingDashboard" :class="{'loading': isLoadingDashboard}">
-                            <i class="fas fa-sync mr-1" x-show="!isLoadingDashboard"></i> Refresh
+                <div class="mt-6 border-t border-base-300/50 pt-4">
+                    <h2 class="text-base font-semibold mb-3 flex items-center"><i
+                            class="fas fa-database mr-2 text-primary"></i>Cache Management</h2>
+
+                    <div class="flex flex-wrap gap-2 mb-4">
+                        <button class="btn btn-xs btn-outline" @click="fetchCacheData()" :disabled="isLoadingCache"
+                            :class="{'loading': isLoadingCache}">
+                            <i class="fas fa-sync mr-1" x-show="!isLoadingCache"></i> Refresh Cache Info
+                        </button>
+                        <button class="btn btn-xs btn-outline btn-warning" @click="cleanCacheAPI()"
+                            :disabled="isLoadingCache">
+                            <i class="fas fa-broom mr-1"></i> Clean Expired
+                        </button>
+                        <button class="btn btn-xs btn-outline btn-error" @click="clearAllCacheAPI()"
+                            :disabled="isLoadingCache">
+                            <i class="fas fa-trash-alt mr-1"></i> Clear All Cache
                         </button>
                     </div>
 
-                    <!-- Loading indicator for dashboard -->
-                    <div x-show="isLoadingDashboard" class="text-center p-4">
-                        <span class="loading loading-dots loading-md"></span>
-                        <p class="text-sm mt-2">Loading dashboard data...</p>
+                    <!-- Cache Entries Table -->
+                    <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-list-ul mr-1.5"></i>
+                        Cached
+                        Entries</h3>
+                    <div x-show="isLoadingCache && cacheEntries.length === 0" class="text-center p-4">
+                        <span class="loading loading-dots loading-sm"></span> Loading Cache...
                     </div>
-                    <!-- Dashboard content -->
+                    <div id="cache-entries-table" class="text-xs border border-base-300/30 rounded mb-4"
+                        x-show="!isLoadingCache">
+                    </div>
 
-                    <div x-show="!isLoadingDashboard" class="space-y-4">
-                        <!-- Quick stats -->
-                        <div class="dashboard-card">
-                            <div class="dashboard-card-header">
-                                <h3 class="dashboard-card-title">
-                                    <i class="fas fa-chart-line mr-1.5 text-info"></i> System Overview
-                                </h3>
-                                <span class="text-xs opacity-70">Last updated: <span
-                                        x-text="formatTimestamp(dashboardLastUpdated)"></span></span>
+                    <!-- Cache Dependencies Table -->
+                    <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-project-diagram mr-1.5"></i>
+                        Tool Dependencies</h3>
+                    <div x-show="isLoadingCache && Object.keys(cacheDependencies).length === 0" class="text-center p-4">
+                        <span class="loading loading-dots loading-sm"></span> Loading
+                        Dependencies...
+                    </div>
+                    <div id="cache-dependencies-table" class="text-xs border border-base-300/30 rounded"
+                        x-show="!isLoadingCache">
+                    </div>
+                </div>
+            </div>
+            <!-- End Config Tab -->
+
+            <!-- NEW: Dashboard Tab -->
+            <div x-show="activeTab === 'dashboard'" x-transition.opacity>
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="text-base font-semibold flex items-center">
+                        <i class="fas fa-chart-bar mr-2 text-primary"></i>Dashboard
+                    </h2>
+                    <button class="btn btn-xs btn-outline" @click="refreshDashboardData()"
+                        :disabled="isLoadingDashboard" :class="{'loading': isLoadingDashboard}">
+                        <i class="fas fa-sync mr-1" x-show="!isLoadingDashboard"></i> Refresh
+                    </button>
+                </div>
+
+                <!-- Loading indicator for dashboard -->
+                <div x-show="isLoadingDashboard" class="text-center p-4">
+                    <span class="loading loading-dots loading-md"></span>
+                    <p class="text-sm mt-2">Loading dashboard data...</p>
+                </div>
+                <!-- Dashboard content -->
+
+                <div x-show="!isLoadingDashboard" class="space-y-4">
+                    <!-- Quick stats -->
+                    <div class="dashboard-card">
+                        <div class="dashboard-card-header">
+                            <h3 class="dashboard-card-title">
+                                <i class="fas fa-chart-line mr-1.5 text-info"></i> System Overview
+                            </h3>
+                            <span class="text-xs opacity-70">Last updated: <span
+                                    x-text="formatTimestamp(dashboardLastUpdated)"></span></span>
+                        </div>
+                        <div class="stats-grid dashboard-card-content">
+                            <div class="stat-item">
+                                <div class="stat-value" x-text="dashboardStats.activeServers"></div>
+                                <div class="stat-label">Active Servers</div>
                             </div>
-                            <div class="stats-grid dashboard-card-content">
-                                <div class="stat-item">
-                                    <div class="stat-value" x-text="dashboardStats.activeServers"></div>
-                                    <div class="stat-label">Active Servers</div>
-                                </div>
-                                <div class="stat-item">
-                                    <div class="stat-value" x-text="dashboardStats.totalTools"></div>
-                                    <div class="stat-label">Available Tools</div>
-                                </div>
-                                <div class="stat-item">
-                                    <div class="stat-value" x-text="dashboardStats.totalConversations"></div>
-                                    <div class="stat-label">Conversations</div>
-                                </div>
-                                <div class="stat-item">
-                                    <div class="stat-value" x-text="dashboardStats.totalMessages"></div>
-                                    <div class="stat-label">Total Messages</div>
-                                </div>
-                                <div class="stat-item">
-                                    <div class="stat-value" x-text="dashboardStats.cacheHitRate + '%'"></div>
-                                    <div class="stat-label">Cache Hit Rate</div>
-                                </div>
-                                <div class="stat-item">
-                                    <div class="stat-value" x-text="dashboardStats.systemUptime"></div>
-                                    <div class="stat-label">System Uptime</div>
-                                </div>
+                            <div class="stat-item">
+                                <div class="stat-value" x-text="dashboardStats.totalTools"></div>
+                                <div class="stat-label">Available Tools</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-value" x-text="dashboardStats.totalConversations"></div>
+                                <div class="stat-label">Conversations</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-value" x-text="dashboardStats.totalMessages"></div>
+                                <div class="stat-label">Total Messages</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-value" x-text="dashboardStats.cacheHitRate + '%'"></div>
+                                <div class="stat-label">Cache Hit Rate</div>
+                            </div>
+                            <div class="stat-item">
+                                <div class="stat-value" x-text="dashboardStats.systemUptime"></div>
+                                <div class="stat-label">System Uptime</div>
                             </div>
                         </div>
+                    </div>
 
-                        <!-- Tool usage stats -->
-                        <div class="dashboard-card">
-                            <div class="dashboard-card-header">
-                                <h3 class="dashboard-card-title">
-                                    <i class="fas fa-tools mr-1.5 text-accent"></i> Tool Usage
-                                </h3>
-                                <div class="flex items-center gap-2">
-                                    <select class="select select-xs select-bordered bg-base-100 text-base-content"
-                                        x-model="toolUsageTimeframe">
-                                        <option value="day">Last 24 Hours</option>
-                                        <option value="week">Last Week</option>
-                                        <option value="month">Last Month</option>
-                                        <option value="all">All Time</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div class="dashboard-card-content">
-                                <div class="text-center text-sm p-4" x-show="!dashboardStats.topTools?.length">
-                                    <i class="fas fa-info-circle text-info mr-1"></i> No
-                                    tool usage data available for
-                                    the selected timeframe.
-                                </div>
-
-                                <!-- Tool usage bar chart (placeholder for visualization) -->
-                                <div id="tool-usage-chart" class="h-64 w-full bg-base-200/50 rounded-md my-4"
-                                    x-show="dashboardStats.topTools?.length > 0">
-                                    <!-- Chart would render here -->
-                                </div>
-
-                                <!-- Most used tools -->
-                                <div class="mt-4 overflow-x-auto" x-show="dashboardStats.topTools?.length > 0">
-                                    <h4 class="text-sm font-medium mb-2">Most Used Tools</h4>
-                                    <table class="table table-xs w-full">
-                                        <thead>
-                                            <tr class="bg-base-200">
-                                                <th class="text-left">Tool</th>
-                                                <th class="text-left">Server</th>
-                                                <th class="text-right">Usage Count</th>
-                                                <th class="text-right">Success Rate</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            <template x-for="tool in dashboardStats.topTools.slice(0, 5)"
-                                                :key="tool.name">
-                                                <tr class="hover:bg-base-200/50">
-                                                    <td class="font-medium" x-text="tool.shortName"></td>
-                                                    <td x-text="tool.server"></td>
-                                                    <td class="text-right" x-text="tool.count"></td>
-                                                    <td class="text-right">
-                                                        <span
-                                                            :class="tool.successRate > 90 ? 'text-success font-medium' : (tool.successRate > 70 ? 'text-warning font-medium' : 'text-error font-medium')"
-                                                            x-text="tool.successRate + '%'"></span>
-                                                    </td>
-                                                </tr>
-                                            </template>
-                                        </tbody>
-                                    </table>
-                                </div>
+                    <!-- Tool usage stats -->
+                    <div class="dashboard-card">
+                        <div class="dashboard-card-header">
+                            <h3 class="dashboard-card-title">
+                                <i class="fas fa-tools mr-1.5 text-accent"></i> Tool Usage
+                            </h3>
+                            <div class="flex items-center gap-2">
+                                <select class="select select-xs select-bordered bg-base-100 text-base-content"
+                                    x-model="toolUsageTimeframe">
+                                    <option value="day">Last 24 Hours</option>
+                                    <option value="week">Last Week</option>
+                                    <option value="month">Last Month</option>
+                                    <option value="all">All Time</option>
+                                </select>
                             </div>
                         </div>
-
-                        <!-- Server health -->
-                        <div class="dashboard-card">
-                            <div class="dashboard-card-header">
-                                <h3 class="dashboard-card-title">
-                                    <i class="fas fa-server mr-1.5 text-success"></i> Server Health
-                                </h3>
-                                <button class="btn btn-xs btn-outline bg-base-100" @click="checkAllServerHealth()"
-                                    :disabled="isCheckingServerHealth" :class="{'loading': isCheckingServerHealth}">
-                                    <i class="fas fa-heartbeat" x-show="!isCheckingServerHealth"></i> Check
-                                    Health
-                                </button>
+                        <div class="dashboard-card-content">
+                            <div class="text-center text-sm p-4" x-show="!dashboardStats.topTools?.length">
+                                <i class="fas fa-info-circle text-info mr-1"></i> No
+                                tool usage data available for
+                                the selected timeframe.
                             </div>
-                            <div class="dashboard-card-content overflow-x-auto">
+
+                            <!-- Tool usage bar chart (placeholder for visualization) -->
+                            <div id="tool-usage-chart" class="h-64 w-full bg-base-200/50 rounded-md my-4"
+                                x-show="dashboardStats.topTools?.length > 0">
+                                <!-- Chart would render here -->
+                            </div>
+
+                            <!-- Most used tools -->
+                            <div class="mt-4 overflow-x-auto" x-show="dashboardStats.topTools?.length > 0">
+                                <h4 class="text-sm font-medium mb-2">Most Used Tools</h4>
                                 <table class="table table-xs w-full">
                                     <thead>
                                         <tr class="bg-base-200">
+                                            <th class="text-left">Tool</th>
                                             <th class="text-left">Server</th>
-                                            <th class="text-left">Status</th>
-                                            <th class="text-right">Response Time</th>
-                                            <th class="text-right">Error Rate</th>
-                                            <th class="text-right">Uptime</th>
+                                            <th class="text-right">Usage Count</th>
+                                            <th class="text-right">Success Rate</th>
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        <template x-for="server in dashboardStats.serverHealth" :key="server.name">
+                                        <template x-for="tool in dashboardStats.topTools.slice(0, 5)" :key="tool.name">
                                             <tr class="hover:bg-base-200/50">
-                                                <td>
-                                                    <div class="flex items-center gap-1.5 font-medium">
-                                                        <i
-                                                            :class="server.type === 'stdio' ? 'fas fa-terminal text-accent' : 'fas fa-network-wired text-info'"></i>
-                                                        <span x-text="server.name"></span>
-                                                    </div>
-                                                </td>
-                                                <td>
-                                                    <div>
-                                                        <span class="badge badge-sm font-medium" :class="{
-                                        'badge-success': server.status === 'healthy',
-                                        'badge-warning': server.status === 'degraded',
-                                        'badge-error': server.status === 'error',
-                                        'badge-ghost': server.status === 'unknown'
-                                    }">
-                                                            <span x-text="server.status"></span>
-                                                        </span>
-                                                    </div>
-                                                </td>
-                                                <td class="text-right" x-text="server.responseTime + ' ms'"></td>
+                                                <td class="font-medium" x-text="tool.shortName"></td>
+                                                <td x-text="tool.server"></td>
+                                                <td class="text-right" x-text="tool.count"></td>
                                                 <td class="text-right">
-                                                    <span :class="{
-                                    'text-success font-medium': server.errorRate < 1,
-                                    'text-warning font-medium': server.errorRate >= 1 && server.errorRate < 5,
-                                    'text-error font-medium': server.errorRate >= 5
-                                }" x-text="server.errorRate + '%'"></span>
+                                                    <span
+                                                        :class="tool.successRate > 90 ? 'text-success font-medium' : (tool.successRate > 70 ? 'text-warning font-medium' : 'text-error font-medium')"
+                                                        x-text="tool.successRate + '%'"></span>
                                                 </td>
-                                                <td class="text-right" x-text="server.uptime"></td>
                                             </tr>
                                         </template>
                                     </tbody>
@@ -2171,91 +2131,151 @@
                             </div>
                         </div>
                     </div>
-                    <!-- End Dashboard Tab -->
+
+                    <!-- Server health -->
+                    <div class="dashboard-card">
+                        <div class="dashboard-card-header">
+                            <h3 class="dashboard-card-title">
+                                <i class="fas fa-server mr-1.5 text-success"></i> Server Health
+                            </h3>
+                            <button class="btn btn-xs btn-outline bg-base-100" @click="checkAllServerHealth()"
+                                :disabled="isCheckingServerHealth" :class="{'loading': isCheckingServerHealth}">
+                                <i class="fas fa-heartbeat" x-show="!isCheckingServerHealth"></i> Check
+                                Health
+                            </button>
+                        </div>
+                        <div class="dashboard-card-content overflow-x-auto">
+                            <table class="table table-xs w-full">
+                                <thead>
+                                    <tr class="bg-base-200">
+                                        <th class="text-left">Server</th>
+                                        <th class="text-left">Status</th>
+                                        <th class="text-right">Response Time</th>
+                                        <th class="text-right">Error Rate</th>
+                                        <th class="text-right">Uptime</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <template x-for="server in dashboardStats.serverHealth" :key="server.name">
+                                        <tr class="hover:bg-base-200/50">
+                                            <td>
+                                                <div class="flex items-center gap-1.5 font-medium">
+                                                    <i
+                                                        :class="server.type === 'stdio' ? 'fas fa-terminal text-accent' : 'fas fa-network-wired text-info'"></i>
+                                                    <span x-text="server.name"></span>
+                                                </div>
+                                            </td>
+                                            <td>
+                                                <div>
+                                                    <span class="badge badge-sm font-medium" :class="{
+                                        'badge-success': server.status === 'healthy',
+                                        'badge-warning': server.status === 'degraded',
+                                        'badge-error': server.status === 'error',
+                                        'badge-ghost': server.status === 'unknown'
+                                    }">
+                                                        <span x-text="server.status"></span>
+                                                    </span>
+                                                </div>
+                                            </td>
+                                            <td class="text-right" x-text="server.responseTime + ' ms'"></td>
+                                            <td class="text-right">
+                                                <span :class="{
+                                    'text-success font-medium': server.errorRate < 1,
+                                    'text-warning font-medium': server.errorRate >= 1 && server.errorRate < 5,
+                                    'text-error font-medium': server.errorRate >= 5
+                                }" x-text="server.errorRate + '%'"></span>
+                                            </td>
+                                            <td class="text-right" x-text="server.uptime"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
-                <!-- End Tab Content -->
+                <!-- End Dashboard Tab -->
             </div>
-        </aside>
+            <!-- End Tab Content -->
+    </aside>
 
-        <!-- Chat Area -->
-        <main class="flex-1 flex flex-col h-full bg-gradient-to-b from-base-200 to-base-300/50">
-            <!-- Message Search Container (hidden by default, shown when activated) -->
-            <div class="message-search-container" :class="{'active': isMessageSearchActive}">
-                <input type="text" placeholder="Search in conversation..." class="input input-sm input-bordered flex-1"
-                    x-model="messageSearchQuery" @keyup.enter="findNextSearchMatch"
-                    @keyup.esc="isMessageSearchActive = false">
-                <button class="btn btn-sm btn-ghost" @click="findPreviousSearchMatch"
-                    :disabled="currentSearchMatchIndex <= 0">
-                    <i class="fas fa-chevron-up"></i>
-                </button>
-                <button class="btn btn-sm btn-ghost" @click="findNextSearchMatch"
-                    :disabled="currentSearchMatchIndex >= searchMatches.length - 1">
-                    <i class="fas fa-chevron-down"></i>
-                </button>
-                <button class="btn btn-sm btn-ghost" @click="isMessageSearchActive = false">
-                    <i class="fas fa-times"></i>
-                </button>
-                <span class="text-xs opacity-70" x-show="searchMatches.length > 0">
-                    <span x-text="currentSearchMatchIndex + 1"></span>/<span x-text="searchMatches.length"></span>
-                </span>
-            </div>
+    <!-- Chat Area -->
+    <main class="flex-1 flex flex-col h-full bg-gradient-to-b from-base-200 to-base-300/50">
+        <!-- Message Search Container (hidden by default, shown when activated) -->
+        <div class="message-search-container" :class="{'active': isMessageSearchActive}">
+            <input type="text" placeholder="Search in conversation..." class="input input-sm input-bordered flex-1"
+                x-model="messageSearchQuery" @keyup.enter="findNextSearchMatch"
+                @keyup.esc="isMessageSearchActive = false">
+            <button class="btn btn-sm btn-ghost" @click="findPreviousSearchMatch"
+                :disabled="currentSearchMatchIndex <= 0">
+                <i class="fas fa-chevron-up"></i>
+            </button>
+            <button class="btn btn-sm btn-ghost" @click="findNextSearchMatch"
+                :disabled="currentSearchMatchIndex >= searchMatches.length - 1">
+                <i class="fas fa-chevron-down"></i>
+            </button>
+            <button class="btn btn-sm btn-ghost" @click="isMessageSearchActive = false">
+                <i class="fas fa-times"></i>
+            </button>
+            <span class="text-xs opacity-70" x-show="searchMatches.length > 0">
+                <span x-text="currentSearchMatchIndex + 1"></span>/<span x-text="searchMatches.length"></span>
+            </span>
+        </div>
 
-            <!-- Messages Display -->
-            <div class="flex-1 p-4 overflow-y-auto chat-messages"
-                :class="{'virtual-scroll-container': uiSettings.virtualScrolling}" x-ref="chatbox">
-                <div :class="{'virtual-scroll-content': uiSettings.virtualScrolling}"
-                    :style="uiSettings.virtualScrolling ? `height: ${virtualScrollHeight}px` : ''">
+        <!-- Messages Display -->
+        <div class="flex-1 p-4 overflow-y-auto chat-messages"
+            :class="{'virtual-scroll-container': uiSettings.virtualScrolling}" x-ref="chatbox">
+            <div :class="{'virtual-scroll-content': uiSettings.virtualScrolling}"
+                :style="uiSettings.virtualScrolling ? `height: ${virtualScrollHeight}px` : ''">
 
-                    <!-- Non-Grouped View -->
-                    <template x-if="!uiSettings.groupMessagesByDate">
-                        <template x-for="(message, index) in currentConversation" :key="message.id || index">
-                            <!-- ## START: Single Message Render Block ## -->
-                            <div :id="`message-${message.id || index}`" class="chat relative group/message" :class="{
+                <!-- Non-Grouped View -->
+                <template x-if="!uiSettings.groupMessagesByDate">
+                    <template x-for="(message, index) in currentConversation" :key="message.id || index">
+                        <!-- ## START: Single Message Render Block ## -->
+                        <div :id="`message-${message.id || index}`" class="chat relative group/message" :class="{
                                 'chat-start': message.role === 'user', 'chat-end': message.role !== 'user',
                                 'compact-mode': uiSettings.compactMode
                                 // Animation handled by shouldAnimate check in bubble
                                 }">
-                                <!-- Bookmark Indicator -->
-                                <div class="bookmark-indicator" x-show="isMessageBookmarked(message.id || index)">
-                                    <i class="fas fa-bookmark"></i>
-                                </div>
+                            <!-- Bookmark Indicator -->
+                            <div class="bookmark-indicator" x-show="isMessageBookmarked(message.id || index)">
+                                <i class="fas fa-bookmark"></i>
+                            </div>
 
-                                <!-- Avatar -->
-                                <div class="chat-image avatar" x-show="message.role !== 'user'">
-                                    <div class="w-8 rounded-full flex items-center justify-center" :class="{
+                            <!-- Avatar -->
+                            <div class="chat-image avatar" x-show="message.role !== 'user'">
+                                <div class="w-8 rounded-full flex items-center justify-center" :class="{
                                             'bg-secondary text-secondary-content': message.role === 'assistant',
                                             'bg-neutral text-neutral-content': message.role === 'system',
                                             'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
                                             'bg-warning text-warning-content': message.content_type === 'tool_result' && message.is_error
                                           }">
-                                        <i :class="messageRoleIcon(message.role, message.content_type)"
-                                            class="text-sm m-0 p-0"></i>
-                                    </div>
+                                    <i :class="messageRoleIcon(message.role, message.content_type)"
+                                        class="text-sm m-0 p-0"></i>
                                 </div>
-                                <div class="chat-image avatar" x-show="message.role === 'user'">
-                                    <div
-                                        class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
-                                        <i :class="messageRoleIcon(message.role)" class="text-sm m-0 p-0"></i>
-                                    </div>
+                            </div>
+                            <div class="chat-image avatar" x-show="message.role === 'user'">
+                                <div
+                                    class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
+                                    <i :class="messageRoleIcon(message.role)" class="text-sm m-0 p-0"></i>
                                 </div>
+                            </div>
 
-                                <!-- Header -->
-                                <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
-                                    :class="{'text-left mr-1': message.role === 'user'}">
-                                    <span x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
-                                    <span x-show="message.model" class="opacity-70"
-                                        x-text="message.model ? (' (' + message.model + ')') : ''"></span>
-                                    <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
-                                        x-text="formatTimestamp(message.timestamp)"></time>
-                                    <!-- Bookmark Toggle Icon -->
-                                    <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
-                                        :class="isMessageBookmarked(message.timestamp) ? 'text-warning opacity-100' : 'text-base-content/30 hover:text-warning/70'"
-                                        @click="toggleBookmark(message.timestamp)"
-                                        data-tippy-content="Toggle Bookmark"></i>
-                                </div>
+                            <!-- Header -->
+                            <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
+                                :class="{'text-left mr-1': message.role === 'user'}">
+                                <span x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
+                                <span x-show="message.model" class="opacity-70"
+                                    x-text="message.model ? (' (' + message.model + ')') : ''"></span>
+                                <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
+                                    x-text="formatTimestamp(message.timestamp)"></time>
+                                <!-- Bookmark Toggle Icon -->
+                                <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
+                                    :class="isMessageBookmarked(message.timestamp) ? 'text-warning opacity-100' : 'text-base-content/30 hover:text-warning/70'"
+                                    @click="toggleBookmark(message.timestamp)" data-tippy-content="Toggle Bookmark"></i>
+                            </div>
 
-                                <!-- Chat Bubble (integrates search highlighting) -->
-                                <div class="chat-bubble prose prose-sm max-w-none" :class="{
+                            <!-- Chat Bubble (integrates search highlighting) -->
+                            <div class="chat-bubble prose prose-sm max-w-none" :class="{
                                         'chat-bubble-primary text-primary-content': message.role === 'user' && message.content_type !== 'tool_result',
                                         'bg-neutral text-neutral-content': message.role === 'assistant' && !message.current_status && message.content_type !== 'tool_result',
                                         'chat-bubble-info text-info-content': message.role === 'system',
@@ -2264,6 +2284,91 @@
                                         'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
                                         'animate__animated animate__fadeInUp animate__faster': shouldAnimate(message.id || index)
                                      }"
+                                x-html="isMessageSearchActive ? renderMessageWithHighlight(message) : renderMessageContent(message)">
+                                <!-- Content rendered by x-html -->
+                            </div>
+
+                            <!-- Status Updates -->
+                            <div class="chat-footer" x-show="message.role === 'assistant' && message.current_status">
+                                <span class="streaming-status opacity-70" x-text="message.current_status"></span>
+                            </div>
+                        </div>
+                        <!-- ## END: Single Message Render Block ## -->
+                    </template>
+                </template>
+
+                <!-- Grouped View -->
+                <template x-if="uiSettings.groupMessagesByDate">
+                    <!-- Sort dates: Oldest first. Convert keys to Date objects for proper sorting. -->
+                    <template x-for="date in Object.keys(groupedMessages).sort((a, b) => new Date(a) - new Date(b))"
+                        :key="date">
+                        <!-- Date Divider -->
+                        <div class="message-date-divider">
+                            <span x-text="formatMessageDate(date)"></span>
+                        </div>
+                        <!-- Messages in this date group -->
+                        <template x-for="(message, index) in groupedMessages[date]" :key="message.id || index">
+                            <!-- ## START: Single Message Render Block (Pasted) ## -->
+                            <div :id="`message-${message.id || index}`" class="chat relative group/message" <!-- Add
+                                group/message -->
+                                :class="{
+                                'chat-end': message.role === 'user',
+                                'chat-start': message.role !== 'user',
+                                'compact-mode': uiSettings.compactMode
+                                // Animation handled by shouldAnimate check in bubble
+                                }">
+                                <!-- Bookmark Indicator -->
+                                <div class="bookmark-indicator" x-show="isMessageBookmarked(message.timestamp)">
+                                    <i class="fas fa-bookmark"></i>
+                                </div>
+
+                                <!-- Avatar -->
+                                <div class="chat-image avatar" x-show="message.role !== 'user'">
+                                    <div class="w-8 rounded-full flex items-center justify-center" :class="{
+                                                 'bg-secondary text-secondary-content': message.role === 'assistant',
+                                                 'bg-neutral text-neutral-content': message.role === 'system',
+                                                 'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
+                                                 'bg-warning text-warning-content': message.content_type === 'tool_result' && message.is_error
+                                               }">
+                                        <i :class="messageRoleIcon(message.role, message.content_type)"
+                                            class="text-sm"></i>
+                                    </div>
+                                </div>
+                                <div class="chat-image avatar" x-show="message.role === 'user'">
+                                    <div
+                                        class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
+                                        <i :class="messageRoleIcon(message.role)" class="text-sm"></i>
+                                    </div>
+                                </div>
+
+                                <!-- Header -->
+                                <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
+                                    :class="{'text-right mr-1': message.role === 'user'}">
+                                    <span x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
+                                    <span x-show="message.model" class="opacity-70"
+                                        x-text="message.model ? (' (' + message.model + ')') : ''"></span>
+                                    <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
+                                        x-text="formatTimestamp(message.timestamp)"></time>
+                                    <!-- Timestamp toggle -->
+                                    <!-- Bookmark Toggle Icon -->
+                                    <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
+                                        <!-- Add group hover -->
+                                        :class="isMessageBookmarked(message.timestamp) ? 'text-warning
+                                        opacity-100' : 'text-base-content/30 hover:text-warning/70'"
+                                        @click="toggleBookmark(message.timestamp)"
+                                        data-tippy-content="Toggle Bookmark"></i>
+                                </div>
+
+                                <!-- Chat Bubble (integrates search highlighting) -->
+                                <div class="chat-bubble prose prose-sm max-w-none" :class="{
+                                            'chat-bubble-primary text-primary-content': message.role === 'user' && message.content_type !== 'tool_result',
+                                            'bg-neutral text-neutral-content': message.role === 'assistant' && !message.current_status && message.content_type !== 'tool_result',
+                                            'chat-bubble-info text-info-content': message.role === 'system',
+                                            'chat-bubble-info text-info-content': message.role === 'assistant' && message.current_status,
+                                            'chat-bubble-warning text-warning-content': message.content_type === 'tool_result' && message.is_error,
+                                            'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
+                                            'animate__animated animate__fadeInUp animate__faster': shouldAnimate(message.id || index)
+                                         }"
                                     x-html="isMessageSearchActive ? renderMessageWithHighlight(message) : renderMessageContent(message)">
                                     <!-- Content rendered by x-html -->
                                 </div>
@@ -2277,150 +2382,61 @@
                             <!-- ## END: Single Message Render Block ## -->
                         </template>
                     </template>
+                </template>
 
-                    <!-- Grouped View -->
-                    <template x-if="uiSettings.groupMessagesByDate">
-                        <!-- Sort dates: Oldest first. Convert keys to Date objects for proper sorting. -->
-                        <template x-for="date in Object.keys(groupedMessages).sort((a, b) => new Date(a) - new Date(b))"
-                            :key="date">
-                            <!-- Date Divider -->
-                            <div class="message-date-divider">
-                                <span x-text="formatMessageDate(date)"></span>
-                            </div>
-                            <!-- Messages in this date group -->
-                            <template x-for="(message, index) in groupedMessages[date]" :key="message.id || index">
-                                <!-- ## START: Single Message Render Block (Pasted) ## -->
-                                <div :id="`message-${message.id || index}`" class="chat relative group/message" <!-- Add
-                                    group/message -->
-                                    :class="{
-                                    'chat-end': message.role === 'user',
-                                    'chat-start': message.role !== 'user',
-                                    'compact-mode': uiSettings.compactMode
-                                    // Animation handled by shouldAnimate check in bubble
-                                    }">
-                                    <!-- Bookmark Indicator -->
-                                    <div class="bookmark-indicator" x-show="isMessageBookmarked(message.timestamp)">
-                                        <i class="fas fa-bookmark"></i>
-                                    </div>
-
-                                    <!-- Avatar -->
-                                    <div class="chat-image avatar" x-show="message.role !== 'user'">
-                                        <div class="w-8 rounded-full flex items-center justify-center" :class="{
-                                                 'bg-secondary text-secondary-content': message.role === 'assistant',
-                                                 'bg-neutral text-neutral-content': message.role === 'system',
-                                                 'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
-                                                 'bg-warning text-warning-content': message.content_type === 'tool_result' && message.is_error
-                                               }">
-                                            <i :class="messageRoleIcon(message.role, message.content_type)"
-                                                class="text-sm"></i>
-                                        </div>
-                                    </div>
-                                    <div class="chat-image avatar" x-show="message.role === 'user'">
-                                        <div
-                                            class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
-                                            <i :class="messageRoleIcon(message.role)" class="text-sm"></i>
-                                        </div>
-                                    </div>
-
-                                    <!-- Header -->
-                                    <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
-                                        :class="{'text-right mr-1': message.role === 'user'}">
-                                        <span
-                                            x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
-                                        <span x-show="message.model" class="opacity-70"
-                                            x-text="message.model ? (' (' + message.model + ')') : ''"></span>
-                                        <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
-                                            x-text="formatTimestamp(message.timestamp)"></time>
-                                        <!-- Timestamp toggle -->
-                                        <!-- Bookmark Toggle Icon -->
-                                        <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
-                                            <!-- Add group hover -->
-                                            :class="isMessageBookmarked(message.timestamp) ? 'text-warning
-                                            opacity-100' : 'text-base-content/30 hover:text-warning/70'"
-                                            @click="toggleBookmark(message.timestamp)"
-                                            data-tippy-content="Toggle Bookmark"></i>
-                                    </div>
-
-                                    <!-- Chat Bubble (integrates search highlighting) -->
-                                    <div class="chat-bubble prose prose-sm max-w-none" :class="{
-                                            'chat-bubble-primary text-primary-content': message.role === 'user' && message.content_type !== 'tool_result',
-                                            'bg-neutral text-neutral-content': message.role === 'assistant' && !message.current_status && message.content_type !== 'tool_result',
-                                            'chat-bubble-info text-info-content': message.role === 'system',
-                                            'chat-bubble-info text-info-content': message.role === 'assistant' && message.current_status,
-                                            'chat-bubble-warning text-warning-content': message.content_type === 'tool_result' && message.is_error,
-                                            'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
-                                            'animate__animated animate__fadeInUp animate__faster': shouldAnimate(message.id || index)
-                                         }"
-                                        x-html="isMessageSearchActive ? renderMessageWithHighlight(message) : renderMessageContent(message)">
-                                        <!-- Content rendered by x-html -->
-                                    </div>
-
-                                    <!-- Status Updates -->
-                                    <div class="chat-footer"
-                                        x-show="message.role === 'assistant' && message.current_status">
-                                        <span class="streaming-status opacity-70"
-                                            x-text="message.current_status"></span>
-                                    </div>
-                                </div>
-                                <!-- ## END: Single Message Render Block ## -->
-                            </template>
-                        </template>
-                    </template>
-
-                    <!-- Loading Indicator & Scroll Target (Remain outside templates) -->
-                    <div x-show="isSendingMessage && !currentStatusMessage" class="chat chat-start">
-                        <div class="chat-image avatar">
-                            <div
-                                class="w-8 rounded-full bg-secondary text-secondary-content flex items-center justify-center">
-                                <i class="fas fa-robot text-sm"></i>
-                            </div>
+                <!-- Loading Indicator & Scroll Target (Remain outside templates) -->
+                <div x-show="isSendingMessage && !currentStatusMessage" class="chat chat-start">
+                    <div class="chat-image avatar">
+                        <div
+                            class="w-8 rounded-full bg-secondary text-secondary-content flex items-center justify-center">
+                            <i class="fas fa-robot text-sm"></i>
                         </div>
-                        <div class="chat-bubble chat-bubble-secondary animate-pulse"><span
-                                class="loading loading-dots loading-sm"></span></div>
                     </div>
-                    <div x-ref="endofchat" class="h-1 m-0 p-0"></div> <!-- Scroll target -->
-
-                </div> <!-- End virtual-scroll-content -->
-            </div> <!-- End chat-messages -->
-
-            <!-- Input Area -->
-            <div class="p-3 border-t border-base-300/50 bg-base-100 flex-shrink-0 shadow-inner drop-zone"
-                :class="{'drag-over': isDraggingOverDropZone}" @dragover.prevent="isDraggingOverDropZone = true"
-                @dragleave.prevent="isDraggingOverDropZone = false" @drop.prevent="handleDrop($event)">
-                <!-- Status Message -->
-                <div x-show="currentStatusMessage"
-                    class="text-xs text-info mb-1.5 flex items-center gap-1.5 animate__animated animate__fadeIn animate__faster">
-                    <i :class="currentStatusIcon()"></i> <span x-text="currentStatusMessage"></span>
+                    <div class="chat-bubble chat-bubble-secondary animate-pulse"><span
+                            class="loading loading-dots loading-sm"></span></div>
                 </div>
-                <!-- Input -->
-                <div class="flex items-end gap-2">
-                    <textarea class="textarea textarea-bordered w-full resize-none text-sm leading-tight pt-2 pb-2"
-                        placeholder="Ask Claude anything... (Shift+Enter for newline)" rows="1" x-model="userInput"
-                        @keydown.enter.exact.prevent.stop="sendMessage"
-                        @keydown.shift.enter.exact.prevent="userInput += '\n'; adjustTextareaHeight($el)"
-                        @input="adjustTextareaHeight($event.target)" x-ref="inputarea"
-                        :disabled="isSendingMessage && !config.enableStreaming"></textarea>
-                        <button x-show="isSendingMessage"
-                        class="btn btn-warning btn-square btn-sm animate__animated animate__faster animate__fadeIn"
-                        @click="abortQuery"
-                        data-tippy-content="Stop Generation (Esc)">
+                <div x-ref="endofchat" class="h-1 m-0 p-0"></div> <!-- Scroll target -->
+
+            </div> <!-- End virtual-scroll-content -->
+        </div> <!-- End chat-messages -->
+
+        <!-- Input Area -->
+        <div class="p-3 border-t border-base-300/50 bg-base-100 flex-shrink-0 shadow-inner drop-zone"
+            :class="{'drag-over': isDraggingOverDropZone}" @dragover.prevent="isDraggingOverDropZone = true"
+            @dragleave.prevent="isDraggingOverDropZone = false" @drop.prevent="handleDrop($event)">
+            <!-- Status Message -->
+            <div x-show="currentStatusMessage"
+                class="text-xs text-info mb-1.5 flex items-center gap-1.5 animate__animated animate__fadeIn animate__faster">
+                <i :class="currentStatusIcon()"></i> <span x-text="currentStatusMessage"></span>
+            </div>
+            <!-- Input -->
+            <div class="flex items-end gap-2">
+                <textarea class="textarea textarea-bordered w-full resize-none text-sm leading-tight pt-2 pb-2"
+                    placeholder="Ask Claude anything... (Shift+Enter for newline)" rows="1" x-model="userInput"
+                    @keydown.enter="if (uiSettings.sendOnEnter && !$event.shiftKey && !$event.ctrlKey && !$event.metaKey) { $event.preventDefault(); sendMessage(); } else if (!uiSettings.sendOnEnter && ($event.ctrlKey || $event.metaKey) && !$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
+                    @keydown.shift.enter.exact.prevent="userInput += '\n'; adjustTextareaHeight($el)"
+                    @input="adjustTextareaHeight($event.target)" x-ref="inputarea"
+                    :disabled="isSendingMessage && !config.enableStreaming"></textarea>
+                <button x-show="isSendingMessage"
+                    class="btn btn-warning btn-square btn-sm animate__animated animate__faster animate__fadeIn"
+                    @click="abortQuery" data-tippy-content="Stop Generation (Esc)">
                     <i class="fas fa-stop"></i>
                 </button>
-                    <button class="btn btn-ghost btn-square btn-sm" @click="showTemplatesModal = true"
-                        data-tippy-content="Message Templates">
-                        <i class="fas fa-clipboard-list"></i>
-                    </button>
-                    <label class="btn btn-ghost btn-square btn-sm cursor-pointer" data-tippy-content="Upload File">
-                        <i class="fas fa-paperclip"></i>
-                        <input type="file" class="hidden" @change="handleFileUpload($event)">
-                    </label>
-                    <button x-show="!isSendingMessage" class="btn btn-primary btn-square btn-sm" @click="sendMessage"
-                        :disabled="!userInput.trim()">
-                        <i class="fas fa-paper-plane"></i>
-                    </button>
-                </div>
+                <button class="btn btn-ghost btn-square btn-sm" @click="showTemplatesModal = true"
+                    data-tippy-content="Message Templates">
+                    <i class="fas fa-clipboard-list"></i>
+                </button>
+                <label class="btn btn-ghost btn-square btn-sm cursor-pointer" data-tippy-content="Upload File">
+                    <i class="fas fa-paperclip"></i>
+                    <input type="file" class="hidden" @change="handleFileUpload($event)">
+                </label>
+                <button x-show="!isSendingMessage" class="btn btn-primary btn-square btn-sm" @click="sendMessage"
+                    :disabled="!userInput.trim()">
+                    <i class="fas fa-paper-plane"></i>
+                </button>
             </div>
-        </main>
+        </div>
+    </main>
 
     </div>
 
@@ -3212,7 +3228,9 @@
                     groupMessagesByDate: false,
                     compactMode: false,
                     showStatusBar: false,
-                    virtualScrolling: false
+                    virtualScrolling: false,
+                    sendOnEnter: true,
+                    showToolDataMessages: true
                 },
                 bookmarkedMessages: [],
                 isMessageSearchActive: false,
@@ -3585,7 +3603,9 @@
                             groupMessagesByDate: false,
                             compactMode: false,
                             showStatusBar: true,
-                            virtualScrolling: false
+                            virtualScrolling: false,
+                            sendOnEnter: true,
+                            showToolDataMessages: true
                         };
 
                         // Initialize with defaults
@@ -3605,7 +3625,9 @@
                             groupMessagesByDate: false,
                             compactMode: false,
                             showStatusBar: true,
-                            virtualScrolling: false
+                            virtualScrolling: false,
+                            sendOnEnter: true,
+                            showToolDataMessages: true
                         };
                     }
                 },
@@ -5104,92 +5126,161 @@
                 }, // Added comma
 
                 handleWebSocketMessage(message) {
+                    // Attempt to find the message being updated or create a new one
                     let assistantMsg = this.currentConversation.find(m => m.id === this.currentAssistantMessageId);
-                    const backendMessageId = message.message_id;
+                    const backendMessageId = message.message_id; // Use the ID from the backend if provided
 
+                    // If a backend ID is present and doesn't match the current stream, try to find/create based on it
                     if (backendMessageId && (!assistantMsg || assistantMsg.id !== backendMessageId)) {
                         const existingMsg = this.currentConversation.find(m => m.id === backendMessageId);
                         if (existingMsg) {
                             assistantMsg = existingMsg;
                             this.currentAssistantMessageId = backendMessageId;
+                            console.log(`WS: Switched to existing assistant message ID: ${backendMessageId}`);
                         } else if (['stream_start', 'text_chunk', 'status', 'tool_call'].includes(message.type)) {
-                            assistantMsg = { role: 'assistant', content: '', id: backendMessageId, timestamp: new Date().toISOString(), current_status: null, model: this.currentModelShort };
+                            const timestamp = new Date().toISOString();
+                            assistantMsg = {
+                                role: 'assistant',
+                                content: '',
+                                id: backendMessageId,
+                                timestamp: timestamp,
+                                current_status: message.type === 'status' ? message.payload : null,
+                                model: this.currentModelShort
+                            };
                             this.currentConversation.push(assistantMsg);
                             this.currentAssistantMessageId = backendMessageId;
+                            console.log(`WS: Started new assistant message ID: ${backendMessageId}`);
                         }
+                    } else if (!assistantMsg && message.type !== 'state_update' && message.type !== 'command_response' && message.type !== 'error') {
+                        const timestamp = new Date().toISOString();
+                        const tempId = `assistant_${timestamp}_${Math.random().toString(16).slice(2)}`;
+                        assistantMsg = {
+                            role: 'assistant',
+                            content: '',
+                            id: tempId,
+                            timestamp: timestamp,
+                            current_status: message.type === 'status' ? message.payload : null,
+                            model: this.currentModelShort
+                        };
+                        this.currentConversation.push(assistantMsg);
+                        this.currentAssistantMessageId = tempId;
+                        console.warn(`WS: Started assistant message with temporary ID: ${tempId}`);
                     }
 
+                    // --- Process message types ---
                     switch (message.type) {
                         case 'text_chunk':
                             if (assistantMsg) {
                                 let chunkText = message.payload;
-                                if (typeof chunkText !== 'string') {
-                                    console.warn('Non-string text_chunk received, stringifying:', chunkText);
-                                    chunkText = JSON.stringify(chunkText, null, 2);
-                                }
-                                if (typeof assistantMsg.content !== 'string') {
-                                    assistantMsg.content.push({ type: 'text', text: chunkText });
-                                } else {
-                                    assistantMsg.content += chunkText;
-                                }
+                                if (typeof chunkText !== 'string') { chunkText = JSON.stringify(chunkText, null, 2); }
+                                if (typeof assistantMsg.content !== 'string') { assistantMsg.content = ''; } // Ensure content is string for append
+                                assistantMsg.content += chunkText;
                                 assistantMsg.current_status = null;
-                            }
+                                this.currentConversation = [...this.currentConversation]; // Trigger reactivity
+                            } else { console.warn("WS: Received text_chunk but no assistant message found/created."); }
                             this.scrollToBottom();
                             break;
-                        case 'tool_result_chunk':
+
+                        case 'status':
                             if (assistantMsg) {
-                                let chunkText = message.payload.content_chunk;
-                                if (typeof chunkText !== 'string') {
-                                    console.warn('Non-string tool_result_chunk received, stringifying:', chunkText);
-                                    chunkText = JSON.stringify(chunkText, null, 2);
-                                }
-                                const resultPrefix = `\nTool Result Chunk (for ...${(message.payload.tool_use_id || '').slice(-4)}): `;
-                                if (typeof assistantMsg.content === 'string') {
-                                    assistantMsg.content += resultPrefix + chunkText;
-                                } else if (Array.isArray(assistantMsg.content)) {
-                                    const lastBlock = assistantMsg.content[assistantMsg.content.length - 1];
-                                    if (lastBlock?.type === 'text') {
-                                        lastBlock.text += (lastBlock.text.includes('Tool Result Chunk') ? '' : resultPrefix) + chunkText;
-                                    } else {
-                                        assistantMsg.content.push({ type: 'text', text: resultPrefix + chunkText });
-                                    }
-                                }
-                                assistantMsg.current_status = `Receiving result for tool...`;
+                                assistantMsg.current_status = message.payload;
+                                this.currentConversation = [...this.currentConversation]; // Trigger reactivity
+                            } else {
+                                this.currentStatusMessage = message.payload;
+                                setTimeout(() => { if (this.currentStatusMessage === message.payload) this.currentStatusMessage = null; }, 4000);
                             }
                             this.scrollToBottom();
                             break;
+
+                        case 'tool_result': // Received from backend after execution
+                            const toolResultPayload = message.payload;
+                            this.addMessageToConversation('user', [toolResultPayload], {
+                                content_type: 'tool_result',
+                                id: `tool_result_${toolResultPayload.tool_use_id || Date.now()}`,
+                                is_error: toolResultPayload.is_error || false,
+                                tool_name: toolResultPayload.tool_name // Pass tool name if available
+                            });
+                            this.scrollToBottom();
+                            break;
+
                         case 'query_complete':
-                        case 'stream_end': // Treat stream_end like query_complete
+                        case 'stream_end':
                             this.isSendingMessage = false;
                             this.isLoading = false;
-                            this.currentStatusMessage = null; // Clear transient status
-                            this.currentAssistantMessageId = null; // Ready for next message
-                            if (assistantMsg) assistantMsg.current_status = null; // Clear status on final message
-                            this.$nextTick(() => this.initHighlighting(this.$refs.chatbox)); // Highlight final code
+                            this.currentStatusMessage = null;
+                            if (assistantMsg) assistantMsg.current_status = null;
+                            this.currentAssistantMessageId = null;
+                            this.currentConversation = [...this.currentConversation]; // Trigger final reactivity
+                            this.$nextTick(() => this.initHighlighting(this.$refs.chatbox));
                             break;
-                        case 'error':
+
+                        case 'error': // General backend errors
                             this.addNotification(`Backend Error: ${message.payload}`, 'error');
                             this.isSendingMessage = false;
                             this.isLoading = false;
                             this.currentStatusMessage = null;
                             this.currentAssistantMessageId = null;
-                            // Add a system message to the chat about the error
                             this.addMessageToConversation('system', `Error processing last request: ${message.payload}`);
                             break;
-                        case 'state_update': // Handle full state updates if backend sends them
+
+                        case 'command_response':
+                            const responseData = message.payload;
+                            const notificationType = responseData.success ? 'success' : 'error';
+                            this.addNotification(responseData.message, notificationType);
+
+                            if (responseData.success) {
+                                // If successful, check if we need to update UI state
+                                const command = responseData.originalCommand || this.lastSentCommand; // Need to track last command sent
+
+                                // Update model display if /model command succeeded
+                                if (responseData.message.startsWith("Model set to:")) {
+                                    const newModel = responseData.message.split("Model set to: ")[1];
+                                    if (newModel) {
+                                        this.currentModel = newModel;
+                                        // Optionally update available models if it was custom
+                                        if (!this.availableModels.includes(newModel)) {
+                                            this.availableModels.push(newModel);
+                                        }
+                                    }
+                                }
+
+                                // Refresh conversation state for commands that modify it
+                                // (clear, fork, checkout, optimize, prompt)
+                                // We check based on the response message content as a heuristic
+                                // or ideally, the backend would include which command succeeded.
+                                // A simpler approach: refresh after *any* successful command response.
+                                if (responseData.success) { // Refresh on any success for safety
+                                    console.log("Command successful, refreshing conversation state...");
+                                    // Use a small delay to allow backend saving if needed
+                                    setTimeout(() => {
+                                        this.fetchConversation().catch(err => console.error("Error fetching conversation after command:", err));
+                                    }, 150); // 150ms delay
+                                }
+                            }
+                            break;
+
+                        case 'state_update': // Unchanged from previous version
                             console.log("Received state update:", message.payload);
                             if (message.payload.servers) this.servers = message.payload.servers;
-                            if (message.payload.tools) this.tools = message.payload.tools;
-                            if (message.payload.resources) this.resources = message.payload.resources;
-                            if (message.payload.prompts) this.prompts = message.payload.prompts;
+                            if (message.payload.tools) {
+                                this.tools = (message.payload.tools || []).map(t => ({ ...t, shortName: t.name.split(':').pop() }));
+                                this.reconcileFavoriteTools();
+                                this.reconcileRecentTools();
+                            }
+                            if (message.payload.resources) {
+                                this.resources = (message.payload.resources || []).map(r => ({ ...r, shortName: r.name.split(':').pop() }));
+                            }
+                            if (message.payload.prompts) {
+                                this.prompts = (message.payload.prompts || []).map(p => ({ ...p, shortName: p.name.split(':').pop() }));
+                            }
                             if (message.payload.conversation) {
                                 this.currentConversation = message.payload.conversation.messages || [];
-                                console.log('WS state_update is SETTING nodes:', JSON.stringify(message.payload.conversation.nodes || []));
                                 Alpine.store('conversation').setNodes(message.payload.conversation.nodes || [{ id: 'root', name: 'Root', parentId: null, childrenIds: [] }]);
                                 Alpine.store('conversation').setCurrentNodeId(message.payload.conversation.currentNodeId || 'root');
                                 this.currentModel = message.payload.conversation.model || this.config.defaultModel;
                                 this.scrollToBottom();
-                                this.$nextTick(() => this.initHighlighting(this.$refs.chatbox)); // Highlight potentially new messages
+                                this.$nextTick(() => this.initHighlighting(this.$refs.chatbox));
+                                this.loadConversationTags();
                             }
                             if (message.payload.config) {
                                 this.config = { ...this.config, ...message.payload.config };
@@ -5197,37 +5288,11 @@
                             }
                             this.$nextTick(() => this.initTippy()); // Re-init Tippy after state update
                             break;
-                        case 'command_response': // Generic response for non-chat commands
-                            this.addNotification(message.payload.message || JSON.stringify(message.payload), message.payload.success ? 'success' : 'info');
-                            break;
+
                         default:
                             console.warn('Received unknown WebSocket message type:', message.type, message);
                     }
-
-                    if (message.type === 'tool_result' ||
-                        (Array.isArray(message.payload) && message.payload.some(item => item?.type === 'tool_result'))) {
-
-                        // Only add this as assistant content, not as a new user message
-                        if (assistantMsg) {
-                            // Add to assistant message directly
-                            if (Array.isArray(assistantMsg.content)) {
-                                assistantMsg.content.push(...message.payload);
-                            } else if (typeof assistantMsg.content === 'string') {
-                                // If content was a string, convert to block format
-                                assistantMsg.content = [
-                                    { type: 'text', text: assistantMsg.content },
-                                    ...message.payload
-                                ];
-                            }
-                            this.currentConversation = [...this.currentConversation];
-                            return; // Skip adding as a separate message
-                        }
-                    }
-
-                    // Ensure the list reference updates for Alpine's reactivity if modifying nested props
-                    this.currentConversation = [...this.currentConversation];
-                },
-
+                }, // End handleWebSocketMessage
 
                 // --- DATA FETCHING ---
                 async fetchInitialData() {
@@ -6896,14 +6961,19 @@
                 },
 
                 renderUserProvidedToolResult(block, message) {
+                    if (!this.uiSettings.showToolDataMessages) {
+                        return '<!-- Tool data hidden by setting -->';
+                    }
                     const toolUseId = block.tool_use_id || 'Unknown Tool Call';
                     let contentData = block.content; // Default to original content string
                     let parsedSuccessfully = false;
                     let isLikelyJson = false;
                     let displayAsJson = false; // Flag to decide rendering format
+                    let isRawText = false; // ADDED: Flag for raw text content
 
                     // Start with Tool Result styling (improved contrast colors)
-                    let containerClasses = "not-prose my-2 p-3 bg-info/15 border border-info/30 rounded-lg text-base-content";
+                    // Using a lighter background based on --b2
+                    let containerClasses = "tool-data-bubble not-prose my-2 p-3 border border-base-300/20 rounded-lg text-base-content";
                     let headerIconClass = "fas fa-database fa-fw text-info";
                     let headerText = 'Tool Data Received';
 
@@ -6914,24 +6984,26 @@
 
                         if (isLikelyJson) {
                             try {
-                                // Try to parse, but keep the original string if it fails
                                 contentData = JSON.parse(block.content);
                                 parsedSuccessfully = true;
                                 displayAsJson = true; // Parsed successfully, display as JSON
                             } catch (e) {
                                 console.warn("Expected JSON string in user tool result, but parsing failed:", e, block.content);
-                                // Keep contentData as the original string
                                 parsedSuccessfully = false;
                                 displayAsJson = false; // Display as raw string
+                                isRawText = true; // ADDED: Mark as raw text
                             }
                         } else {
                             // It's a string, but doesn't look like JSON. Check if it's an error message.
                             parsedSuccessfully = false;
                             displayAsJson = false;
+                            isRawText = true; // ADDED: Mark as raw text
                             if (contentData.toLowerCase().startsWith('error:')) {
-                                containerClasses = "not-prose my-2 p-3 bg-error/15 border border-error/30 rounded-lg text-base-content";
+                                // Use error styling instead
+                                containerClasses = "tool-data-bubble not-prose my-2 p-3 bg-error/15 border border-error/30 rounded-lg text-base-content";
                                 headerIconClass = "fas fa-exclamation-triangle fa-fw text-error";
                                 headerText = 'Tool Error Received';
+                                isRawText = false; // Don't apply special text styling to errors
                             }
                         }
                     } else {
@@ -6939,6 +7011,7 @@
                         contentData = block.content;
                         parsedSuccessfully = true; // Assume structure is valid if not string
                         displayAsJson = true; // Display as JSON
+                        isRawText = false;
                     }
 
                     // Build HTML container with improved contrast
@@ -6951,16 +7024,14 @@
                     // Render based on whether we should display as JSON or raw string
                     if (displayAsJson) {
                         // Parsed successfully or was already an object/array
-                        html += `<p class="text-xs font-semibold mt-1 mb-1">Parsed Data (JSON):</p>`;
                         html += `<div class="mt-1 bg-base-100 border border-base-300/30 p-2 rounded-md relative group">
            <pre class="overflow-auto max-h-60"><code class="language-json hljs whitespace-pre-wrap break-all">${hljs.highlight(JSON.stringify(contentData, null, 2), { language: 'json', ignoreIllegals: true }).value}</code></pre>
            ${this.createCopyButton(JSON.stringify(contentData, null, 2), 'result')}
        </div>`;
                     } else {
                         // Display as raw string (might be an error message or non-JSON string)
-                        html += `<p class="text-xs font-semibold mt-1 mb-1">Raw Data Received:</p>`;
                         html += `<div class="mt-1 bg-base-100 border border-base-300/30 p-2 rounded-md relative group">
-         <pre class="text-xs whitespace-pre-wrap break-all text-base-content">${DOMPurify.sanitize(contentData)}</pre>
+         <pre class="tool-data-raw-text text-xs whitespace-pre-wrap break-all">${DOMPurify.sanitize(contentData)}</pre>
          ${this.createCopyButton(contentData, 'result')}
       </div>`;
                     }

@@ -9167,16 +9167,38 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 if req.tool_name not in mcp_client.server_manager.tools:
                      raise HTTPException(status_code=404, detail=f"Tool '{req.tool_name}' not found")
                 tool = mcp_client.server_manager.tools[req.tool_name]
+                tool_short_name = req.tool_name.split(':')[-1] # Get short name for printing
+                mcp_client.safe_print(f"{STATUS_EMOJI['server']} API executing [bold]{tool_short_name}[/] via {tool.server_name}...")
                 try:
+                    start_time = time.time() # Start timer
                     result : CallToolResult = await mcp_client.execute_tool(tool.server_name, req.tool_name, req.params)
+                    latency = (time.time() - start_time) * 1000 # Calculate latency in ms
+                    if result.isError:
+                         error_text = "Unknown Error"
+                         if result.content:
+                              if isinstance(result.content, str): error_text = result.content[:100] + ("..." if len(result.content) > 100 else "")
+                              else: error_text = str(result.content)[:100] + "..."
+                         mcp_client.safe_print(f"{STATUS_EMOJI['failure']} API Tool Error [bold]{tool_short_name}[/] ({latency:.0f}ms): {error_text}")
+                    else:
+                         # Estimate tokens for success message
+                         content_str = ""
+                         if isinstance(result.content, str): content_str = result.content
+                         elif result.content is not None:
+                              try: content_str = json.dumps(result.content)
+                              except Exception: content_str = str(result.content)
+                         result_tokens = mcp_client._estimate_string_tokens(content_str) # Use helper
+                         mcp_client.safe_print(f"{STATUS_EMOJI['success']} API Tool Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {latency:.0f}ms)")
                     # Convert result content if necessary for JSON serialization
                     content_to_return = result.content
                     if isinstance(content_to_return, list):
                         # Try to serialize Pydantic models if present
                         content_to_return = [getattr(item, 'model_dump', lambda item=item: item)() for item in content_to_return]
-
                     return {"isError": result.isError, "content": content_to_return}
+                except asyncio.CancelledError as e:
+                    mcp_client.safe_print(f"[yellow]API Tool execution [bold]{tool_short_name}[/] cancelled.[/]")
+                    raise HTTPException(status_code=499, detail="Tool execution cancelled by client") from e # 499 Client Closed Request
                 except Exception as e:
+                    mcp_client.safe_print(f"{STATUS_EMOJI['failure']} API Tool Execution Failed [bold]{tool_short_name}[/]: {str(e)}")
                     log.error(f"Error executing tool '{req.tool_name}' via API: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Tool execution failed: {str(e)}") from e
 
@@ -9374,6 +9396,22 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
                 await websocket.accept()
                 log.info("WebSocket connection accepted.")
+
+                # --- Helper to send command responses ---
+                async def send_command_response(success: bool, message: str, data: Optional[Dict] = None):
+                    payload = {"success": success, "message": message}
+                    if data:
+                        payload["data"] = data
+                    await websocket.send_json(WebSocketMessage(type="command_response", payload=payload).model_dump())
+
+                # --- Helper to send errors ---
+                async def send_error_response(message: str):
+                     log.warning(f"WebSocket Command Error: {message}")
+                     await websocket.send_json(WebSocketMessage(type="error", payload=message).model_dump())
+                     # Also send a command_response with failure status for consistency
+                     await send_command_response(success=False, message=message)
+
+
                 try:
                     while True:
                         raw_data = await websocket.receive_text() # Use receive_text and parse JSON manually for flexibility
@@ -9383,49 +9421,179 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                             log.debug(f"WebSocket received: Type={message.type}, Payload={str(message.payload)[:100]}...")
 
                             if message.type == "query":
+                                # --- Query handling (as before) ---
                                 query_text = str(message.payload)
                                 try:
                                     async for chunk in mcp_client.process_streaming_query(query_text):
-                                        # Check for status updates vs text chunks
                                         if chunk.startswith("@@STATUS@@"):
                                              status_payload = chunk[len("@@STATUS@@"):].strip()
+                                             mcp_client.safe_print(status_payload) # Print status to console
                                              await websocket.send_json(WebSocketMessage(type="status", payload=status_payload).model_dump())
                                         else:
                                              await websocket.send_json(WebSocketMessage(type="text_chunk", payload=chunk).model_dump())
-                                    # Send a final message indicator maybe?
                                     await websocket.send_json(WebSocketMessage(type="query_complete").model_dump())
+                                except asyncio.CancelledError:
+                                     log.debug("Query cancelled during WebSocket processing.")
+                                     cancel_msg = "[yellow]Request Aborted by User.[/]"
+                                     mcp_client.safe_print(cancel_msg)
+                                     await websocket.send_json(WebSocketMessage(type="status", payload=cancel_msg).model_dump())
                                 except Exception as e:
+                                    error_msg_print = f"[bold red]Error during query processing: {str(e)}[/]"
+                                    error_msg_ws = f"Error processing query: {str(e)}"
                                     log.error(f"Error processing query via WebSocket: {e}", exc_info=True)
-                                    await websocket.send_json(WebSocketMessage(type="error", payload=f"Error processing query: {str(e)}").model_dump())
+                                    mcp_client.safe_print(error_msg_print)
+                                    await websocket.send_json(WebSocketMessage(type="error", payload=error_msg_ws).model_dump())
 
                             elif message.type == "command":
-                                # Basic command handling - more complex commands might need specific API endpoints
-                                command_str = str(message.payload)
+                                # --- Expanded Command Handling ---
+                                command_str = str(message.payload).strip()
                                 if command_str.startswith('/'):
                                     parts = command_str[1:].split(maxsplit=1)
                                     cmd = parts[0].lower()
                                     args = parts[1] if len(parts) > 1 else ""
-                                    response_payload = f"Command '{cmd}' received (basic handling)."
-                                    # Example: Handle simple commands directly
-                                    if cmd == "clear":
-                                         mcp_client.conversation_graph.current_node.messages = []
-                                         mcp_client.conversation_graph.set_current_node("root")
-                                         await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                         response_payload = "Conversation cleared."
-                                         await websocket.send_json(WebSocketMessage(type="command_response", payload=response_payload).model_dump())
-                                         # Also need to maybe send an empty message list update?
-                                    elif cmd == "model":
-                                         if args:
-                                             mcp_client.current_model = args
-                                             response_payload = f"Model set to {args}"
-                                         else:
-                                             response_payload = f"Current model: {mcp_client.current_model}"
-                                         await websocket.send_json(WebSocketMessage(type="command_response", payload=response_payload).model_dump())
-                                    # Add more simple commands or guide user to use UI elements/API
-                                    else:
-                                         await websocket.send_json(WebSocketMessage(type="command_response", payload=f"Command '{cmd}' not fully handled via WebSocket.").model_dump())
+                                    log.info(f"WebSocket processing command: /{cmd} {args}")
+
+                                    # --- Command Implementations ---
+                                    try:
+                                        if cmd == "clear":
+                                             # --- Clear Command ---
+                                             if mcp_client.conversation_graph.current_node.id == "root" and not mcp_client.conversation_graph.current_node.messages:
+                                                 await send_command_response(success=True, message="Conversation is already empty at root.")
+                                             else:
+                                                 # Clear current node messages and go to root
+                                                 mcp_client.conversation_graph.current_node.messages = []
+                                                 mcp_client.conversation_graph.set_current_node("root")
+                                                 await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
+                                                 await send_command_response(success=True, message="Conversation cleared and switched to root.")
+                                                 # Optionally: Send updated conversation state via WebSocket?
+                                                 # For now, let the UI re-fetch if needed.
+
+                                        elif cmd == "model":
+                                             # --- Model Command ---
+                                             if args:
+                                                 mcp_client.current_model = args
+                                                 mcp_client.config.default_model = args # Also update config default
+                                                 # Save config non-blockingly
+                                                 asyncio.create_task(mcp_client.config.save_async())
+                                                 await send_command_response(success=True, message=f"Model set to: {args}")
+                                             else:
+                                                 await send_command_response(success=True, message=f"Current model: {mcp_client.current_model}")
+
+                                        elif cmd == "fork":
+                                             # --- Fork Command ---
+                                             fork_name = args if args else None
+                                             try:
+                                                 new_node = mcp_client.conversation_graph.create_fork(name=fork_name)
+                                                 mcp_client.conversation_graph.set_current_node(new_node.id)
+                                                 await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
+                                                 await send_command_response(
+                                                     success=True,
+                                                     message=f"Created and switched to branch: {new_node.name}",
+                                                     data={"newNodeId": new_node.id, "newNodeName": new_node.name}
+                                                 )
+                                             except Exception as e:
+                                                  await send_error_response(f"Error creating fork: {e}")
+
+                                        elif cmd == "checkout":
+                                             # --- Checkout Command ---
+                                             if not args:
+                                                 await send_error_response("Usage: /checkout NODE_ID_or_Prefix")
+                                             else:
+                                                 node_id = args
+                                                 matched_node = None
+                                                 if node_id in mcp_client.conversation_graph.nodes:
+                                                     matched_node = mcp_client.conversation_graph.get_node(node_id)
+                                                 else:
+                                                     prefix_matches = []
+                                                     for n_id, node in mcp_client.conversation_graph.nodes.items():
+                                                          if n_id.startswith(node_id):
+                                                              prefix_matches.append(node)
+                                                     if len(prefix_matches) == 1:
+                                                          matched_node = prefix_matches[0]
+                                                     elif len(prefix_matches) > 1:
+                                                          await send_error_response(f"Ambiguous node ID prefix '{node_id}'. Multiple matches.")
+                                                          matched_node = None # Ensure it's None
+
+                                                 if matched_node:
+                                                     if mcp_client.conversation_graph.set_current_node(matched_node.id):
+                                                         await send_command_response(
+                                                             success=True,
+                                                             message=f"Switched to branch: {matched_node.name}",
+                                                             data={"currentNodeId": matched_node.id}
+                                                         )
+                                                         # UI should fetch conversation state after this response
+                                                     else:
+                                                         await send_error_response(f"Failed to switch to node {matched_node.id}")
+                                                 else:
+                                                     await send_error_response(f"Node ID '{node_id}' not found.")
+
+                                        elif cmd == "optimize":
+                                            # --- Optimize Command ---
+                                             # Use same logic as cmd_optimize but send WS messages
+                                             await websocket.send_json(WebSocketMessage(type="status", payload="Optimizing conversation...").model_dump())
+                                             mcp_client.safe_print("[yellow]API optimizing conversation context...[/]")
+
+                                             summarization_model = mcp_client.config.summarization_model
+                                             target_length = mcp_client.config.max_summarized_tokens
+                                             initial_tokens = await mcp_client.count_tokens()
+
+                                             try:
+                                                 summary = await mcp_client.process_query(
+                                                      ("Summarize this conversation history preserving key facts, "
+                                                       "decisions, and context needed for future interactions. "
+                                                       "Keep technical details, code snippets, and numbers intact. "
+                                                       f"Create a summary that captures all essential information "
+                                                       f"while being concise enough to fit in roughly {target_length} tokens."),
+                                                      model=summarization_model
+                                                  )
+                                                 mcp_client.conversation_graph.current_node.messages = [
+                                                      {"role": "system", "content": "Conversation summary:\n" + summary}
+                                                  ]
+                                                 final_tokens = await mcp_client.count_tokens()
+                                                 await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
+
+                                                 result_message = f"Conversation optimized: {initial_tokens} -> {final_tokens} tokens"
+                                                 await send_command_response(
+                                                     success=True,
+                                                     message=result_message,
+                                                     data={"initialTokens": initial_tokens, "finalTokens": final_tokens}
+                                                 )
+                                                 mcp_client.safe_print(f"[green]{result_message}[/]")
+                                                 # UI should refetch conversation after this
+
+                                             except Exception as e:
+                                                 error_msg = f"Optimization failed: {e}"
+                                                 await send_error_response(error_msg)
+                                                 mcp_client.safe_print(f"[red]{error_msg}[/]")
+
+                                        elif cmd == "prompt":
+                                             # --- Apply Prompt Command ---
+                                             if not args:
+                                                 # List available prompts (better suited for API, but basic list here)
+                                                 prompt_names = list(mcp_client.server_manager.prompts.keys())
+                                                 await send_command_response(success=True, message="Available prompts:", data={"prompts": prompt_names})
+                                             else:
+                                                 prompt_name = args
+                                                 success = await mcp_client.apply_prompt_to_conversation(prompt_name)
+                                                 if success:
+                                                      await send_command_response(success=True, message=f"Applied prompt: {prompt_name}")
+                                                      mcp_client.safe_print(f"[green]Applied prompt '{prompt_name}' via WebSocket[/]")
+                                                      # UI should refetch conversation
+                                                 else:
+                                                      await send_error_response(f"Prompt not found: {prompt_name}")
+
+                                        else:
+                                            # --- Fallback for Unhandled Commands ---
+                                            log.warning(f"WebSocket received unhandled command: /{cmd}")
+                                            await send_command_response(success=False, message=f"Command '/{cmd}' not handled via WebSocket.")
+
+                                    except Exception as cmd_err:
+                                        # Catch errors during command execution
+                                        await send_error_response(f"Error executing command '/{cmd}': {cmd_err}")
+                                        log.error(f"Error executing WebSocket command /{cmd}: {cmd_err}", exc_info=True)
+
                                 else:
-                                     await websocket.send_json(WebSocketMessage(type="error", payload="Invalid command format via WebSocket.").model_dump())
+                                     await send_error_response("Invalid command format. Commands must start with '/'.")
 
                             # Add handlers for other message types if needed
 
