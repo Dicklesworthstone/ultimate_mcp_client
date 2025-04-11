@@ -181,7 +181,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple, Type, Union
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 import aiofiles  # For async file operations
 import anthropic
@@ -191,8 +191,6 @@ import colorama
 # Cache libraries
 import diskcache
 import httpx
-from httpx_sse import aconnect_sse, EventSource
-import mcp.types as types
 
 # Third-party imports
 import psutil
@@ -225,17 +223,9 @@ from mcp.types import (
     CallToolResult,
     GetPromptResult,
     InitializeResult,
-    JSONRPCMessage,
-    InitializeRequestParams,
-    InitializedNotification,
-    Implementation,
     ListPromptsResult,
-    ClientCapabilities,
-    ClientNotification,
-    RootsCapability,
     ListResourcesResult,
     ListToolsResult,
-    SamplingCapability,
     ReadResourceResult,
     Resource,
     Tool,
@@ -3679,309 +3669,6 @@ class ServerManager:
                 except Exception as close_err:
                     log.error(f"Error closing stderr log file handle for {current_server_name}: {close_err}")
 
-    async def _connect_sse_server_custom(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[InitializeResult]]:
-        """
-        Handles SSE connection: establishes persistent SSE stream first, then
-        performs manual handshake POST, and uses custom stream handlers.
-        """
-        initialize_result_obj: Optional[InitializeResult] = None
-        session: Optional[ClientSession] = None
-        task_group_exit_stack = AsyncExitStack()
-        background_http_client: Optional[httpx.AsyncClient] = None # For POST writer
-        sse_event_source: Optional[EventSource] = None # Keep persistent connection
-
-        connect_url = server_config.path
-        parsed_connect_url = urlparse(connect_url)
-        if not parsed_connect_url.scheme:
-            connect_url = f"http://{connect_url}"
-            log.debug(f"[{current_server_name}] Prepended http scheme: {connect_url}")
-
-        sse_stream_url = connect_url # URL for the persistent GET stream
-        post_url_to_use: Optional[str] = None # Session-specific POST URL
-
-        # Define timeouts
-        connect_timeout = server_config.timeout if server_config.timeout > 0 else 15.0 # Slightly longer connect default
-        read_timeout = (server_config.timeout * 2) if server_config.timeout > 0 else 30.0
-        # Handshake timeout needs to cover GET + endpoint wait + POST
-        handshake_timeout = (connect_timeout + read_timeout + 5.0)
-        capability_load_timeout = (server_config.timeout * 2) + 20.0 if server_config.timeout > 0 else 40.0
-        outer_wait_timeout = capability_load_timeout + 10.0
-
-        log.debug(f"[{current_server_name}] SSE Timeouts: Connect={connect_timeout}s, Read={read_timeout}s, Handshake={handshake_timeout}s, Caps={capability_load_timeout}s")
-
-        try:
-            # --- Step 1: Establish Persistent SSE Connection & Get Session URL ---
-            log.debug(f"[{current_server_name}] Establishing persistent GET {sse_stream_url} connection...")
-            # Use a separate client just for the initial persistent connection setup
-            sse_connect_client = httpx.AsyncClient(timeout=handshake_timeout)
-            try:
-                # We need to keep the event_source alive, so don't use 'async with' here yet.
-                # Enter the client context into the exit stack for later cleanup.
-                await task_group_exit_stack.enter_async_context(sse_connect_client)
-
-                sse_event_source = await aconnect_sse(
-                    sse_connect_client, "GET", sse_stream_url,
-                    timeout=httpx.Timeout(connect_timeout, read=read_timeout) # Standard timeouts for connect/read
-                )
-                # Ensure event source is cleaned up if function fails later
-                task_group_exit_stack.push_async_callback(sse_event_source.aclose)
-
-                log.debug(f"[{current_server_name}] Checking initial SSE connection status...")
-                sse_event_source.response.raise_for_status() # Check connection status
-                log.info(f"[{current_server_name}] Persistent SSE GET connection established. Waiting for endpoint...")
-
-                # Wait for the endpoint event with a timeout
-                async with asyncio.timeout(read_timeout + 2.0): # Timeout for getting the endpoint event
-                    async for sse in sse_event_source.aiter_sse():
-                        if sse.event == "endpoint":
-                            potential_url = urljoin(connect_url, sse.data)
-                            log.info(f"[{current_server_name}] Received potential session POST URL: {potential_url}")
-                            if urlparse(connect_url).netloc == urlparse(potential_url).netloc and 'sessionId=' in potential_url:
-                                post_url_to_use = potential_url
-                                log.info(f"[{current_server_name}] Using session POST URL: {post_url_to_use}")
-                                break # Got the URL
-                            else: log.warning(f"[{current_server_name}] Endpoint origin/format mismatch: {potential_url}")
-                        # Keep listening briefly if other events arrive first
-                    else:
-                        # Loop finished without finding endpoint
-                        raise RuntimeError("Did not receive valid 'endpoint' event from server.")
-
-            except (httpx.RequestError, httpx.HTTPStatusError, asyncio.TimeoutError, RuntimeError) as conn_err:
-                log.error(f"[{current_server_name}] Failed to establish persistent SSE connection or get endpoint event: {conn_err}")
-                raise conn_err # Re-raise to outer handler
-
-            # --- MUST have the session URL now ---
-            if not post_url_to_use:
-                 raise RuntimeError("Failed to obtain session-specific POST URL, cannot proceed.")
-
-            # --- Step 2: Send initialize POST manually to the SESSION URL ---
-            # (No retry needed now, as the session should be firmly registered by the server)
-            handshake_id = f"init-handshake-sess-{retry_count}-{uuid.uuid4().hex[:8]}"
-            initialize_payload_params = InitializeRequestParams(
-                protocolVersion=types.LATEST_PROTOCOL_VERSION,
-                capabilities=ClientCapabilities(sampling=SamplingCapability(), roots=RootsCapability(listChanged=True)),
-                clientInfo=Implementation(name="ultimate-mcp-client", version="1.0.0")
-            )
-            initialize_json = { "jsonrpc": "2.0", "method": "initialize", "params": initialize_payload_params.model_dump(mode='json', by_alias=True, exclude_none=True), "id": handshake_id }
-            log.debug(f"[{current_server_name}] Sending manual POST initialize (ID: {handshake_id}) to SESSION URL: {post_url_to_use}...")
-
-            # Use a short-lived client just for this single POST
-            post_client = httpx.AsyncClient(timeout=handshake_timeout)
-            try:
-                response = await post_client.post(post_url_to_use, json=initialize_json)
-                log.info(f"[{current_server_name}] Manual POST initialize response status: {response.status_code}")
-
-                if response.status_code == 200:
-                    try:
-                        init_result_data = response.json()
-                        if isinstance(init_result_data, dict) and init_result_data.get("id") == handshake_id and "result" in init_result_data:
-                            initialize_result_obj = InitializeResult.model_validate(init_result_data["result"])
-                            log.info(f"[{current_server_name}] Successfully parsed InitializeResult from POST.")
-                        else: raise ValueError("Invalid/mismatched InitializeResult JSON structure from POST.")
-                    except (json.JSONDecodeError, ValidationError) as parse_err:
-                         log.error(f"[{current_server_name}] Failed parsing/validating InitializeResult from POST 200 OK: {parse_err}")
-                         raise ValueError(f"Failed parsing InitializeResult: {parse_err}") from parse_err
-                elif response.status_code == 202:
-                     raise RuntimeError("Server accepted initialize but did not return result (Status 202). Cannot proceed.")
-                else: response.raise_for_status() # Raise other errors
-            finally:
-                await post_client.aclose()
-
-            if not initialize_result_obj: # Should be caught above
-                raise RuntimeError("Did not receive a valid InitializeResult from manual handshake.")
-
-            # --- Step 3: Manual Stream Creation ---
-            buffer_size = 0 # Infinite buffer
-            read_stream_writer, read_stream = anyio.create_memory_object_stream[JSONRPCMessage | Exception](buffer_size)
-            write_stream, write_stream_reader = anyio.create_memory_object_stream[JSONRPCMessage](buffer_size)
-            log.debug(f"[{current_server_name}] Manually created memory streams (Buffer: {buffer_size}) (Custom).")
-
-            # --- Step 4: Task Group and Custom Stream Handlers ---
-            background_http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect_timeout, read=read_timeout*5))
-            task_group_exit_stack.push_async_callback(background_http_client.aclose) # Ensure closure
-
-            # --- Custom SSE Reader Task (Uses existing sse_event_source) ---
-            async def custom_sse_reader_task(evt_src: EventSource):
-                nonlocal sse_event_source # Allow modification if needed
-                log.debug(f"[{current_server_name}] Starting custom SSE reader task using existing connection...")
-                try:
-                    async for sse in evt_src.aiter_sse(): # Iterate the existing source
-                        if sse.event == "message":
-                            try:
-                                message = JSONRPCMessage.model_validate_json(sse.data)
-                                if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{current_server_name}] Custom SSE reader received message: {message.model_dump(exclude_none=True, warnings=False)}")
-                                await read_stream_writer.send(message)
-                            except (ValidationError, json.JSONDecodeError) as e:
-                                log.error(f"[{current_server_name}] Error parsing SSE message: {e}. Data: {sse.data[:100]}...")
-                                with suppress(Exception): await read_stream_writer.send(e)
-                            except Exception as e:
-                                log.error(f"[{current_server_name}] Unexpected error processing/sending SSE message: {e}", exc_info=True)
-                                with suppress(Exception): await read_stream_writer.send(e)
-                        # Ignore other events like 'endpoint'
-                    log.info(f"[{current_server_name}] Custom SSE reader loop finished (server closed stream?).")
-                except httpx.StreamError as stream_err:
-                     log.warning(f"[{current_server_name}] SSE stream error in reader task: {stream_err}")
-                     with suppress(Exception): await read_stream_writer.send(stream_err)
-                except asyncio.CancelledError:
-                    log.info(f"[{current_server_name}] Custom SSE reader task cancelled.")
-                    raise # Propagate cancellation
-                except Exception as e:
-                    log.error(f"[{current_server_name}] Unexpected error in custom SSE reader task: {e}", exc_info=True)
-                    with suppress(Exception): await read_stream_writer.send(e)
-                finally:
-                    log.info(f"[{current_server_name}] Custom SSE reader task finished.")
-                    # Don't close the event source here, exit stack handles it
-                    if not read_stream_writer.is_closed: await read_stream_writer.aclose()
-
-
-            # --- Custom POST Writer/Response Reader Task (Uses session URL) ---
-            # (POST Writer logic remains the same as last correct version)
-            async def custom_post_writer_task():
-                nonlocal post_url_to_use # Use the session URL determined earlier
-                log.debug(f"[{current_server_name}] Starting custom POST writer task for SESSION URL: {post_url_to_use}...")
-                post_rw_timeout = capability_load_timeout + 5.0
-                post_timeout_httpx = httpx.Timeout(connect_timeout, write=post_rw_timeout, read=post_rw_timeout)
-                try:
-                    async for message in write_stream_reader:
-                        if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{current_server_name}] Custom POST writer sending to SESSION: {message.model_dump(exclude_none=True, warnings=False)}")
-                        try:
-                            response = await background_http_client.post(
-                                post_url_to_use, # POST to the session URL
-                                json=message.model_dump(mode="json", by_alias=True, exclude_none=True),
-                                timeout=post_timeout_httpx
-                            )
-                            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{current_server_name}] Custom POST response status: {response.status_code}")
-
-                            if response.status_code == 200 and response.headers.get('content-type','').lower().startswith('application/json'):
-                                try:
-                                    response_data = response.json()
-                                    if isinstance(response_data, dict) and response_data.get('jsonrpc') == '2.0' and 'id' in response_data:
-                                        rpc_response_msg = JSONRPCMessage.model_validate(response_data)
-                                        if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{current_server_name}] Custom POST writer received response body: {rpc_response_msg.model_dump(exclude_none=True, warnings=False)}")
-                                        await read_stream_writer.send(rpc_response_msg)
-                                    else:
-                                        log.debug(f"[{current_server_name}] Custom POST writer received non-RPC JSON: {str(response_data)[:100]}...")
-                                except (ValidationError, json.JSONDecodeError) as e:
-                                    log.error(f"[{current_server_name}] Error parsing/validating POST response: {e}. Body: {response.text[:100]}...")
-                                    with suppress(Exception): await read_stream_writer.send(e)
-                                except Exception as e:
-                                     log.error(f"[{current_server_name}] Unexpected error processing POST response body: {e}", exc_info=True)
-                                     with suppress(Exception): await read_stream_writer.send(e)
-                            elif response.status_code >= 400:
-                                try: response.raise_for_status()
-                                except httpx.HTTPStatusError as http_error:
-                                    log.error(f"[{current_server_name}] Custom POST writer HTTP error: {http_error}")
-                                    with suppress(Exception): await read_stream_writer.send(http_error)
-                        except httpx.RequestError as e:
-                            log.error(f"[{current_server_name}] Custom POST writer network error: {e}")
-                            with suppress(Exception): await read_stream_writer.send(e)
-                            break
-                        except asyncio.CancelledError: log.info(f"[{current_server_name}] Custom POST writer task cancelled during send/recv."); raise
-                        except Exception as e:
-                            log.error(f"[{current_server_name}] Unexpected error in custom POST writer send/recv: {e}", exc_info=True)
-                            with suppress(Exception): await read_stream_writer.send(e)
-                except asyncio.CancelledError: log.info(f"[{current_server_name}] Custom POST writer task cancelled."); raise
-                except Exception as e:
-                    log.error(f"[{current_server_name}] Unexpected error in custom POST writer loop: {e}", exc_info=True)
-                    if not read_stream_writer.is_closed: 
-                        with suppress(Exception): 
-                            await read_stream_writer.send(e)
-                finally:
-                    log.info(f"[{current_server_name}] Custom POST writer task finished.")
-                    if not write_stream_reader.is_closed: await write_stream_reader.aclose()
-                    if not read_stream_writer.is_closed: await read_stream_writer.aclose()
-
-
-            # Start tasks
-            tg = await task_group_exit_stack.enter_async_context(anyio.create_task_group())
-            log.debug(f"[{current_server_name}] Starting custom SSE reader and POST writer background tasks...")
-            bg_tasks = []
-            # Pass the existing event source to the reader task
-            if sse_event_source is None: raise RuntimeError("SSE Event Source not established before starting reader task")
-            bg_tasks.append(tg.start_soon(custom_sse_reader_task, sse_event_source))
-            bg_tasks.append(tg.start_soon(custom_post_writer_task))
-            self._session_tasks.setdefault(current_server_name, []).extend(bg_tasks)
-            log.info(f"[{current_server_name}] Custom stream handler tasks started (Custom).")
-
-            # --- Step 5: Instantiate ClientSession ---
-            log.info(f"[{current_server_name}] Initializing standard ClientSession with custom streams...")
-            session_read_timeout_seconds = max(90.0, capability_load_timeout * 2)
-            session = ClientSession(
-                read_stream=read_stream,
-                write_stream=write_stream,
-                read_timeout_seconds=timedelta(seconds=session_read_timeout_seconds)
-            )
-            await self.exit_stack.enter_async_context(session) # Add session cleanup to main manager stack
-            log.debug(f"[{current_server_name}] Standard ClientSession instantiated and context entered (Custom).")
-
-            # --- Step 6: Send Initialized Notification ---
-            log.info(f"[{current_server_name}] Sending initialized notification via session (Custom)...")
-            initialized_notification_root = InitializedNotification(method="notifications/initialized")
-            initialized_notification = ClientNotification(root=initialized_notification_root)
-            try:
-                await asyncio.wait_for(session.send_notification(initialized_notification), timeout=connect_timeout)
-                log.debug(f"[{current_server_name}] Initialized notification sent (Custom).")
-            except asyncio.TimeoutError:
-                 log.error(f"[{current_server_name}] Timeout sending initialized notification.")
-                 raise
-
-            # --- Step 7: Load Capabilities using the session ---
-            log.info(f"[{current_server_name}] Loading capabilities via session (Custom)...")
-            # (Capability loading logic remains the same)
-            server_capabilities = initialize_result_obj.capabilities
-            log.debug(f"[{current_server_name}] Capabilities from InitializeResult: {server_capabilities}")
-            capability_results = {}
-
-            async def load_tools():
-                 if server_capabilities and server_capabilities.tools is not None:
-                     log.info(f"[{current_server_name}] Listing tools (Custom SSE)...")
-                     try: result = await session.list_tools(); capability_results['tools'] = result.tools if result else []
-                     except Exception as e: capability_results['tools_error'] = e
-                 else: log.info(f"[{current_server_name}] Skipping tools (not advertised)")
-
-            async def load_resources():
-                 if server_capabilities and server_capabilities.resources is not None:
-                     log.info(f"[{current_server_name}] Listing resources (Custom SSE)...")
-                     try: result = await session.list_resources(); capability_results['resources'] = result.resources if result else []
-                     except Exception as e: capability_results['resources_error'] = e
-                 else: log.info(f"[{current_server_name}] Skipping resources (not advertised)")
-
-            async def load_prompts():
-                 if server_capabilities and server_capabilities.prompts is not None:
-                     log.info(f"[{current_server_name}] Listing prompts (Custom SSE)...")
-                     try: result = await session.list_prompts(); capability_results['prompts'] = result.prompts if result else []
-                     except Exception as e: capability_results['prompts_error'] = e
-                 else: log.info(f"[{current_server_name}] Skipping prompts (not advertised)")
-
-            try: # Load concurrently
-                 async with asyncio.timeout(outer_wait_timeout):
-                      async with anyio.create_task_group() as cap_tg:
-                           cap_tg.start_soon(load_tools)
-                           cap_tg.start_soon(load_resources)
-                           cap_tg.start_soon(load_prompts)
-            except TimeoutError: log.error(f"[{current_server_name}] Overall timeout ({outer_wait_timeout}s) loading capabilities.")
-
-            if 'tools' in capability_results: self._process_list_result(current_server_name, capability_results['tools'], self.tools, MCPTool, "tool")
-            elif 'tools_error' in capability_results: log.error(f"[{current_server_name}] Error loading tools: {capability_results['tools_error']}")
-            if 'resources' in capability_results: self._process_list_result(current_server_name, capability_results['resources'], self.resources, MCPResource, "resource")
-            elif 'resources_error' in capability_results: log.error(f"[{current_server_name}] Error loading resources: {capability_results['resources_error']}")
-            if 'prompts' in capability_results: self._process_list_result(current_server_name, capability_results['prompts'], self.prompts, McpPromptType, "prompt")
-            elif 'prompts_error' in capability_results: log.error(f"[{current_server_name}] Error loading prompts: {capability_results['prompts_error']}")
-
-            log.info(f"[{current_server_name}] Custom SSE handshake and capability loading complete.")
-            return session, initialize_result_obj
-
-        except Exception as e:
-            # Log and re-raise for the main retry loop
-            log.error(f"[{current_server_name}] Error during custom SSE setup/handshake/loading: {e}", exc_info=True)
-            # Ensure exit stack is cleaned up, which should close http client and event source
-            await task_group_exit_stack.aclose()
-            # Close memory streams manually just in case
-            if 'read_stream_writer' in locals() and not read_stream_writer.is_closed: await read_stream_writer.aclose()
-            if 'write_stream_reader' in locals() and not write_stream_reader.is_closed: await write_stream_reader.aclose()
-            raise e
-
-    # Add _connect_sse_server back for the smart wrapper
     async def _connect_sse_server(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[InitializeResult]]:
         """
         Handles the specific logic for connecting, performing the MCP handshake,
@@ -4042,7 +3729,6 @@ class ServerManager:
 
             # --- Step 4: LOAD CAPABILITIES ---
             log.info(f"[{current_server_name}] Loading capabilities after standard handshake (SSE)...")
-            # (Capability loading logic is identical to the one in _connect_sse_server_custom)
             server_capabilities = initialize_result_obj.capabilities if initialize_result_obj else None
             log.debug(f"[{current_server_name}] Received Server Capabilities (Standard SSE): {server_capabilities}")
             capability_results = {}
@@ -4091,64 +3777,16 @@ class ServerManager:
         except (httpx.RequestError, httpx.HTTPStatusError, McpError, asyncio.TimeoutError) as err:
             log.warning(f"[{current_server_name}] Standard SSE connection/handshake failed ({type(err).__name__}): {err}")
             # IMPORTANT: Cleanup is handled by the main exit stack automatically on exception
-            raise err # Re-raise for the smart wrapper or main retry loop
+            raise err
         except Exception as e:
             log.error(f"[{current_server_name}] Unexpected error during standard SSE connection/handshake: {e}", exc_info=True)
             # IMPORTANT: Cleanup is handled by the main exit stack automatically on exception
             raise e # Re-raise
 
-    # Smart wrapper remains the same as provided in the previous response
-    async def _connect_sse_smart(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[InitializeResult]]:
-        """
-        Intelligently attempts to connect to an SSE server, trying the standard
-        method first and falling back to the custom method if a handshake timeout occurs.
-        """
-        session: Optional[ClientSession] = None
-        initialize_result: Optional[InitializeResult] = None
-        is_verbose = log.isEnabledFor(logging.DEBUG) # Check verbosity once
-
-        log.info(f"[{current_server_name}] Smart Connect: Trying standard SSE connection method (Attempt {retry_count + 1})...")
-        try:
-            # Attempt 1: Standard Compliant Method
-            session, initialize_result = await self._connect_sse_server(
-                server_config, current_server_name, retry_count
-            )
-            log.info(f"[{current_server_name}] Smart Connect: Standard method successful.")
-            return session, initialize_result
-
-        except asyncio.TimeoutError as standard_timeout:
-            log.warning(f"[{current_server_name}] Smart Connect: Standard method timed out (likely waiting for InitializeResult via SSE). Trying custom method...")
-            if not is_verbose: log.warning(f"[{current_server_name}] (Timeout detail suppressed in non-verbose mode)")
-            else: log.debug(f"[{current_server_name}] Standard method timeout detail:", exc_info=standard_timeout)
-            # Proceed to fallback
-
-        except (httpx.RequestError, httpx.HTTPStatusError, McpError) as standard_conn_error:
-             log.warning(f"[{current_server_name}] Smart Connect: Standard method failed with connection/protocol error: {standard_conn_error}. Aborting fallback.")
-             raise standard_conn_error
-        except Exception as standard_unexpected_error:
-             log.error(f"[{current_server_name}] Smart Connect: Unexpected error during standard attempt: {standard_unexpected_error}", exc_info=True)
-             raise standard_unexpected_error
-
-        # --- Fallback Attempt: Custom Method ---
-        log.info(f"[{current_server_name}] Smart Connect: Attempting custom SSE connection method...")
-        try:
-            session, initialize_result = await self._connect_sse_server_custom(
-                server_config, current_server_name, retry_count
-            )
-            log.info(f"[{current_server_name}] Smart Connect: Custom method successful.")
-            return session, initialize_result
-
-        except Exception as custom_conn_error:
-            log_func = log.error if is_verbose else log.warning
-            log_func(f"[{current_server_name}] Smart Connect: Custom method also failed: {custom_conn_error}", exc_info=is_verbose)
-            raise custom_conn_error
-
-
-    # connect_to_server remains the same, calling _connect_sse_smart for SSE
     async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
         """
         Connect to a single MCP server (STDIO or SSE) with retry logic.
-        Handles server renaming based on InitializeResult. Uses smart SSE connection.
+        Handles server renaming based on InitializeResult.
         """
         current_server_name = server_config.name
         current_server_config = dataclasses.replace(server_config)
@@ -4189,8 +3827,7 @@ class ServerManager:
                                 current_server_config, current_server_name, retry_count
                             )
                         elif current_server_config.type == ServerType.SSE:
-                            # *** USE THE SMART WRAPPER ***
-                            session, initialize_result_obj = await self._connect_sse_smart(
+                            session, initialize_result_obj = await self._connect_sse_server(
                                 current_server_config, current_server_name, retry_count
                             )
                             process_this_attempt = None # No process for SSE
@@ -4204,7 +3841,6 @@ class ServerManager:
                         # --- Rename Logic ---
                         original_name_before_rename = current_server_name
                         if initialize_result_obj:
-                            # ... (Rename logic remains the same as previous version) ...
                             actual_server_name = None
                             if isinstance(initialize_result_obj, dict): # STDIO (or potentially custom SSE result)
                                 actual_server_name = initialize_result_obj.get("serverInfo", {}).get("name")
