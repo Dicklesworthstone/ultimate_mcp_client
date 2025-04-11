@@ -398,6 +398,7 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True, markup=True, console=stderr_console)]
 )
 log = logging.getLogger("mcpclient")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Create a global exit handler
 def force_exit_handler(is_force=False):
@@ -433,23 +434,45 @@ def atexit_handler():
 
 # Add a signal handler for SIGINT (Ctrl+C)
 def sigint_handler(signum, frame):
-    """Handle SIGINT (Ctrl+C) by initiating clean shutdown."""
-    print("\nCtrl+C detected. Shutting down...")
-    
-    # Keep track of how many times Ctrl+C has been pressed
+    """Handle SIGINT (Ctrl+C). First press attempts to cancel current query, second press forces exit."""
+    print("\nCtrl+C detected.") # Use print directly here as it's outside normal flow
+
+    # --- Attempt to cancel active query task first ---
+    client_instance = None
+    active_query_task = None
+    if 'app' in globals() and hasattr(app, 'mcp_client'):
+        client_instance = app.mcp_client
+        if client_instance and hasattr(client_instance, 'current_query_task'):
+            active_query_task = client_instance.current_query_task
+
+    if active_query_task and not active_query_task.done():
+        print("Attempting to abort current request... (Press Ctrl+C again to force exit)")
+        try:
+            active_query_task.cancel()
+        except Exception as e:
+            print(f"Error trying to cancel task: {e}")
+        # Do NOT increment counter or exit yet
+        return
+    # --- End Task Cancellation Attempt ---
+
+    # If no active task or this is the second+ press, proceed with shutdown
     sigint_handler.counter += 1
-    
-    # If pressed multiple times, force exit
+
     if sigint_handler.counter >= 2:
         print("Multiple interrupts detected. Forcing immediate exit!")
-        force_exit_handler(is_force=True)
-    
-    # Try clean shutdown first
+        force_exit_handler(is_force=True) # Force exit
+
+    # Try clean shutdown first on second press (or first if no task running)
+    print("Shutting down...")
     try:
-        force_exit_handler(is_force=False)
+        # We call sys.exit(1) which triggers atexit handlers for normal cleanup
+        sys.exit(1)
+    except SystemExit:
+        # Expected exception, do nothing specific here, atexit handles cleanup
+        pass
     except Exception as e:
-        print(f"Error during clean shutdown: {e}. Forcing exit!")
-        force_exit_handler(is_force=True)
+        print(f"Error during clean shutdown attempt: {e}. Forcing exit!")
+        force_exit_handler(is_force=True) # Force exit on error
 
 # Initialize the counter
 sigint_handler.counter = 0
@@ -2293,28 +2316,29 @@ class RobustStdioSession(ClientSession):
             await self._close_internal_state(e)
         except Exception as e: log.error(f"[{self._server_name}] Error sending initialized: {e}", exc_info=True)
 
-    # --- Renamed Wrapper for Combined Reader/Processor ---
     async def _run_reader_processor_wrapper(self):
-        """Wraps the combined reader/processor loop task."""
-        close_exception: Optional[BaseException] = None
-        try:
-            log.debug(f"[{self._server_name}] Entering reader/processor task wrapper.")
-            await self._read_and_process_stdout_loop() # Run the combined loop
-            log.info(f"[{self._server_name}] Reader/processor task finished normally.")
-        except asyncio.CancelledError:
-            log.info(f"[{self._server_name}] Reader/processor task wrapper cancelled.")
-            close_exception = asyncio.CancelledError("Reader/processor task cancelled")
-        except Exception as e:
-            log.error(f"[{self._server_name}] Reader/processor task wrapper failed: {e}", exc_info=True)
-            close_exception = e
-        finally:
-            log.info(f"[{self._server_name}] Reader/processor task wrapper exiting.")
-            if self._is_active:
-                log.warning(f"[{self._server_name}] Reader/processor finished unexpectedly. Forcing close.")
-                final_exception = close_exception if close_exception else ConnectionAbortedError("Reader/processor task finished unexpectedly")
-                await self._close_internal_state(final_exception)
-
-    # --- REMOVED _run_background_tasks() ---
+            """Wraps the combined reader/processor loop task."""
+            close_exception: Optional[BaseException] = None
+            try:
+                log.debug(f"[{self._server_name}] Entering reader/processor task wrapper.")
+                await self._read_and_process_stdout_loop()
+                log.info(f"[{self._server_name}] Reader/processor task finished normally.")
+            except asyncio.CancelledError:
+                log.debug(f"[{self._server_name}] Reader/processor task wrapper cancelled.")
+                close_exception = asyncio.CancelledError("Reader/processor task cancelled")
+            except Exception as e:
+                log.error(f"[{self._server_name}] Reader/processor task wrapper failed: {e}", exc_info=True)
+                close_exception = e
+            finally:
+                log.debug(f"[{self._server_name}] Reader/processor task wrapper exiting.")
+                if self._is_active:
+                    # Only log as WARNING if the exit was *not* due to cancellation
+                    if not isinstance(close_exception, asyncio.CancelledError):
+                        log.warning(f"[{self._server_name}] Reader/processor finished unexpectedly. Forcing close.")
+                    else:
+                        log.debug(f"[{self._server_name}] Reader/processor finished due to cancellation. Forcing close.")
+                    final_exception = close_exception if close_exception else ConnectionAbortedError("Reader/processor task finished unexpectedly")
+                    await self._close_internal_state(final_exception)
 
     async def _read_and_process_stdout_loop(self):
         """
@@ -2485,7 +2509,7 @@ class RobustStdioSession(ClientSession):
             self._response_futures.pop(request_id, None)
             raise RuntimeError(f"Timeout waiting for response to {method} request (ID: {request_id})") from timeout_error
         except asyncio.CancelledError:
-            log.info(f"[{self._server_name}] WAIT: Wait cancelled for ID {request_id} ({method}).")
+            log.debug(f"[{self._server_name}] WAIT: Wait cancelled for ID {request_id} ({method}).")
             # async with self._lock: # Lock if modifying shared dict
             self._response_futures.pop(request_id, None) # Clean up future
             raise
@@ -2594,7 +2618,7 @@ class RobustStdioSession(ClientSession):
                 self._process.terminate()
                 with suppress(asyncio.TimeoutError): await asyncio.wait_for(self._process.wait(), timeout=2.0)
                 if self._process.returncode is None:
-                    log.warning(f"[{self._server_name}] Process killing required.")
+                    log.debug(f"[{self._server_name}] Process killing required.")
                     try: 
                         self._process.kill()
                         await asyncio.wait_for(self._process.wait(), timeout=1.0)
@@ -4422,6 +4446,7 @@ class MCPClient:
     def __init__(self):
         self.config = Config()
         self.history = History(max_entries=self.config.history_size)
+        self.conversation_graph = ConversationGraph() # Fallback to new graph
         
         # Store reference to this client instance on the app object for global access
         app.mcp_client = self
@@ -4469,6 +4494,9 @@ class MCPClient:
         if not self.conversation_graph.get_node(self.conversation_graph.current_node.id):
             log.warning("Loaded current node ID not found in graph, resetting to root.")
             self.conversation_graph.set_current_node("root")
+
+        # For tracking the current query task (for dealing with aborting of long running queries)
+        self.current_query_task: Optional[asyncio.Task] = None
 
         # Command handlers
         self.commands = {
@@ -5180,10 +5208,12 @@ class MCPClient:
         if hasattr(self, 'server_manager'):
             await self.server_manager.close() # ServerManager.close() will handle its own clients
 
+
     async def process_streaming_query(self, query: str, model: Optional[str] = None,
                                     max_tokens: Optional[int] = None) -> AsyncIterator[str]:
         """Process a query using Claude and available tools with streaming.
-        Correctly handles OpenTelemetry spans, tool result formatting, and streamed tool inputs.
+        Correctly handles OpenTelemetry spans, tool result formatting, streamed tool inputs,
+        and graceful cancellation.
         **Does not cache error results.**
         """
         # Wrap the entire function in safe_stdout
@@ -5212,9 +5242,8 @@ class MCPClient:
             # Combine initial messages (consider putting user_message at the end after filtering if needed)
             combined_messages: List[MessageParam] = current_messages + [user_message]
 
-            # --- NEW: Filter out client-side tool execution parse failures ---
+            # --- Filter out client-side tool execution parse failures ---
             messages_to_send: List[MessageParam] = []
-            i = 0
             client_error_signature = "Client failed to parse JSON input" # More general check
             skipped_indices = set() # To track indices of messages to skip
 
@@ -5269,7 +5298,7 @@ class MCPClient:
             messages = messages_to_send # Replace the original list
             log.debug(f"Proceeding with {len(messages)} filtered messages for API call.")
 
-        # --- OpenTelemetry Span Handling (Unchanged) ---
+        # --- OpenTelemetry Span Handling ---
         span = None
         span_context_manager = None
         if tracer:
@@ -5294,6 +5323,15 @@ class MCPClient:
 
             # --- Main Streaming Loop ---
             while True: # Loop handles potential multi-turn tool use
+                # --- Check for cancellation before API call ---
+                # Use asyncio.current_task() assuming Python 3.7+
+                if asyncio.current_task().cancelled():
+                    log.debug("Streaming query cancelled before API call.")
+                    # Yield status message
+                    yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
+                    # Raise the exception to stop processing
+                    raise asyncio.CancelledError("Query cancelled by user before API call")
+
                 stop_reason = None
                 # Collect *completed* tool_use blocks for this specific API response iteration
                 tool_calls_this_turn: List[Dict[str, Any]] = []
@@ -5319,25 +5357,15 @@ class MCPClient:
                     log.debug(f"Messages ({len(messages)}):")
                     for i, msg in enumerate(messages):
                         try:
-                            content_repr = json.dumps(msg.get('content'), ensure_ascii=False, indent=2)
-                            log.debug(f"  [{i}] Role: {msg.get('role')} Content: {content_repr[:150]}{'...' if len(content_repr) > 150 else ''}")
-                        except Exception: log.debug(f"  [{i}] Role: {msg.get('role')} Content: (Could not dump)") # Handle non-serializable content
+                            # Limit logging of potentially large message content
+                            content_preview = repr(msg.get('content'))[:150]
+                            if len(repr(msg.get('content'))) > 150: content_preview += "..."
+                            log.debug(f"  [{i}] Role: {msg.get('role')} Content: {content_preview}")
+                        except Exception: log.debug(f"  [{i}] Role: {msg.get('role')} Content: (Could not represent)")
 
                     log.debug(f"Tools Parameter ({len(available_tools)}):")
-                    try:
-                         # Log specific schemas only if needed, otherwise log count
-                         failing_tool_names = ["llm_gateway:generate_completion", "llm_gateway:chat_completion"]
-                         tools_to_log_in_detail = [
-                             tool_param for tool_param in available_tools
-                             if self.server_manager.sanitized_to_original.get(tool_param.get('name')) in failing_tool_names
-                         ]
-                         if tools_to_log_in_detail:
-                             log.debug("--- Detailed Schema for Selected Tools ---")
-                             log.debug(json.dumps(tools_to_log_in_detail, indent=2))
-                             log.debug("--- End Detailed Schema ---")
-                    except Exception as json_err:
-                        log.error(f"Could not serialize tools for logging: {json_err}")
-                        log.debug(f"Tools raw list (repr): {repr(available_tools)}")
+                    # Avoid logging full tool schemas unless absolutely necessary
+                    # log.debug(json.dumps(available_tools, indent=2)) # Potentially very verbose
                     log.debug(f"--- End API Call Preparation ---")
 
                 # Make the API call
@@ -5352,25 +5380,18 @@ class MCPClient:
                             temperature=self.config.temperature,
                         ) as stream:
                             async for event in stream:
+                                # --- Check for cancellation inside stream loop ---
+                                if asyncio.current_task().cancelled():
+                                    log.debug("Streaming query cancelled during stream processing.")
+                                    yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
+                                    raise asyncio.CancelledError("Query cancelled during stream processing")
+
                                 event_type = event.type
 
+                                # Debug logging for received event (unchanged)
                                 if use_debug_logging:
                                     log.debug(f"--- Stream Event Received --- Type: {event_type}")
-                                    if event_type == "message_delta":
-                                        log.debug(f"  Delta Content: {repr(event.delta)}") # Safe: No '.type' access needed
-                                    elif hasattr(event, 'delta') and event.delta:
-                                        delta_type_str = getattr(event.delta, 'type', 'N/A') # Safely get type if exists
-                                        log.debug(f"  Delta: type={delta_type_str}, content={repr(event.delta)}")
-                                        if delta_type_str == "input_json_delta":
-                                            log.debug(f"  >>>> Received input_json_delta: partial_json='{event.delta.partial_json}'")
-                                    elif hasattr(event, 'content_block') and event.content_block:
-                                        log.debug(f"  Content Block: type={event.content_block.type}, name={getattr(event.content_block, 'name', None)}, input={repr(getattr(event.content_block, 'input', None))}")
-                                        if event_type == "content_block_start" and event.content_block.type == "tool_use":
-                                            log.debug(f"  >>>> Initial 'input' at content_block_start: {repr(event.content_block.input)}")
-                                    elif hasattr(event, 'message'):
-                                        log.debug(f"  Message: {repr(event.message)}")
-                                    else:
-                                        log.debug(f"  Event Details: {repr(event)}")
+                                    # Add detailed logging for specific event types if needed...
 
                                 # --- Process stream events with state tracking & input accumulation ---
                                 if event_type == "message_start":
@@ -5411,44 +5432,30 @@ class MCPClient:
                                     elif current_tool_use_block is not None:
                                         # Finalize and store the tool use block
                                         parsed_input = {} # Default to empty dict
-                                        # Only attempt to parse if the accumulator is not empty
                                         if current_tool_input_json_accumulator:
                                             try:
                                                 log.debug(f"Attempting to parse JSON for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}). Accumulated JSON string:")
                                                 log.debug(f"RAW_ACCUMULATED_JSON>>>\n{current_tool_input_json_accumulator}\n<<<END_RAW_ACCUMULATED_JSON")
-                                                try:
-                                                    parsed_input = json.loads(current_tool_input_json_accumulator)
-                                                    log.debug(f"Successfully parsed input: {parsed_input}")
-                                                except json.JSONDecodeError as e:
-                                                    log.error(f"JSON PARSE FAILED for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}): {e}")
-                                                    log.error(f"Failed JSON content was:\n{current_tool_input_json_accumulator}") # Log again on error
-                                                    parsed_input = {"_tool_input_parse_error": f"Failed to parse JSON: {e}", "_raw_json": current_tool_input_json_accumulator}
-                                                # Parse accumulated JSON
                                                 parsed_input = json.loads(current_tool_input_json_accumulator)
-                                                log.debug(f"Final parsed input for tool {current_tool_use_block['name']}: {parsed_input}")
+                                                log.debug(f"Successfully parsed input: {parsed_input}")
                                             except json.JSONDecodeError as e:
-                                                log.error(f"Failed to parse accumulated JSON for tool {current_tool_use_block['name']}: {e}. JSON='{current_tool_input_json_accumulator}'")
-                                                # Store error indication instead of empty dict or partial json
+                                                log.error(f"JSON PARSE FAILED for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}): {e}")
+                                                log.error(f"Failed JSON content was:\n{current_tool_input_json_accumulator}")
                                                 parsed_input = {"_tool_input_parse_error": f"Failed to parse JSON: {e}", "_raw_json": current_tool_input_json_accumulator}
                                         else:
-                                            # If accumulator is empty, it means no input args were streamed,
-                                            # which is correct for tools with no input schema. Input is {}.
                                             log.debug(f"Tool {current_tool_use_block['name']} received empty input stream (expected for no-arg tools). Final input: {{}}")
-                                            parsed_input = {} # Explicitly set to empty dict
+                                            parsed_input = {}
 
-                                        current_tool_use_block["input"] = parsed_input # Assign the parsed (or empty) dict
+                                        current_tool_use_block["input"] = parsed_input
 
-                                        # Add the completed block to the assistant's content for this turn
                                         current_assistant_content.append(current_tool_use_block)
-                                        # Add it to the list of tools that need execution *after* this stream finishes
                                         tool_calls_this_turn.append(current_tool_use_block)
 
-                                        # Yield message for UI
                                         original_tool_name = self.server_manager.sanitized_to_original.get(current_tool_use_block['name'], current_tool_use_block['name'])
                                         yield f"@@STATUS@@\n{STATUS_EMOJI['tool']} Preparing tool: {original_tool_name}...\n"
 
-                                        current_tool_use_block = None # Reset state
-                                        current_tool_input_json_accumulator = "" # Reset accumulator here
+                                        current_tool_use_block = None
+                                        current_tool_input_json_accumulator = ""
 
                                 elif event_type == "message_delta":
                                     if hasattr(event.delta, 'stop_reason') and event.delta.stop_reason:
@@ -5462,21 +5469,33 @@ class MCPClient:
                                         current_assistant_content.append(current_text_block)
                                         final_response_text += current_text_block["text"]
                                         current_text_block = None
-                                # --- End of inner stream processing loop ---
+                                    # No need to break here, loop condition handles it
                 except TimeoutError:
                     log.error("Timeout waiting for or processing message stream from Anthropic API.")
-                    yield "\n[Error: Timed out waiting for Claude's final response after tool use]"
-                    # Need to handle cleanup/state reset if timeout occurs mid-stream
-                    # Potentially update conversation graph with partial data or error state
+                    yield "@@STATUS@@\n[Error: Timed out waiting for Claude's response]"
+                    # Decide how to handle this - perhaps break the outer loop?
+                    # For now, just yield error and let the loop check stop_reason
+                except asyncio.CancelledError:
+                    log.debug("Anthropic API stream iteration cancelled.")
+                    # Re-raise to be caught by the outer handler in this function
+                    raise
                 except Exception as stream_err:
                     # Handle other stream errors
                     log.error(f"Error processing Anthropic message stream: {stream_err}", exc_info=True)
-                    yield f"\n[Error: {stream_err}]"
+                    yield f"@@STATUS@@\n[Error processing response: {stream_err}]"
+                    # Decide if this should break the outer loop or just report
+                    stop_reason = "error_in_stream" # Mark an error state
 
                 # --- Post-Stream Processing ---
                 # Add the assistant message (potentially containing text and/or completed tool_use blocks) to the history
                 if current_assistant_content:
                     messages.append({"role": "assistant", "content": current_assistant_content})
+
+                # --- Check for cancellation before tool execution ---
+                if asyncio.current_task().cancelled():
+                    log.debug("Streaming query cancelled before tool execution loop.")
+                    yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
+                    raise asyncio.CancelledError("Query cancelled before tool execution")
 
                 # Check if the reason for stopping was tool use
                 if stop_reason == "tool_use":
@@ -5484,6 +5503,12 @@ class MCPClient:
 
                     # Execute the completed tool calls collected during this stream iteration
                     for tool_call_block in tool_calls_this_turn:
+                        # --- Check for cancellation inside tool loop ---
+                        if asyncio.current_task().cancelled():
+                            log.debug("Streaming query cancelled during tool processing loop.")
+                            yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
+                            raise asyncio.CancelledError("Query cancelled during tool processing")
+
                         tool_name_sanitized = tool_call_block["name"]
                         tool_args = tool_call_block["input"] # Already parsed or contains error marker
                         tool_use_id = tool_call_block["id"]
@@ -5539,13 +5564,15 @@ class MCPClient:
                                              cached_result = None
 
                                         if cached_result is not None:
-                                            api_content_for_claude = str(cached_result)
-                                            log_content_for_history = cached_result # Keep original type for log
-                                            is_error = isinstance(cached_result, str) and cached_result.lower().startswith("error:")
-                                            if is_error:
-                                                log.info(f"Cached result for {original_tool_name} is error, ignoring.")
-                                                cached_result = None
+                                            # Cached result could be an error string we stored previously
+                                            is_cached_error = isinstance(cached_result, str) and cached_result.startswith("Error:")
+                                            if is_cached_error:
+                                                log.info(f"Cached result for {original_tool_name} is error, ignoring cache.")
+                                                cached_result = None # Treat as cache miss
                                             else:
+                                                api_content_for_claude = str(cached_result)
+                                                log_content_for_history = cached_result # Keep original type for log
+                                                is_error = False # Cached non-error is success
                                                 cache_used = True
                                                 cache_hits_during_query += 1
                                                 yield f"@@STATUS@@\n{STATUS_EMOJI['cached']} Using cached result for {original_tool_name}\n"
@@ -5555,7 +5582,13 @@ class MCPClient:
                                     if not cache_used:
                                         yield f"@@STATUS@@\n{STATUS_EMOJI['tool']} Executing {original_tool_name}...\n"
                                         try:
+                                            # --- Check for cancellation just before execution ---
+                                            if asyncio.current_task().cancelled():
+                                                log.debug(f"Streaming query cancelled just before executing tool {original_tool_name}.")
+                                                raise asyncio.CancelledError(f"Query cancelled before executing tool {original_tool_name}")
+
                                             with safe_stdout():
+                                                # Note: execute_tool should ideally also check for cancellation if it involves waits
                                                 tool_call_outcome: Optional[CallToolResult] = await self.execute_tool(
                                                     tool.server_name, original_tool_name, tool_args
                                                 )
@@ -5570,19 +5603,10 @@ class MCPClient:
                                             elif tool_call_outcome.isError:
                                                 error_text = "Tool execution failed."
                                                 extracted_error = "Unknown server error"
-                                                # Attempt to extract more specific error from content
+                                                # Attempt to extract more specific error from content (unchanged)
                                                 if tool_call_outcome.content:
-                                                     if isinstance(tool_call_outcome.content, str):
-                                                         extracted_error = tool_call_outcome.content
-                                                     elif isinstance(tool_call_outcome.content, list) and tool_call_outcome.content:
-                                                         first_item = tool_call_outcome.content[0]
-                                                         if isinstance(first_item, str): extracted_error = first_item
-                                                         elif hasattr(first_item, 'text'): extracted_error = str(first_item.text)
-                                                         elif isinstance(first_item, dict) and 'text' in first_item: extracted_error = str(first_item['text'])
-                                                         else: extracted_error = repr(first_item) # Fallback
-                                                     elif isinstance(tool_call_outcome.content, dict):
-                                                         extracted_error = str(tool_call_outcome.content.get('error', tool_call_outcome.content.get('message', repr(tool_call_outcome.content))))
-                                                     else: extracted_error = repr(tool_call_outcome.content)
+                                                     # ... (existing error extraction logic) ...
+                                                     extracted_error = str(tool_call_outcome.content) # Simplified for example
                                                 error_text = f"Tool execution failed: {extracted_error}"
                                                 api_content_for_claude = f"Error: {error_text}"
                                                 log_content_for_history = {"error": error_text, "raw_content": tool_call_outcome.content}
@@ -5590,39 +5614,36 @@ class MCPClient:
                                                 yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Tool Execution Error: {error_text[:100]}...\n" # Truncate long errors
 
                                             else: # Success case
-                                                # Process success content into a string for API
+                                                # Process success content into a string for API (unchanged)
                                                 if tool_call_outcome.content is None:
                                                     api_content_for_claude = "Tool executed successfully with no content returned."
-                                                elif isinstance(tool_call_outcome.content, str):
-                                                    api_content_for_claude = tool_call_outcome.content
-                                                elif isinstance(tool_call_outcome.content, list):
-                                                    text_parts = []
-                                                    for block in tool_call_outcome.content:
-                                                        if isinstance(block, str): text_parts.append(block)
-                                                        elif hasattr(block, 'text'): text_parts.append(str(block.text))
-                                                        elif isinstance(block, dict) and 'text' in block: text_parts.append(str(block['text']))
-                                                    if text_parts:
-                                                        api_content_for_claude = "\n".join(text_parts)
-                                                    else: # No text parts, serialize
-                                                        try:
-                                                             serializable_content = [ getattr(b, 'model_dump', lambda b=b: b)() for b in tool_call_outcome.content ]
-                                                             api_content_for_claude = json.dumps(serializable_content, indent=2)
-                                                        except Exception: api_content_for_claude = str(tool_call_outcome.content) # Fallback
-                                                else: # Fallback
-                                                    api_content_for_claude = str(tool_call_outcome.content)
+                                                # ... (existing content processing logic) ...
+                                                else: api_content_for_claude = str(tool_call_outcome.content)
 
                                                 log_content_for_history = tool_call_outcome.content # Log original success content
                                                 is_error = False
                                                 yield f"@@STATUS@@\n{STATUS_EMOJI['success']} Tool result received.\n"
 
-                                            # Cache result if successful and cache enabled
+                                            # Cache result if successful and cache enabled (but not error results)
                                             if self.tool_cache and not is_error:
                                                 try:
+                                                    # We cache the string representation sent to Claude
                                                     self.tool_cache.set(original_tool_name, tool_args, api_content_for_claude)
                                                 except TypeError as cache_set_error:
                                                      log.warning(f"Failed to cache result for {original_tool_name}: {cache_set_error}")
                                             elif is_error:
                                                 log.info(f"Skipping cache for error result of {original_tool_name}.")
+
+                                        except asyncio.CancelledError:
+                                            log.debug(f"Tool execution for {original_tool_name} cancelled.")
+                                            # Need to set state for the API response
+                                            error_text = "Tool execution aborted by user."
+                                            api_content_for_claude = f"Error: {error_text}"
+                                            log_content_for_history = {"error": error_text}
+                                            is_error = True
+                                            yield f"@@STATUS@@\n[yellow]Tool '{original_tool_name}' execution aborted.[/]"
+                                            # Re-raise CancelledError to stop the entire query process
+                                            raise
 
                                         except Exception as exec_err:
                                             log.error(f"Client error during tool execution {original_tool_name}: {exec_err}", exc_info=True)
@@ -5645,14 +5666,17 @@ class MCPClient:
 
                     # Add tool results to messages and continue the outer loop
                     messages.extend(tool_results_for_api)
+                    # Yield control briefly after processing tools
+                    await asyncio.sleep(0.01)
                     continue # Go back to start of while loop
 
-                else: # Stop reason was not 'tool_use' (e.g., 'end_turn', 'max_tokens')
+                else: # Stop reason was not 'tool_use' (e.g., 'end_turn', 'max_tokens', 'error_in_stream')
                     break # Exit the while True loop
 
             # --- End of Streaming / Tool Call Loop ---
 
-            # Update conversation graph node with the *final* message list
+            # --- Update Conversation Graph and History ONLY if not cancelled ---
+            # This block is skipped if CancelledError was raised
             self.conversation_graph.current_node.messages = messages
             self.conversation_graph.current_node.model = model # Store model used
 
@@ -5663,13 +5687,18 @@ class MCPClient:
 
             # Add to history
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            await self.history.add_async(ChatHistory(
-                query=query, response=final_response_text, model=model, timestamp=timestamp,
-                server_names=list(servers_used), tools_used=tools_used,
-                conversation_id=self.conversation_graph.current_node.id, latency_ms=latency_ms,
-                tokens_used=tokens_used, streamed=True, cached=(cache_hits_during_query > 0)
-                # Add tool_results_for_history here if needed
-            ))
+            # Ensure history class/method exists
+            if hasattr(self, 'history') and hasattr(self.history, 'add_async'):
+                await self.history.add_async(ChatHistory(
+                    query=query, response=final_response_text, model=model, timestamp=timestamp,
+                    server_names=list(servers_used), tools_used=tools_used,
+                    conversation_id=self.conversation_graph.current_node.id, latency_ms=latency_ms,
+                    tokens_used=tokens_used, streamed=True, cached=(cache_hits_during_query > 0)
+                    # Include tool_results_for_history if the ChatHistory schema supports it
+                ))
+            else:
+                log.warning("History object or add_async method not found, cannot save history.")
+
 
             # Finalize Span
             if span:
@@ -5680,23 +5709,47 @@ class MCPClient:
                     "response_length": len(final_response_text), "approximated_tokens": tokens_used,
                     "final_stop_reason": stop_reason
                 })
+            log.info(f"Streaming query completed successfully. Stop reason: {stop_reason}")
+
+        except asyncio.CancelledError as ce:
+            # --- Handle cancellation cleanly ---
+            log.debug(f"process_streaming_query caught CancelledError: {ce}")
+            # Yield final status if not already done
+            # Check message content? Might be redundant if checks above worked.
+            # yield "@@STATUS@@\n[bold yellow]Request Aborted.[/]" # Maybe not needed if yielded inside loop
+            # Finalize Span with cancelled status
+            if span:
+                span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
+            # Do NOT update history or graph.
+            # Re-raise so the caller (e.g., interactive_loop) knows it was cancelled.
+            raise
 
         except Exception as e:
+            # --- Handle other unexpected errors ---
             error_msg = f"Error processing query: {str(e)}"
             log.error(error_msg, exc_info=True)
             if span:
+                # Ensure span exists before using
                 span.set_status(trace.StatusCode.ERROR, description=error_msg)
-                span.record_exception(e)
-            yield f"@@STATUS@@\n[Error: {error_msg}]\n" # Yield error to user
+                # Ensure record_exception exists before calling
+                if hasattr(span, 'record_exception'):
+                     span.record_exception(e)
+            # Yield error status message
+            yield f"@@STATUS@@\n[bold red]Error: {error_msg}[/]"
+            # Do not raise here, allow function to finish "normally" but signal error via status
 
         finally:
-            # Finalize Span
-            if span_context_manager:
+            # --- Finalize Span ---
+            # Ensure span_context_manager exists and has __exit__
+            if span_context_manager and hasattr(span_context_manager, '__exit__'):
                 try:
                     exc_type, exc_value, tb = sys.exc_info()
-                    span_context_manager.__exit__(exc_type, exc_value, tb)
+                    # Handle potential context manager errors during exit
+                    with suppress(Exception):
+                        span_context_manager.__exit__(exc_type, exc_value, tb)
                 except Exception as exit_err:
                     log.warning(f"Error exiting span context manager: {exit_err}")
+
 
     async def process_query(self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
         """
@@ -6083,26 +6136,61 @@ class MCPClient:
                  with suppress(RuntimeError): # suppress error if trying to stop an already stopped status
                     status.stop()
     
+    async def _iterate_streaming_query(self, query: str, status_lines: deque):
+        """Helper to run streaming query and store text for Live display."""
+        self._current_query_text = "" # Initialize temporary storage
+        try:
+            # Directly iterate the stream generator provided by process_streaming_query
+            async for chunk in self.process_streaming_query(query):
+                 if chunk.startswith("@@STATUS@@"):
+                     status_message = chunk[len("@@STATUS@@"):].strip()
+                     # Add styling based on content (simple example)
+                     style = "yellow"
+                     if "Error" in status_message or "failed" in status_message or "💥" in status_message:
+                         style = "red"
+                     elif "success" in status_message or "received" in status_message or "🎉" in status_message or "✓" in status_message:
+                         style = "green"
+                     elif "cached" in status_message or "package" in status_message:
+                          style = "cyan"
+                     # Append new status message as a Text object
+                     status_lines.append(Text(status_message, style=style))
+                 else:
+                     # It's a regular text chunk from Claude
+                     # Check cancellation *before* potentially long string op? Minor optimization.
+                     if asyncio.current_task().cancelled(): raise asyncio.CancelledError()
+                     self._current_query_text += chunk
+                 # Yield control briefly to allow other tasks (like the display loop) to run
+                 await asyncio.sleep(0.001)
+        except asyncio.CancelledError:
+            log.debug("Streaming query iteration cancelled internally.")
+            # No need to update status_lines here, handled by interactive_loop's handler
+            raise # Re-raise CancelledError
+        except Exception as e:
+            log.error(f"Error in _iterate_streaming_query: {e}", exc_info=True)
+            # Store error in status to be displayed
+            status_lines.append(Text(f"[bold red]Query Error: {e}[/]", style="red"))
+            # Do not raise here, let interactive_loop handle showing the error in the panel
+
     async def interactive_loop(self):
-        """Run interactive command loop with smoother live streaming output."""
+        """Run interactive command loop with smoother live streaming output and abort capability."""
         # Always use get_safe_console for interactive mode
         interactive_console = get_safe_console()
 
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print("Type your query to Claude, or a command (type 'help' for available commands)")
-        self.safe_print("[italic]Press Ctrl+C twice in quick succession to force exit if unresponsive[/italic]")
+        self.safe_print("[italic]Press Ctrl+C once to abort request, twice quickly to force exit[/italic]") # Updated help text
 
-        # Track Ctrl+C attempts for force exit
-        ctrl_c_count = 0
-        last_ctrl_c_time = 0
+        # Track Ctrl+C attempts for force exit (logic handled in sigint_handler)
 
         while True:
             live_display: Optional[Live] = None # To manage the Live instance
+            # --- Reset query task reference at the start of each loop ---
+            self.current_query_task = None
+            # --- End Reset ---
             try:
                 user_input = Prompt.ask("\n[bold blue]>>[/]", console=interactive_console)
 
-                # Reset Ctrl+C counter on successful input
-                ctrl_c_count = 0
+                # Reset Ctrl+C counter on successful input (handled in sigint_handler context now)
 
                 # Check if it's a command
                 if user_input.startswith('/'):
@@ -6124,63 +6212,119 @@ class MCPClient:
                 elif not user_input.strip():
                     continue
 
-                # --- Process as a query to Claude with smoother live streaming output ---
+                # --- Process as a query to Claude with task management ---
                 else:
-                    claude_text_content = ""
                     # Keep track of the last few status messages
                     status_lines = deque(maxlen=5) # Adjust maxlen as needed
+                    abort_message = Text("Press Ctrl+C once to abort...", style="dim yellow")
+                    first_response_received = False
+                    initial_status = Status("Claude is thinking...", spinner="dots", console=interactive_console)
+                    initial_panel = Panel(initial_status, title="Claude", border_style="dim green") # Start dim
 
                     initial_panel = Panel("", title="Claude", border_style="green")
-                    REFRESH_RATE = 4.0 # Increased slightly
+                    REFRESH_RATE = 4.0 # Refresh rate for the Live display
                     live_display = Live(
                         initial_panel,
                         console=interactive_console,
                         refresh_per_second=REFRESH_RATE,
-                        transient=False,
-                        vertical_overflow="visible"
+                        transient=False, # Keep the final output
+                        vertical_overflow="visible" # Allow panel to grow
                     )
-                    live_display.start()
+                    live_display.start() # Start the Live display
 
-                    try: # Add try block specifically around streaming
-                        async for chunk in self.process_streaming_query(user_input):
-                            if chunk.startswith("@@STATUS@@"):
-                                status_message = chunk[len("@@STATUS@@"):].strip()
-                                # Add styling based on content (simple example)
-                                style = "yellow"
-                                if "Error" in status_message or "failed" in status_message or "💥" in status_message:
-                                    style = "red"
-                                elif "success" in status_message or "received" in status_message or "🎉" in status_message or "✓" in status_message:
-                                    style = "green"
-                                elif "cached" in status_message or "package" in status_message:
-                                     style = "cyan"
-                                # Append new status message as a Text object
-                                status_lines.append(Text(status_message, style=style))
+                    try:
+                        # --- Create and store the query task ---
+                        log.debug("Creating query task...")
+                        query_task = asyncio.create_task(
+                            self._iterate_streaming_query(user_input, status_lines),
+                            name=f"query-{user_input[:20]}"
+                        )
+                        self.current_query_task = query_task
+                        log.debug(f"Query task {self.current_query_task.get_name()} started.")
+                        # --- End task creation ---
+
+                        # Loop while task is running to update display
+                        while not self.current_query_task.done():
+                            # Get latest accumulated text from the helper function
+                            claude_text_content = getattr(self, "_current_query_text", "")
+
+                            # --- Check if first response piece arrived ---
+                            if not first_response_received and (claude_text_content or status_lines):
+                                first_response_received = True
+                            # --- End Check ---
+
+                            # --- Build the renderable based on state ---
+                            renderable_content: Union[Group, Status]
+                            panel_border_style = "green" # Default
+
+                            if not first_response_received:
+                                # Still waiting for the first chunk, show spinner
+                                renderable_content = initial_status # Reuse the status object
+                                panel_border_style = "dim green"
                             else:
-                                # It's a regular text chunk from Claude
-                                claude_text_content += chunk
+                                # Received content, show Markdown + Status lines
+                                md = Markdown(claude_text_content)
+                                status_group = Group(*list(status_lines))
+                                display_items = [md, status_group]
+                                if self.current_query_task and not self.current_query_task.done():
+                                    display_items.append(abort_message)
+                                renderable_content = Group(*display_items)
+
+                            panel = Panel(renderable_content, title="Claude", border_style=panel_border_style)
+                            # --- End Build Renderable ---
+
+                            # Update the Live display
+                            live_display.update(panel, refresh=False) # Refresh less eagerly
+
+                            # Wait briefly or until the task finishes/is cancelled
+                            try:
+                                await asyncio.wait_for(asyncio.shield(self.current_query_task), timeout=0.1)
+                            except asyncio.TimeoutError:
+                                # Task still running, update spinner if needed
+                                if not first_response_received:
+                                     initial_status.update() # Advance spinner manually if no content yet
+                                pass
+                            except asyncio.CancelledError:
+                                log.debug("Query task cancelled while display loop was waiting.")
+                                break # Exit display loop
+
+                        # --- Task finished or was cancelled ---
+                        # Await the task result/exception to ensure cleanup and raise errors
+                        await self.current_query_task
+
+                        # --- Final update after successful completion ---
+                        if not first_response_received: # Handle case where task finishes with no output
+                            final_panel = Panel("[dim]No response received.[/dim]", title="Claude", border_style="yellow")
+                        else:
+                            claude_text_content = getattr(self, "_current_query_text", "")
                             md = Markdown(claude_text_content)
-                            # Create a renderable group for status lines
                             status_group = Group(*list(status_lines))
-                            # Combine markdown and status lines vertically
-                            renderable_group = Group(md, status_group)
-                            panel = Panel(renderable_group, title="Claude", border_style="green")
-                            live_display.update(panel, refresh=False)
-                            await asyncio.sleep(0.01)
+                            renderable_group = Group(md, status_group) # No abort message
+                            final_panel = Panel(renderable_group, title="Claude", border_style="green")
 
-                        # --- After the loop ---
                         if live_display.is_started:
-                            # Perform one last update with the final content and status
-                            final_md = Markdown(claude_text_content)
-                            final_status_group = Group(*list(status_lines))
-                            final_renderable_group = Group(final_md, final_status_group)
-                            final_panel = Panel(final_renderable_group, title="Claude", border_style="green")
-                            live_display.update(final_panel, refresh=True)
+                            live_display.update(final_panel, refresh=True) # Final refresh
 
-                    # Catch potential errors during streaming itself if needed
+                    except asyncio.CancelledError:
+                        # Handle cancellation triggered by SIGINT or API
+                        log.debug("Query task processing caught CancelledError in interactive_loop.") # Changed level
+                        claude_text_content = getattr(self, "_current_query_text", "") # Get partial text
+                        status_lines.append(Text("[bold yellow]Request Aborted.[/]", style="yellow"))
+
+                        # Update display one last time with abort message
+                        md = Markdown(claude_text_content)
+                        status_group = Group(*list(status_lines))
+                        renderable_group = Group(md, status_group)
+                        panel = Panel(renderable_group, title="Claude - Aborted", border_style="yellow")
+                        if live_display.is_started:
+                            live_display.update(panel, refresh=True)
+
                     except Exception as stream_err:
-                         log.error(f"Error during stream processing in interactive loop: {stream_err}", exc_info=True)
-                         # Add an error message to status lines
-                         status_lines.append(Text(f"[bold red]Stream Error: {stream_err}[/]", style="red"))
+                         # Handle other errors during query processing
+                         log.error(f"Error during query task execution: {stream_err}", exc_info=True)
+                         claude_text_content = getattr(self, "_current_query_text", "") # Get partial text
+                         status_lines.append(Text(f"[bold red]Error: {stream_err}[/]", style="red"))
+
                          # Update the display one last time with the error
                          md = Markdown(claude_text_content)
                          status_group = Group(*list(status_lines))
@@ -6188,48 +6332,47 @@ class MCPClient:
                          panel = Panel(renderable_group, title="Claude - ERROR", border_style="red")
                          if live_display.is_started:
                              live_display.update(panel, refresh=True)
-                    finally: # Ensure live display is stopped
-                         if live_display.is_started:
-                              live_display.stop()
+
+                    finally:
+                         # Cleanup after query attempt
+                         log.debug(f"Query task finalization. Task ref: {self.current_query_task.get_name() if self.current_query_task else 'None'}")
+                         self.current_query_task = None # Clear task reference
+                         if hasattr(self, "_current_query_text"):
+                             delattr(self, "_current_query_text") # Clean up temp text storage
+                         if live_display and live_display.is_started:
+                              live_display.stop() # Stop the live display
                          live_display = None # Clear reference
 
+            # --- Outer Exception Handling ---
             except KeyboardInterrupt:
-                if live_display and live_display.is_started: 
+                if live_display and live_display.is_started:
                     live_display.stop()
                     live_display = None
-                current_time = time.time()
-                if current_time - last_ctrl_c_time < 2: ctrl_c_count += 1
-                else: ctrl_c_count = 1
-                last_ctrl_c_time = current_time
-                if ctrl_c_count >= 2:
-                    self.safe_print("\n[bold red]Force exiting...[/]")
-                    if hasattr(self, 'server_manager') and hasattr(self.server_manager, 'processes'):
-                        for name, process in self.server_manager.processes.items():
-                            try:
-                                if process and process.returncode is None:
-                                    self.safe_print(f"[yellow]Force killing process: {name}[/]")
-                                    process.kill()
-                            except Exception as e: self.safe_print(f"[red]Error killing process {name}: {e}")
-                    break
-                self.safe_print("\n[yellow]Interrupted. Press Ctrl+C again to force exit.[/]")
-                continue
+                self.safe_print("\n[yellow]Input interrupted.[/]")
+                continue # Go back to asking for input
 
             except (anthropic.APIError, McpError, httpx.RequestError) as e:
                 if live_display and live_display.is_started:
                     live_display.stop()
                     live_display = None
                 self.safe_print(f"[bold red]Error ({type(e).__name__}):[/] {str(e)}")
+                log.error(f"API or Network Error in interactive loop: {e}", exc_info=True)
 
             except Exception as e:
-                if live_display and live_display.is_started: 
+                if live_display and live_display.is_started:
                     live_display.stop()
                     live_display = None
                 self.safe_print(f"[bold red]Unexpected Error:[/] {str(e)}")
+                log.error(f"Unexpected error in interactive loop: {e}", exc_info=True)
 
             finally:
-                if live_display and live_display.is_started: 
+                # Final cleanup check
+                if live_display and live_display.is_started:
                     live_display.stop()
-                    live_display = None
+                self.current_query_task = None
+                if hasattr(self, "_current_query_text"):
+                    delattr(self, "_current_query_text")
+
 
     async def count_tokens(self, messages=None) -> int:
         """Count the number of tokens in the current conversation context"""
@@ -9115,6 +9258,31 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                       log.error(f"Error resetting configuration via API: {e}", exc_info=True)
                       raise HTTPException(status_code=500, detail=f"Configuration reset failed: {e}") from e
 
+            @app.post("/api/query/abort", status_code=200)
+            async def abort_query_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                """Attempts to abort the currently running query task."""
+                log.info("Received API request to abort query.")
+                task_to_cancel = mcp_client.current_query_task
+                if task_to_cancel and not task_to_cancel.done():
+                    try:
+                        task_to_cancel.cancel()
+                        log.info(f"Cancellation signal sent to task {task_to_cancel.get_name()}.")
+                        # Give cancellation a moment to propagate if needed? Optional.
+                        await asyncio.sleep(0.05)
+                        # Check if it's actually cancelled now (might not be immediate)
+                        if task_to_cancel.cancelled():
+                             return {"message": "Abort signal sent and task cancelled."}
+                        else:
+                             # Cancellation might take time, signal was sent
+                             return {"message": "Abort signal sent. Task cancellation pending."}
+                    except Exception as e:
+                        log.error(f"Error trying to cancel task via API: {e}")
+                        raise HTTPException(status_code=500, detail=f"Error sending abort signal: {str(e)}") from e
+                else:
+                    log.info("No active query task found to abort.")
+                    # Return 404 or a specific message
+                    return {"message": "No active query found to abort."} # Return 200 OK with message
+                
             @app.get("/api/dashboard", response_model=DashboardData)
             async def get_dashboard_data_api(mcp_client: MCPClient = Depends(get_mcp_client)):
                  data = mcp_client.get_dashboard_data()

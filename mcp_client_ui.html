@@ -158,6 +158,18 @@
             width: 6px;
         }
 
+        /* Add left padding to the main content area that contains chat messages */
+        main.flex-1.flex.flex-col.h-full {
+            padding-left: 1rem !important;
+        }
+
+        /* For larger screens, increase padding */
+        @media (min-width: 768px) {
+            main.flex-1.flex.flex-col.h-full {
+                padding-left: 1.5rem !important;
+            }
+        }
+
         .chat-messages::-webkit-scrollbar-track,
         .sidebar ::-webkit-scrollbar-track {
             background: hsl(var(--b2) / 0.5);
@@ -188,6 +200,131 @@
         .tippy-box {
             font-size: 0.8rem;
             max-width: 300px !important;
+        }
+
+        /* Docstring section styling */
+        .docstring-section {
+            margin-bottom: 1.5rem;
+            background-color: hsl(var(--b1));
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid hsl(var(--b3) / 0.5);
+            box-shadow: 0 1px 3px hsla(var(--bc) / 0.1);
+        }
+
+        .docstring-section:last-child {
+            margin-bottom: 0;
+        }
+
+        .docstring-section h4 {
+            color: hsl(var(--p));
+            font-weight: 600;
+            font-size: 1rem;
+            margin-bottom: 0.75rem;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid hsl(var(--b3) / 0.5);
+            padding-bottom: 0.5rem;
+        }
+
+        .docstring-section h4::before {
+            content: '';
+            display: block;
+            width: 4px;
+            height: 1.25rem;
+            margin-right: 0.5rem;
+            background-color: hsl(var(--p));
+            border-radius: 2px;
+        }
+
+        /* Parameter highlighting */
+        .docstring-section .font-mono.text-info {
+            padding: 0.15rem 0.4rem;
+            background-color: hsl(var(--p) / 0.1);
+            border: 1px solid hsl(var(--p) / 0.2);
+            border-radius: 0.25rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: hsl(var(--p));
+        }
+
+        .docstring-section p {
+            line-height: 1.6;
+            font-size: 0.95rem;
+            margin-bottom: 0.75rem;
+        }
+
+        /* Code block improvements */
+        .docstring-section pre {
+            margin: 0.75rem 0;
+            border-radius: 0.5rem;
+            max-height: 300px;
+            overflow-y: auto;
+            background-color: hsl(var(--n) / 0.8) !important;
+            border: 1px solid hsl(var(--n) / 0.3);
+        }
+
+        .docstring-section pre code.hljs {
+            padding: 1rem;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            color: hsl(var(--nc)) !important;
+            background-color: transparent !important;
+        }
+
+        /* Examples section highlighting */
+        .docstring-section p strong:first-child {
+            color: hsl(var(--p));
+            font-weight: 600;
+        }
+
+        /* Improved scrollbars for code blocks */
+        .docstring-section pre::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        .docstring-section pre::-webkit-scrollbar-track {
+            background: hsl(var(--n) / 0.3);
+            border-radius: 0 0 0.5rem 0;
+        }
+
+        .docstring-section pre::-webkit-scrollbar-thumb {
+            background: hsl(var(--p) / 0.5);
+            border-radius: 4px;
+        }
+
+        .docstring-section pre::-webkit-scrollbar-thumb:hover {
+            background: hsl(var(--p) / 0.7);
+        }
+
+        /* Copy button enhancements */
+        .copy-code-btn {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            background-color: hsl(var(--b1) / 0.8);
+            color: hsl(var(--bc) / 0.8);
+            border: 1px solid hsl(var(--b3) / 0.5);
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            cursor: pointer;
+            font-size: 0.75rem;
+            opacity: 0;
+            transition: all 0.2s ease-in-out;
+            z-index: 10;
+            box-shadow: 0 1px 3px hsla(var(--bc) / 0.2);
+        }
+
+        pre:hover .copy-code-btn,
+        .copy-code-btn:focus {
+            opacity: 1;
+        }
+
+        .copy-code-btn:hover {
+            background-color: hsl(var(--p) / 0.1);
+            color: hsl(var(--p));
+            border-color: hsl(var(--p) / 0.3);
         }
 
         /* Chat bubble styling */
@@ -409,6 +546,15 @@
         .chat-image .avatar .w-8 i {
             line-height: 1;
             display: block;
+        }
+
+        .chat-image.avatar i {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translateX(-50%) translateY(-50%);
+            font-size: 1rem;
+            /* Adjust this value if the icons need to be larger or smaller */
         }
 
         /* Tabulator styling */
@@ -1587,7 +1733,7 @@
                                     </template>
                                 </div>
                             </div>
-                            <div class="mt-3" x-show="currentConversationTags.length > 0">
+                            <div class="mt-3" x-show="conversationTags.length > 0">
                                 <h4 class="text-sm font-medium mb-2">Tags for This Conversation</h4>
                                 <div class="space-y-1.5">
                                     <template x-for="tag in conversationTags" :key="tag.id">
@@ -2084,13 +2230,13 @@
                                             'bg-warning text-warning-content': message.content_type === 'tool_result' && message.is_error
                                           }">
                                         <i :class="messageRoleIcon(message.role, message.content_type)"
-                                            class="text-sm"></i>
+                                            class="text-sm m-0 p-0"></i>
                                     </div>
                                 </div>
                                 <div class="chat-image avatar" x-show="message.role === 'user'">
                                     <div
                                         class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
-                                        <i :class="messageRoleIcon(message.role)" class="text-sm"></i>
+                                        <i :class="messageRoleIcon(message.role)" class="text-sm m-0 p-0"></i>
                                     </div>
                                 </div>
 
@@ -2104,8 +2250,8 @@
                                         x-text="formatTimestamp(message.timestamp)"></time>
                                     <!-- Bookmark Toggle Icon -->
                                     <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
-                                        :class="isMessageBookmarked(message.id || index, $store.conversation.currentNodeId) ? 'text-warning opacity-100' : 'text-base-content/30 hover:text-warning/70'"
-                                        @click.stop="toggleBookmark(message.id || index, $store.conversation.currentNodeId)"
+                                        :class="isMessageBookmarked(message.timestamp) ? 'text-warning opacity-100' : 'text-base-content/30 hover:text-warning/70'"
+                                        @click="toggleBookmark(message.timestamp)"
                                         data-tippy-content="Toggle Bookmark"></i>
                                 </div>
 
@@ -2154,7 +2300,7 @@
                                     // Animation handled by shouldAnimate check in bubble
                                     }">
                                     <!-- Bookmark Indicator -->
-                                    <div class="bookmark-indicator" x-show="isMessageBookmarked(message.id || index)">
+                                    <div class="bookmark-indicator" x-show="isMessageBookmarked(message.timestamp)">
                                         <i class="fas fa-bookmark"></i>
                                     </div>
 
@@ -2190,9 +2336,9 @@
                                         <!-- Bookmark Toggle Icon -->
                                         <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
                                             <!-- Add group hover -->
-                                            :class="isMessageBookmarked(message.id || index) ? 'text-warning
+                                            :class="isMessageBookmarked(message.timestamp) ? 'text-warning
                                             opacity-100' : 'text-base-content/30 hover:text-warning/70'"
-                                            @click="toggleBookmark(message.id || index)"
+                                            @click="toggleBookmark(message.timestamp)"
                                             data-tippy-content="Toggle Bookmark"></i>
                                     </div>
 
@@ -2233,7 +2379,7 @@
                         <div class="chat-bubble chat-bubble-secondary animate-pulse"><span
                                 class="loading loading-dots loading-sm"></span></div>
                     </div>
-                    <div x-ref="endofchat" class="h-1"></div> <!-- Scroll target -->
+                    <div x-ref="endofchat" class="h-1 m-0 p-0"></div> <!-- Scroll target -->
 
                 </div> <!-- End virtual-scroll-content -->
             </div> <!-- End chat-messages -->
@@ -2434,21 +2580,21 @@
                 <div class="comparison-branch">
                     <div class="comparison-header">Current Branch</div>
                     <div class="space-y-2">
-                        <template x-for="(message, index) in comparisonMessages.current" :key="index">
+                        <template x-for="(message, index) in branchComparison.current" :key="index">
                             <div class="p-2 rounded" :class="{
-                            'bg-base-200': message.status === 'unchanged',
-                            'bg-success/10 border-success/20 border': message.status === 'added',
-                            'bg-warning/10 border-warning/20 border': message.status === 'changed',
-                            'bg-base-200 opacity-40': message.status === 'missing'
-                        }">
+                                'bg-base-200': message.status === 'unchanged',
+                                'bg-success/10 border-success/20 border': message.status === 'added',
+                                'bg-warning/10 border-warning/20 border': message.status === 'changed',
+                                'bg-base-200 opacity-40': message.status === 'missing'
+                            }">
                                 <div class="flex justify-between text-xs mb-1">
                                     <span x-text="message.role"></span>
                                     <span class="badge badge-xs" :class="{
-                                    'badge-success': message.status === 'added',
-                                    'badge-warning': message.status === 'changed',
-                                    'badge-ghost': message.status === 'unchanged',
-                                    'badge-ghost opacity-40': message.status === 'missing'
-                                }" x-text="message.status"></span>
+                                        'badge-success': message.status === 'added',
+                                        'badge-warning': message.status === 'changed',
+                                        'badge-ghost': message.status === 'unchanged',
+                                        'badge-ghost opacity-40': message.status === 'missing'
+                                    }" x-text="message.status"></span>
                                 </div>
                                 <div class="text-xs line-clamp-3" x-text="message.content"></div>
                             </div>
@@ -2458,21 +2604,21 @@
                 <div class="comparison-branch">
                     <div class="comparison-header">Comparison Branch</div>
                     <div class="space-y-2">
-                        <template x-for="(message, index) in comparisonMessages.comparison" :key="index">
+                        <template x-for="(message, index) in branchComparison.comparison" :key="index">
                             <div class="p-2 rounded" :class="{
-                            'bg-base-200': message.status === 'unchanged',
-                            'bg-success/10 border-success/20 border': message.status === 'added',
-                            'bg-warning/10 border-warning/20 border': message.status === 'changed',
-                            'bg-base-200 opacity-40': message.status === 'missing'
-                        }">
+                                'bg-base-200': message.status === 'unchanged',
+                                'bg-success/10 border-success/20 border': message.status === 'added',
+                                'bg-warning/10 border-warning/20 border': message.status === 'changed',
+                                'bg-base-200 opacity-40': message.status === 'missing'
+                            }">
                                 <div class="flex justify-between text-xs mb-1">
                                     <span x-text="message.role"></span>
                                     <span class="badge badge-xs" :class="{
-                                    'badge-success': message.status === 'added',
-                                    'badge-warning': message.status === 'changed',
-                                    'badge-ghost': message.status === 'unchanged',
-                                    'badge-ghost opacity-40': message.status === 'missing'
-                                }" x-text="message.status"></span>
+                                        'badge-success': message.status === 'added',
+                                        'badge-warning': message.status === 'changed',
+                                        'badge-ghost': message.status === 'unchanged',
+                                        'badge-ghost opacity-40': message.status === 'missing'
+                                    }" x-text="message.status"></span>
                                 </div>
                                 <div class="text-xs line-clamp-3" x-text="message.content"></div>
                             </div>
@@ -2527,10 +2673,10 @@
 
                 <!-- Template List -->
                 <div class="space-y-2 max-h-80 overflow-y-auto" x-show="!showCreateTemplateForm && !editingTemplate">
-                    <div x-show="templates.length === 0" class="text-center p-4 text-base-content/60">
+                    <div x-show="messageTemplates.length === 0" class="text-center p-4 text-base-content/60">
                         No templates found. Create one to get started!
                     </div>
-                    <template x-for="template in templates" :key="template.id">
+                    <template x-for="template in messageTemplates" :key="template.id">
                         <div class="template-item" @click="applyTemplate(template)">
                             <div class="flex justify-between">
                                 <div class="template-name" x-text="template.name"></div>
@@ -2613,16 +2759,16 @@
                     No bookmarks yet. Click the bookmark icon on any message to save it.
                 </div>
                 <div class="space-y-2 max-h-80 overflow-y-auto">
-                    <template x-for="bookmark in bookmarkedMessages" :key="bookmark.id">
+                    <template x-for="bookmark in bookmarkedMessages" :key="bookmark.timestamp + '_' + bookmark.nodeId">
                         <div class="bg-base-200 p-2 rounded hover:bg-base-300 cursor-pointer transition-colors"
                             @click="navigateToBookmark(bookmark)">
                             <div class="flex justify-between items-center text-sm mb-1">
                                 <div>
                                     <span class="badge badge-xs" :class="{
-                                    'badge-primary': bookmark.role === 'user',
-                                    'badge-secondary': bookmark.role === 'assistant',
-                                    'badge-neutral': bookmark.role === 'system'
-                                }" x-text="bookmark.role"></span>
+                                        'badge-primary': bookmark.role === 'user',
+                                        'badge-secondary': bookmark.role === 'assistant',
+                                        'badge-neutral': bookmark.role === 'system'
+                                    }" x-text="bookmark.role"></span>
                                     <span class="text-xs ml-1 opacity-70"
                                         x-text="bookmark.nodeName || 'Unnamed Branch'"></span>
                                 </div>
@@ -2630,7 +2776,7 @@
                                     <span class="text-xs opacity-70"
                                         x-text="formatTimestamp(bookmark.timestamp)"></span>
                                     <button class="btn btn-xs btn-ghost text-error"
-                                        @click.stop="removeBookmark(bookmark.id)">
+                                        @click.stop="removeBookmark(bookmark.timestamp, bookmark.nodeId)">
                                         <i class="fas fa-times"></i>
                                     </button>
                                 </div>
@@ -2649,53 +2795,94 @@
         </form>
     </dialog>
 
+    <!-- Replace your existing toolDetailsModal with this improved version -->
     <dialog id="toolDetailsModal" class="modal" :class="{ 'modal-open': showToolDetailsModal }"
         @keydown.escape.window="showToolDetailsModal = false">
-        <div class="modal-box w-11/12 max-w-2xl bg-base-100">
-            <h3 class="font-bold text-lg mb-2 flex items-center gap-2"><i class="fas fa-info-circle text-info"></i><span
-                    x-text="selectedTool?.name || 'Tool Details'"></span></h3>
-            <p class="text-sm mb-1">Server: <span class="badge badge-ghost" x-text="selectedTool?.server_name"></span>
-            </p>
-            <p class="text-sm mb-4 opacity-80" x-text="selectedTool?.description"></p>
-            <h4 class="font-semibold mb-2">Input Schema:</h4>
-            <div class="bg-base-200 p-3 rounded max-h-60 overflow-y-auto text-xs relative group">
-                <pre><code class="language-json" x-text="JSON.stringify(selectedTool?.input_schema || {}, null, 2)"></code></pre>
-                <button class="copy-code-btn" x-data="{ copied: false }"
-                    @click.stop="copyToClipboard(btoa(JSON.stringify(selectedTool?.input_schema || {}, null, 2))); copied = true; setTimeout(() => copied = false, 1500)">
-                    <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i> <span
-                        x-text="copied ? 'Copied!' : 'Copy'"></span>
-                </button>
+        <div class="modal-box w-11/12 max-w-4xl bg-base-100"> <!-- Increased from max-w-2xl to max-w-4xl -->
+            <h3 class="font-bold text-lg mb-3 flex items-center gap-2">
+                <i class="fas fa-info-circle text-info"></i>
+                <span x-text="selectedTool?.name || 'Tool Details'"></span>
+            </h3>
+
+            <!-- Basic Tool Info (with description removed as requested) -->
+            <div class="mb-4 grid grid-cols-1 gap-y-1 text-sm">
+                <p>
+                    <span class="font-semibold">Server:</span>
+                    <span class="badge badge-ghost" x-text="selectedTool?.server_name"></span>
+                </p>
             </div>
-            <div class="mt-4 border-t border-base-300/50 pt-4">
-                <h4 class="font-semibold mb-2">Execute Tool Directly:</h4>
-                <textarea class="textarea textarea-bordered w-full text-xs font-mono" rows="5"
-                    placeholder='Enter JSON parameters... e.g., {"query": "example"}'
-                    x-model="directToolParams"></textarea>
+
+            <!-- Enhanced Documentation Display -->
+            <div class="mb-4">
+                <h4 class="font-semibold text-sm mb-2 flex items-center gap-1 text-primary">
+                    <i class="fas fa-book"></i> Documentation
+                </h4>
+                <div class="bg-base-200 rounded-md p-4 border border-base-300 max-h-96 overflow-y-auto">
+                    <!-- Increased height from max-h-72 to max-h-96 -->
+                    <!-- Use the new renderDocstring method -->
+                    <div x-html="renderDocstring(selectedTool?.description)"></div>
+                </div>
+            </div>
+
+            <!-- Input Schema -->
+            <div class="mb-4">
+                <h4 class="font-semibold text-sm mb-2 flex items-center gap-1 text-primary">
+                    <i class="fas fa-code"></i> Input Schema
+                </h4>
+                <div
+                    class="bg-base-200 p-4 rounded border border-base-300 max-h-80 overflow-y-auto text-sm relative group">
+                    <!-- Increased from max-h-60 to max-h-80 and text-xs to text-sm -->
+                    <pre><code class="language-json" x-text="JSON.stringify(selectedTool?.input_schema || {}, null, 2)"></code></pre>
+                    <button class="copy-code-btn" x-data="{ copied: false }"
+                        @click.stop="copyToClipboard(btoa(JSON.stringify(selectedTool?.input_schema || {}, null, 2))); copied = true; setTimeout(() => copied = false, 1500)">
+                        <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i>
+                        <span x-text="copied ? 'Copied!' : 'Copy'"></span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Execute Tool Section -->
+            <div class="mt-5 border-t border-base-300 pt-4">
+                <h4 class="font-semibold text-sm mb-2 flex items-center gap-1 text-primary">
+                    <i class="fas fa-play"></i> Execute Tool Directly
+                </h4>
+                <textarea class="textarea textarea-bordered w-full text-sm font-mono" rows="4"
+                    placeholder='Enter JSON parameters... e.g., {"query": "example"}' x-model="directToolParams"
+                    @drop.prevent="handleToolParamsDrop($event)" @dragover.prevent="isDraggingOverToolParams = true"
+                    @dragleave.prevent="isDraggingOverToolParams = false"
+                    :class="{'bg-base-200/50 border-dashed border-2': isDraggingOverToolParams}"></textarea>
                 <button class="btn btn-sm btn-primary mt-2" @click="executeToolDirectly"
                     :disabled="!selectedTool || isLoadingDirectTool" :class="{'loading': isLoadingDirectTool}">
                     <i class="fas fa-play mr-1"></i> Execute
                 </button>
+
+                <!-- Tool Result -->
                 <div x-show="directToolResult || directToolError"
-                    class="mt-2 text-xs bg-base-200 p-3 rounded max-h-40 overflow-y-auto relative group">
-                    <h5 class="font-semibold mb-1" :class="directToolError ? 'text-error' : 'text-success'"
+                    class="mt-3 bg-base-200 p-4 rounded border border-base-300 max-h-60 overflow-y-auto relative group">
+                    <!-- Increased max-h-40 to max-h-60 -->
+                    <h5 class="font-semibold mb-2" :class="directToolError ? 'text-error' : 'text-success'"
                         x-text="directToolError ? 'Error:' : 'Result:'"></h5>
-                    <pre><code class="language-json whitespace-pre-wrap break-all" x-text="directToolError ? directToolError : JSON.stringify(directToolResult?.content, null, 2)"></code></pre>
+                    <pre
+                        class="text-sm"><code class="language-json whitespace-pre-wrap break-all" 
+            x-text="directToolError ? directToolError : JSON.stringify(directToolResult?.content, null, 2)"></code></pre>
+                    <!-- text-xs to text-sm -->
                     <button x-show="!directToolError && directToolResult" class="copy-code-btn"
                         x-data="{ copied: false }"
                         @click.stop="copyToClipboard(btoa(JSON.stringify(directToolResult?.content, null, 2))); copied = true; setTimeout(() => copied = false, 1500)">
-                        <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i> <span
-                            x-text="copied ? 'Copied!' : 'Copy Result'"></span>
+                        <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i>
+                        <span x-text="copied ? 'Copied!' : 'Copy Result'"></span>
                     </button>
                 </div>
             </div>
+
             <div class="modal-action mt-4">
                 <button class="btn btn-ghost" @click="showToolDetailsModal = false">Close</button>
             </div>
         </div>
-        <form method="dialog" class="modal-backdrop"> <button @click="showToolDetailsModal = false">close</button>
+        <form method="dialog" class="modal-backdrop">
+            <button @click="showToolDetailsModal = false">close</button>
         </form>
     </dialog>
-
 
     <!-- Server Details Modal -->
     <dialog id="serverDetailsModal" class="modal" :class="{ 'modal-open': showServerDetailsModal }"
@@ -3864,20 +4051,21 @@
                     return truncatedContent.replace(regex, '<span class="search-result-highlight">$1</span>');
                 },
 
-                checkoutBranchAndScrollToMessage(nodeId, messageId) {
+                checkoutBranchAndScrollToMessage(nodeId, messageTimestamp) {
                     this.checkoutBranch(nodeId).then(() => {
                         this.$nextTick(() => {
                             setTimeout(() => {
-                                const messageEl = document.getElementById(`message-${messageId}`);
-                                if (messageEl) {
-                                    messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                    // Highlight the message temporarily
-                                    messageEl.classList.add('bg-warning/10');
-                                    setTimeout(() => {
-                                        messageEl.classList.remove('bg-warning/10');
-                                    }, 1500);
+                                const message = this.currentConversation.find(m => m.timestamp === messageTimestamp);
+                                if (message) {
+                                    const messageIndex = this.currentConversation.indexOf(message);
+                                    const messageEl = document.getElementById(`message-${message.id || messageIndex}`);
+                                    if (messageEl) {
+                                        messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                        messageEl.classList.add('bg-warning/10');
+                                        setTimeout(() => messageEl.classList.remove('bg-warning/10'), 1500);
+                                    }
                                 }
-                            }, 300); // Small delay to ensure messages are rendered
+                            }, 300); // Delay to ensure rendering
                         });
                     });
                 },
@@ -3952,9 +4140,8 @@
                     }
                 },
 
-
-                toggleBookmark(messageId, nodeId = this.currentNodeId) {
-                    if (!messageId || !nodeId) return;
+                toggleBookmark(messageTimestamp, nodeId = this.currentNodeId) {
+                    if (!messageTimestamp || !nodeId) return;
 
                     // Stop event propagation
                     if (event) {
@@ -3962,38 +4149,32 @@
                         event.preventDefault();
                     }
 
-                    const isBookmarked = this.isMessageBookmarked(messageId, nodeId);
+                    const isBookmarked = this.isMessageBookmarked(messageTimestamp, nodeId);
 
                     if (isBookmarked) {
-                        this.bookmarkedMessages = this.bookmarkedMessages.filter(m => m.id !== messageId || m.nodeId !== nodeId);
+                        this.bookmarkedMessages = this.bookmarkedMessages.filter(m => m.timestamp !== messageTimestamp || m.nodeId !== nodeId);
                         this.addNotification('Message removed from bookmarks', 'info');
                     } else {
-                        const message = this.currentConversation.find(m => m.id === messageId || (m.id === undefined && messageId.toString().includes(m.timestamp)));
+                        const message = this.currentConversation.find(m => m.timestamp === messageTimestamp);
                         if (message) {
-                            // Create a simplified version with essential data
                             const bookmarkData = {
-                                id: message.id || `gen_${Date.now()}`,
+                                timestamp: messageTimestamp,
                                 role: message.role,
                                 content: typeof message.content === 'string' ? message.content : JSON.stringify(message.content),
-                                timestamp: message.timestamp,
                                 nodeId: nodeId,
                                 nodeName: this.conversationNodes.find(n => n.id === nodeId)?.name || 'Unnamed'
                             };
-
                             this.bookmarkedMessages.push(bookmarkData);
                             this.addNotification('Message bookmarked', 'success');
                         }
                     }
 
-                    // Ensure saving happens
-                    this.$nextTick(() => {
-                        this.saveBookmarkedMessages();
-                    });
+                    this.$nextTick(() => this.saveBookmarkedMessages());
                 },
 
-                isMessageBookmarked(messageId, nodeId = this.currentNodeId) {
-                    if (!messageId) return false;
-                    return this.bookmarkedMessages.some(m => m.id === messageId && m.nodeId === nodeId);
+                isMessageBookmarked(messageTimestamp, nodeId = this.currentNodeId) {
+                    if (!messageTimestamp) return false;
+                    return this.bookmarkedMessages.some(m => m.timestamp === messageTimestamp && m.nodeId === nodeId);
                 },
 
                 openMessageBookmarks() {
@@ -4001,19 +4182,19 @@
                 },
 
                 navigateToBookmark(bookmark) {
-                    this.checkoutBranchAndScrollToMessage(bookmark.nodeId, bookmark.id);
+                    this.checkoutBranchAndScrollToMessage(bookmark.nodeId, bookmark.timestamp);
                     this.showBookmarksModal = false;
                 },
 
-                removeBookmark(messageId) {
-                    this.bookmarkedMessages = this.bookmarkedMessages.filter(m => m.id !== messageId);
+                removeBookmark(messageTimestamp, nodeId) {
+                    this.bookmarkedMessages = this.bookmarkedMessages.filter(m => m.timestamp !== messageTimestamp || m.nodeId !== nodeId);
                     this.saveBookmarkedMessages();
                 },
 
                 // Virtual Scrolling
                 updateVirtualScrollHeight() {
                     // Calculate approximate height based on message count and average height
-                    const avgMessageHeight = 150; // Rough estimate in pixels
+                    const avgMessageHeight = 100; // Rough estimate in pixels
                     this.virtualScrollHeight = Math.max(500, this.currentConversation.length * avgMessageHeight);
                 },
 
@@ -5748,8 +5929,451 @@
                 },
 
                 // --- TOOLS ---
+                // Add or update these functions in your Alpine.js component
+                renderDocstring(docstring) {
+                    if (!docstring) return '<div class="text-base-content/50 italic">No documentation available</div>';
+
+                    // Check for common docstring section headers
+                    const sectionHeaders = [
+                        'Description:', 'Args:', 'Arguments:', 'Parameters:',
+                        'Returns:', 'Raises:', 'Exceptions:', 'Example:', 'Examples:',
+                        'Notes:', 'References:', 'See Also:'
+                    ];
+
+                    // Determine if the docstring already has section headers
+                    const hasSections = sectionHeaders.some(header =>
+                        docstring.includes('\n' + header) || docstring.startsWith(header)
+                    );
+
+                    // If no section headers found, wrap everything in a Description section
+                    if (!hasSections) {
+                        return this.renderSections([{ title: 'Description', content: docstring }]);
+                    }
+
+                    // Parse sections - using a more robust approach
+                    const sections = [];
+                    let currentSection = { title: 'Description', content: '' };
+
+                    // Split by lines and process each line
+                    const lines = docstring.split('\n');
+                    let inSectionHeader = false;
+
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i];
+
+                        // Check if this line is a section header
+                        const isHeader = sectionHeaders.some(header =>
+                            line.trim() === header || line.trim().toLowerCase() === header.toLowerCase()
+                        );
+
+                        // Get the section header text if this is a header line
+                        let headerText = '';
+                        if (isHeader) {
+                            headerText = line.trim().replace(/:$/, ''); // Remove trailing colon if present
+                            inSectionHeader = true;
+                        }
+                        // Check if this line looks like a continuation of a header (empty or indented)
+                        else if (inSectionHeader && (line.trim() === '' || line.startsWith('    '))) {
+                            // Skip empty lines after headers or keep the indentation for the first content line
+                            continue;
+                        }
+                        // Otherwise, this line is content for the current section
+                        else {
+                            inSectionHeader = false;
+
+                            // Check for section headers in the standard format "Header:" at the start of a line
+                            const headerMatch = line.match(/^([A-Za-z][A-Za-z\s_]+):$/);
+                            if (headerMatch && sectionHeaders.some(h => h.toLowerCase() === (headerMatch[1].toLowerCase() + ':'))) {
+                                // We found a section header
+
+                                // Save previous section if it has content
+                                if (currentSection.content.trim()) {
+                                    sections.push({ ...currentSection });
+                                }
+
+                                // Start new section
+                                currentSection = {
+                                    title: headerMatch[1],
+                                    content: ''
+                                };
+                                continue;
+                            }
+
+                            // Add to current section
+                            currentSection.content += line + '\n';
+                        }
+
+                        // If we found a header, save the previous section and start a new one
+                        if (isHeader) {
+                            // Save previous section if it has content
+                            if (currentSection.content.trim()) {
+                                sections.push({ ...currentSection });
+                            }
+
+                            // Start new section
+                            currentSection = {
+                                title: headerText.replace(/:$/, ''), // Remove trailing colon if present
+                                content: ''
+                            };
+                        }
+                    }
+
+                    // Add the final section
+                    if (currentSection.content.trim()) {
+                        sections.push(currentSection);
+                    }
+
+                    return this.renderSections(sections);
+                },
+                // Function to render multiple sections
+                renderSections(sections) {
+                    if (!sections || !sections.length) return '';
+
+                    let html = `<div class="space-y-4">`;
+
+                    // Render each section
+                    sections.forEach(section => {
+                        html += `<div class="docstring-section">`;
+                        html += `<h4>${section.title}</h4>`;
+
+                        const content = section.content.trim();
+
+                        // Process the content based on section type
+                        if (section.title.toLowerCase() === 'args' ||
+                            section.title.toLowerCase() === 'arguments' ||
+                            section.title.toLowerCase() === 'parameters') {
+                            // Parameters section gets special formatting
+                            html += this.renderParametersSection(content);
+                        }
+                        else if (section.title.toLowerCase() === 'returns') {
+                            // Returns section
+                            html += this.renderReturnsSection(content);
+                        }
+                        else if (section.title.toLowerCase() === 'raises' ||
+                            section.title.toLowerCase() === 'exceptions') {
+                            // Exceptions section
+                            html += this.renderExceptionsSection(content);
+                        }
+                        else if ((section.title.toLowerCase() === 'example' ||
+                            section.title.toLowerCase() === 'examples') &&
+                            content.includes('```')) {
+                            // Example with code blocks
+                            html += this.renderExamplesSection(content);
+                        }
+                        else {
+                            // Generic section - check if JSON content
+                            if (this.isJsonContent(content)) {
+                                html += this.renderJsonContent(content);
+                            } else {
+                                // Regular text
+                                html += this.renderFormattedText(content);
+                            }
+                        }
+
+                        html += `</div>`;
+                    });
+
+                    html += `</div>`;
+                    return html;
+                },
+
+                // Function to check if content is JSON
+                isJsonContent(content) {
+                    const trimmed = content.trim();
+                    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+                        (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                        try {
+                            JSON.parse(trimmed);
+                            return true;
+                        } catch (e) {
+                            return false;
+                        }
+                    }
+                    return false;
+                },
+
+                // Function to render JSON content
+                renderJsonContent(content) {
+                    try {
+                        const jsonData = JSON.parse(content.trim());
+                        const formattedJson = JSON.stringify(jsonData, null, 2);
+
+                        return `
+        <div class="bg-base-200 rounded-md p-2 relative group">
+            <pre><code class="language-json hljs">${hljs.highlight(formattedJson, { language: 'json', ignoreIllegals: true }).value}</code></pre>
+            <button class="copy-code-btn" x-data="{ copied: false }" 
+                @click.stop="copyToClipboard(btoa(JSON.stringify(${JSON.stringify(formattedJson)})));
+                copied = true; setTimeout(() => copied = false, 1500)">
+                <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i>
+                <span x-text="copied ? 'Copied!' : 'Copy'"></span>
+            </button>
+        </div>`;
+                    } catch (e) {
+                        console.error("JSON parsing error:", e);
+                        return this.renderFormattedText(content);
+                    }
+                },
+
+                // Function to render parameters section with better formatting
+                renderParametersSection(content) {
+                    const lines = content.split('\n');
+                    let html = '<div class="space-y-3">';
+
+                    const paramPattern = /^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(([^)]+)\))?\s*:\s*(.+)$/;
+                    let currentParam = null;
+                    let currentDesc = '';
+
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i].trim();
+                        if (!line) continue;
+
+                        const match = line.match(paramPattern);
+
+                        if (match) {
+                            // Save previous parameter if there was one
+                            if (currentParam) {
+                                html += this.formatParameterItem(currentParam, currentDesc);
+                            }
+
+                            // Start a new parameter
+                            currentParam = {
+                                name: match[1],
+                                type: match[2] || '',
+                                desc: match[3]
+                            };
+                            currentDesc = match[3];
+                        }
+                        else if (currentParam && line.startsWith(' ')) {
+                            // Continuation of the current parameter's description
+                            currentDesc += ' ' + line.trim();
+                        }
+                        else {
+                            // Not a parameter entry or continuation - just render as text
+                            if (currentParam) {
+                                // Save the last parameter first
+                                html += this.formatParameterItem(currentParam, currentDesc);
+                                currentParam = null;
+                            }
+                            html += `<p>${DOMPurify.sanitize(line)}</p>`;
+                        }
+                    }
+
+                    // Add the last parameter if there is one
+                    if (currentParam) {
+                        html += this.formatParameterItem(currentParam, currentDesc);
+                    }
+
+                    html += '</div>';
+                    return html;
+                },
+
+                // Helper to format a parameter list item
+                formatParameterItem(param, description) {
+                    return `
+    <div class="parameter-item mb-3">
+        <div class="flex flex-wrap items-baseline gap-x-2 mb-1">
+            <span class="font-mono text-info">${param.name}</span>
+            ${param.type ? `<span class="text-xs bg-base-300 px-1.5 py-0.5 rounded">${param.type}</span>` : ''}
+        </div>
+        <div class="pl-4 text-base-content/90">${DOMPurify.sanitize(description)}</div>
+    </div>`;
+                },
+
+                // Function to render returns section
+                renderReturnsSection(content) {
+                    // Similar structure to parameters but usually shorter
+                    return `<div>${this.renderFormattedText(content)}</div>`;
+                },
+
+                // Function to render exceptions section
+                renderExceptionsSection(content) {
+                    // Format exception types specially
+                    const exceptionPattern = /^\s*([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*)\s*:/;
+                    const lines = content.split('\n');
+
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i];
+                        const match = line.match(exceptionPattern);
+                        if (match) {
+                            lines[i] = line.replace(match[1], `<span class="font-mono text-error">${match[1]}</span>`);
+                        }
+                    }
+
+                    return `<div>${this.renderFormattedText(lines.join('\n'))}</div>`;
+                },
+
+                // Function to render examples section
+                renderExamplesSection(content) {
+                    // Handle markdown-style code blocks
+                    const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
+                    let html = '';
+                    let lastIndex = 0;
+                    let match;
+
+                    while ((match = codeBlockRegex.exec(content)) !== null) {
+                        // Add text before the code block
+                        if (match.index > lastIndex) {
+                            html += this.renderFormattedText(content.substring(lastIndex, match.index));
+                        }
+
+                        // Get language and code
+                        const language = match[1] || 'python'; // Default to python for code blocks in API docs
+                        const code = match[2];
+
+                        // Add syntax highlighted code block
+                        html += this.renderCodeBlock(code, language);
+
+                        // Update last index
+                        lastIndex = match.index + match[0].length;
+                    }
+
+                    // Add any remaining text after the last code block
+                    if (lastIndex < content.length) {
+                        html += this.renderFormattedText(content.substring(lastIndex));
+                    }
+
+                    return html;
+                },
+
+                // Helper function to render a code block with syntax highlighting
+                renderCodeBlock(code, language) {
+                    try {
+                        const highlightedCode = hljs.highlight(code.trim(), { language, ignoreIllegals: true }).value;
+
+                        return `
+        <div class="bg-base-200 rounded-md p-2 my-2 relative group">
+            <pre><code class="language-${language} hljs">${highlightedCode}</code></pre>
+            <button class="copy-code-btn" x-data="{ copied: false }" 
+                @click.stop="copyToClipboard(btoa(JSON.stringify(${JSON.stringify(code.trim())})));
+                copied = true; setTimeout(() => copied = false, 1500)">
+                <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i>
+                <span x-text="copied ? 'Copied!' : 'Copy'"></span>
+            </button>
+        </div>`;
+                    } catch (e) {
+                        console.error("Code highlighting error:", e);
+                        return `<pre><code>${DOMPurify.sanitize(code)}</code></pre>`;
+                    }
+                },
+
+                // Helper method to render formatted text with parameter highlighting
+                renderFormattedText(text) {
+                    if (!text) return '';
+
+                    // Clean the text
+                    text = text.trim();
+
+                    // Convert parameter references like `param_name` or similar
+                    const backtickParamRegex = /`([a-zA-Z_][a-zA-Z0-9_]*)`/g;
+                    text = text.replace(backtickParamRegex, '<span class="font-mono text-info">$1</span>');
+
+                    // Convert parameter descriptions (name: description format often found in docstrings)
+                    const paramRegex = /^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)/gm;
+                    text = text.replace(paramRegex, '<span class="font-mono text-info">$1</span>: $2');
+
+                    // Split into paragraphs and handle indented code blocks
+                    const lines = text.split('\n');
+                    const paragraphs = [];
+                    let currentParagraph = [];
+                    let inCodeBlock = false;
+                    let codeContent = '';
+
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i];
+                        const isIndented = line.startsWith('    ');
+
+                        // Handle transitions in/out of code blocks
+                        if (!inCodeBlock && isIndented) {
+                            // Start code block
+
+                            // First flush the current paragraph if there is one
+                            if (currentParagraph.length > 0) {
+                                paragraphs.push({ type: 'paragraph', content: currentParagraph.join('\n') });
+                                currentParagraph = [];
+                            }
+
+                            inCodeBlock = true;
+                            codeContent = line.substring(4); // Remove indentation
+                        }
+                        else if (inCodeBlock && !isIndented) {
+                            // End code block
+
+                            // Add the code block to paragraphs
+                            if (codeContent.trim()) {
+                                paragraphs.push({ type: 'code', content: codeContent });
+                            }
+
+                            inCodeBlock = false;
+
+                            // Start a new paragraph with this line
+                            if (line.trim()) {
+                                currentParagraph.push(line);
+                            }
+                        }
+                        else if (inCodeBlock) {
+                            // Continue code block
+                            codeContent += '\n' + (isIndented ? line.substring(4) : line);
+                        }
+                        else {
+                            // Handle paragraph breaks (blank lines)
+                            if (!line.trim() && currentParagraph.length > 0) {
+                                paragraphs.push({ type: 'paragraph', content: currentParagraph.join('\n') });
+                                currentParagraph = [];
+                            }
+                            else if (line.trim()) {
+                                currentParagraph.push(line);
+                            }
+                        }
+                    }
+
+                    // Add any remaining content
+                    if (inCodeBlock && codeContent.trim()) {
+                        paragraphs.push({ type: 'code', content: codeContent });
+                    }
+                    else if (currentParagraph.length > 0) {
+                        paragraphs.push({ type: 'paragraph', content: currentParagraph.join('\n') });
+                    }
+
+                    // Render paragraphs and code blocks
+                    let html = '';
+
+                    paragraphs.forEach(item => {
+                        if (item.type === 'paragraph') {
+                            html += `<p>${DOMPurify.sanitize(item.content)}</p>`;
+                        }
+                        else if (item.type === 'code') {
+                            // Try to detect language
+                            let language = 'python'; // Default to python for indented code in API docs
+
+                            // Try to detect language from content
+                            if (item.content.includes('function') && (item.content.includes('{') || item.content.includes('=>'))) {
+                                language = 'javascript';
+                            }
+                            else if (item.content.includes('class ') || item.content.includes('def ')) {
+                                language = 'python';
+                            }
+
+                            html += this.renderCodeBlock(item.content, language);
+                        }
+                    });
+
+                    return html;
+                },
                 showToolDetails(tool) {
-                    this.selectedTool = tool; this.directToolParams = '{}'; this.directToolResult = null; this.directToolError = null; this.isLoadingDirectTool = false; this.showToolDetailsModal = true;
+                    this.selectedTool = tool;
+                    this.directToolParams = '{}';
+                    this.directToolResult = null;
+                    this.directToolError = null;
+                    this.isLoadingDirectTool = false;
+                    this.showToolDetailsModal = true;
+
+                    // Initialize the highlighting on next tick to ensure content is rendered
+                    this.$nextTick(() => {
+                        // Add a small delay to make sure the content is fully rendered
+                        setTimeout(() => {
+                            this.initHighlighting(document.getElementById('toolDetailsModal'));
+                        }, 100);
+                    });
                 },
                 async executeToolDirectly() {
                     if (!this.selectedTool) return; let params;
