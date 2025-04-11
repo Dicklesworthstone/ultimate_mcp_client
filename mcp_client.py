@@ -7,6 +7,7 @@
 #     "typer>=0.9.0",
 #     "rich>=13.6.0",
 #     "httpx>=0.25.0",
+#     "httpx-sse>=0.4.0",
 #     "pyyaml>=6.0.1",
 #     "python-dotenv>=1.0.0",
 #     "colorama>=0.4.6",
@@ -50,8 +51,10 @@ Key Features:
 - Health Dashboard: Real-time monitoring of servers and tool performance in CLI and Web UI
 - Observability: Comprehensive metrics and tracing
 - Registry Integration: Connect to remote registries to discover servers
-- Local Discovery: Discover MCP servers on your local network via mDNS
-- Context Optimization: Automatic summarization of long conversations
+- Local Discovery (mDNS): Discover MCP servers on your local network via mDNS/Zeroconf.
+- Local Port Scanning: Actively scan a configurable range of local ports to find MCP servers (useful for servers not using mDNS).
+
+Context Optimization: Automatic summarization of long conversations
 - Direct Tool Execution: Run specific tools directly with custom parameters
 - Dynamic Prompting: Apply pre-defined prompt templates to conversations
 - Claude Desktop Integration: Automatically import server configs from Claude desktop
@@ -84,6 +87,8 @@ python mcpclient.py import-conv [FILE_PATH]
 
 # Configuration
 python mcpclient.py config --show
+python mcpclient.py config port-scan enable true
+python mcpclient.py config port-scan range 8000 9000
 
 # Claude Desktop Integration
 # Place a claude_desktop_config.json file in the project root directory
@@ -108,9 +113,19 @@ Interactive mode commands:
 - /dashboard - Open health monitoring dashboard
 - /monitor - Control server monitoring
 - /registry - Manage server registry connections
-- /discover - Discover and connect to MCP servers on local network
+- /discover - Discover and connect to MCP servers on local network (via mDNS and Port Scanning)
 - /optimize - Optimize conversation context through summarization
 - /clear - Clear the conversation context
+- /config - Manage client configuration (API keys, models, discovery methods, port scanning settings, etc.)
+    - /config api-key [KEY] - Set Anthropic API key
+    - /config model [NAME] - Set default AI model
+    - /config max-tokens [NUMBER] - Set default max tokens for generation
+    - /config history-size [NUMBER] - Set number of history entries to keep
+    - /config auto-discover [true|false] - Enable/disable filesystem discovery
+    - /config discovery-path [add|remove|list] [PATH] - Manage filesystem discovery paths
+    - /config port-scan enable [true|false] - Enable/disable local port scanning
+    - /config port-scan range [start] [end] - Set port range for scanning
+    - /config port-scan targets [ip1,ip2,...] - Set IP targets for scanning
 
 Web UI Features:
 --------------
@@ -140,6 +155,7 @@ Version: 1.0.0
 
 import asyncio
 import atexit
+import dataclasses
 import functools
 import hashlib
 import inspect
@@ -165,16 +181,18 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple, Type, Union
+from urllib.parse import urlparse, urljoin
 
 import aiofiles  # For async file operations
 import anthropic
-
 # Additional utilities
 import colorama
 
 # Cache libraries
 import diskcache
 import httpx
+from httpx_sse import aconnect_sse, EventSource
+import mcp.types as types
 
 # Third-party imports
 import psutil
@@ -200,20 +218,30 @@ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 
 # MCP SDK imports
-from mcp import ClientSession
 from mcp.client.sse import sse_client
+from mcp import ClientSession
 from mcp.shared.exceptions import McpError
 from mcp.types import (
     CallToolResult,
     GetPromptResult,
+    InitializeResult,
+    JSONRPCMessage,
+    InitializeRequestParams,
+    InitializedNotification,
+    Implementation,
     ListPromptsResult,
+    ClientCapabilities,
+    ClientNotification,
+    RootsCapability,
     ListResourcesResult,
     ListToolsResult,
+    SamplingCapability,
     ReadResourceResult,
     Resource,
     Tool,
 )
-from mcp.types import Prompt as McpPrompt
+from mcp.types import Prompt as McpPromptType
+import anyio
 
 # Observability
 from opentelemetry import metrics, trace
@@ -953,7 +981,7 @@ class MCPPrompt:
     description: str
     server_name: str
     template: str
-    original_prompt: McpPrompt
+    original_prompt: McpPromptType
     call_count: int = 0
     last_used: datetime = field(default_factory=datetime.now)
 
@@ -1612,7 +1640,13 @@ class Config:
         self.summarization_model: str = "claude-3-7-sonnet-latest"  # Model used for conversation summarization
         self.auto_summarize_threshold: int = 6000  # Auto-summarize when token count exceeds this
         self.max_summarized_tokens: int = 1500  # Target token count after summarization
-        
+        self.enable_port_scanning: bool = True # Enable by default? Or False? Let's start with True.
+        self.port_scan_range_start: int = 8000
+        self.port_scan_range_end: int = 9000 # Scan 1001 ports
+        self.port_scan_concurrency: int = 100 # Max simultaneous probes
+        self.port_scan_timeout: float = 2.5 # Timeout per port probe (seconds)
+        self.port_scan_targets: List[str] = ["127.0.0.1"] # Scan localhost by default
+
         # Use synchronous load for initialization since __init__ can't be async
         self.load()
     
@@ -1638,6 +1672,12 @@ class Config:
             'summarization_model': self.summarization_model,
             'auto_summarize_threshold': self.auto_summarize_threshold,
             'max_summarized_tokens': self.max_summarized_tokens,
+            'enable_port_scanning': self.enable_port_scanning,
+            'port_scan_range_start': self.port_scan_range_start,
+            'port_scan_range_end': self.port_scan_range_end,
+            'port_scan_concurrency': self.port_scan_concurrency,
+            'port_scan_timeout': self.port_scan_timeout,
+            'port_scan_targets': self.port_scan_targets,            
             'servers': {
                 name: {
                     'type': server.type.value,
@@ -1673,33 +1713,49 @@ class Config:
         if not CONFIG_FILE.exists():
             self.save()  # Create default config
             return
-        
+
         try:
             with open(CONFIG_FILE, 'r') as f:
                 config_data = yaml.safe_load(f) or {}
-            
+
             # Update config with loaded values
             for key, value in config_data.items():
                 if key == 'servers':
                     self.servers = {}
                     for server_name, server_data in value.items():
                         server_type = ServerType(server_data.get('type', 'stdio'))
-                        
+
                         # Parse version if available
                         version = None
                         if 'version' in server_data:
                             version_str = server_data['version']
                             if version_str:
-                                version = ServerVersion.from_string(version_str)
-                        
+                                try: # Add try-except for version parsing
+                                    version = ServerVersion.from_string(version_str)
+                                except ValueError:
+                                    log.warning(f"Invalid version string '{version_str}' for server {server_name}, setting version to None.")
+                                    version = None
+
+
                         # Parse metrics if available
                         metrics = ServerMetrics()
                         if 'metrics' in server_data:
                             metrics_data = server_data['metrics']
                             for metric_key, metric_value in metrics_data.items():
                                 if hasattr(metrics, metric_key):
-                                    setattr(metrics, metric_key, metric_value)
-                        
+                                    if metric_key == 'status':
+                                        try:
+                                            # Attempt to convert the loaded string value to the ServerStatus enum
+                                            status_enum = ServerStatus(metric_value)
+                                            setattr(metrics, metric_key, status_enum)
+                                        except ValueError:
+                                            # Handle cases where the loaded status string is invalid
+                                            log.warning(f"Invalid status value '{metric_value}' loaded for server {server_name}, defaulting to UNKNOWN.")
+                                            setattr(metrics, metric_key, ServerStatus.UNKNOWN)
+                                    else:
+                                        # Load other metrics as before
+                                        setattr(metrics, metric_key, metric_value)
+
                         self.servers[server_name] = ServerConfig(
                             name=server_name,
                             type=server_type,
@@ -1714,7 +1770,7 @@ class Config:
                             rating=server_data.get('rating', 5.0),
                             retry_count=server_data.get('retry_count', 3),
                             timeout=server_data.get('timeout', 30.0),
-                            metrics=metrics,
+                            metrics=metrics, # Assign the populated metrics object
                             registry_url=server_data.get('registry_url'),
                             retry_policy=server_data.get('retry_policy', {
                                 "max_attempts": 3,
@@ -1732,18 +1788,75 @@ class Config:
                 else:
                     if hasattr(self, key):
                         setattr(self, key, value)
-            
+
         except FileNotFoundError:
-            # This is expected if the file doesn't exist yet
-            self.save() # Create default config
+            self.save()
             return
         except IOError as e:
             log.error(f"Error reading config file {CONFIG_FILE}: {e}")
         except yaml.YAMLError as e:
             log.error(f"Error parsing config file {CONFIG_FILE}: {e}")
-        # Keep a broad exception for unexpected issues during config parsing/application
-        except Exception as e: 
+        except Exception as e:
             log.error(f"Unexpected error loading config: {e}")
+
+    async def load_async(self):
+        """Load configuration from file asynchronously"""
+        if not CONFIG_FILE.exists():
+            await self.save_async()
+            return
+
+        try:
+            async with aiofiles.open(CONFIG_FILE, 'r') as f:
+                content = await f.read()
+                config_data = yaml.safe_load(content) or {}
+
+            for key, value in config_data.items():
+                if key == 'servers':
+                    self.servers = {}
+                    for server_name, server_data in value.items():
+                        server_type = ServerType(server_data.get('type', 'stdio'))
+                        version = None
+                        if 'version' in server_data:
+                            version_str = server_data['version']
+                            if version_str:
+                                try: version = ServerVersion.from_string(version_str)
+                                except ValueError: version = None # Handle potential parsing errors
+
+                        metrics = ServerMetrics()
+                        if 'metrics' in server_data:
+                            metrics_data = server_data['metrics']
+                            for metric_key, metric_value in metrics_data.items():
+                                if hasattr(metrics, metric_key):
+                                    if metric_key == 'status':
+                                        try:
+                                            status_enum = ServerStatus(metric_value)
+                                            setattr(metrics, metric_key, status_enum)
+                                        except ValueError:
+                                            log.warning(f"Invalid async status value '{metric_value}' for {server_name}, defaulting to UNKNOWN.")
+                                            setattr(metrics, metric_key, ServerStatus.UNKNOWN)
+                                    else:
+                                        setattr(metrics, metric_key, metric_value)
+
+                        self.servers[server_name] = ServerConfig(
+                            name=server_name, type=server_type, path=server_data.get('path', ''),
+                            args=server_data.get('args', []), enabled=server_data.get('enabled', True),
+                            auto_start=server_data.get('auto_start', True), description=server_data.get('description', ''),
+                            trusted=server_data.get('trusted', False), categories=server_data.get('categories', []),
+                            version=version, rating=server_data.get('rating', 5.0), retry_count=server_data.get('retry_count', 3),
+                            timeout=server_data.get('timeout', 30.0), metrics=metrics, registry_url=server_data.get('registry_url'),
+                            retry_policy=server_data.get('retry_policy', {"max_attempts": 3, "backoff_factor": 0.5, "timeout_increment": 5}),
+                            capabilities=server_data.get('capabilities', {"tools": True, "resources": True, "prompts": True})
+                        )
+                elif key == 'cache_ttl_mapping': self.cache_ttl_mapping = value
+                else:
+                    if hasattr(self, key): setattr(self, key, value)
+
+        except FileNotFoundError: 
+            await self.save_async()
+            return
+        except IOError as e: log.error(f"Error reading config async {CONFIG_FILE}: {e}")
+        except yaml.YAMLError as e: log.error(f"Error parsing config async {CONFIG_FILE}: {e}")
+        except Exception as e: log.error(f"Unexpected error loading config async: {e}")
     
     def save(self):
         """Save configuration to file synchronously"""
@@ -1764,84 +1877,6 @@ class Config:
         # Keep broad exception for unexpected saving issues
         except Exception as e: 
             log.error(f"Unexpected error saving config: {e}")
-            
-    async def load_async(self):
-        """Load configuration from file asynchronously"""
-        if not CONFIG_FILE.exists():
-            await self.save_async()  # Create default config
-            return
-        
-        try:
-            async with aiofiles.open(CONFIG_FILE, 'r') as f:
-                content = await f.read()
-                config_data = yaml.safe_load(content) or {}
-            
-            # Update config with loaded values (reuse the same logic)
-            for key, value in config_data.items():
-                if key == 'servers':
-                    self.servers = {}
-                    for server_name, server_data in value.items():
-                        server_type = ServerType(server_data.get('type', 'stdio'))
-                        
-                        # Parse version if available
-                        version = None
-                        if 'version' in server_data:
-                            version_str = server_data['version']
-                            if version_str:
-                                version = ServerVersion.from_string(version_str)
-                        
-                        # Parse metrics if available
-                        metrics = ServerMetrics()
-                        if 'metrics' in server_data:
-                            metrics_data = server_data['metrics']
-                            for metric_key, metric_value in metrics_data.items():
-                                if hasattr(metrics, metric_key):
-                                    setattr(metrics, metric_key, metric_value)
-                        
-                        self.servers[server_name] = ServerConfig(
-                            name=server_name,
-                            type=server_type,
-                            path=server_data.get('path', ''),
-                            args=server_data.get('args', []),
-                            enabled=server_data.get('enabled', True),
-                            auto_start=server_data.get('auto_start', True),
-                            description=server_data.get('description', ''),
-                            trusted=server_data.get('trusted', False),
-                            categories=server_data.get('categories', []),
-                            version=version,
-                            rating=server_data.get('rating', 5.0),
-                            retry_count=server_data.get('retry_count', 3),
-                            timeout=server_data.get('timeout', 30.0),
-                            metrics=metrics,
-                            registry_url=server_data.get('registry_url'),
-                            retry_policy=server_data.get('retry_policy', {
-                                "max_attempts": 3,
-                                "backoff_factor": 0.5,
-                                "timeout_increment": 5
-                            }),
-                            capabilities=server_data.get('capabilities', {
-                                "tools": True,
-                                "resources": True,
-                                "prompts": True
-                            })
-                        )
-                elif key == 'cache_ttl_mapping':
-                    self.cache_ttl_mapping = value
-                else:
-                    if hasattr(self, key):
-                        setattr(self, key, value)
-            
-        except FileNotFoundError:
-            # This is expected if the file doesn't exist yet
-            await self.save_async() # Create default config
-            return
-        except IOError as e:
-            log.error(f"Error reading config file {CONFIG_FILE}: {e}")
-        except yaml.YAMLError as e:
-            log.error(f"Error parsing config file {CONFIG_FILE}: {e}")
-        # Keep a broad exception for unexpected issues during config parsing/application
-        except Exception as e: 
-            log.error(f"Unexpected error loading config: {e}")
     
     async def save_async(self):
         """Save configuration to file asynchronously"""
@@ -2186,7 +2221,7 @@ class RobustStdioSession(ClientSession):
         )
 
     # --- Methods initialize() and send_initialized_notification() remain the same ---
-    async def initialize(self, capabilities: Optional[Dict[str, Any]] = None, response_timeout: float = 10.0) -> Any:
+    async def initialize(self, capabilities: Optional[Dict[str, Any]] = None, response_timeout: float = 60.0) -> Any:
             """Sends the MCP initialize request and waits for the response."""
             log.info(f"[{self._server_name}] Sending initialize request...")
             client_capabilities = capabilities if capabilities is not None else {}
@@ -2433,7 +2468,7 @@ class RobustStdioSession(ClientSession):
 
     # --- ClientSession Methods (list_tools, call_tool, etc.) remain the same ---
     # They use the _send_request method which now relies on the combined reader/processor.
-    async def list_tools(self, response_timeout: float = 10.0) -> ListToolsResult:
+    async def list_tools(self, response_timeout: float = 40.0) -> ListToolsResult:
         log.debug(f"[{self._server_name}] Calling list_tools")
         result = await self._send_request("tools/list", {}, response_timeout=response_timeout) # Correct method name
         try: return ListToolsResult(**result)
@@ -2446,7 +2481,7 @@ class RobustStdioSession(ClientSession):
         try: return CallToolResult(**result)
         except Exception as e: raise RuntimeError(f"Invalid call_tool response format: {e}") from e
 
-    async def list_resources(self, response_timeout: float = 10.0) -> ListResourcesResult:
+    async def list_resources(self, response_timeout: float = 40.0) -> ListResourcesResult:
         log.debug(f"[{self._server_name}] Calling list_resources")
         result = await self._send_request("resources/list", {}, response_timeout=response_timeout) # Correct method name
         try: return ListResourcesResult(**result)
@@ -2459,7 +2494,7 @@ class RobustStdioSession(ClientSession):
         try: return ReadResourceResult(**result)
         except Exception as e: raise RuntimeError(f"Invalid read_resource response format: {e}") from e
 
-    async def list_prompts(self, response_timeout: float = 10.0) -> ListPromptsResult:
+    async def list_prompts(self, response_timeout: float = 40.0) -> ListPromptsResult:
         log.debug(f"[{self._server_name}] Calling list_prompts")
         result = await self._send_request("prompts/list", {}, response_timeout=response_timeout) # Correct method name
         try: return ListPromptsResult(**result)
@@ -2471,7 +2506,6 @@ class RobustStdioSession(ClientSession):
         result = await self._send_request("prompts/get", params, response_timeout=response_timeout)
         try: return GetPromptResult(**result)
         except Exception as e: raise RuntimeError(f"Invalid get_prompt response format: {e}") from e
-
 
     async def _close_internal_state(self, exception: Exception):
         """Closes internal session state."""
@@ -2556,6 +2590,7 @@ class ServerManager:
         self.registered_services: Dict[str, ServiceInfo] = {} # Store zeroconf info
         self._session_tasks: Dict[str, List[asyncio.Task]] = {} # Store tasks per session        
         self.sanitized_to_original = {}  # Maps sanitized name -> original name
+        self._port_scan_client: Optional[httpx.AsyncClient] = None # Client for port scanning
 
     @property
     def tools_by_server(self) -> Dict[str, List[MCPTool]]:
@@ -2713,110 +2748,500 @@ class ServerManager:
         log.info(f"Discovered {len(discovered_mdns)} local network servers via mDNS")
     
     async def _process_discovery_results(self):
-        """Process and display discovery results, prompting user to add servers"""
+        """
+        Process and display discovery results. Prompts user to add servers in interactive mode,
+        otherwise automatically adds all newly discovered servers.
+        """
         # Get all discovered servers from class attributes
         discovered_local = getattr(self, '_discovered_local', [])
         discovered_remote = getattr(self, '_discovered_remote', [])
         discovered_mdns = getattr(self, '_discovered_mdns', [])
-        
-        # Show discoveries to user with clear categorization
-        total_discovered = len(discovered_local) + len(discovered_remote) + len(discovered_mdns)
+        discovered_port_scan = getattr(self, '_discovered_port_scan', [])
+
+        # Get safe console instance
+        safe_console = get_safe_console()
+
+        # --- Display Discoveries (Unchanged) ---
+        total_discovered = len(discovered_local) + len(discovered_remote) + len(discovered_mdns) + len(discovered_port_scan)
         if total_discovered > 0:
-            safe_console = get_safe_console()
             safe_console.print(f"\n[bold green]Discovered {total_discovered} potential MCP servers:[/]")
-            
+
             if discovered_local:
                 safe_console.print("\n[bold blue]Local File System:[/]")
                 for i, (name, path, server_type) in enumerate(discovered_local, 1):
-                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {path}")
-            
+                    # Check if already in config for display purposes
+                    exists = any(s.path == path for s in self.config.servers.values())
+                    status = "[dim](exists)[/]" if exists else ""
+                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {path} {status}")
+
             if discovered_remote:
                 safe_console.print("\n[bold magenta]Remote Registry:[/]")
                 for i, (name, url, server_type, version, categories, rating) in enumerate(discovered_remote, 1):
                     version_str = f"v{version}" if version else "unknown version"
                     categories_str = ", ".join(categories) if categories else "no categories"
-                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - Rating: {rating:.1f}/5.0 - {categories_str}")
-            
+                    exists = any(s.path == url for s in self.config.servers.values())
+                    status = "[dim](exists)[/]" if exists else ""
+                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - Rating: {rating:.1f}/5.0 - {categories_str} {status}")
+
             if discovered_mdns:
                 safe_console.print("\n[bold cyan]Local Network (mDNS):[/]")
                 for i, (name, url, server_type, version, categories, description) in enumerate(discovered_mdns, 1):
                     version_str = f"v{version}" if version else "unknown version"
                     categories_str = ", ".join(categories) if categories else "no categories"
                     desc_str = f" - {description}" if description else ""
-                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - {categories_str}{desc_str}")
+                    exists = any(s.path == url for s in self.config.servers.values())
+                    status = "[dim](exists)[/]" if exists else ""
+                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url} - {version_str} - {categories_str}{desc_str} {status}")
+
+            if discovered_port_scan:
+                safe_console.print("\n[bold yellow]Local Port Scan:[/]")
+                for i, (name, url, server_type, version, categories, description) in enumerate(discovered_port_scan, 1):
+                    desc_str = f" - {description}" if description else ""
+                    exists = any(s.path == url for s in self.config.servers.values())
+                    status = "[dim](exists)[/]" if exists else ""
+                    safe_console.print(f"{i}. [bold]{name}[/] ({server_type}) - {url}{desc_str} {status}")
+
+            # --- Determine Mode (Interactive vs Non-Interactive) ---
+            # Check sys.argv for the interactive flag presence during initial call
+            is_interactive_mode = "--interactive" in sys.argv or "-i" in sys.argv
+
+            servers_added_count = 0
+            added_server_paths = {s.path for s in self.config.servers.values()} # Track paths to avoid duplicates
             
-            # Ask user which ones to add
-            if Confirm.ask("\nAdd discovered servers to configuration?", console=safe_console):
-                # Create selection interface
-                selections = []
-                
-                if discovered_local:
-                    safe_console.print("\n[bold blue]Local File System Servers:[/]")
-                    for i, (name, path, server_type) in enumerate(discovered_local, 1):
-                        if Confirm.ask(f"Add {name} ({path})?", console=safe_console):
-                            selections.append(("local", i-1))
-                
-                if discovered_remote:
-                    safe_console.print("\n[bold magenta]Remote Registry Servers:[/]")
-                    for i, (name, url, server_type, version, categories, rating) in enumerate(discovered_remote, 1):
-                        if Confirm.ask(f"Add {name} ({url})?", console=safe_console):
-                            selections.append(("remote", i-1))
-                
-                if discovered_mdns:
-                    safe_console.print("\n[bold cyan]Local Network Servers:[/]")
-                    for i, (name, url, server_type, version, categories, description) in enumerate(discovered_mdns, 1):
-                        if Confirm.ask(f"Add {name} ({url})?", console=safe_console):
-                            selections.append(("mdns", i-1))
-                
-                # Process selections
-                for source, idx in selections:
-                    if source == "local":
-                        name, path, server_type = discovered_local[idx]
+            if is_interactive_mode:
+                # --- Interactive Mode: Ask user ---
+                if Confirm.ask("\nAdd discovered servers to configuration?", console=safe_console):
+                    # Create selection interface
+                    selections = []
+
+                    if discovered_local:
+                        safe_console.print("\n[bold blue]Local File System Servers:[/]")
+                        for i, (name, path, server_type) in enumerate(discovered_local, 1):
+                            if path not in added_server_paths: # Only ask for non-existing
+                                if Confirm.ask(f"Add {name} ({path})?", default=False, console=safe_console):
+                                    selections.append(("local", i-1))
+                            else:
+                                safe_console.print(f"[dim]Skipping {name} ({path}) - already configured.[/dim]")
+
+
+                    if discovered_remote:
+                        safe_console.print("\n[bold magenta]Remote Registry Servers:[/]")
+                        for i, (name, url, server_type, version, categories, rating) in enumerate(discovered_remote, 1):
+                            if url not in added_server_paths:
+                                if Confirm.ask(f"Add {name} ({url})?", default=False, console=safe_console):
+                                    selections.append(("remote", i-1))
+                            else:
+                                safe_console.print(f"[dim]Skipping {name} ({url}) - already configured.[/dim]")
+
+
+                    if discovered_mdns:
+                        safe_console.print("\n[bold cyan]Local Network Servers:[/]")
+                        for i, (name, url, server_type, version, categories, description) in enumerate(discovered_mdns, 1):
+                            if url not in added_server_paths:
+                                if Confirm.ask(f"Add {name} ({url})?", default=False, console=safe_console):
+                                    selections.append(("mdns", i-1))
+                            else:
+                                safe_console.print(f"[dim]Skipping {name} ({url}) - already configured.[/dim]")
+
+
+                    if discovered_port_scan:
+                        safe_console.print("\n[bold yellow]Port Scan Servers:[/]")
+                        for i, (name, url, server_type, version, categories, description) in enumerate(discovered_port_scan, 1):
+                             if url not in added_server_paths:
+                                if Confirm.ask(f"Add {name} ({url})?", default=False, console=safe_console):
+                                    selections.append(("portscan", i-1))
+                             else:
+                                safe_console.print(f"[dim]Skipping {name} ({url}) - already configured.[/dim]")
+
+                    # Process selections
+                    for source, idx in selections:
+                        if source == "local":
+                            name, path, server_type = discovered_local[idx]
+                            if path not in added_server_paths: # Double check before adding
+                                self.config.servers[name] = ServerConfig(
+                                    name=name, type=ServerType(server_type), path=path,
+                                    enabled=True, auto_start=False, description=f"Discovered {server_type} server"
+                                )
+                                added_server_paths.add(path)
+                                servers_added_count += 1
+                        elif source == "remote":
+                            name, url, server_type, version, categories, rating = discovered_remote[idx]
+                            if url not in added_server_paths:
+                                self.config.servers[name] = ServerConfig(
+                                    name=name, type=ServerType(server_type), path=url,
+                                    enabled=True, auto_start=False, description="Discovered from registry",
+                                    categories=categories, version=version, rating=rating,
+                                    registry_url=self.registry.registry_urls[0] if self.registry and self.registry.registry_urls else None
+                                )
+                                added_server_paths.add(url)
+                                servers_added_count += 1
+                        elif source == "mdns":
+                            name, url, server_type, version, categories, description = discovered_mdns[idx]
+                            if url not in added_server_paths:
+                                self.config.servers[name] = ServerConfig(
+                                    name=name, type=ServerType(server_type), path=url,
+                                    enabled=True, auto_start=False, description=description or "Discovered on local network",
+                                    categories=categories, version=version if version else None
+                                )
+                                added_server_paths.add(url)
+                                servers_added_count += 1
+                        elif source == "portscan":
+                            name, url, server_type, version, categories, description = discovered_port_scan[idx]
+                            if url not in added_server_paths:
+                                self.config.servers[name] = ServerConfig(
+                                    name=name, type=ServerType(server_type), path=url,
+                                    enabled=True, auto_start=False, description=description or f"Discovered via port scan",
+                                )
+                                added_server_paths.add(url)
+                                servers_added_count += 1
+                # --- End Interactive Selection ---
+
+            else:
+                # --- Non-Interactive Mode: Auto-add all new servers ---
+                safe_console.print("\n[yellow]Non-interactive mode: Auto-adding newly discovered servers...[/]")
+                auto_added_list = [] # Keep track of names for logging
+
+                # Auto-add Local
+                for name, path, server_type in discovered_local:
+                    if path not in added_server_paths:
                         self.config.servers[name] = ServerConfig(
-                            name=name,
-                            type=ServerType(server_type),
-                            path=path,
-                            enabled=True,
-                            auto_start=False,  # Default to not auto-starting discovered servers
-                            description=f"Auto-discovered {server_type} server"
+                            name=name, type=ServerType(server_type), path=path,
+                            enabled=True, auto_start=False, description=f"Auto-discovered {server_type} server"
                         )
-                    
-                    elif source == "remote":
-                        name, url, server_type, version, categories, rating = discovered_remote[idx]
+                        added_server_paths.add(path)
+                        servers_added_count += 1
+                        auto_added_list.append(f"{name} (local)")
+
+                # Auto-add Remote
+                for name, url, server_type, version, categories, rating in discovered_remote:
+                     if url not in added_server_paths:
                         self.config.servers[name] = ServerConfig(
-                            name=name,
-                            type=ServerType(server_type),
-                            path=url,
-                            enabled=True,
-                            auto_start=False,
-                            description="Discovered from registry",
-                            categories=categories,
-                            version=version,
-                            rating=rating,
-                            registry_url=self.registry.registry_urls[0]  # Use first registry as source
+                            name=name, type=ServerType(server_type), path=url,
+                            enabled=True, auto_start=False, description="Discovered from registry",
+                            categories=categories, version=version, rating=rating,
+                            registry_url=self.registry.registry_urls[0] if self.registry and self.registry.registry_urls else None
                         )
-                    
-                    elif source == "mdns":
-                        name, url, server_type, version, categories, description = discovered_mdns[idx]
+                        added_server_paths.add(url)
+                        servers_added_count += 1
+                        auto_added_list.append(f"{name} (remote)")
+
+                # Auto-add mDNS
+                for name, url, server_type, version, categories, description in discovered_mdns:
+                     if url not in added_server_paths:
                         self.config.servers[name] = ServerConfig(
-                            name=name,
-                            type=ServerType(server_type),
-                            path=url,
-                            enabled=True,
-                            auto_start=False,
-                            description=description or "Discovered on local network",
-                            categories=categories,
-                            version=version if version else None
+                            name=name, type=ServerType(server_type), path=url,
+                            enabled=True, auto_start=False, description=description or "Discovered on local network",
+                            categories=categories, version=version if version else None
                         )
-                
-                self.config.save()
-                safe_console.print("[green]Selected servers added to configuration[/]")
+                        added_server_paths.add(url)
+                        servers_added_count += 1
+                        auto_added_list.append(f"{name} (mDNS)")
+
+                # Auto-add Port Scan
+                for name, url, server_type, version, categories, description in discovered_port_scan:
+                     if url not in added_server_paths:
+                        self.config.servers[name] = ServerConfig(
+                            name=name, type=ServerType(server_type), path=url,
+                            enabled=True, auto_start=False, description=description or f"Discovered via port scan",
+                        )
+                        added_server_paths.add(url)
+                        servers_added_count += 1
+                        auto_added_list.append(f"{name} (port scan)")
+
+                if auto_added_list:
+                    safe_console.print(f"  Auto-added: {', '.join(auto_added_list)}")
+                else:
+                    safe_console.print("  No new servers to auto-add.")
+            # --- End Non-Interactive Mode ---
+
+            # --- Save configuration if servers were added ---
+            if servers_added_count > 0:
+                await self.config.save_async() # Use async save
+                safe_console.print(f"[green]{servers_added_count} server(s) added to configuration.[/]")
+            elif not is_interactive_mode:
+                # If non-interactive and nothing added, explicitly state it
+                safe_console.print("[yellow]No new servers added (they might already exist).[/]")
+            # If interactive and user declined or selected none, no message needed here
+
         else:
-            safe_console = get_safe_console()
+            # Only print this if no servers were discovered at all
             safe_console.print("[yellow]No new servers discovered.[/]")
 
+    async def _probe_port(self, ip_address: str, port: int, probe_timeout: float, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+        """
+        Attempts to detect an MCP SSE server. First performs a quick TCP check.
+        If TCP port is open, tries GET /sse (streaming), then falls back to POST initialize on /.
+        RETURNS None if TCP port is closed or no MCP pattern is detected via HTTP probes.
+        Logs failures only if USE_VERBOSE_SESSION_LOGGING is True.
+        """
+        # --- Step 1: Quick TCP Pre-check ---
+        tcp_check_timeout = 0.1
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip_address, port),
+                timeout=tcp_check_timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"TCP Port open: {ip_address}:{port}. Proceeding.")
+        except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
+            return None
+        except Exception as e:
+            log.warning(f"Unexpected error during TCP pre-check for {ip_address}:{port}: {e}")
+            return None
+
+        # --- Step 2: HTTP Probes ---
+        base_url = f"http://{ip_address}:{port}"
+        sse_url = f"{base_url}/sse"
+        mcp_server_found = False
+
+        # --- Attempt 2a: GET /sse (Streaming Check) ---
+        try:
+            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probing via streaming GET {sse_url}...")
+            # Use client.stream for finer control
+            async with client.stream("GET", sse_url, timeout=probe_timeout) as response:
+                # Check headers immediately after response starts
+                if response.status_code == 200 and response.headers.get("content-type", "").lower().startswith("text/event-stream"):
+                    log.info(f"MCP SSE Server detected via streaming GET /sse at {sse_url}")
+                    server_name = f"mcp-scan-{ip_address}-{port}-sse"
+                    mcp_server_found = True
+                    # Return success *without reading the body*
+                    return {
+                        "name": server_name, "path": sse_url, "type": ServerType.SSE, "args": [],
+                        "description": f"Auto-discovered SSE server via port scan GET /sse on {ip_address}:{port}", "source": "portscan"
+                    }
+                else: # Log failure reason only if verbose
+                    if USE_VERBOSE_SESSION_LOGGING:
+                        log.debug(f"Probe failed for streaming GET {sse_url} - Status: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
+            # The 'async with' ensures the response (and connection) is closed here
+            
+        # Catch specific timeouts/errors related to establishing the connection or reading *headers*
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as http_err:
+            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probe error for streaming GET {sse_url}: {type(http_err).__name__}")
+        except Exception as e: log.warning(f"Unexpected error probing streaming GET {sse_url}: {e}")
+
+        # --- Attempt 2b: POST initialize ---
+        # Only proceed if GET /sse didn't find an MCP server
+        if not mcp_server_found:
+            initialize_payload = {
+                "jsonrpc": "2.0", "method": "initialize",
+                "params": { "processId": os.getpid(), "clientInfo": {"name": "mcpclient-discover", "version": "1.0.0"}, "capabilities": {}, "protocolVersion": "2025-03-25"},
+                "id": str(uuid.uuid4())
+            }
+            try:
+                if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probing via POST {base_url}...")
+                response = await client.post(base_url, json=initialize_payload, timeout=probe_timeout)
+                if response.status_code == 200:
+                    try:
+                        response_data = response.json()
+                        if (isinstance(response_data, dict) and
+                            response_data.get("jsonrpc") == "2.0" and
+                            str(response_data.get("id")) == initialize_payload["id"] and
+                            ("result" in response_data or "error" in response_data)):
+                            log.info(f"MCP Server detected via POST initialize at {base_url}")
+                            server_name = f"mcp-scan-{ip_address}-{port}-base"
+                            mcp_server_found = True
+                            return {
+                                "name": server_name, "path": base_url, "type": ServerType.SSE, "args": [],
+                                "description": f"Auto-discovered SSE server via port scan POST initialize on {ip_address}:{port}", "source": "portscan"
+                            }
+                        else:
+                            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Non-MCP JSON response from POST {base_url}: {str(response_data)[:100]}...")
+                    except json.JSONDecodeError:
+                         if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Non-JSON response at POST {base_url}")
+                    except Exception as parse_err:
+                         if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Error parsing response from POST {base_url}: {parse_err}")
+                else:
+                    if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probe failed for POST {base_url} - Status: {response.status_code}")
+            except (httpx.TimeoutException, httpx.RequestError) as http_err:
+                if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probe error for POST {base_url}: {type(http_err).__name__}")
+            except Exception as e: log.warning(f"Unexpected error probing POST {base_url}: {e}")
+
+        # --- No MCP Server Detected ---
+        if USE_VERBOSE_SESSION_LOGGING and not mcp_server_found:
+             # This log now means TCP open, but GET /sse failed headers check AND POST initialize failed check
+             log.debug(f"TCP Port {ip_address}:{port} open, but no MCP pattern detected.")
+        return None
+
+    async def _discover_port_scan(self):
+        """Scan configured local IP addresses and port ranges for MCP servers."""
+        if not self.config.enable_port_scanning:
+            log.info("Port scanning discovery disabled by configuration.")
+            self._discovered_port_scan = []
+            return
+
+        start_port = self.config.port_scan_range_start
+        end_port = self.config.port_scan_range_end
+        concurrency = self.config.port_scan_concurrency
+        probe_timeout = self.config.port_scan_timeout
+        targets = self.config.port_scan_targets
+
+        # --- Sanity check parameters ---
+        if start_port > end_port:
+            log.error(f"Invalid port range: start ({start_port}) > end ({end_port}). Skipping scan.")
+            self._discovered_port_scan = []
+            return
+        if concurrency <= 0:
+            log.warning(f"Port scan concurrency set to {concurrency}. Using default 1000.")
+            concurrency = 1000
+        if probe_timeout <= 0:
+            log.warning(f"Port scan timeout set to {probe_timeout}. Using default 0.5s.")
+            probe_timeout = 0.5
+
+        # *** ADDED: Explicit check of the verbose flag ***
+        log.info(f"Starting port scan. USE_VERBOSE_SESSION_LOGGING = {USE_VERBOSE_SESSION_LOGGING}")
+        # *** END ADDED ***
+
+        log.info(f"Scanning ports [{start_port}-{end_port}] on {targets} (Concurrency: {concurrency}, Timeout: {probe_timeout}s)...")
+
+        discovered_servers_to_add = []
+        semaphore = asyncio.Semaphore(concurrency)
+        tasks = []
+        http_client = None
+        httpx_logger = logging.getLogger("httpx")
+        original_httpx_level = httpx_logger.level
+
+        # Synchronous callback
+        def release_semaphore_callback(task: asyncio.Task, sem: asyncio.Semaphore, port: int, ip: str):
+            """Synchronous callback to release the semaphore."""
+            try:
+                # Minimal logging in callback unless verbose
+                if USE_VERBOSE_SESSION_LOGGING:
+                    try:
+                        task_exception = task.exception()
+                        if task_exception and not isinstance(task_exception, (httpx.ConnectError, httpx.TimeoutException, httpx.ReadTimeout, ConnectionRefusedError, asyncio.TimeoutError)):
+                             log.debug(f"Probe task {ip}:{port} finished with error: {task_exception}")
+                    except asyncio.CancelledError: pass
+                    except Exception: pass # Ignore errors checking exception itself
+                sem.release()
+            except Exception as e:
+                log.error(f"CRITICAL Error releasing semaphore in callback for {ip}:{port}: {e}")
+
+        try:
+            # Temporarily silence httpx logs
+            log.debug(f"Temporarily setting httpx log level to WARNING (was {logging.getLevelName(original_httpx_level)})")
+            httpx_logger.setLevel(logging.WARNING)
+
+            # Setup shared HTTP client
+            client_timeout = httpx.Timeout(probe_timeout + 0.5, connect=probe_timeout)
+            http_client = httpx.AsyncClient(
+                 verify=False,
+                 timeout=client_timeout,
+                 limits=httpx.Limits(max_connections=concurrency + 10, max_keepalive_connections=50)
+             )
+
+            total_ports_to_scan = (end_port - start_port + 1) * len(targets)
+            log.info(f"Preparing to scan {total_ports_to_scan} total IP:Port combinations.")
+
+            for ip_target in targets:
+                for port in range(start_port, end_port + 1):
+                    await semaphore.acquire()
+                    # Calls the revised _probe_port
+                    probe_task = asyncio.create_task(
+                        self._probe_port(ip_target, port, probe_timeout, http_client),
+                        name=f"probe-{ip_target}-{port}"
+                    )
+                    probe_task.add_done_callback(
+                        functools.partial(release_semaphore_callback, sem=semaphore, port=port, ip=ip_target)
+                    )
+                    tasks.append(probe_task)
+
+            log.info(f"Launched {len(tasks)} scanning tasks. Waiting for completion...")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            log.info("All scanning tasks completed.")
+
+        except Exception as gather_err:
+            log.error(f"Error during port scan task creation/gathering: {gather_err}", exc_info=True)
+            for task in tasks:
+                if not task.done(): task.cancel()
+            results = []
+
+        finally:
+            # Restore original httpx log level
+            log.debug(f"Restoring httpx log level to {logging.getLevelName(original_httpx_level)}")
+            httpx_logger.setLevel(original_httpx_level)
+
+            # Close client
+            if http_client:
+                log.debug("Closing shared HTTP client...")
+                try:
+                    await http_client.aclose()
+                    log.debug("HTTP client closed.")
+                except Exception as close_err:
+                    log.warning(f"Error closing port scan HTTP client: {close_err}")
+
+            # Robust semaphore release & Code Style Fix
+            released_in_finally = 0
+            try:
+                if hasattr(semaphore, '_value'):
+                    initial_value = concurrency
+                    current_value = semaphore._value
+                    while current_value < initial_value:
+                        try:
+                            semaphore.release()
+                            released_in_finally += 1
+                            current_value += 1
+                        except (ValueError, RuntimeError):
+                            # Stop if over-released or other error
+                            break
+                else:
+                    # Fallback if internal value not accessible
+                    for _ in range(concurrency):
+                        try:
+                            if semaphore.locked():
+                                semaphore.release()
+                                released_in_finally += 1
+                            else:
+                                # Stop if it's not locked anymore
+                                break
+                        except (ValueError, RuntimeError):
+                            # Stop if over-released or other error
+                            break
+                if released_in_finally > 0:
+                    log.debug(f"Released semaphore {released_in_finally} times in finally block.")
+            except Exception as final_sem_err:
+                log.error(f"Unexpected error during final semaphore cleanup: {final_sem_err}")
+
+
+        # Process results
+        mcp_endpoints_found = 0
+        if results:
+            for result in results:
+                if isinstance(result, dict):
+                    mcp_endpoints_found += 1
+                    server_path = result.get("path")
+                    server_name_discovered = result.get("name", "UNKNOWN")
+                    existing_config_entry = next((s for s in self.config.servers.values() if s.path == server_path), None)
+
+                    if server_path and not existing_config_entry:
+                         discovered_servers_to_add.append((
+                             server_name_discovered, server_path, result["type"].value,
+                             result.get("version"), result.get("categories", []), result.get("description", "")
+                         ))
+                    elif existing_config_entry:
+                         # This log now only appears if an MCP server is found *and* it's already configured
+                         log.info(f"Detected configured server {existing_config_entry.name} at {server_path} during scan (skipped adding).")
+                    elif not server_path:
+                         log.warning(f"Detected MCP server ({server_name_discovered}) but path missing in result.")
+
+                elif isinstance(result, Exception):
+                     # Minimal logging for common/expected errors unless verbose
+                     if not isinstance(result, (httpx.ConnectError, httpx.TimeoutException, httpx.ReadTimeout, asyncio.CancelledError, ConnectionRefusedError, asyncio.TimeoutError)):
+                         log.warning(f"Port probe task failed with unexpected exception: {result}")
+                     # Explicitly check the flag here for the debug log
+                     elif USE_VERBOSE_SESSION_LOGGING:
+                         log.debug(f"Port probe task failed with expected exception: {type(result).__name__}")
+        else:
+             log.warning("Port scan results list is empty or None.")
+
+        # Store results
+        self._discovered_port_scan = discovered_servers_to_add
+
+        # Log summary
+        log.info(f"Port scan complete. Detected {mcp_endpoints_found} responsive MCP endpoints. Found {len(self._discovered_port_scan)} servers not already in config.")
+
     async def discover_servers(self):
-        """Auto-discover MCP servers in configured paths and from registry"""
+        """Auto-discover MCP servers via filesystem, registry, mDNS, and port scanning."""
         steps = []
         descriptions = []
         
@@ -2835,6 +3260,11 @@ class ServerManager:
             steps.append(self._discover_mdns_servers)
             descriptions.append(f"{STATUS_EMOJI['search']} Discovering local network servers...")
         
+        # Add port scanning step if enabled
+        if self.config.enable_port_scanning:
+            steps.append(self._discover_port_scan) # Add the new method
+            descriptions.append(f"{STATUS_EMOJI['search']} Scanning local ports [{self.config.port_scan_range_start}-{self.config.port_scan_range_end}]...")
+
         # Run the discovery steps with progress tracking
         if steps:
             await self.run_multi_step_task(
@@ -3046,530 +3476,871 @@ class ServerManager:
                 items_skipped += 1
         log.info(f"[{server_name}] Processed {items_added} {item_type_name}s ({items_skipped} skipped).")
 
+    async def _connect_stdio_server(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[Dict[str, Any]], Optional[asyncio.subprocess.Process], None]:
+        """
+        Handles STDIO connection, handshake, and capability loading.
+        Uses async file opening for stderr redirection to a file descriptor.
+        Includes explicit initialized notification and uses default capability timeouts.
+        """
+        session: Optional[ClientSession] = None
+        initialize_result_obj: Optional[Dict[str, Any]] = None
+        process_this_attempt: Optional[asyncio.subprocess.Process] = None
+        BUFFER_LIMIT = 2**22 # 4 MiB
+
+        # === Process Start/Restart Logic ===
+        existing_process = self.processes.get(current_server_name)
+        restart_process = False
+        process_to_use: Optional[asyncio.subprocess.Process] = None
+
+        # --- Decide if process needs restart ---
+        if existing_process:
+            if existing_process.returncode is None:
+                if retry_count > 0: # Only restart on retries
+                    log.warning(f"Restarting process for {current_server_name} on retry {retry_count}")
+                    self._safe_printer(f"[yellow]Restarting process for {current_server_name} on retry {retry_count}[/]")
+                    restart_process = True
+                    await self.terminate_process(current_server_name, existing_process)
+                    if current_server_name in self.registered_services: await self.unregister_local_server(current_server_name)
+                else: # First attempt, reuse existing process
+                    log.debug(f"Found existing process for {current_server_name} (PID {existing_process.pid}), will attempt connection.")
+                    process_to_use = existing_process
+            else: # Process existed but already terminated
+                log.warning(f"Previously managed process for {current_server_name} has exited with code {existing_process.returncode}. Cleaning up entry.")
+                self._safe_printer(f"[yellow]Previous process for {current_server_name} exited (code {existing_process.returncode}). Starting new one.[/]")
+                restart_process = True
+                if current_server_name in self.registered_services: await self.unregister_local_server(current_server_name)
+                if current_server_name in self.processes: del self.processes[current_server_name]
+        else: # No existing process found
+            restart_process = True
+
+        log_file_handle = None # Initialize file handle variable outside try
+        try:
+            if restart_process:
+                executable = server_config.path
+                current_args = server_config.args
+                log_file_path = (CONFIG_DIR / f"{current_server_name}_stderr.log").resolve()
+                log_file_path.parent.mkdir(parents=True, exist_ok=True)
+                log.info(f"Executing STDIO server '{current_server_name}': Executable='{executable}', Args={current_args}")
+                log.info(f"Stderr for {current_server_name} will be redirected to -> {log_file_path}")
+
+                process: Optional[asyncio.subprocess.Process] = None
+                is_shell_cmd = (
+                    isinstance(executable, str) and
+                    any(executable.endswith(shell) for shell in ["bash", "sh", "zsh"]) and
+                    len(current_args) == 2 and
+                    current_args[0] == "-c" and
+                    isinstance(current_args[1], str)
+                )
+
+                # *** Open file asynchronously to get the FD, manage closure manually ***
+                log_file_handle = await aiofiles.open(log_file_path, "ab")
+                stderr_fileno = log_file_handle.fileno() # Get integer file descriptor
+
+                try:
+                    if is_shell_cmd:
+                        command_string = current_args[1]
+                        self._safe_printer(f"[cyan]Starting server process (shell: {executable}): {command_string[:100]}...[/]")
+                        process = await asyncio.create_subprocess_shell(
+                            command_string, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                            stderr=stderr_fileno, # Pass integer FD
+                            limit=BUFFER_LIMIT, env=os.environ.copy(), executable=executable
+                        )
+                    else:
+                        final_cmd_list = [executable] + current_args
+                        self._safe_printer(f"[cyan]Starting server process: {' '.join(map(str, final_cmd_list))}[/]")
+                        process = await asyncio.create_subprocess_exec(
+                            *final_cmd_list, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                            stderr=stderr_fileno, # Pass integer FD
+                            limit=BUFFER_LIMIT, env=os.environ.copy()
+                        )
+
+                    process_this_attempt = process
+                    self.processes[current_server_name] = process
+                    log.info(f"Started process for {current_server_name} with PID {process.pid}")
+
+                    await asyncio.sleep(0.5) # Allow process startup
+                    if process.returncode is not None:
+                        log.error(f"Process {current_server_name} failed immediately (code {process.returncode}). Log: {log_file_path}")
+                        raise RuntimeError(f"Process for {current_server_name} failed immediately (code {process.returncode}). Check log '{log_file_path}'.")
+                    process_to_use = process
+
+                except FileNotFoundError as fnf_err:
+                    log.error(f"Executable/Shell not found for {current_server_name}: {executable}. Error: {fnf_err}")
+                    raise
+                except Exception as proc_start_err:
+                    log.error(f"Error starting process for {current_server_name}: {proc_start_err}", exc_info=True)
+                    raise
+                # REMOVED: No separate stderr reader task needed
+
+            # === Session Creation ===
+            if not process_to_use or process_to_use.returncode is not None:
+                raise RuntimeError(f"Process for STDIO server {current_server_name} is invalid or has exited.")
+
+            log.info(f"[{current_server_name}] Initializing RobustStdioSession...")
+            session = RobustStdioSession(process_to_use, current_server_name)
+            # REMOVED: Linking stderr task
+
+            # === Handshake AND Capability Loading ===
+            log.info(f"[{current_server_name}] Attempting MCP handshake: initialize...")
+            init_timeout = server_config.timeout + 5.0
+            initialize_result_obj = await asyncio.wait_for(
+                session.initialize(response_timeout=server_config.timeout),
+                timeout=init_timeout
+            )
+            log.info(f"[{current_server_name}] Initialize successful. Server reported: {initialize_result_obj.get('serverInfo')}")
+
+            # === EXPLICIT Initialized Notification ===
+            log.info(f"[{current_server_name}] Sending EXPLICIT initialized notification...")
+            await session.send_initialized_notification()
+            log.info(f"[{current_server_name}] Explicit initialized notification sent.")
+
+            # --- Extract capabilities ---
+            server_capabilities = None
+            if isinstance(initialize_result_obj, dict):
+                server_capabilities = initialize_result_obj.get("capabilities")
+
+            # === LOAD CAPABILITIES IMMEDIATELY (Using Default 10s Timeout) ===
+            log.info(f"[{current_server_name}] Loading capabilities immediately...")
+            outer_capability_timeout = server_config.timeout + 15.0 # Overall wait limit
+
+            # --- List/Load Tools ---
+            has_tools_capability = isinstance(server_capabilities, dict) and "tools" in server_capabilities
+            if has_tools_capability:
+                log.info(f"[{current_server_name}] Loading tools (using default 10s request timeout)...")
+                try:
+                    list_tools_result: ListToolsResult = await asyncio.wait_for(
+                        session.list_tools(), # Uses default 10s timeout internally
+                        timeout=outer_capability_timeout
+                    )
+                    if list_tools_result and hasattr(list_tools_result, 'tools'):
+                        self._process_list_result(current_server_name, list_tools_result.tools, self.tools, MCPTool, "tool")
+                    else: log.warning(f"[{current_server_name}] Invalid ListToolsResult.")
+                except asyncio.TimeoutError:
+                    log.error(f"[{current_server_name}] Outer timeout ({outer_capability_timeout}s) waiting for list_tools response.")
+                except RuntimeError as e:
+                    log.error(f"[{current_server_name}] RuntimeError loading tools: {e}")
+                except Exception as e: log.error(f"[{current_server_name}] Error loading tools: {e}", exc_info=True)
+            else:
+                log.info(f"[{current_server_name}] Server does not advertise 'tools' capability.")
+
+            # --- List/Load Resources ---
+            has_resources_capability = isinstance(server_capabilities, dict) and "resources" in server_capabilities
+            if has_resources_capability and hasattr(session, 'list_resources'):
+                log.info(f"[{current_server_name}] Loading resources (using default 10s request timeout)...")
+                try:
+                    list_resources_result: ListResourcesResult = await asyncio.wait_for(
+                        session.list_resources(), # Uses default 10s timeout internally
+                        timeout=outer_capability_timeout
+                    )
+                    if list_resources_result and hasattr(list_resources_result, 'resources'):
+                        self._process_list_result(current_server_name, list_resources_result.resources, self.resources, MCPResource, "resource")
+                    else: log.warning(f"[{current_server_name}] Invalid ListResourcesResult.")
+                except asyncio.TimeoutError: log.error(f"[{current_server_name}] Outer timeout loading resources.")
+                except RuntimeError as e: log.error(f"[{current_server_name}] RuntimeError loading resources: {e}")
+                except Exception as e: log.error(f"[{current_server_name}] Error loading resources: {e}", exc_info=True)
+            else:
+                log.info(f"[{current_server_name}] Server does not advertise 'resources' capability.")
+
+            # --- List/Load Prompts ---
+            has_prompts_capability = isinstance(server_capabilities, dict) and "prompts" in server_capabilities
+            if has_prompts_capability and hasattr(session, 'list_prompts'):
+                log.info(f"[{current_server_name}] Loading prompts (using default 10s request timeout)...")
+                try:
+                    list_prompts_result: ListPromptsResult = await asyncio.wait_for(
+                        session.list_prompts(), # Uses default 10s timeout internally
+                        timeout=outer_capability_timeout
+                    )
+                    if list_prompts_result and hasattr(list_prompts_result, 'prompts'):
+                        self._process_list_result(current_server_name, list_prompts_result.prompts, self.prompts, MCPPrompt, "prompt")
+                    else: log.warning(f"[{current_server_name}] Invalid ListPromptsResult.")
+                except asyncio.TimeoutError: log.error(f"[{current_server_name}] Outer timeout loading prompts.")
+                except RuntimeError as e: log.error(f"[{current_server_name}] RuntimeError loading prompts: {e}")
+                except Exception as e: log.error(f"[{current_server_name}] Error loading prompts: {e}", exc_info=True)
+            else:
+                log.info(f"[{current_server_name}] Server does not advertise 'prompts' capability.")
+
+            log.info(f"[{current_server_name}] MCP handshake and capability loading complete inside helper.")
+            # Return session, result, the process created, and None for the removed task
+            # The file handle log_file_handle will be closed by the finally block
+            return session, initialize_result_obj, process_this_attempt, None
+
+        except Exception as setup_or_load_err:
+            log.error(f"[{current_server_name}] Failed setup/handshake/loading in helper ({type(setup_or_load_err).__name__}): {setup_or_load_err}", exc_info=True)
+            if session and hasattr(session, 'aclose'):
+                with suppress(Exception): await session.aclose()
+            # Process termination is handled by the outer connect_to_server's error handling for process_this_attempt
+            raise setup_or_load_err
+        finally:
+            # Ensure the log file handle is closed if it was opened
+            if log_file_handle:
+                try:
+                    await log_file_handle.close()
+                    log.debug(f"Closed stderr log file handle for {current_server_name}")
+                except Exception as close_err:
+                    log.error(f"Error closing stderr log file handle for {current_server_name}: {close_err}")
+
+    async def _connect_sse_server_custom(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[InitializeResult]]:
+        """
+        Handles SSE connection: establishes persistent SSE stream first, then
+        performs manual handshake POST, and uses custom stream handlers.
+        """
+        initialize_result_obj: Optional[InitializeResult] = None
+        session: Optional[ClientSession] = None
+        task_group_exit_stack = AsyncExitStack()
+        background_http_client: Optional[httpx.AsyncClient] = None # For POST writer
+        sse_event_source: Optional[EventSource] = None # Keep persistent connection
+
+        connect_url = server_config.path
+        parsed_connect_url = urlparse(connect_url)
+        if not parsed_connect_url.scheme:
+            connect_url = f"http://{connect_url}"
+            log.debug(f"[{current_server_name}] Prepended http scheme: {connect_url}")
+
+        sse_stream_url = connect_url # URL for the persistent GET stream
+        post_url_to_use: Optional[str] = None # Session-specific POST URL
+
+        # Define timeouts
+        connect_timeout = server_config.timeout if server_config.timeout > 0 else 15.0 # Slightly longer connect default
+        read_timeout = (server_config.timeout * 2) if server_config.timeout > 0 else 30.0
+        # Handshake timeout needs to cover GET + endpoint wait + POST
+        handshake_timeout = (connect_timeout + read_timeout + 5.0)
+        capability_load_timeout = (server_config.timeout * 2) + 20.0 if server_config.timeout > 0 else 40.0
+        outer_wait_timeout = capability_load_timeout + 10.0
+
+        log.debug(f"[{current_server_name}] SSE Timeouts: Connect={connect_timeout}s, Read={read_timeout}s, Handshake={handshake_timeout}s, Caps={capability_load_timeout}s")
+
+        try:
+            # --- Step 1: Establish Persistent SSE Connection & Get Session URL ---
+            log.debug(f"[{current_server_name}] Establishing persistent GET {sse_stream_url} connection...")
+            # Use a separate client just for the initial persistent connection setup
+            sse_connect_client = httpx.AsyncClient(timeout=handshake_timeout)
+            try:
+                # We need to keep the event_source alive, so don't use 'async with' here yet.
+                # Enter the client context into the exit stack for later cleanup.
+                await task_group_exit_stack.enter_async_context(sse_connect_client)
+
+                sse_event_source = await aconnect_sse(
+                    sse_connect_client, "GET", sse_stream_url,
+                    timeout=httpx.Timeout(connect_timeout, read=read_timeout) # Standard timeouts for connect/read
+                )
+                # Ensure event source is cleaned up if function fails later
+                task_group_exit_stack.push_async_callback(sse_event_source.aclose)
+
+                log.debug(f"[{current_server_name}] Checking initial SSE connection status...")
+                sse_event_source.response.raise_for_status() # Check connection status
+                log.info(f"[{current_server_name}] Persistent SSE GET connection established. Waiting for endpoint...")
+
+                # Wait for the endpoint event with a timeout
+                async with asyncio.timeout(read_timeout + 2.0): # Timeout for getting the endpoint event
+                    async for sse in sse_event_source.aiter_sse():
+                        if sse.event == "endpoint":
+                            potential_url = urljoin(connect_url, sse.data)
+                            log.info(f"[{current_server_name}] Received potential session POST URL: {potential_url}")
+                            if urlparse(connect_url).netloc == urlparse(potential_url).netloc and 'sessionId=' in potential_url:
+                                post_url_to_use = potential_url
+                                log.info(f"[{current_server_name}] Using session POST URL: {post_url_to_use}")
+                                break # Got the URL
+                            else: log.warning(f"[{current_server_name}] Endpoint origin/format mismatch: {potential_url}")
+                        # Keep listening briefly if other events arrive first
+                    else:
+                        # Loop finished without finding endpoint
+                        raise RuntimeError("Did not receive valid 'endpoint' event from server.")
+
+            except (httpx.RequestError, httpx.HTTPStatusError, asyncio.TimeoutError, RuntimeError) as conn_err:
+                log.error(f"[{current_server_name}] Failed to establish persistent SSE connection or get endpoint event: {conn_err}")
+                raise conn_err # Re-raise to outer handler
+
+            # --- MUST have the session URL now ---
+            if not post_url_to_use:
+                 raise RuntimeError("Failed to obtain session-specific POST URL, cannot proceed.")
+
+            # --- Step 2: Send initialize POST manually to the SESSION URL ---
+            # (No retry needed now, as the session should be firmly registered by the server)
+            handshake_id = f"init-handshake-sess-{retry_count}-{uuid.uuid4().hex[:8]}"
+            initialize_payload_params = InitializeRequestParams(
+                protocolVersion=types.LATEST_PROTOCOL_VERSION,
+                capabilities=ClientCapabilities(sampling=SamplingCapability(), roots=RootsCapability(listChanged=True)),
+                clientInfo=Implementation(name="ultimate-mcp-client", version="1.0.0")
+            )
+            initialize_json = { "jsonrpc": "2.0", "method": "initialize", "params": initialize_payload_params.model_dump(mode='json', by_alias=True, exclude_none=True), "id": handshake_id }
+            log.debug(f"[{current_server_name}] Sending manual POST initialize (ID: {handshake_id}) to SESSION URL: {post_url_to_use}...")
+
+            # Use a short-lived client just for this single POST
+            post_client = httpx.AsyncClient(timeout=handshake_timeout)
+            try:
+                response = await post_client.post(post_url_to_use, json=initialize_json)
+                log.info(f"[{current_server_name}] Manual POST initialize response status: {response.status_code}")
+
+                if response.status_code == 200:
+                    try:
+                        init_result_data = response.json()
+                        if isinstance(init_result_data, dict) and init_result_data.get("id") == handshake_id and "result" in init_result_data:
+                            initialize_result_obj = InitializeResult.model_validate(init_result_data["result"])
+                            log.info(f"[{current_server_name}] Successfully parsed InitializeResult from POST.")
+                        else: raise ValueError("Invalid/mismatched InitializeResult JSON structure from POST.")
+                    except (json.JSONDecodeError, ValidationError) as parse_err:
+                         log.error(f"[{current_server_name}] Failed parsing/validating InitializeResult from POST 200 OK: {parse_err}")
+                         raise ValueError(f"Failed parsing InitializeResult: {parse_err}") from parse_err
+                elif response.status_code == 202:
+                     raise RuntimeError("Server accepted initialize but did not return result (Status 202). Cannot proceed.")
+                else: response.raise_for_status() # Raise other errors
+            finally:
+                await post_client.aclose()
+
+            if not initialize_result_obj: # Should be caught above
+                raise RuntimeError("Did not receive a valid InitializeResult from manual handshake.")
+
+            # --- Step 3: Manual Stream Creation ---
+            buffer_size = 0 # Infinite buffer
+            read_stream_writer, read_stream = anyio.create_memory_object_stream[JSONRPCMessage | Exception](buffer_size)
+            write_stream, write_stream_reader = anyio.create_memory_object_stream[JSONRPCMessage](buffer_size)
+            log.debug(f"[{current_server_name}] Manually created memory streams (Buffer: {buffer_size}) (Custom).")
+
+            # --- Step 4: Task Group and Custom Stream Handlers ---
+            background_http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect_timeout, read=read_timeout*5))
+            task_group_exit_stack.push_async_callback(background_http_client.aclose) # Ensure closure
+
+            # --- Custom SSE Reader Task (Uses existing sse_event_source) ---
+            async def custom_sse_reader_task(evt_src: EventSource):
+                nonlocal sse_event_source # Allow modification if needed
+                log.debug(f"[{current_server_name}] Starting custom SSE reader task using existing connection...")
+                try:
+                    async for sse in evt_src.aiter_sse(): # Iterate the existing source
+                        if sse.event == "message":
+                            try:
+                                message = JSONRPCMessage.model_validate_json(sse.data)
+                                if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{current_server_name}] Custom SSE reader received message: {message.model_dump(exclude_none=True, warnings=False)}")
+                                await read_stream_writer.send(message)
+                            except (ValidationError, json.JSONDecodeError) as e:
+                                log.error(f"[{current_server_name}] Error parsing SSE message: {e}. Data: {sse.data[:100]}...")
+                                with suppress(Exception): await read_stream_writer.send(e)
+                            except Exception as e:
+                                log.error(f"[{current_server_name}] Unexpected error processing/sending SSE message: {e}", exc_info=True)
+                                with suppress(Exception): await read_stream_writer.send(e)
+                        # Ignore other events like 'endpoint'
+                    log.info(f"[{current_server_name}] Custom SSE reader loop finished (server closed stream?).")
+                except httpx.StreamError as stream_err:
+                     log.warning(f"[{current_server_name}] SSE stream error in reader task: {stream_err}")
+                     with suppress(Exception): await read_stream_writer.send(stream_err)
+                except asyncio.CancelledError:
+                    log.info(f"[{current_server_name}] Custom SSE reader task cancelled.")
+                    raise # Propagate cancellation
+                except Exception as e:
+                    log.error(f"[{current_server_name}] Unexpected error in custom SSE reader task: {e}", exc_info=True)
+                    with suppress(Exception): await read_stream_writer.send(e)
+                finally:
+                    log.info(f"[{current_server_name}] Custom SSE reader task finished.")
+                    # Don't close the event source here, exit stack handles it
+                    if not read_stream_writer.is_closed: await read_stream_writer.aclose()
+
+
+            # --- Custom POST Writer/Response Reader Task (Uses session URL) ---
+            # (POST Writer logic remains the same as last correct version)
+            async def custom_post_writer_task():
+                nonlocal post_url_to_use # Use the session URL determined earlier
+                log.debug(f"[{current_server_name}] Starting custom POST writer task for SESSION URL: {post_url_to_use}...")
+                post_rw_timeout = capability_load_timeout + 5.0
+                post_timeout_httpx = httpx.Timeout(connect_timeout, write=post_rw_timeout, read=post_rw_timeout)
+                try:
+                    async for message in write_stream_reader:
+                        if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{current_server_name}] Custom POST writer sending to SESSION: {message.model_dump(exclude_none=True, warnings=False)}")
+                        try:
+                            response = await background_http_client.post(
+                                post_url_to_use, # POST to the session URL
+                                json=message.model_dump(mode="json", by_alias=True, exclude_none=True),
+                                timeout=post_timeout_httpx
+                            )
+                            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{current_server_name}] Custom POST response status: {response.status_code}")
+
+                            if response.status_code == 200 and response.headers.get('content-type','').lower().startswith('application/json'):
+                                try:
+                                    response_data = response.json()
+                                    if isinstance(response_data, dict) and response_data.get('jsonrpc') == '2.0' and 'id' in response_data:
+                                        rpc_response_msg = JSONRPCMessage.model_validate(response_data)
+                                        if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{current_server_name}] Custom POST writer received response body: {rpc_response_msg.model_dump(exclude_none=True, warnings=False)}")
+                                        await read_stream_writer.send(rpc_response_msg)
+                                    else:
+                                        log.debug(f"[{current_server_name}] Custom POST writer received non-RPC JSON: {str(response_data)[:100]}...")
+                                except (ValidationError, json.JSONDecodeError) as e:
+                                    log.error(f"[{current_server_name}] Error parsing/validating POST response: {e}. Body: {response.text[:100]}...")
+                                    with suppress(Exception): await read_stream_writer.send(e)
+                                except Exception as e:
+                                     log.error(f"[{current_server_name}] Unexpected error processing POST response body: {e}", exc_info=True)
+                                     with suppress(Exception): await read_stream_writer.send(e)
+                            elif response.status_code >= 400:
+                                try: response.raise_for_status()
+                                except httpx.HTTPStatusError as http_error:
+                                    log.error(f"[{current_server_name}] Custom POST writer HTTP error: {http_error}")
+                                    with suppress(Exception): await read_stream_writer.send(http_error)
+                        except httpx.RequestError as e:
+                            log.error(f"[{current_server_name}] Custom POST writer network error: {e}")
+                            with suppress(Exception): await read_stream_writer.send(e)
+                            break
+                        except asyncio.CancelledError: log.info(f"[{current_server_name}] Custom POST writer task cancelled during send/recv."); raise
+                        except Exception as e:
+                            log.error(f"[{current_server_name}] Unexpected error in custom POST writer send/recv: {e}", exc_info=True)
+                            with suppress(Exception): await read_stream_writer.send(e)
+                except asyncio.CancelledError: log.info(f"[{current_server_name}] Custom POST writer task cancelled."); raise
+                except Exception as e:
+                    log.error(f"[{current_server_name}] Unexpected error in custom POST writer loop: {e}", exc_info=True)
+                    if not read_stream_writer.is_closed: 
+                        with suppress(Exception): 
+                            await read_stream_writer.send(e)
+                finally:
+                    log.info(f"[{current_server_name}] Custom POST writer task finished.")
+                    if not write_stream_reader.is_closed: await write_stream_reader.aclose()
+                    if not read_stream_writer.is_closed: await read_stream_writer.aclose()
+
+
+            # Start tasks
+            tg = await task_group_exit_stack.enter_async_context(anyio.create_task_group())
+            log.debug(f"[{current_server_name}] Starting custom SSE reader and POST writer background tasks...")
+            bg_tasks = []
+            # Pass the existing event source to the reader task
+            if sse_event_source is None: raise RuntimeError("SSE Event Source not established before starting reader task")
+            bg_tasks.append(tg.start_soon(custom_sse_reader_task, sse_event_source))
+            bg_tasks.append(tg.start_soon(custom_post_writer_task))
+            self._session_tasks.setdefault(current_server_name, []).extend(bg_tasks)
+            log.info(f"[{current_server_name}] Custom stream handler tasks started (Custom).")
+
+            # --- Step 5: Instantiate ClientSession ---
+            log.info(f"[{current_server_name}] Initializing standard ClientSession with custom streams...")
+            session_read_timeout_seconds = max(90.0, capability_load_timeout * 2)
+            session = ClientSession(
+                read_stream=read_stream,
+                write_stream=write_stream,
+                read_timeout_seconds=timedelta(seconds=session_read_timeout_seconds)
+            )
+            await self.exit_stack.enter_async_context(session) # Add session cleanup to main manager stack
+            log.debug(f"[{current_server_name}] Standard ClientSession instantiated and context entered (Custom).")
+
+            # --- Step 6: Send Initialized Notification ---
+            log.info(f"[{current_server_name}] Sending initialized notification via session (Custom)...")
+            initialized_notification_root = InitializedNotification(method="notifications/initialized")
+            initialized_notification = ClientNotification(root=initialized_notification_root)
+            try:
+                await asyncio.wait_for(session.send_notification(initialized_notification), timeout=connect_timeout)
+                log.debug(f"[{current_server_name}] Initialized notification sent (Custom).")
+            except asyncio.TimeoutError:
+                 log.error(f"[{current_server_name}] Timeout sending initialized notification.")
+                 raise
+
+            # --- Step 7: Load Capabilities using the session ---
+            log.info(f"[{current_server_name}] Loading capabilities via session (Custom)...")
+            # (Capability loading logic remains the same)
+            server_capabilities = initialize_result_obj.capabilities
+            log.debug(f"[{current_server_name}] Capabilities from InitializeResult: {server_capabilities}")
+            capability_results = {}
+
+            async def load_tools():
+                 if server_capabilities and server_capabilities.tools is not None:
+                     log.info(f"[{current_server_name}] Listing tools (Custom SSE)...")
+                     try: result = await session.list_tools(); capability_results['tools'] = result.tools if result else []
+                     except Exception as e: capability_results['tools_error'] = e
+                 else: log.info(f"[{current_server_name}] Skipping tools (not advertised)")
+
+            async def load_resources():
+                 if server_capabilities and server_capabilities.resources is not None:
+                     log.info(f"[{current_server_name}] Listing resources (Custom SSE)...")
+                     try: result = await session.list_resources(); capability_results['resources'] = result.resources if result else []
+                     except Exception as e: capability_results['resources_error'] = e
+                 else: log.info(f"[{current_server_name}] Skipping resources (not advertised)")
+
+            async def load_prompts():
+                 if server_capabilities and server_capabilities.prompts is not None:
+                     log.info(f"[{current_server_name}] Listing prompts (Custom SSE)...")
+                     try: result = await session.list_prompts(); capability_results['prompts'] = result.prompts if result else []
+                     except Exception as e: capability_results['prompts_error'] = e
+                 else: log.info(f"[{current_server_name}] Skipping prompts (not advertised)")
+
+            try: # Load concurrently
+                 async with asyncio.timeout(outer_wait_timeout):
+                      async with anyio.create_task_group() as cap_tg:
+                           cap_tg.start_soon(load_tools)
+                           cap_tg.start_soon(load_resources)
+                           cap_tg.start_soon(load_prompts)
+            except TimeoutError: log.error(f"[{current_server_name}] Overall timeout ({outer_wait_timeout}s) loading capabilities.")
+
+            if 'tools' in capability_results: self._process_list_result(current_server_name, capability_results['tools'], self.tools, MCPTool, "tool")
+            elif 'tools_error' in capability_results: log.error(f"[{current_server_name}] Error loading tools: {capability_results['tools_error']}")
+            if 'resources' in capability_results: self._process_list_result(current_server_name, capability_results['resources'], self.resources, MCPResource, "resource")
+            elif 'resources_error' in capability_results: log.error(f"[{current_server_name}] Error loading resources: {capability_results['resources_error']}")
+            if 'prompts' in capability_results: self._process_list_result(current_server_name, capability_results['prompts'], self.prompts, McpPromptType, "prompt")
+            elif 'prompts_error' in capability_results: log.error(f"[{current_server_name}] Error loading prompts: {capability_results['prompts_error']}")
+
+            log.info(f"[{current_server_name}] Custom SSE handshake and capability loading complete.")
+            return session, initialize_result_obj
+
+        except Exception as e:
+            # Log and re-raise for the main retry loop
+            log.error(f"[{current_server_name}] Error during custom SSE setup/handshake/loading: {e}", exc_info=True)
+            # Ensure exit stack is cleaned up, which should close http client and event source
+            await task_group_exit_stack.aclose()
+            # Close memory streams manually just in case
+            if 'read_stream_writer' in locals() and not read_stream_writer.is_closed: await read_stream_writer.aclose()
+            if 'write_stream_reader' in locals() and not write_stream_reader.is_closed: await write_stream_reader.aclose()
+            raise e
+
+    # Add _connect_sse_server back for the smart wrapper
+    async def _connect_sse_server(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[InitializeResult]]:
+        """
+        Handles the specific logic for connecting, performing the MCP handshake,
+        AND LOADING CAPABILITIES for an SSE server using the standard mcp library client.
+        (This is intended for compliant servers).
+        """
+        session: Optional[ClientSession] = None
+        initialize_result_obj: Optional[InitializeResult] = None
+        sse_client_context = None # Keep track of the context manager instance
+
+        connect_url = server_config.path
+        parsed_connect_url = urlparse(connect_url)
+        if not parsed_connect_url.scheme:
+            connect_url = f"http://{connect_url}"
+            log.debug(f"[{current_server_name}] Prepended http scheme for standard SSE connection: {connect_url}")
+
+        # Define timeouts based on config, providing reasonable defaults
+        connect_timeout = server_config.timeout if server_config.timeout > 0 else 10.0
+        read_timeout = (server_config.timeout * 2) if server_config.timeout > 0 else 20.0
+        # Handshake timeout includes initial GET + POST + result wait via SSE stream
+        handshake_timeout = (server_config.timeout * 3) + 15.0 if server_config.timeout > 0 else 45.0
+        capability_load_timeout = (server_config.timeout * 2) + 20.0 if server_config.timeout > 0 else 40.0
+        outer_wait_timeout = capability_load_timeout + 10.0
+
+        log.debug(f"[{current_server_name}] Standard SSE Timeouts: Connect={connect_timeout}s, Read={read_timeout}s, Handshake={handshake_timeout}s, Caps={capability_load_timeout}s")
+
+        try:
+            # --- Step 1: Setup Persistent Streams using the standard sse_client ---
+            log.info(f"[{current_server_name}] Attempting standard SSE connection via sse_client to {connect_url} (Attempt {retry_count+1})...")
+
+            sse_client_context = sse_client(
+                url=connect_url,
+                headers=None,
+                timeout=connect_timeout, # Base timeout for connect/initial ops
+                sse_read_timeout=timedelta(minutes=15).total_seconds()
+            )
+            read_stream, write_stream = await self.exit_stack.enter_async_context(sse_client_context)
+            log.debug(f"[{current_server_name}] Standard SSE streams obtained via sse_client.")
+
+            # --- Step 2: Instantiate the standard ClientSession ---
+            log.info(f"[{current_server_name}] Initializing standard ClientSession...")
+            session_read_timeout_seconds = max(90.0, capability_load_timeout * 2)
+            session = ClientSession(
+                read_stream=read_stream,
+                write_stream=write_stream,
+                read_timeout_seconds=timedelta(seconds=session_read_timeout_seconds)
+            )
+            await self.exit_stack.enter_async_context(session)
+            log.debug(f"[{current_server_name}] Standard ClientSession instantiated and context entered.")
+
+            # --- Step 3: Perform Handshake using ClientSession ---
+            log.info(f"[{current_server_name}] Performing standard MCP handshake via ClientSession.initialize()...")
+            initialize_result_obj = await asyncio.wait_for(
+                session.initialize(),
+                timeout=handshake_timeout
+            )
+            log.info(f"[{current_server_name}] Standard Initialize successful (SSE). Server reported: {initialize_result_obj.serverInfo}")
+
+            # --- Step 4: LOAD CAPABILITIES ---
+            log.info(f"[{current_server_name}] Loading capabilities after standard handshake (SSE)...")
+            # (Capability loading logic is identical to the one in _connect_sse_server_custom)
+            server_capabilities = initialize_result_obj.capabilities if initialize_result_obj else None
+            log.debug(f"[{current_server_name}] Received Server Capabilities (Standard SSE): {server_capabilities}")
+            capability_results = {}
+
+            async def load_tools():
+                 if server_capabilities and server_capabilities.tools is not None:
+                     log.info(f"[{current_server_name}] Listing tools (Standard SSE)...")
+                     try: result = await session.list_tools(); capability_results['tools'] = result.tools if result else []
+                     except Exception as e: capability_results['tools_error'] = e
+                 else: log.info(f"[{current_server_name}] Skipping tools (not advertised, Standard SSE)")
+
+            async def load_resources():
+                 if server_capabilities and server_capabilities.resources is not None:
+                     log.info(f"[{current_server_name}] Listing resources (Standard SSE)...")
+                     try: result = await session.list_resources(); capability_results['resources'] = result.resources if result else []
+                     except Exception as e: capability_results['resources_error'] = e
+                 else: log.info(f"[{current_server_name}] Skipping resources (not advertised, Standard SSE)")
+
+            async def load_prompts():
+                 if server_capabilities and server_capabilities.prompts is not None:
+                     log.info(f"[{current_server_name}] Listing prompts (Standard SSE)...")
+                     try: result = await session.list_prompts(); capability_results['prompts'] = result.prompts if result else []
+                     except Exception as e: capability_results['prompts_error'] = e
+                 else: log.info(f"[{current_server_name}] Skipping prompts (not advertised, Standard SSE)")
+
+            try: # Load concurrently
+                 async with asyncio.timeout(outer_wait_timeout):
+                      async with anyio.create_task_group() as cap_tg:
+                           cap_tg.start_soon(load_tools)
+                           cap_tg.start_soon(load_resources)
+                           cap_tg.start_soon(load_prompts)
+            except TimeoutError: log.error(f"[{current_server_name}] Overall timeout ({outer_wait_timeout}s) loading capabilities (Standard SSE).")
+
+            # Process results
+            if 'tools' in capability_results: self._process_list_result(current_server_name, capability_results['tools'], self.tools, MCPTool, "tool")
+            elif 'tools_error' in capability_results: log.error(f"[{current_server_name}] Error loading tools (Standard SSE): {capability_results['tools_error']}")
+            if 'resources' in capability_results: self._process_list_result(current_server_name, capability_results['resources'], self.resources, MCPResource, "resource")
+            elif 'resources_error' in capability_results: log.error(f"[{current_server_name}] Error loading resources (Standard SSE): {capability_results['resources_error']}")
+            if 'prompts' in capability_results: self._process_list_result(current_server_name, capability_results['prompts'], self.prompts, McpPromptType, "prompt")
+            elif 'prompts_error' in capability_results: log.error(f"[{current_server_name}] Error loading prompts (Standard SSE): {capability_results['prompts_error']}")
+
+
+            log.info(f"[{current_server_name}] Standard SSE handshake and capability loading complete.")
+            return session, initialize_result_obj
+
+        except (httpx.RequestError, httpx.HTTPStatusError, McpError, asyncio.TimeoutError) as err:
+            log.warning(f"[{current_server_name}] Standard SSE connection/handshake failed ({type(err).__name__}): {err}")
+            # IMPORTANT: Cleanup is handled by the main exit stack automatically on exception
+            raise err # Re-raise for the smart wrapper or main retry loop
+        except Exception as e:
+            log.error(f"[{current_server_name}] Unexpected error during standard SSE connection/handshake: {e}", exc_info=True)
+            # IMPORTANT: Cleanup is handled by the main exit stack automatically on exception
+            raise e # Re-raise
+
+    # Smart wrapper remains the same as provided in the previous response
+    async def _connect_sse_smart(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[InitializeResult]]:
+        """
+        Intelligently attempts to connect to an SSE server, trying the standard
+        method first and falling back to the custom method if a handshake timeout occurs.
+        """
+        session: Optional[ClientSession] = None
+        initialize_result: Optional[InitializeResult] = None
+        is_verbose = log.isEnabledFor(logging.DEBUG) # Check verbosity once
+
+        log.info(f"[{current_server_name}] Smart Connect: Trying standard SSE connection method (Attempt {retry_count + 1})...")
+        try:
+            # Attempt 1: Standard Compliant Method
+            session, initialize_result = await self._connect_sse_server(
+                server_config, current_server_name, retry_count
+            )
+            log.info(f"[{current_server_name}] Smart Connect: Standard method successful.")
+            return session, initialize_result
+
+        except asyncio.TimeoutError as standard_timeout:
+            log.warning(f"[{current_server_name}] Smart Connect: Standard method timed out (likely waiting for InitializeResult via SSE). Trying custom method...")
+            if not is_verbose: log.warning(f"[{current_server_name}] (Timeout detail suppressed in non-verbose mode)")
+            else: log.debug(f"[{current_server_name}] Standard method timeout detail:", exc_info=standard_timeout)
+            # Proceed to fallback
+
+        except (httpx.RequestError, httpx.HTTPStatusError, McpError) as standard_conn_error:
+             log.warning(f"[{current_server_name}] Smart Connect: Standard method failed with connection/protocol error: {standard_conn_error}. Aborting fallback.")
+             raise standard_conn_error
+        except Exception as standard_unexpected_error:
+             log.error(f"[{current_server_name}] Smart Connect: Unexpected error during standard attempt: {standard_unexpected_error}", exc_info=True)
+             raise standard_unexpected_error
+
+        # --- Fallback Attempt: Custom Method ---
+        log.info(f"[{current_server_name}] Smart Connect: Attempting custom SSE connection method...")
+        try:
+            session, initialize_result = await self._connect_sse_server_custom(
+                server_config, current_server_name, retry_count
+            )
+            log.info(f"[{current_server_name}] Smart Connect: Custom method successful.")
+            return session, initialize_result
+
+        except Exception as custom_conn_error:
+            log_func = log.error if is_verbose else log.warning
+            log_func(f"[{current_server_name}] Smart Connect: Custom method also failed: {custom_conn_error}", exc_info=is_verbose)
+            raise custom_conn_error
+
+
+    # connect_to_server remains the same, calling _connect_sse_smart for SSE
     async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
         """
-        Connect to a single MCP server, perform full handshake including capability loading,
-        with retry logic, robust STDIO handling, automatic stderr redirection,
-        direct shell execution for remapped commands, increased buffer limits,
-        and corrected tracing context management.
+        Connect to a single MCP server (STDIO or SSE) with retry logic.
+        Handles server renaming based on InitializeResult. Uses smart SSE connection.
         """
-        server_name = server_config.name
+        current_server_name = server_config.name
+        current_server_config = dataclasses.replace(server_config)
         retry_count = 0
-        # Use retry_policy from config, fallback to default if missing/invalid
-        max_retries = server_config.retry_policy.get("max_attempts", 3)
-        backoff_factor = server_config.retry_policy.get("backoff_factor", 0.5)
+        config_updated_by_rename = False
+        max_retries = current_server_config.retry_policy.get("max_attempts", 3)
+        backoff_factor = current_server_config.retry_policy.get("backoff_factor", 0.5)
 
-        # Define buffer limit
-        BUFFER_LIMIT = 2**22     # 4 MiB
-
-        # Use safe_stdout context manager to protect client's output
-        with safe_stdout():
+        with safe_stdout(): # Ensure all prints go to stderr if stdio active
             while retry_count <= max_retries:
                 start_time = time.time()
                 session: Optional[ClientSession] = None
+                initialize_result_obj: Optional[Union[InitializeResult, Dict[str, Any]]] = None
                 process_this_attempt: Optional[asyncio.subprocess.Process] = None
                 stderr_reader_task_this_attempt: Optional[asyncio.Task] = None
-                # NOTE: created_session_tasks removed, tasks handled internally by RobustStdioSession now
-                connection_error: Optional[BaseException] = None # Capture BaseException for groups
-                zeroconf_registered_this_attempt = False # Reset for each attempt
-
-                # --- Corrected Tracing Setup ---
+                connection_error: Optional[BaseException] = None
+                rename_occurred_this_attempt = False
                 span = None
                 span_context_manager = None
-                try:
-                    # Start the span context manager if tracer is available
+
+                try: # Trace span setup
                     if tracer:
                         try:
                             span_context_manager = tracer.start_as_current_span(
-                                f"connect_server.{server_name}",
-                                attributes={
-                                    "server.name": server_name,
-                                    "server.type": server_config.type.value,
-                                    "server.path": str(server_config.path),
-                                    "retry": retry_count
-                                }
+                                f"connect_server.{current_server_name}",
+                                attributes={ "server.name": current_server_name, "server.type": current_server_config.type.value, "retry": retry_count }
                             )
-                            if span_context_manager:
-                                span = span_context_manager.__enter__()
-                        except Exception as e:
-                            log.warning(f"Failed to start trace span: {e}")
-                            span = None
-                            span_context_manager = None
+                            if span_context_manager: span = span_context_manager.__enter__()
+                        except Exception as e: log.warning(f"Failed to start trace span: {e}"); span = None; span_context_manager = None
 
-                    # --- Main Connection Logic ---
+                    # --- Main Connection Attempt ---
                     try:
-                        self._safe_printer(f"[cyan]Attempting to connect to server {server_name} (Attempt {retry_count+1}/{max_retries+1})...[/]")
+                        self._safe_printer(f"[cyan]Attempting connection & full setup for {current_server_name} (Attempt {retry_count+1}/{max_retries+1})...[/]")
 
-                        if server_config.type == ServerType.STDIO:
-                            # ====================================================
-                            # STDIO Connection Logic (Process Management)
-                            # ====================================================
-                            existing_process = self.processes.get(server_config.name)
-                            restart_process = False
-                            process_to_use: Optional[asyncio.subprocess.Process] = None
-
-                            # --- Decide if process needs restart (Logic unchanged) ---
-                            if existing_process:
-                                if existing_process.returncode is None:
-                                    if retry_count > 0:
-                                        log.warning(f"Restarting process for {server_name} on retry {retry_count}")
-                                        self._safe_printer(f"[yellow]Restarting process for {server_name} on retry {retry_count}[/]")
-                                        restart_process = True
-                                        await self.terminate_process(server_name, existing_process)
-                                        if server_name in self.registered_services: await self.unregister_local_server(server_name)
-                                    else:
-                                        log.debug(f"Found existing process for {server_name} (PID {existing_process.pid}), will attempt connection.")
-                                        process_to_use = existing_process
-                                else:
-                                    log.warning(f"Previously managed process for {server_name} has exited with code {existing_process.returncode}. Cleaning up entry.")
-                                    self._safe_printer(f"[yellow]Previous process for {server_name} exited (code {existing_process.returncode}). Starting new one.[/]")
-                                    restart_process = True
-                                    if server_name in self.registered_services: await self.unregister_local_server(server_name)
-                                    if server_name in self.processes: del self.processes[server_name]
-                            else:
-                                restart_process = True
-
-                            # --- Start or restart the process if needed (Logic mostly unchanged) ---
-                            if restart_process:
-                                executable = server_config.path
-                                current_args = server_config.args
-                                log_file_path = (CONFIG_DIR / f"{server_name}_stderr.log").resolve()
-                                log_file_path.parent.mkdir(parents=True, exist_ok=True)
-
-                                log.info(f"Preparing to execute server '{server_name}': Executable='{executable}', Args={current_args}")
-                                log.info(f"Stderr for STDIO server {server_name} will be captured via pipe -> {log_file_path}")
-
-                                process: Optional[asyncio.subprocess.Process] = None
-                                is_shell_cmd = (
-                                    isinstance(executable, str) and
-                                    any(executable.endswith(shell) for shell in ["bash", "sh", "zsh"]) and
-                                    len(current_args) == 2 and
-                                    current_args[0] == "-c" and
-                                    isinstance(current_args[1], str)
-                                )
-
-                                if is_shell_cmd:
-                                    command_string = current_args[1] # Correctly use current_args
-                                    log.info(f"Executing server '{server_name}' via shell '{executable}': {command_string}")
-                                    # Give the server more time to initialize
-                                    log.info(f"Waiting 2 seconds for {server_name} to initialize...")
-                                    await asyncio.sleep(2.0)
-                                    self._safe_printer(f"[cyan]Starting server process (shell: {executable}): {command_string[:100]}...[/]")
-                                    try:
-                                        process = await asyncio.create_subprocess_shell(
-                                            command_string, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                                            stderr=asyncio.subprocess.PIPE, limit=BUFFER_LIMIT, env=os.environ.copy(), executable=executable
-                                        )
-                                    except FileNotFoundError: 
-                                        log.error(f"Shell executable not found: '{executable}'.")
-                                        raise
-                                    except Exception as e: 
-                                        log.error(f"Error starting shell '{executable}': {e}", exc_info=True)
-                                        raise
-                                else:
-                                    final_cmd_list = [executable] + current_args
-                                    log.info(f"Executing server '{server_name}' directly: {' '.join(map(str, final_cmd_list))}")
-                                    self._safe_printer(f"[cyan]Starting server process: {' '.join(map(str, final_cmd_list))}[/]")
-                                    try:
-                                        process = await asyncio.create_subprocess_exec(
-                                            *final_cmd_list, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                                            stderr=asyncio.subprocess.PIPE, limit=BUFFER_LIMIT, env=os.environ.copy()
-                                        )
-                                    except FileNotFoundError: 
-                                        log.error(f"Executable not found: '{executable}'.")
-                                        raise
-                                    except Exception as e: 
-                                        log.error(f"Error starting '{executable}': {e}", exc_info=True)
-                                        raise
-
-                                process_this_attempt = process # Store ref to process created *this* attempt
-                                self.processes[server_name] = process
-                                log.info(f"Started process for {server_name} with PID {process.pid}")
-
-                                # --- Start stderr reader task (Function definition unchanged) ---
-                                log.info(f"Starting stderr pipe reader task for {server_name} -> {log_file_path}")
-                                async def read_stderr_to_file(proc_stderr, log_path_str, server_id):
-                                    if proc_stderr is None: 
-                                        log.warning(f"Stderr pipe is None for {server_id}.")
-                                        return
-                                    try:
-                                        async with aiofiles.open(log_path_str, "ab") as log_f: # Append mode
-                                            while True:
-                                                line_bytes = await proc_stderr.readline()
-                                                if not line_bytes:
-                                                    if proc_stderr.at_eof(): 
-                                                        log.debug(f"Stderr EOF for {server_id}")
-                                                        break
-                                                    else: 
-                                                        await asyncio.sleep(0.01)
-                                                        continue
-                                                await log_f.write(line_bytes)
-                                    except asyncio.CancelledError: log.info(f"Stderr reader cancelled for {server_id}")
-                                    except (BrokenPipeError, ConnectionResetError): log.warning(f"Stderr pipe broken for {server_id}")
-                                    except Exception as e: log.error(f"Error reading/writing stderr for {server_id}: {e}", exc_info=True)
-                                    finally: log.debug(f"Exiting stderr reader for {server_id}")
-
-                                # Create and store the task
-                                stderr_reader_task_this_attempt = asyncio.create_task(
-                                    read_stderr_to_file(process.stderr, str(log_file_path), server_name),
-                                    name=f"stderr-reader-{server_name}"
-                                )
-                                self._session_tasks.setdefault(server_name, []).append(stderr_reader_task_this_attempt) # Track it
-                                await asyncio.sleep(0.01) # Give reader a moment
-
-                                # --- Check for Immediate Exit (Logic unchanged) ---
-                                await asyncio.sleep(0.5) # Increased slightly
-                                if process.returncode is not None:
-                                    log.error(f"Process for {server_name} failed immediately (code {process.returncode}). Check stderr log: {log_file_path}")
-                                    # Attempt cleanup of the reader task for this specific attempt
-                                    if stderr_reader_task_this_attempt and not stderr_reader_task_this_attempt.done():
-                                        stderr_reader_task_this_attempt.cancel()
-                                        with suppress(asyncio.CancelledError): await stderr_reader_task_this_attempt
-                                        # Remove from tracking if cancelled here
-                                        if server_name in self._session_tasks and stderr_reader_task_this_attempt in self._session_tasks[server_name]:
-                                            self._session_tasks[server_name].remove(stderr_reader_task_this_attempt)
-                                    raise RuntimeError(f"Process for {server_name} failed immediately (code {process.returncode}). Check log '{log_file_path}'.")
-
-                                process_to_use = process
-                                # Skip Zeroconf for STDIO here, might add later if needed
-                                log.debug(f"Skipping Zeroconf registration for STDIO server: {server_name}")
-
-                            # --- Use RobustStdioSession ---
-                            if not process_to_use or process_to_use.returncode is not None:
-                                raise RuntimeError(f"Process for STDIO server {server_name} is not valid or has exited.")
-
-                            log.info(f"[{server_name}] Initializing RobustStdioSession...")
-                            # NOTE: robust_session is created INSIDE the try block below
-                            session = None # Ensure session is None before try
-
-                            # ====================================================
-                            # == FULL HANDSHAKE & CAPABILITY LOADING (STDIO) ====
-                            # ====================================================
-                            try:
-                                # Create the session object
-                                session = RobustStdioSession(process_to_use, server_name)
-                                # Link the external stderr reader task to the session for cleanup
-                                session._stderr_reader_task = stderr_reader_task_this_attempt
-
-                                # --- Step 1: Initialize ---
-                                log.info(f"[{server_name}] Attempting MCP handshake: initialize...")
-                                init_timeout = server_config.timeout + 5.0
-                                initialize_result: Dict[str, Any] = await asyncio.wait_for( # Expecting Dict
-                                    session.initialize(response_timeout=server_config.timeout), timeout=init_timeout
-                                )
-                                log.info(f"[{server_name}] Initialize successful.")
-
-                                # --- Corrected Capability Extraction ---
-                                server_capabilities = None
-                                if isinstance(initialize_result, dict):
-                                    server_capabilities = initialize_result.get("capabilities")
-                                log.info(f"[{server_name}] Received Server Capabilities: {server_capabilities}")
-
-                                # --- Step 1.5: Send Initialized Notification ---
-                                log.info(f"[{server_name}] Sending initialized notification...")
-                                await session.send_initialized_notification()
-
-                                # --- Step 2: List and Load Tools (Conditional) ---
-                                has_tools_capability = isinstance(server_capabilities, dict) and "tools" in server_capabilities
-                                if has_tools_capability:
-                                    log.info(f"[{server_name}] Server supports tools. Listing and loading...")
-                                    try:
-                                        list_tools_result: ListToolsResult = await asyncio.wait_for(
-                                            session.list_tools(response_timeout=server_config.timeout + 10.0),
-                                            timeout=server_config.timeout + 15.0
-                                        )
-                                        if list_tools_result and hasattr(list_tools_result, 'tools'):
-                                            self._process_list_result(server_name, list_tools_result.tools, self.tools, MCPTool, "tool")
-                                        else: log.warning(f"[{server_name}] Invalid ListToolsResult.")
-                                    except RuntimeError as e: # Handle specific runtime errors
-                                        if "Method not found" in str(e): log.warning(f"[{server_name}] list_tools failed: Method not found.")
-                                        elif "Timeout waiting for response" in str(e): log.error(f"[{server_name}] Timeout waiting for list_tools.")
-                                        else: log.error(f"[{server_name}] RuntimeError during list_tools: {e}")
-                                    except Exception as e: log.error(f"[{server_name}] Error during list_tools: {e}", exc_info=True)
-                                else:
-                                    log.info(f"[{server_name}] Server does not advertise 'tools' capability.")
-
-                                # --- Step 3: List and Load Resources (Conditional) ---
-                                has_resources_capability = isinstance(server_capabilities, dict) and "resources" in server_capabilities
-                                if has_resources_capability:
-                                    log.info(f"[{server_name}] Server supports resources. Listing and loading...")
-                                    if hasattr(session, 'list_resources') and callable(session.list_resources):
-                                        try:
-                                            list_resources_result: ListResourcesResult = await asyncio.wait_for(
-                                                session.list_resources(response_timeout=server_config.timeout + 10.0),
-                                                timeout=server_config.timeout + 15.0
-                                            )
-                                            if list_resources_result and hasattr(list_resources_result, 'resources'):
-                                                self._process_list_result(server_name, list_resources_result.resources, self.resources, MCPResource, "resource")
-                                            else: log.warning(f"[{server_name}] Invalid ListResourcesResult.")
-                                        except RuntimeError as e:
-                                            if "Method not found" in str(e): log.warning(f"[{server_name}] list_resources failed: Method not found.")
-                                            elif "Timeout waiting for response" in str(e): log.error(f"[{server_name}] Timeout waiting for list_resources.")
-                                            else: log.error(f"[{server_name}] RuntimeError during list_resources: {e}")
-                                        except Exception as e: log.error(f"[{server_name}] Error during list_resources: {e}", exc_info=True)
-                                    else: log.warning(f"[{server_name}] Session object missing list_resources method.")
-                                else:
-                                    log.info(f"[{server_name}] Server does not advertise 'resources' capability.")
-
-                                # --- Step 4: List and Load Prompts (Conditional) ---
-                                has_prompts_capability = isinstance(server_capabilities, dict) and "prompts" in server_capabilities
-                                if has_prompts_capability:
-                                    log.info(f"[{server_name}] Server supports prompts. Listing and loading...")
-                                    if hasattr(session, 'list_prompts') and callable(session.list_prompts):
-                                        try:
-                                            list_prompts_result: ListPromptsResult = await asyncio.wait_for(
-                                                session.list_prompts(response_timeout=server_config.timeout + 10.0),
-                                                timeout=server_config.timeout + 15.0
-                                            )
-                                            if list_prompts_result and hasattr(list_prompts_result, 'prompts'):
-                                                self._process_list_result(server_name, list_prompts_result.prompts, self.prompts, MCPPrompt, "prompt")
-                                            else: log.warning(f"[{server_name}] Invalid ListPromptsResult.")
-                                        except RuntimeError as e:
-                                            if "Method not found" in str(e): log.warning(f"[{server_name}] list_prompts failed: Method not found.")
-                                            elif "Timeout waiting for response" in str(e): log.error(f"[{server_name}] Timeout waiting for list_prompts.")
-                                            else: log.error(f"[{server_name}] RuntimeError during list_prompts: {e}")
-                                        except Exception as e: log.error(f"[{server_name}] Error during list_prompts: {e}", exc_info=True)
-                                    else: log.warning(f"[{server_name}] Session object missing list_prompts method.")
-                                else:
-                                     log.info(f"[{server_name}] Server does not advertise 'prompts' capability.")
-
-                                log.info(f"[{server_name}] MCP handshake and capability loading complete.")
-                                # If we reached here, handshake and loading were successful for STDIO
-                                # The 'session' variable holds the RobustStdioSession
-
-                            except Exception as handshake_or_load_err:
-                                # Handle failures during the handshake/loading phase
-                                connection_error = handshake_or_load_err
-                                log.error(f"[{server_name}] Failed MCP handshake/loading ({type(handshake_or_load_err).__name__}): {handshake_or_load_err}", exc_info=True)
-                                self._safe_printer(f"[red]Failed MCP handshake/setup with {server_name}.[/]")
-                                # Cleanup resources created in *this* try block
-                                if session and hasattr(session, 'aclose'):
-                                     with suppress(Exception): await session.aclose()
-                                # Process termination handled in the outer except block
-                                break  # Connection error already set, proceed to shared error handling
-
-                            # ====================================================
-                            # == END STDIO HANDSHAKE & LOADING ===================
-                            # ====================================================
-
-                        elif server_config.type == ServerType.SSE:
-                            # ====================================================
-                            # == SSE Connection & Handshake/Loading =============
-                            # ====================================================
-                            log.info(f"Connecting to SSE server {server_name} at {server_config.path}")
-                            sse_url = server_config.path
-                            if not sse_url.startswith(("http://", "https://")): sse_url = f"http://{sse_url}"
-
-                            # SSE client connection uses AsyncExitStack
-                            sse_session = None # Ensure it's None before try
-                            try:
-                                # Enter context manager for SSE client
-                                sse_session = await self.exit_stack.enter_async_context(
-                                    sse_client(url=sse_url, timeout=server_config.timeout, sse_read_timeout=server_config.timeout * 12)
-                                )
-                                session = sse_session # Assign to the main session variable
-
-                                if not session: raise RuntimeError("sse_client returned None")
-
-                                # --- Step 1: Initialize (SSE) ---
-                                log.info(f"[{server_name}] Attempting MCP handshake: initialize (SSE)...")
-                                init_timeout = server_config.timeout + 5.0
-                                initialize_result: Dict[str, Any] = await asyncio.wait_for( # Expect Dict
-                                    session.initialize(response_timeout=server_config.timeout), timeout=init_timeout
-                                )
-                                log.info(f"[{server_name}] Initialize successful (SSE).")
-
-                                # --- Corrected Capability Extraction (SSE) ---
-                                server_capabilities = None
-                                if isinstance(initialize_result, dict):
-                                    server_capabilities = initialize_result.get("capabilities")
-                                log.info(f"[{server_name}] Received Server Capabilities (SSE): {server_capabilities}")
-
-                                # --- Step 1.5: Send Initialized Notification (SSE) ---
-                                log.info(f"[{server_name}] Sending initialized notification (SSE)...")
-                                await session.send_initialized_notification()
-
-                                # --- Step 2: List and Load Tools (Conditional, SSE) ---
-                                has_tools_capability = isinstance(server_capabilities, dict) and "tools" in server_capabilities
-                                if has_tools_capability:
-                                    log.info(f"[{server_name}] Server supports tools. Listing and loading (SSE)...")
-                                    if hasattr(session, 'list_tools') and callable(session.list_tools):
-                                        try:
-                                            list_tools_result: ListToolsResult = await asyncio.wait_for(
-                                                session.list_tools(response_timeout=server_config.timeout + 10.0),
-                                                timeout=server_config.timeout + 15.0
-                                            )
-                                            if list_tools_result and hasattr(list_tools_result, 'tools'):
-                                                self._process_list_result(server_name, list_tools_result.tools, self.tools, MCPTool, "tool")
-                                            else: log.warning(f"[{server_name}] Invalid ListToolsResult (SSE).")
-                                        except RuntimeError as e: # Handle specific runtime errors
-                                            if "Method not found" in str(e): log.warning(f"[{server_name}] list_tools failed (SSE): Method not found.")
-                                            elif "Timeout waiting for response" in str(e): log.error(f"[{server_name}] Timeout waiting for list_tools (SSE).")
-                                            else: log.error(f"[{server_name}] RuntimeError during list_tools (SSE): {e}")
-                                        except Exception as e: log.error(f"[{server_name}] Error during list_tools (SSE): {e}", exc_info=True)
-                                    else: log.warning(f"[{server_name}] SSE session object missing list_tools method.")
-                                else:
-                                    log.info(f"[{server_name}] Server does not advertise 'tools' capability (SSE).")
-
-                                # --- Step 3 & 4: List/Load Resources & Prompts (Conditional, SSE) ---
-                                # (Add similar blocks for resources and prompts as done for STDIO,
-                                #  checking capabilities and session methods)
-                                # --- TODO: Implement resource/prompt loading for SSE here ---
-                                log.warning(f"[{server_name}] SSE resource/prompt loading not fully implemented yet.") # Placeholder
-
-                                log.info(f"[{server_name}] MCP handshake and capability loading complete (SSE).")
-                                # If reached here, handshake/loading successful for SSE
-
-                            except Exception as sse_handshake_err:
-                                connection_error = sse_handshake_err
-                                log.error(f"[{server_name}] Failed MCP handshake/loading (SSE) ({type(sse_handshake_err).__name__}): {sse_handshake_err}", exc_info=True)
-                                self._safe_printer(f"[red]Failed MCP handshake/setup with {server_name} (SSE).[/]")
-                                # SSE client cleanup is handled by AsyncExitStack on exception
-                                break  # Connection error already set, proceed to shared error handling
-
-                            # ====================================================
-                            # == END SSE HANDSHAKE & LOADING =====================
-                            # ====================================================
-
+                        # --- Call Connection Helpers ---
+                        if current_server_config.type == ServerType.STDIO:
+                            session, initialize_result_obj, process_this_attempt, stderr_reader_task_this_attempt = await self._connect_stdio_server(
+                                current_server_config, current_server_name, retry_count
+                            )
+                        elif current_server_config.type == ServerType.SSE:
+                            # *** USE THE SMART WRAPPER ***
+                            session, initialize_result_obj = await self._connect_sse_smart(
+                                current_server_config, current_server_name, retry_count
+                            )
+                            process_this_attempt = None # No process for SSE
+                            stderr_reader_task_this_attempt = None
                         else:
-                            # --- Unknown Server Type ---
-                            unknown_type_msg = f"Unknown server type: {server_config.type}"
-                            if span: span.set_status(trace.StatusCode.ERROR, unknown_type_msg)
-                            log.error(unknown_type_msg)
-                            self._safe_printer(f"[red]{unknown_type_msg}[/]")
-                            # Must exit span context before returning
-                            if span_context_manager: span_context_manager.__exit__(None, None, None)
-                            return None # Cannot connect
+                            raise RuntimeError(f"Unknown server type: {current_server_config.type}")
 
-                        # --- Success Path (Common for STDIO/SSE after handshake/load) ---
+                        if not session:
+                             raise RuntimeError(f"Connection helper returned None session for {current_server_name}")
+
+                        # --- Rename Logic ---
+                        original_name_before_rename = current_server_name
+                        if initialize_result_obj:
+                            # ... (Rename logic remains the same as previous version) ...
+                            actual_server_name = None
+                            if isinstance(initialize_result_obj, dict): # STDIO (or potentially custom SSE result)
+                                actual_server_name = initialize_result_obj.get("serverInfo", {}).get("name")
+                            elif isinstance(initialize_result_obj, InitializeResult): # Standard/Custom SSE result
+                                if hasattr(initialize_result_obj, 'serverInfo') and initialize_result_obj.serverInfo:
+                                    actual_server_name = initialize_result_obj.serverInfo.name
+
+                            if actual_server_name and actual_server_name != current_server_name:
+                                if actual_server_name in self.config.servers and actual_server_name != current_server_name:
+                                    log.warning(f"Server '{current_server_name}' reported name '{actual_server_name}', but it already exists. Keeping '{current_server_name}'.")
+                                else:
+                                    log.info(f"Server '{current_server_name}' identified as '{actual_server_name}'. Renaming config & loaded items.")
+                                    self._safe_printer(f"[yellow]Server '{current_server_name}' identified as '{actual_server_name}', updating config.[/]")
+                                    try:
+                                        if current_server_name in self.config.servers:
+                                            original_config_entry = self.config.servers.pop(current_server_name)
+                                            original_config_entry.name = actual_server_name
+                                            self.config.servers[actual_server_name] = original_config_entry
+                                            if current_server_config.type == ServerType.STDIO and session and hasattr(session, '_server_name'): session._server_name = actual_server_name
+                                            if current_server_config.type == ServerType.STDIO:
+                                                if current_server_name in self.processes: self.processes[actual_server_name] = self.processes.pop(current_server_name)
+                                                if current_server_name in self._session_tasks: self._session_tasks[actual_server_name] = self._session_tasks.pop(current_server_name)
+                                            for item_dict in [self.tools, self.resources, self.prompts]:
+                                                keys_to_update = {} ; items_to_update = []
+                                                for key, item in item_dict.items():
+                                                    if item.server_name == original_name_before_rename:
+                                                        items_to_update.append(item)
+                                                        if key.startswith(original_name_before_rename + ":"):
+                                                            new_key = key.replace(original_name_before_rename + ":", actual_server_name + ":", 1)
+                                                            keys_to_update[key] = new_key
+                                                for item in items_to_update: item.server_name = actual_server_name
+                                                for old_key, new_key in keys_to_update.items():
+                                                    if old_key in item_dict: item_dict[new_key] = item_dict.pop(old_key)
+                                            current_server_name = actual_server_name
+                                            current_server_config.name = actual_server_name
+                                            config_updated_by_rename = True
+                                            rename_occurred_this_attempt = True
+                                        else: log.warning(f"Attempted rename for '{current_server_name}' (to '{actual_server_name}'), but it was no longer in config.")
+                                    except Exception as rename_err:
+                                        log.error(f"Failed to rename server '{current_server_name}' to '{actual_server_name}': {rename_err}", exc_info=True)
+                                        if current_server_name not in self.config.servers and 'original_config_entry' in locals(): self.config.servers[current_server_name] = original_config_entry
+
+                        # --- Success Path ---
                         connection_time = (time.time() - start_time) * 1000
-                        server_config.metrics.request_count += 1
-                        server_config.metrics.update_response_time(connection_time / 1000.0)
-                        server_config.metrics.update_status()
-
+                        server_config_in_dict = self.config.servers.get(current_server_name)
+                        if server_config_in_dict:
+                            server_config_in_dict.metrics.request_count += 1
+                            server_config_in_dict.metrics.update_response_time(connection_time / 1000.0)
+                            server_config_in_dict.metrics.update_status()
                         if latency_histogram:
-                            try: latency_histogram.record(connection_time, {"server.name": server_name})
-                            except Exception as metric_err: log.warning(f"Failed to record latency metric for {server_name}: {metric_err}")
-
-                        if span: span.set_status(trace.StatusCode.OK)
-
-                        # Use more detailed success message
-                        tools_loaded = len([t for t in self.tools.values() if t.server_name == server_name])
-                        log.info(f"Connected to server {server_name} and loaded capabilities ({tools_loaded} tools) in {connection_time:.2f}ms")
-                        self._safe_printer(f"[green]Connected & loaded: {server_name} ({tools_loaded} tools)[/]")
-
-                        # NOTE: Removed tracking 'created_session_tasks' as RobustStdioSession manages its own tasks
-                        # Track the main session object itself
-                        self.active_sessions[server_name] = session # Store the active session
-
-                        # --- Add Delay Before Returning Session ---
-                        settle_delay = 0.5 # Shorter delay ok now?
-                        log.info(f"[{server_name}] Connection appears stable. Waiting {settle_delay}s before use...")
-                        await asyncio.sleep(settle_delay)
-
-                        # Exit span context manager cleanly before returning session
+                            with suppress(Exception): latency_histogram.record(connection_time, {"server.name": current_server_name})
+                        if span:
+                            span.set_status(trace.StatusCode.OK)
+                            if rename_occurred_this_attempt: span.set_attribute("server.name", current_server_name)
+                        tools_loaded_count = len([t for t in self.tools.values() if t.server_name == current_server_name])
+                        log.info(f"Connected to {current_server_name} ({tools_loaded_count} tools loaded) in {connection_time:.2f}ms")
+                        self._safe_printer(f"[green]Connected & loaded: {current_server_name} ({tools_loaded_count} tools)[/]")
+                        self.active_sessions[current_server_name] = session
+                        if config_updated_by_rename:
+                            log.info(f"Saving configuration after server rename to {current_server_name}...")
+                            await self.config.save_async()
+                            config_updated_by_rename = False
                         if span_context_manager: span_context_manager.__exit__(None, None, None)
-                        return session # Return the successfully connected session
+                        return session # Return success
 
-                    # --- Outer Exception Handling Block (for connection attempt) ---
-                    # Catch BaseException to include ExceptionGroup from TaskGroup if RobustStdioSession fails internally
+                    # --- Outer Exception Handling for Connection Attempt ---
                     except (McpError, RuntimeError, ConnectionAbortedError, httpx.RequestError, subprocess.SubprocessError, OSError, FileNotFoundError, asyncio.TimeoutError, BaseException) as e:
                         connection_error = e
-                        log.warning(f"Connection/Handshake attempt failed for {server_name} ({type(e).__name__}): {e}")
-                        if isinstance(e, BaseExceptionGroup): # Log sub-exceptions if it's a group
-                             for i, sub_exc in enumerate(e.exceptions):
-                                 log.warning(f"  Sub-exception {i+1}: ({type(sub_exc).__name__}) {sub_exc}")
-
-                        # Cleanup logic for STDIO process if started in this attempt
+                        log.warning(f"Connection attempt failed for {current_server_name} (Attempt {retry_count + 1}, {type(e).__name__}): {e}")
+                        if isinstance(e, BaseExceptionGroup):
+                             for i, sub_exc in enumerate(e.exceptions): log.warning(f"  Sub-exception {i+1}: ({type(sub_exc).__name__}) {sub_exc}")
+                        # Cleanup resources specific to FAILED attempt (process, stderr task)
                         if process_this_attempt and process_this_attempt.returncode is None:
-                             log.debug(f"Terminating process {server_name} due to connection/handshake error.")
-                             await self.terminate_process(server_name, process_this_attempt)
-                        # Cleanup stderr reader task if started in this attempt
+                            await self.terminate_process(current_server_name, process_this_attempt)
                         if stderr_reader_task_this_attempt and not stderr_reader_task_this_attempt.done():
-                             log.debug(f"Cancelling stderr reader task for {server_name} due to error.")
-                             stderr_reader_task_this_attempt.cancel()
-                             with suppress(asyncio.CancelledError): await stderr_reader_task_this_attempt
-                             # Remove from tracking if cancelled here
-                             if server_name in self._session_tasks and stderr_reader_task_this_attempt in self._session_tasks[server_name]:
-                                 self._session_tasks[server_name].remove(stderr_reader_task_this_attempt)
-
-                        # NOTE: SSE cleanup is handled by AsyncExitStack
+                            stderr_reader_task_this_attempt.cancel()
+                            with suppress(asyncio.CancelledError): await stderr_reader_task_this_attempt
+                            if current_server_name in self._session_tasks and stderr_reader_task_this_attempt in self._session_tasks[current_server_name]:
+                                self._session_tasks[current_server_name].remove(stderr_reader_task_this_attempt)
+                        # NOTE: SSE cleanup is managed by self.exit_stack when the exception propagates
 
                     # --- Shared Error Handling & Retry Logic ---
-                    log.debug(f"Entering shared error handling for {server_name}, attempt {retry_count+1}")
-
-                    # NOTE: Removed cancellation of 'created_session_tasks'
-
-                    if zeroconf_registered_this_attempt: await self.unregister_local_server(server_name)
-
-                    # Update metrics for the failed attempt
                     retry_count += 1
-                    server_config.metrics.error_count += 1
-                    server_config.metrics.update_status()
+                    config_for_metrics = self.config.servers.get(current_server_name)
+                    if config_for_metrics:
+                        config_for_metrics.metrics.error_count += 1
+                        config_for_metrics.metrics.update_status()
+                    else: log.error(f"Could not find server config for '{current_server_name}' during error metric update.")
 
-                    # Set span status to ERROR if span exists
-                    error_msg_for_span = str(connection_error) if connection_error else "Unknown connection error"
-                    # Shorten potentially long messages for span status
-                    if len(error_msg_for_span) > 200: error_msg_for_span = error_msg_for_span[:200] + "..."
-                    if span: span.set_status(trace.StatusCode.ERROR, error_msg_for_span)
+                    error_msg_for_span = str(connection_error)[:200] + "..." if connection_error and len(str(connection_error)) > 200 else str(connection_error or "Unknown connection error")
+                    if span:
+                        span.set_status(trace.StatusCode.ERROR, error_msg_for_span)
+                        if rename_occurred_this_attempt: span.set_attribute("server.name", current_server_name)
 
-                    # Decide whether to retry or give up
                     if retry_count <= max_retries:
-                        # Use configured backoff values
-                        delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.1, 10.0) # Max 10s
-                        error_msg_display = str(connection_error) if connection_error else "Unknown connection error"
-                        log.warning(f"Error details for {server_name} (attempt {retry_count-1} failed): {error_msg_display}")
-                        self._safe_printer(f"[yellow]Error connecting/handshaking with {server_name}: {error_msg_display[:150]}...[/]") # Truncate long errors
-                        log.info(f"Retrying connection to {server_name} in {delay:.2f} seconds...")
-                        self._safe_printer(f"[cyan]Retrying in {delay:.2f} seconds...[/]")
-
-                        # --- Manually exit span context BEFORE sleep ---
+                        delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.1, 10.0)
+                        error_msg_display = str(connection_error or "Unknown error")[:150] + "..."
+                        log.warning(f"Error details for {current_server_name} (attempt {retry_count-1} failed): {str(connection_error or 'Unknown')}")
+                        self._safe_printer(f"[yellow]Error connecting {current_server_name}: {error_msg_display}[/]")
+                        log.info(f"Retrying connection to {current_server_name} in {delay:.2f}s...")
+                        self._safe_printer(f"[cyan]Retrying in {delay:.2f}s...[/]")
                         if span_context_manager:
-                            current_exc_info = sys.exc_info() if connection_error else (None, None, None)
-                            # Ensure we capture the correct exception info if it's a BaseExceptionGroup
-                            if isinstance(connection_error, BaseExceptionGroup):
-                                 # For simplicity, just pass the group itself. Tracing might handle it.
-                                 span_context_manager.__exit__(type(connection_error), connection_error, getattr(connection_error, '__traceback__', None))
-                            else:
-                                 span_context_manager.__exit__(*current_exc_info)
-                            span_context_manager = None
-                            span = None
-                        # --- End change ---
+                            with suppress(Exception): span_context_manager.__exit__(*sys.exc_info())
+                            span_context_manager = None; span = None
                         await asyncio.sleep(delay)
-                        # Continue to the next iteration of the while loop
-                    else:
-                        # Max retries exceeded
-                        final_error_msg = str(connection_error) if connection_error else "Unknown connection error"
-                        log.error(f"Failed to connect to server {server_name} after {max_retries+1} attempts. Final error: {final_error_msg}")
-                        self._safe_printer(f"[red]Failed to connect to {server_name} after {max_retries+1} attempts.[/]")
-                        # Cleanup process entry if it definitively failed and exited
-                        if server_name in self.processes and self.processes[server_name].returncode is not None:
-                            del self.processes[server_name]
-
+                        # Continue main while loop
+                    else: # Max retries exceeded
+                        final_error_msg = str(connection_error or "Unknown connection error")
+                        log.error(f"Failed to connect to {current_server_name} after {max_retries+1} attempts. Final error: {final_error_msg}")
+                        self._safe_printer(f"[red]Failed to connect to {current_server_name} after {max_retries+1} attempts.[/]")
+                        if current_server_config.type == ServerType.STDIO and current_server_name in self.processes:
+                            proc_to_clean = self.processes.pop(current_server_name, None)
+                            if proc_to_clean and proc_to_clean.returncode is None:
+                                log.info(f"Terminating process for {current_server_name} after max retries.")
+                                await self.terminate_process(current_server_name, proc_to_clean)
                         if span: span.set_status(trace.StatusCode.ERROR, f"Max retries exceeded. Final: {final_error_msg[:150]}...")
+                        if span_context_manager: 
+                            with suppress(Exception): 
+                                span_context_manager.__exit__(*sys.exc_info())
+                        if config_updated_by_rename:
+                            log.info(f"Saving configuration after failed connection attempts for renamed server {current_server_name}...")
+                            await self.config.save_async()
+                        return None # Connection failed
 
-                        # Exit span context manager before returning None
-                        if span_context_manager: span_context_manager.__exit__(*sys.exc_info())
-                        return None # Return None indicating connection failure
-
-                # --- End of while loop ---
-
-                # --- FINALLY block to ensure span context manager is ALWAYS exited ---
+                # --- Finally block for trace span ---
                 finally:
                     if span_context_manager:
-                        # Get current exception info, if any, to pass to __exit__
-                        exc_type, exc_value, tb = sys.exc_info()
-                        try:
-                            span_context_manager.__exit__(exc_type, exc_value, tb)
-                        except Exception as exit_err:
-                            log.warning(f"Error exiting span context manager for {server_name}: {exit_err}")
-                # --- END FINALLY block ---
+                         with suppress(Exception): span_context_manager.__exit__(*sys.exc_info())
 
-                # This path indicates loop finished without returning session or None after retries - should be rare
-                log.error(f"Connection loop for {server_name} exited without explicit return.")
-                return None
-
-                            
+            # --- Loop Exit (Should only happen if max retries exceeded) ---
+            log.error(f"Connection loop for {current_server_name} exited after max retries.")
+            if config_updated_by_rename:
+                log.info(f"Saving configuration after loop exit for renamed server {current_server_name}...")
+                await self.config.save_async()
+            return None
+        
     async def connect_to_servers(self):
         """Connect to all enabled MCP servers"""
         if not self.config.servers:
@@ -3616,56 +4387,59 @@ class ServerManager:
         try:
             # Add a timeout to all cleanup operations
             cleanup_timeout = 5  # seconds
-            
-            # Stop local discovery monitoring if running
-            if self.local_discovery_task:
-                try:
-                    await asyncio.wait_for(self.stop_local_discovery_monitoring(), timeout=cleanup_timeout)
-                except asyncio.TimeoutError:
-                    log.warning("Timeout stopping local discovery monitoring")
-                except Exception as e:
-                    log.error(f"Error stopping local discovery: {e}")
-                    
-            # Save conversation graph
-            try:
-                await asyncio.wait_for(
-                    self.conversation_graph.save(str(self.conversation_graph_file)),
-                    timeout=cleanup_timeout
-                )
-                log.info(f"Saved conversation graph to {self.conversation_graph_file}")
-            except (asyncio.TimeoutError, Exception) as e:
-                log.error(f"Failed to save conversation graph: {e}")
 
-            # Stop server monitor with timeout
-            if hasattr(self, 'server_monitor'):
+            # Close the shared port scan client if it exists
+            if self._port_scan_client:
                 try:
-                    await asyncio.wait_for(self.server_monitor.stop_monitoring(), timeout=cleanup_timeout)
-                except (asyncio.TimeoutError, Exception) as e:
-                    log.error(f"Error stopping server monitor: {e}")
-                    
-            # Close server connections and processes
-            if hasattr(self, 'server_manager'):
-                try:
-                    # Use a more aggressive timeout for server connections
-                    await asyncio.wait_for(self.server_manager.close(), timeout=cleanup_timeout)
-                except (asyncio.TimeoutError, Exception) as e:
-                    log.error(f"Error closing server manager: {e}")
-                    
-                    # Force kill any remaining processes
-                    for name, process in self.server_manager.processes.items():
-                        try:
-                            if process and process.returncode is None:
-                                log.warning(f"Force killing process {name} that didn't terminate properly")
-                                process.kill()
-                        except Exception as kill_error:
-                            log.error(f"Error killing process {name}: {kill_error}")
-                            
+                    await asyncio.wait_for(self._port_scan_client.aclose(), timeout=cleanup_timeout / 2) # Give it some time
+                    log.debug("Closed shared port scan HTTP client.")
+                except asyncio.TimeoutError:
+                    log.warning("Timeout closing port scan HTTP client.")
+                except Exception as e:
+                    log.error(f"Error closing port scan HTTP client: {e}")
+                self._port_scan_client = None
+
+            # Unregister Zeroconf services
+            for name in list(self.registered_services.keys()):
+                await self.unregister_local_server(name)
+
+            # Close SSE connections via exit_stack
+            log.debug(f"Closing {len(self.active_sessions)} active sessions via exit stack...")
+            await self.exit_stack.aclose() # This handles SSE client closures
+            log.debug("Exit stack closed.")
+
+            # Terminate STDIO processes
+            log.debug(f"Terminating {len(self.processes)} tracked processes...")
+            process_terminations = []
+            for name, process in list(self.processes.items()): # Iterate copy
+                process_terminations.append(self.terminate_process(name, process))
+                if name in self.processes: del self.processes[name] # Remove from tracking
+
+            if process_terminations:
+                await asyncio.gather(*process_terminations, return_exceptions=True)
+            log.debug("Processes terminated.")
+
+            # Cancel any remaining stderr reader tasks
+            tasks_to_cancel = []
+            for name, task_list in self._session_tasks.items():
+                tasks_to_cancel.extend(task_list)
+            self._session_tasks.clear()
+
+            if tasks_to_cancel:
+                log.debug(f"Cancelling {len(tasks_to_cancel)} remaining session tasks...")
+                for task in tasks_to_cancel:
+                    if task and not task.done():
+                        task.cancel()
+                # Allow cancellation to propagate
+                await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+                log.debug("Session tasks cancelled.")
+
+            # Close registry client
+            if self.registry:
+                await self.registry.close()
+
         except Exception as e:
-            log.error(f"Unexpected error during cleanup: {e}")
-            
-        finally:
-            # Let user know we're done
-            self._safe_printer("[yellow]Shutdown complete[/]")
+            log.error(f"Error during ServerManager cleanup: {e}", exc_info=True)
 
     def format_tools_for_anthropic(self) -> List[ToolParam]:
         """Format MCP tools for Anthropic API"""
@@ -4101,127 +4875,228 @@ class MCPClient:
                     server_tools = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
                     self.safe_print(f"[green]✓[/] {name} ({server.type.value}) - {server_tools} tools")
         self.safe_print("[green]Ready to process queries![/green]")
-                
+             # Inside class MCPClient:
+
     async def setup(self, interactive_mode=False):
-        """Set up the client, connect to servers, and load capabilities"""
-        # This instance will be passed to widgets requiring an explicit console.
-        safe_console_instance = get_safe_console()
+        """Set up the client, load configs, clean duplicates, discover, and connect to servers."""
+        safe_console_instance = get_safe_console() # Get console instance once
 
-        # Ensure API key is set
+        # --- 1. API Key Check ---
+        api_key_was_missing = False # Flag to track if we prompted
         if not self.config.api_key:
-            self.safe_print("[bold red]ERROR: Anthropic API key not found[/]") # Uses self.safe_print
-            self.safe_print("Please set your API key using one of these methods:") # Uses self.safe_print
-            self.safe_print("1. Set the ANTHROPIC_API_KEY environment variable") # Uses self.safe_print
-            self.safe_print("2. Run 'python mcp_client.py run --interactive' and then use '/config api-key YOUR_API_KEY'") # Uses self.safe_print
+            api_key_was_missing = True
+            self.safe_print("[bold red]ERROR: Anthropic API key not found[/]")
 
-            # Only exit if not in interactive mode
-            if not interactive_mode:
-                sys.exit(1)
+            if interactive_mode:
+                # Prompt the user ONLY in interactive mode
+                self.safe_print("You can enter your Anthropic API key now, or press Enter to continue without it.")
+                api_key_input = Prompt.ask(
+                    "Enter Anthropic API Key (optional)",
+                    default="",
+                    console=safe_console_instance # Use the safe console for prompting
+                )
+
+                if api_key_input.strip():
+                    self.config.api_key = api_key_input.strip()
+                    # Attempt to save the key immediately
+                    try:
+                        await self.config.save_async()
+                        self.safe_print("[green]API key saved to configuration.[/]")
+                    except Exception as e:
+                        self.safe_print(f"[red]Error saving API key: {e}[/]")
+                        self.config.api_key = None # Revert if save failed
+                else:
+                    # User pressed Enter, leave self.config.api_key as None
+                    pass # No key entered
             else:
-                self.safe_print("[yellow]Running in interactive mode without API key.[/]") # Uses self.safe_print
-                self.safe_print("[yellow]Please set your API key using '/config api-key YOUR_API_KEY'[/]") # Uses self.safe_print
-                # Continue setup without API features
-                self.anthropic = None  # Set to None until API key is provided
+                # Non-interactive mode, exit if key is missing
+                self.safe_print("Please set your API key using one of these methods:")
+                self.safe_print("1. Set the ANTHROPIC_API_KEY environment variable")
+                self.safe_print("2. Add 'api_key: YOUR_KEY' to your config file")
+                sys.exit(1)
 
-        self.conversation_graph = ConversationGraph() # Start with a default empty one
+        # --- Initialize Anthropic client AFTER potential prompt/save ---
+        if self.config.api_key:
+            try:
+                # Initialize or re-initialize the client if the key is now available
+                self.anthropic = AsyncAnthropic(api_key=self.config.api_key)
+                if api_key_was_missing: # Only print success if we just added it via prompt
+                    self.safe_print("[green]Anthropic client initialized successfully.[/]")
+            except Exception as e:
+                self.safe_print(f"[red]Error initializing Anthropic client with saved/provided key: {e}[/]")
+                self.safe_print("[yellow]API features will be disabled.[/]")
+                self.anthropic = None # Ensure it's None if init fails even with a key
+        else:
+            # Key is still missing (user didn't enter one in interactive mode)
+            if interactive_mode: # Check interactive_mode again for the correct message
+                 self.safe_print("[yellow]No API key provided. API features disabled.[/]")
+                 self.safe_print("You can set it later using '/config api-key YOUR_KEY'.")
+            # No need for else here, non-interactive already exited
+            self.anthropic = None
 
+        # --- 2. Load Conversation Graph ---
+        self.conversation_graph = ConversationGraph() # Start fresh
         if self.conversation_graph_file.exists():
-            status_text = f"{STATUS_EMOJI['history']} Loading conversation state..." # Use history emoji
+            status_text = f"{STATUS_EMOJI['history']} Loading conversation state..."
             with Status(status_text, console=safe_console_instance) as status:
                 try:
-                    # Load will now always return a graph object, handling errors internally
                     loaded_graph = await ConversationGraph.load(str(self.conversation_graph_file))
-                    self.conversation_graph = loaded_graph # Replace default graph with result
-
+                    self.conversation_graph = loaded_graph
                     # Check if loading resulted in a default graph (meaning load failed)
-                    is_new_graph = (loaded_graph.root.id == "root" and
-                                    not loaded_graph.root.messages and
-                                    not loaded_graph.root.children and
-                                    len(loaded_graph.nodes) == 1)
-
-                    if is_new_graph:
-                        # File existed, but loading failed. Inform user gently.
-                        self.safe_print("[yellow]Could not load previous conversation state, starting fresh.[/yellow]")
+                    is_new_graph = (loaded_graph.root.id == "root" and not loaded_graph.root.messages and
+                                    not loaded_graph.root.children and len(loaded_graph.nodes) == 1)
+                    if is_new_graph and self.conversation_graph_file.read_text().strip(): # Check if file wasn't empty
+                        self.safe_print("[yellow]Could not parse previous conversation state, starting fresh.[/yellow]")
                         status.update(f"{STATUS_EMOJI['warning']} Previous state invalid, starting fresh")
                     else:
-                        # Successfully loaded existing graph
                         log.info(f"Loaded conversation graph from {self.conversation_graph_file}")
                         status.update(f"{STATUS_EMOJI['success']} Conversation state loaded")
                 except Exception as setup_load_err:
-                    # Catch unexpected errors *outside* the ConversationGraph.load logic
-                    # (e.g., issues with the Status widget itself)
                     log.error("Unexpected error during conversation graph loading stage in setup", exc_info=True)
                     self.safe_print(f"[red]Error initializing conversation state: {setup_load_err}[/red]")
-                    # Keep the default self.conversation_graph
                     status.update(f"{STATUS_EMOJI['error']} Error loading state")
-                    # Ensure graph is still valid (it should be the default)
-                    self.conversation_graph = ConversationGraph()
+                    self.conversation_graph = ConversationGraph() # Ensure default graph
         else:
              log.info("No existing conversation graph found, using new graph.")
-             # No need to print anything to console if file just doesn't exist
 
+        # Ensure current node is valid after potential load
         if not self.conversation_graph.get_node(self.conversation_graph.current_node.id):
              log.warning("Current node ID was invalid after graph load/init, resetting to root.")
              self.conversation_graph.set_current_node("root")
-        
-        # Check for and load Claude desktop config if it exists
-        await self.load_claude_desktop_config() # Assumes this uses safe logging/printing
 
-        # Verify no stdout pollution before connecting to servers
+        # --- 3. Load Claude Desktop Config (adds potential initial servers) ---
+        await self.load_claude_desktop_config()
+
+        # --- 4. Clean Duplicate Server Configurations ---
+        log.info("Cleaning up potentially duplicate server configurations...")
+        cleaned_servers: Dict[str, ServerConfig] = {}
+        # Store mapping: unique_identifier -> canonical_name_to_keep
+        canonical_map: Dict[Tuple, str] = {}
+        duplicates_found = False
+
+        # Iterate through a snapshot of current servers
+        servers_to_process = list(self.config.servers.items())
+
+        for name, server_config in servers_to_process:
+            # Create a unique identifier based on execution details
+            identifier: Optional[Tuple] = None
+            if server_config.type == ServerType.STDIO:
+                # For STDIO, path and sorted args define uniqueness
+                # Using frozenset makes the args order-independent and hashable
+                args_frozenset = frozenset(server_config.args)
+                identifier = (server_config.type, server_config.path, args_frozenset)
+            elif server_config.type == ServerType.SSE:
+                # For SSE, the path (URL) defines uniqueness
+                identifier = (server_config.type, server_config.path)
+            else:
+                log.warning(f"Server '{name}' has unknown type '{server_config.type}', cannot check for duplicates.")
+                identifier = (server_config.type, name) # Fallback identifier
+
+            if identifier is not None:
+                if identifier not in canonical_map:
+                    # First time seeing this server config identifier, keep this entry
+                    canonical_map[identifier] = name
+                    cleaned_servers[name] = server_config
+                    log.debug(f"Keeping server config: '{name}' (Identifier: {identifier})")
+                else:
+                    # Duplicate found based on identifier
+                    duplicates_found = True
+                    kept_name = canonical_map[identifier]
+                    log.warning(f"Duplicate server config detected for identifier {identifier}. Removing entry '{name}', keeping '{kept_name}'.")
+                    # We simply don't add 'name' to cleaned_servers
+                    # Optional advanced logic: could compare 'name' vs 'kept_name' and potentially
+                    # replace the entry in cleaned_servers if 'name' is "better" (e.g., not generated)
+                    # but keeping the first encountered is simpler and robust.
+
+        # Update config if duplicates were removed
+        if duplicates_found:
+            num_removed = len(self.config.servers) - len(cleaned_servers)
+            self.safe_print(f"[yellow]Removed {num_removed} duplicate server entries from config.[/]")
+            self.config.servers = cleaned_servers
+            await self.config.save_async() # Save the cleaned config
+        else:
+            log.info("No duplicate server configurations found during initial cleanup.")
+        # --- End Cleanup Step ---
+
+        # --- 5. Stdout Pollution Check ---
         if os.environ.get("MCP_VERIFY_STDOUT", "1") == "1":
-            # Use safe_stdout context manager to prevent the verification itself from polluting
             with safe_stdout():
-                # Only log this, don't print directly to avoid any risk of stdout pollution
                 log.info("Verifying no stdout pollution before connecting to servers...")
                 verify_no_stdout_pollution()
 
-        # Discover servers if enabled - Nested Live fix already applied
+        # --- 6. Discover Servers (Filesystem, Registry, mDNS, Port Scan) ---
+        # This might add *new* servers via _process_discovery_results, which
+        # internally checks for duplicates based on path before adding.
         if self.config.auto_discover:
-            self.safe_print(f"{STATUS_EMOJI['search']} Discovering MCP servers...") # Uses self.safe_print
+            self.safe_print(f"{STATUS_EMOJI['search']} Discovering MCP servers...")
             try:
-                await self.server_manager.discover_servers() # Uses _run_with_progress internally
+                await self.server_manager.discover_servers()
             except Exception as discover_error:
-                # Log the error and inform the user discovery failed
                 log.error("Error during server discovery process", exc_info=True)
-                self.safe_print(f"[red]Error during server discovery: {discover_error}[/red]") # Uses self.safe_print
+                self.safe_print(f"[red]Error during server discovery: {discover_error}[/red]")
 
-        # Start continuous local discovery if enabled
+        # --- 7. Start Continuous Local Discovery (mDNS) ---
         if self.config.enable_local_discovery and self.server_manager.registry:
-            await self.start_local_discovery_monitoring() # Assumes this uses safe logging/printing
+            await self.start_local_discovery_monitoring()
 
-        enabled_servers = [s for s in self.config.servers.values() if s.enabled]
-        if enabled_servers:
-            self.safe_print(f"[bold blue]Connecting to {len(enabled_servers)} servers...[/]") # Uses self.safe_print
+        # --- 8. Connect to Enabled Servers ---
+        # Get the list of servers *after* potential discovery additions and cleanup
+        servers_to_connect = {name: cfg for name, cfg in self.config.servers.items() if cfg.enabled}
+
+        if servers_to_connect:
+            self.safe_print(f"[bold blue]Connecting to {len(servers_to_connect)} servers...[/]")
             connection_results = {}
-            for name, server_config in self.config.servers.items():
-                if not server_config.enabled: continue
-                self.safe_print(f"[cyan]Connecting to {name}...[/]") # Uses self.safe_print
+            # Iterate over a copy of the items from the cleaned + discovered server list
+            for name, server_config in list(servers_to_connect.items()):
+                # The 'name' here is the key currently in self.config.servers
+                self.safe_print(f"[cyan]Connecting to {name}...[/]")
                 try:
-                    result = await self._connect_and_load_server(name, server_config) # Calls connect_to_server which uses _safe_printer
-                    connection_results[name] = result
-                    if result:
-                        self.safe_print(f"  [green]✓ Connected to {name}[/]") # Uses self.safe_print
+                    # Pass the config object associated with this name.
+                    # connect_to_server might rename the entry in self.config.servers
+                    # and will return the session associated with the *final* name.
+                    session = await self.server_manager.connect_to_server(server_config)
+
+                    # Determine the final name after potential rename for status reporting
+                    final_name = name
+                    if name in self.config.servers: # Check if original name still exists
+                       if self.config.servers[name].name != name: # If the object's name changed
+                           final_name = self.config.servers[name].name
+                    elif name not in self.config.servers: # Original name was removed (rename happened)
+                         # Find the new name by looking for the session object? Less reliable.
+                         # Better: Check if the server_config object itself was mutated
+                         if server_config.name != name:
+                              final_name = server_config.name
+                         else: # Fallback: Look for the session in active_sessions (might be slow)
+                              for active_name, active_session in self.server_manager.active_sessions.items():
+                                   if active_session == session:
+                                       final_name = active_name
+                                       break
+
+                    connection_results[name] = (session is not None) # Log success/fail against original iteration name
+
+                    if session:
+                        self.safe_print(f"  [green]✓ Connected to {final_name}[/]") # Print final name on success
                     else:
-                        log.warning(f"Failed to connect and load server: {name}")
-                        self.safe_print(f"  [yellow]✗ Failed to connect to {name}[/]") # Uses self.safe_print
+                        log.warning(f"Failed to connect and load server initially named: {name}")
+                        self.safe_print(f"  [yellow]✗ Failed to connect to {name}[/]") # Print original name on failure
+
                 except Exception as e:
                     log.error(f"Exception connecting to {name}", exc_info=True)
-                    self.safe_print(f"  [red]✗ Error connecting to {name}: {e}[/]") # Uses self.safe_print
+                    self.safe_print(f"  [red]✗ Error connecting to {name}: {e}[/]") # Print original name on error
                     connection_results[name] = False
 
-        # Start server monitoring
-        # This Status widget is fine as it doesn't overlap with Progress calls
+        # --- 9. Start Server Monitoring ---
         try:
             with Status(f"{STATUS_EMOJI['server']} Starting server monitoring...",
-                    spinner="dots", console=safe_console_instance) as status: # Pass variable
-                await self.server_monitor.start_monitoring() # Assumes this uses safe logging
+                    spinner="dots", console=safe_console_instance) as status:
+                await self.server_monitor.start_monitoring()
                 status.update(f"{STATUS_EMOJI['success']} Server monitoring started")
         except Exception as monitor_error:
             log.error("Failed to start server monitoring", exc_info=True)
-            self.safe_print(f"[red]Error starting server monitoring: {monitor_error}[/red]") # Uses self.safe_print
+            self.safe_print(f"[red]Error starting server monitoring: {monitor_error}[/red]")
 
-        # Display status without Progress widgets (uses print_simple_status)
-        await self.print_simple_status() # Assumes print_simple_status uses self.safe_print
+        # --- 10. Display Final Status ---
+        await self.print_simple_status() # Uses the current state of self.config.servers
         
     async def _connect_and_load_server(self, server_name, server_config):
         """Connect to a server and load its capabilities (for use with _run_with_progress)"""
@@ -4460,10 +5335,11 @@ class MCPClient:
 
     async def close(self):
         """Clean up resources before exit"""
+
         # Stop local discovery monitoring if running
         if self.local_discovery_task:
             await self.stop_local_discovery_monitoring()
-            
+
         # Save conversation graph
         try:
             await self.conversation_graph.save(str(self.conversation_graph_file))
@@ -4473,10 +5349,10 @@ class MCPClient:
 
         # Stop server monitor
         if hasattr(self, 'server_monitor'): # Ensure monitor was initialized
-             await self.server_monitor.stop_monitoring()
+            await self.server_monitor.stop_monitoring()
         # Close server connections and processes
         if hasattr(self, 'server_manager'):
-             await self.server_manager.close()
+            await self.server_manager.close() # ServerManager.close() will handle its own clients
 
     async def process_streaming_query(self, query: str, model: Optional[str] = None,
                                     max_tokens: Optional[int] = None) -> AsyncIterator[str]:
@@ -5571,7 +6447,7 @@ class MCPClient:
         ]
         
         config_commands = [
-            Text(f"{STATUS_EMOJI['config']} /config", style="bold"), Text(" - Manage configuration"),
+            Text(f"{STATUS_EMOJI['config']} /config", style="bold"), Text(" - Manage configuration (API key, model, discovery, port scanning, etc.)"),
             Text(f"{STATUS_EMOJI['speech_balloon']} /model", style="bold"), Text(" - Change the current model"),
             Text(f"{STATUS_EMOJI['package']} /cache", style="bold"), Text(" - Manage tool result cache")
         ]
@@ -5644,6 +6520,12 @@ class MCPClient:
             self.safe_print(f"History Size: {self.config.history_size}")
             self.safe_print(f"Auto-Discovery: {'Enabled' if self.config.auto_discover else 'Disabled'}")
             self.safe_print(f"Discovery Paths: {', '.join(self.config.discovery_paths)}")
+            self.safe_print("\n[bold]Port Scanning:[/]")
+            self.safe_print(f"  Enabled: {'Yes' if self.config.enable_port_scanning else 'No'}")
+            self.safe_print(f"  Range: {self.config.port_scan_range_start} - {self.config.port_scan_range_end}")
+            self.safe_print(f"  Targets: {', '.join(self.config.port_scan_targets)}")
+            self.safe_print(f"  Concurrency: {self.config.port_scan_concurrency}")
+            self.safe_print(f"  Timeout: {self.config.port_scan_timeout}s")            
             return
         
         parts = args.split(maxsplit=1)
@@ -5705,6 +6587,55 @@ class MCPClient:
             self.config.save()
             self.safe_print(f"[green]Auto-discovery {'enabled' if self.config.auto_discover else 'disabled'}[/]")
             
+        elif subcmd == "port-scan":
+             scan_parts = subargs.split(maxsplit=1)
+             scan_action = scan_parts[0].lower() if scan_parts else "show"
+             scan_value = scan_parts[1] if len(scan_parts) > 1 else ""
+
+             if scan_action == "enable":
+                 if scan_value.lower() in ("true", "yes", "on", "1"):
+                     self.config.enable_port_scanning = True
+                     self.config.save()
+                     self.safe_print("[green]Port scanning enabled.[/]")
+                 elif scan_value.lower() in ("false", "no", "off", "0"):
+                     self.config.enable_port_scanning = False
+                     self.config.save()
+                     self.safe_print("[yellow]Port scanning disabled.[/]")
+                 else:
+                     self.safe_print("[yellow]Usage: /config port-scan enable [true|false][/]")
+             elif scan_action == "range":
+                 range_parts = scan_value.split()
+                 if len(range_parts) == 2 and range_parts[0].isdigit() and range_parts[1].isdigit():
+                     start, end = int(range_parts[0]), int(range_parts[1])
+                     if start <= end:
+                         self.config.port_scan_range_start = start
+                         self.config.port_scan_range_end = end
+                         self.config.save()
+                         self.safe_print(f"[green]Port scan range set to {start}-{end}[/]")
+                     else:
+                         self.safe_print("[red]Start port must be less than or equal to end port.[/]")
+                 else:
+                     self.safe_print("[yellow]Usage: /config port-scan range START_PORT END_PORT[/]")
+             elif scan_action == "targets":
+                 targets = [t.strip() for t in scan_value.split(',') if t.strip()]
+                 if targets:
+                     self.config.port_scan_targets = targets
+                     self.config.save()
+                     self.safe_print(f"[green]Port scan targets set to: {', '.join(targets)}[/]")
+                 else:
+                     self.safe_print("[yellow]Usage: /config port-scan targets IP1,IP2,...[/]")
+                     self.safe_print("[yellow]Example: /config port-scan targets 127.0.0.1,192.168.1.10[/]")
+             # Add similar handlers for 'concurrency' and 'timeout' if desired
+             elif scan_action == "show" or not scan_action:
+                 self.safe_print("\n[bold]Port Scanning Settings:[/]")
+                 self.safe_print(f"  Enabled: {'Yes' if self.config.enable_port_scanning else 'No'}")
+                 self.safe_print(f"  Range: {self.config.port_scan_range_start} - {self.config.port_scan_range_end}")
+                 self.safe_print(f"  Targets: {', '.join(self.config.port_scan_targets)}")
+                 self.safe_print(f"  Concurrency: {self.config.port_scan_concurrency}")
+                 self.safe_print(f"  Timeout: {self.config.port_scan_timeout}s")
+             else:
+                 self.safe_print("[yellow]Unknown port-scan command. Available: enable, range, targets, concurrency, timeout, show[/]")
+
         elif subcmd == "discovery-path":
             parts = subargs.split(maxsplit=1)
             action = parts[0].lower() if parts else ""

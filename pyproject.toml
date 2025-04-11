@@ -38,6 +38,7 @@ dependencies = [
     "typer",
     "rich",
     "httpx",
+    "httpx-sse",
     "pyyaml",
     "python-dotenv",
     "colorama",
@@ -90,6 +91,7 @@ ignore = [
     "B007",
     "B008",
     "E701",
+    "E702",
     "F541",
 ]
 # Specify the target Python version for ruff

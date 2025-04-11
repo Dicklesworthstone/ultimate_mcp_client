@@ -25,7 +25,7 @@ The Model Context Protocol (MCP) standardizes how AI models interact with extern
 2.  **Rich User Experience:** Offer both a powerful interactive CLI and a modern, reactive Web UI, ensuring usability for diverse workflows.
 3.  **Advanced State Management:** Go beyond simple chat history with forkable conversation graphs, persistent state across sessions, and smart context optimization techniques.
 4.  **Developer Introspection:** Provide deep observability via OpenTelemetry metrics and traces, alongside live dashboards for monitoring client and server health and performance.
-5.  **Seamless Integration:** Easily discover and integrate local filesystem scripts, local network (mDNS) servers, remote registry entries, and even configurations from existing tools like the Claude Desktop app.
+5.  **Seamless Integration:** Easily discover and integrate local filesystem scripts, local network (mDNS) servers, local port scan results, remote registry entries, and even configurations from existing tools like the Claude Desktop app.
 
 **This project tackles significant engineering challenges**, especially around reliable `stdio` communication, asynchronous state management, and providing a consistent experience across both CLI and Web interfaces, to deliver a truly comprehensive MCP client solution.
 
@@ -49,6 +49,7 @@ The Model Context Protocol (MCP) standardizes how AI models interact with extern
 -   **Intelligent Server Discovery**
     -   Auto-discovers local `stdio` servers (Python/JS scripts) in configured filesystem paths.
     -   **mDNS Discovery (Zeroconf):** Real-time discovery and notification of MCP servers (`_mcp._tcp.local.`) on the local network. Interactive commands (`/discover list`, `/discover connect`, etc.) for managing LAN servers.
+    -   **Local Port Scanning:** Actively scans a configurable range of local ports (e.g., 8000-9000) for MCP servers by attempting an `initialize` handshake. Useful for servers not advertising via mDNS. Configurable via `/config port-scan ...` commands.
     -   **Registry Integration:** Connects to remote MCP registries (specified in config) to find and add shared servers.
     -   **Claude Desktop Import:** Automatically detects `claude_desktop_config.json` in the project root. **Intelligently adapts configurations:**
         -   Remaps `wsl.exe ... bash -c "cmd"` calls to direct Linux shell execution (`/bin/bash -c "cmd"`).
@@ -206,6 +207,16 @@ mcpclient run --query "What's the weather in New York?"
 mcpclient run --dashboard
 ```
 
+### Configure Port Scanning
+
+```bash
+# Enable port scanning (if disabled)
+mcpclient config port-scan enable true
+
+# Set the range (example)
+mcpclient config port-scan range 8000 8999
+```
+
 ### Import and Export Conversations
 
 ```bash
@@ -289,7 +300,7 @@ Type `/` followed by a command:
 ```text
 /help         Show this help message
 /exit, /quit  Exit the client
-/config       Manage configuration (api-key, model, max-tokens, history-size, auto-discover, discovery-path)
+/config       Manage configuration (api-key, model, max-tokens, history-size, auto-discover, discovery-path, port-scan)
 /servers      Manage MCP servers (list, add, remove, connect, disconnect, enable, disable, status)
 /discover     Discover/manage LAN servers (list, connect <NAME>, refresh, auto <on|off>)
 /tools        List available tools (optionally filter by server: /tools <server_name>)
@@ -316,7 +327,7 @@ Type `/` followed by a command:
 
 This client employs several techniques to provide a robust and feature-rich experience:
 
--   **Asynchronous Core:** Built entirely on Python's `asyncio` for efficient handling of network I/O (HTTP, WebSockets, SSE), subprocess communication (`stdio`), filesystem operations (`aiofiles`), and concurrent background tasks (monitoring, discovery).
+-   **Asynchronous Core:** Built entirely on Python's `asyncio` for efficient handling of network I/O (HTTP, WebSockets, SSE), subprocess communication (`stdio`), filesystem operations (`aiofiles`), and concurrent background tasks (monitoring, discovery, port scanning).
 -   **Component-Based Design:** While packaged primarily as a single script for ease of use, it internally separates concerns into distinct classes:
     -   `MCPClient`: The main application class, orchestrating UI loops, command handling, and core logic.
     -   `ServerManager`: Handles server configuration, lifecycle (connecting, disconnecting, restarting), discovery mechanisms, capability aggregation (tools, resources, prompts), and manages server processes/sessions. Uses `AsyncExitStack` for reliable resource cleanup.
@@ -383,7 +394,12 @@ This client offers multiple ways to find and integrate MCP servers:
         -   `/discover connect <NAME>`: Add a discovered server to the configuration file and attempt to connect.
         -   `/discover refresh`: Manually trigger a re-scan of the network.
         -   `/discover auto [on|off]`: Toggle continuous background mDNS scanning (requires `enable_local_discovery: true` in config).
-
+  -   **Local Port Scanning:**
+      -   If enabled (`enable_port_scanning: true` in `config.yaml` or via `/config port-scan enable true`), actively scans a range of ports on specified local IP addresses during startup discovery.
+      -   Attempts a basic MCP `initialize` handshake on each port to detect responsive MCP servers (primarily SSE).
+      -   Useful for finding servers that don't use mDNS advertisement.
+      -   The range, target IPs, concurrency, and timeout are configurable via `config.yaml` or the `/config port-scan ...` commands.
+      -   Found servers are presented alongside other discovered servers for optional addition to the configuration.
 ---
 
 ## 📡 Telemetry + Debugging
@@ -404,7 +420,7 @@ This client offers multiple ways to find and integrate MCP servers:
 
 -   **Primary File:** Configuration is loaded from and saved to `.mcpclient_config/config.yaml` located in the project's root directory.
 -   **Environment Variables:** `ANTHROPIC_API_KEY` is the primary way to provide the API key and overrides any key stored in the config file. `EDITOR` is used by `/config edit`. `MCP_CLIENT_DEBUG=1` enables tracebacks.
--   **Interactive CLI:** The `/config` command allows viewing and modifying settings like `api-key`, `model`, `max-tokens`, `discovery-path`, etc. Changes are saved back to `config.yaml`.
+-   **Interactive CLI:** The `/config` command allows viewing and modifying settings like `api-key`, `model`, `max-tokens`, `discovery-path`, port scanning parameters, etc. Changes are saved back to `config.yaml`.
 -   **Web UI Settings:** The "Settings" tab in the Web UI provides controls for common configuration options. Changes made here are sent via the API and saved to `config.yaml`.
 
 **View Current Config:**
