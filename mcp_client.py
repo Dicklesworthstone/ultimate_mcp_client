@@ -211,7 +211,7 @@ from anthropic.types import (
     ToolParam,
 )
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # MCP SDK imports
@@ -501,6 +501,53 @@ class CheckoutRequest(BaseModel):
 class OptimizeRequest(BaseModel):
     model: Optional[str] = None
     target_tokens: Optional[int] = None
+
+class ApplyPromptRequest(BaseModel):
+    prompt_name: str
+
+class DiscoveredServer(BaseModel):
+    name: str
+    type: str # 'stdio' or 'sse'
+    path_or_url: str
+    source: str # 'filesystem', 'registry', 'mdns', 'portscan'
+    description: Optional[str] = None
+    version: Optional[str] = None
+    categories: List[str] = []
+    is_configured: bool = False # Indicate if already in main config
+
+class CacheEntryDetail(BaseModel):
+    key: str
+    tool_name: str
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+
+class CacheDependencyInfo(BaseModel):
+    dependencies: Dict[str, List[str]] # tool_name -> list_of_dependencies
+
+class ServerDetail(BaseModel):
+    name: str
+    type: ServerType
+    path: str
+    args: List[str]
+    enabled: bool
+    auto_start: bool
+    description: str
+    trusted: bool
+    categories: List[str]
+    version: Optional[str] = None # Store as string for simplicity
+    rating: float
+    retry_count: int
+    timeout: float
+    registry_url: Optional[str] = None
+    capabilities: Dict[str, bool]
+    is_connected: bool
+    metrics: Dict[str, Any] # Keep metrics as a dict for flexibility
+    process_info: Optional[Dict[str, Any]] = None # For STDIO process stats
+
+class DashboardData(BaseModel):
+    client_info: Dict[str, Any]
+    servers: List[Dict[str, Any]] # Simplified server list for dashboard
+    tools: List[Dict[str, Any]] # Top tools info
 
 # --- Global variable to hold the FastAPI app (defined later) ---
 # This is needed because uvicorn.run needs the app object path.
@@ -2580,6 +2627,8 @@ class ServerManager:
         self._session_tasks: Dict[str, List[asyncio.Task]] = {} # Store tasks per session        
         self.sanitized_to_original = {}  # Maps sanitized name -> original name
         self._port_scan_client: Optional[httpx.AsyncClient] = None # Client for port scanning
+        self.discovered_servers_cache: List[Dict] = [] # Store discovery results
+        self._discovery_in_progress = asyncio.Lock() # Prevent concurrent discovery runs
 
     @property
     def tools_by_server(self) -> Dict[str, List[MCPTool]]:
@@ -3230,44 +3279,198 @@ class ServerManager:
         log.info(f"Port scan complete. Detected {mcp_endpoints_found} responsive MCP endpoints. Found {len(self._discovered_port_scan)} servers not already in config.")
 
     async def discover_servers(self):
-        """Auto-discover MCP servers via filesystem, registry, mDNS, and port scanning."""
-        steps = []
-        descriptions = []
-        
-        # Add filesystem discovery step if enabled
-        if self.config.auto_discover:
-            steps.append(self._discover_local_servers)
-            descriptions.append(f"{STATUS_EMOJI['search']} Discovering local file system servers...")
-        
-        # Add registry discovery step if enabled
-        if self.config.enable_registry and self.registry:
-            steps.append(self._discover_registry_servers)
-            descriptions.append(f"{STATUS_EMOJI['search']} Discovering registry servers...")
-        
-        # Add mDNS discovery step if enabled
-        if self.config.enable_local_discovery and self.registry:
-            steps.append(self._discover_mdns_servers)
-            descriptions.append(f"{STATUS_EMOJI['search']} Discovering local network servers...")
-        
-        # Add port scanning step if enabled
-        if self.config.enable_port_scanning:
-            steps.append(self._discover_port_scan) # Add the new method
-            descriptions.append(f"{STATUS_EMOJI['search']} Scanning local ports [{self.config.port_scan_range_start}-{self.config.port_scan_range_end}]...")
+        """
+        Auto-discover MCP servers via filesystem, registry, mDNS, and port scanning.
+        Runs the discovery steps and populates self.discovered_servers_cache.
+        """
+        # Use a lock to prevent concurrent discovery runs, which could lead to race conditions
+        # on the internal attributes (_discovered_local, etc.) and the cache.
+        async with self._discovery_in_progress:
+            log.info("Starting server discovery process...")
+            # Reset cache and internal result holders before starting
+            self.discovered_servers_cache = []
+            self._discovered_local = []
+            self._discovered_remote = []
+            self._discovered_mdns = []
+            self._discovered_port_scan = []
 
-        # Run the discovery steps with progress tracking
-        if steps:
-            await self.run_multi_step_task(
-                steps=steps,
-                step_descriptions=descriptions,
-                title=f"{STATUS_EMOJI['search']} Discovering MCP servers..."
-            )
-            
-            # Process and display discovery results
-            await self._process_discovery_results()
-        else:
-            safe_console = get_safe_console()
-            safe_console.print("[yellow]Server discovery is disabled in configuration.[/]")
+            # Define the discovery steps and their descriptions based on config
+            steps = []
+            descriptions = []
+
+            # --- Filesystem Discovery ---
+            if self.config.auto_discover:
+                steps.append(self._discover_local_servers)
+                descriptions.append(f"{STATUS_EMOJI['search']} Discovering local file system servers...")
+            else:
+                log.debug("Skipping filesystem discovery (disabled by config).")
+
+            # --- Registry Discovery ---
+            if self.config.enable_registry and self.registry:
+                steps.append(self._discover_registry_servers)
+                descriptions.append(f"{STATUS_EMOJI['search']} Discovering registry servers...")
+            else:
+                log.debug("Skipping registry discovery (disabled or registry not available).")
+
+            # --- mDNS Discovery ---
+            if self.config.enable_local_discovery and self.registry:
+                # Ensure Zeroconf is started if needed (might be started by registry init)
+                if not self.registry.zeroconf:
+                     try:
+                         self.registry.start_local_discovery()
+                         log.debug("Started Zeroconf for mDNS discovery step.")
+                     except Exception as e:
+                         log.error(f"Failed to start Zeroconf for mDNS discovery: {e}")
+                # Add the step even if start failed, _discover_mdns_servers handles registry check
+                steps.append(self._discover_mdns_servers)
+                descriptions.append(f"{STATUS_EMOJI['search']} Discovering local network servers (mDNS)...")
+            else:
+                log.debug("Skipping mDNS discovery (disabled or registry not available).")
+
+            # --- Port Scanning Discovery ---
+            if self.config.enable_port_scanning:
+                steps.append(self._discover_port_scan)
+                descriptions.append(f"{STATUS_EMOJI['search']} Scanning local ports [{self.config.port_scan_range_start}-{self.config.port_scan_range_end}]...")
+            else:
+                log.debug("Skipping port scanning discovery (disabled by config).")
+
+            # --- Execute Discovery Steps ---
+            if steps:
+                log.info(f"Running {len(steps)} enabled discovery steps...")
+                try:
+                    # Use run_multi_step_task to execute the discovery functions
+                    await self.run_multi_step_task(
+                        steps=steps,
+                        step_descriptions=descriptions,
+                        title=f"{STATUS_EMOJI['search']} Discovering MCP servers...",
+                        show_spinner=True # Set to False if run purely in background API context?
+                    )
+                    log.info("Discovery steps execution complete.")
+                except Exception as discover_err:
+                    log.error(f"Error occurred during multi-step discovery task: {discover_err}", exc_info=True)
+                    # Continue to process any results gathered before the error
+            else:
+                log.info("No discovery methods enabled.")
+                # Exit early if no steps were run, cache remains empty
+                return
+
+            # --- Process Results and Populate Cache ---
+            # The discovery steps (_discover_local_servers, etc.) should have populated
+            # the internal attributes like self._discovered_local, self._discovered_remote, etc.
+            log.info("Processing discovery results and populating cache...")
+
+            # Get results from internal attributes set by the discovery steps ran above
+            discovered_local = getattr(self, '_discovered_local', [])
+            discovered_remote = getattr(self, '_discovered_remote', [])
+            discovered_mdns = getattr(self, '_discovered_mdns', [])
+            discovered_port_scan = getattr(self, '_discovered_port_scan', [])
+
+            # Check existing configured paths/urls to mark discoveries
+            configured_paths = {s.path for s in self.config.servers.values()}
+
+            # Process Local Filesystem Results
+            for name, path, server_type in discovered_local:
+                is_conf = path in configured_paths
+                self.discovered_servers_cache.append({
+                    "name": name, "type": server_type, "path_or_url": path, "source": "filesystem",
+                    "description": f"Discovered {server_type} server", "is_configured": is_conf,
+                    "version": None, "categories": [] # Add defaults for consistency
+                })
+
+            # Process Remote Registry Results
+            for name, url, server_type, version, categories, rating in discovered_remote:
+                is_conf = url in configured_paths
+                self.discovered_servers_cache.append({
+                    "name": name, "type": server_type, "path_or_url": url, "source": "registry",
+                    "description": f"Discovered from registry (Rating: {rating:.1f}/5)",
+                    "version": str(version) if version else None, "categories": categories, "is_configured": is_conf
+                })
+
+            # Process mDNS Results
+            for name, url, server_type, version, categories, description in discovered_mdns:
+                 is_conf = url in configured_paths
+                 self.discovered_servers_cache.append({
+                    "name": name, "type": server_type, "path_or_url": url, "source": "mdns",
+                    "description": description or "Discovered on local network",
+                    "version": str(version) if version else None, "categories": categories, "is_configured": is_conf
+                 })
+
+            # Process Port Scan Results
+            for name, url, server_type, version, categories, description in discovered_port_scan:
+                 is_conf = url in configured_paths
+                 self.discovered_servers_cache.append({
+                     "name": name, "type": server_type, "path_or_url": url, "source": "portscan",
+                     "description": description or f"Discovered via port scan",
+                     "version": str(version) if version else None, # Version might not be available from basic scan
+                     "categories": categories or [], # Categories likely unavailable
+                     "is_configured": is_conf
+                 })
+
+            log.info(f"Discovery complete. Found and cached {len(self.discovered_servers_cache)} potential servers.")
+            # The API endpoint `/api/discover/results` will read this cache.
+            # The CLI command `/discover list` or `servers --search` might call this
+            # method and then potentially call a separate method like `_prompt_add_discovered_servers`.
     
+    async def get_discovery_results(self) -> List[Dict]:
+         return list(self.discovered_servers_cache)
+
+    async def add_and_connect_discovered_server(self, discovered_server_info: Dict) -> Tuple[bool, str]:
+        """Adds a server from discovery results and attempts to connect."""
+        name = discovered_server_info.get("name")
+        path_or_url = discovered_server_info.get("path_or_url")
+        server_type_str = discovered_server_info.get("type")
+        if not all([name, path_or_url, server_type_str]):
+            return False, "Invalid discovered server data."
+        # Check if already configured by path/url
+        if any(s.path == path_or_url for s in self.config.servers.values()):
+             existing_name = next((s.name for s in self.config.servers.values() if s.path == path_or_url), None)
+             # If already connected, return success
+             if existing_name and existing_name in self.active_sessions:
+                  return True, f"Server already configured as '{existing_name}' and connected."
+             # If configured but not connected, try connecting
+             elif existing_name:
+                  try:
+                       server_config = self.config.servers[existing_name]
+                       success = await self._connect_and_load_server(existing_name, server_config)
+                       if success:
+                            return True, f"Connected to existing server '{existing_name}'."
+                       else:
+                            return False, f"Failed to connect to existing server '{existing_name}'."
+                  except Exception as e:
+                       return False, f"Error connecting to existing server '{existing_name}': {e}"
+             else:
+                  # Should not happen if path check passed, but handle anyway
+                  return False, "Server path exists but could not find configuration name."
+        # Add the new server
+        try:
+            server_type = ServerType(server_type_str.lower())
+            new_server_config = ServerConfig(
+                name=name,
+                type=server_type,
+                path=path_or_url,
+                enabled=True,
+                auto_start=False, # Don't auto-start from discovery connect
+                description=discovered_server_info.get("description", f"Discovered via {discovered_server_info.get('source', 'unknown')}"),
+                categories=discovered_server_info.get("categories", []),
+                version=ServerVersion.from_string(discovered_server_info["version"]) if discovered_server_info.get("version") else None
+            )
+            self.config.servers[name] = new_server_config
+            await self.config.save_async()
+            log.info(f"Added discovered server '{name}' to configuration.")
+        except Exception as e:
+            log.error(f"Failed to add server '{name}' from discovery: {e}")
+            return False, f"Error adding server config: {e}"
+        # Attempt to connect
+        try:
+            success = await self._connect_and_load_server(name, new_server_config)
+            if success:
+                return True, f"Server '{name}' added and connected successfully."
+            else:
+                return False, f"Server '{name}' added but failed to connect."
+        except Exception as e:
+            log.error(f"Failed to connect to newly added server '{name}': {e}")
+            return False, f"Server '{name}' added but failed to connect: {e}"
+            
     async def terminate_process(self, server_name: str, process: Optional[asyncio.subprocess.Process]):
         """Helper to terminate a process gracefully with fallback to kill."""
         if process is None or process.returncode is not None:
@@ -6361,7 +6564,6 @@ class MCPClient:
             
         self.safe_print(server_table)
     
-    
     async def add_server(self, args):
         """Add a new server to configuration"""
         safe_console = get_safe_console()
@@ -7196,7 +7398,7 @@ class MCPClient:
         cache_size = len(self.tool_cache.memory_cache) if self.tool_cache else 0
         if self.tool_cache and self.tool_cache.disk_cache:
              # Getting exact disk cache size can be slow, maybe approximate or show memory only
-             # cache_size += len(self.tool_cache.disk_cache) # Example
+             cache_size += len(self.tool_cache.disk_cache) # Example
              pass 
         stats_text.append(f"{STATUS_EMOJI['package']} Cache Entries (Mem): {cache_size}\n")
         stats_text.append(f"{STATUS_EMOJI['trident_emblem']} Current Branch: [yellow]{self.conversation_graph.current_node.name}[/] ([cyan]{self.conversation_graph.current_node.id[:8]}[/])")
@@ -7234,6 +7436,306 @@ class MCPClient:
         finally:
             # Always clear the flag when exiting
             self._active_progress = False
+
+    async def get_conversation_export_data(self, conversation_id: str) -> Optional[Dict]:
+        """Gets the data for exporting a specific conversation branch."""
+        node = self.conversation_graph.get_node(conversation_id)
+        if not node:
+            return None
+
+        all_nodes = self.conversation_graph.get_path_to_root(node)
+        messages = []
+        for ancestor in all_nodes:
+            messages.extend(ancestor.messages)
+
+        return {
+            "id": node.id,
+            "name": node.name,
+            "messages": messages,
+            "model": node.model,
+            "exported_at": datetime.now().isoformat(),
+            "path": [n.id for n in all_nodes]
+        }
+
+    async def import_conversation_from_data(self, data: Dict) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Imports conversation data as a new branch."""
+        try:
+            # Validate basic structure (add more checks if needed)
+            if not isinstance(data.get("messages"), list):
+                return False, "Invalid import data: 'messages' field missing or not a list.", None
+
+            new_node = ConversationNode(
+                id=str(uuid.uuid4()), # Generate new ID
+                name=f"Imported: {data.get('name', 'Unnamed')}",
+                messages=data["messages"],
+                model=data.get('model', self.config.default_model),
+                # Set parent to current node
+                parent=self.conversation_graph.current_node
+            )
+
+            self.conversation_graph.add_node(new_node)
+            self.conversation_graph.current_node.add_child(new_node)
+            await self.conversation_graph.save(str(self.conversation_graph_file))
+            return True, f"Import successful. New node ID: {new_node.id}", new_node.id
+
+        except Exception as e:
+            log.error(f"Error importing conversation data: {e}", exc_info=True)
+            return False, f"Internal error during import: {e}", None
+
+    def get_cache_entries(self) -> List[Dict]:
+        """Gets details of all cache entries."""
+        if not self.tool_cache: return []
+        entries = []
+        # Combine keys from memory and disk
+        all_keys = set(self.tool_cache.memory_cache.keys())
+        if self.tool_cache.disk_cache:
+             try: all_keys.update(self.tool_cache.disk_cache.iterkeys())
+             except Exception as e: log.warning(f"Could not iterate disk cache keys: {e}")
+
+        for key in all_keys:
+            entry_obj: Optional[CacheEntry] = self.tool_cache.memory_cache.get(key)
+            if not entry_obj and self.tool_cache.disk_cache:
+                try: entry_obj = self.tool_cache.disk_cache.get(key)
+                except Exception: entry_obj = None # Skip potentially corrupted
+
+            if entry_obj:
+                entries.append({
+                    "key": key,
+                    "tool_name": entry_obj.tool_name,
+                    "created_at": entry_obj.created_at,
+                    "expires_at": entry_obj.expires_at,
+                })
+        return entries
+
+    def clear_cache(self, tool_name: Optional[str] = None) -> int:
+        """Clears cache entries, optionally filtered by tool name."""
+        if not self.tool_cache: return 0
+
+        keys_before = set(self.tool_cache.memory_cache.keys())
+        disk_keys_before = set()
+        if self.tool_cache.disk_cache:
+             try: disk_keys_before = set(self.tool_cache.disk_cache.iterkeys())
+             except Exception: pass
+        keys_before.update(disk_keys_before)
+
+        if tool_name:
+            self.tool_cache.invalidate(tool_name=tool_name)
+        else:
+            self.tool_cache.invalidate() # Clears all
+
+        keys_after = set(self.tool_cache.memory_cache.keys())
+        disk_keys_after = set()
+        if self.tool_cache.disk_cache:
+             try: disk_keys_after = set(self.tool_cache.disk_cache.iterkeys())
+             except Exception: pass
+        keys_after.update(disk_keys_after)
+
+        return len(keys_before) - len(keys_after)
+
+    def clean_cache(self) -> int:
+        """Cleans expired cache entries."""
+        if not self.tool_cache: return 0
+        # Get counts before
+        mem_before = len(self.tool_cache.memory_cache)
+        disk_before = 0
+        if self.tool_cache.disk_cache:
+             try: disk_before = sum(1 for _ in self.tool_cache.disk_cache.iterkeys())
+             except Exception: pass
+
+        self.tool_cache.clean()
+
+        # Get counts after
+        mem_after = len(self.tool_cache.memory_cache)
+        disk_after = 0
+        if self.tool_cache.disk_cache:
+             try: disk_after = sum(1 for _ in self.tool_cache.disk_cache.iterkeys())
+             except Exception: pass
+
+        return (mem_before - mem_after) + (disk_before - disk_after)
+
+    def get_cache_dependencies(self) -> Dict[str, List[str]]:
+        """Gets the tool dependency graph."""
+        if not self.tool_cache: return {}
+        # Convert sets to lists for JSON serialization
+        return {k: list(v) for k, v in self.tool_cache.dependency_graph.items()}
+
+    def get_tool_schema(self, tool_name: str) -> Optional[Dict]:
+        """Gets the input schema for a specific tool."""
+        tool = self.server_manager.tools.get(tool_name)
+        return tool.input_schema if tool else None
+
+    def get_prompt_template(self, prompt_name: str) -> Optional[str]:
+        """Gets the template for a specific prompt."""
+        prompt = self.server_manager.prompts.get(prompt_name)
+        # The 'template' field in MCPPrompt might be the content itself
+        # or might need extraction from original_prompt depending on structure
+        return prompt.template if prompt else None # Adjust if template is nested
+
+    def get_server_details(self, server_name: str) -> Optional[Dict]:
+        """Gets detailed information about a server."""
+        if server_name not in self.config.servers:
+            return None
+
+        server_config = self.config.servers[server_name]
+        is_connected = server_name in self.server_manager.active_sessions
+        metrics = server_config.metrics
+
+        details = {
+            "name": server_config.name,
+            "type": server_config.type.value,
+            "path": server_config.path,
+            "args": server_config.args,
+            "enabled": server_config.enabled,
+            "auto_start": server_config.auto_start,
+            "description": server_config.description,
+            "trusted": server_config.trusted,
+            "categories": server_config.categories,
+            "version": str(server_config.version) if server_config.version else None,
+            "rating": server_config.rating,
+            "retry_count": server_config.retry_count,
+            "timeout": server_config.timeout,
+            "registry_url": server_config.registry_url,
+            "capabilities": server_config.capabilities,
+            "is_connected": is_connected,
+            "metrics": { # Expose relevant metrics
+                "status": metrics.status.value,
+                "avg_response_time_ms": metrics.avg_response_time * 1000,
+                "error_count": metrics.error_count,
+                "request_count": metrics.request_count,
+                "error_rate": metrics.error_rate,
+                "uptime_minutes": metrics.uptime,
+                "last_checked": metrics.last_checked.isoformat()
+            },
+            "process_info": None # Initialize as None
+        }
+
+        # Add process info for connected STDIO servers
+        if is_connected and server_config.type == ServerType.STDIO and server_name in self.server_manager.processes:
+            process = self.server_manager.processes[server_name]
+            if process and process.returncode is None:
+                try:
+                    p = psutil.Process(process.pid)
+                    mem_info = p.memory_info()
+                    details["process_info"] = {
+                        "pid": process.pid,
+                        "cpu_percent": p.cpu_percent(interval=0.1),
+                        "memory_rss_mb": mem_info.rss / (1024 * 1024),
+                        "memory_vms_mb": mem_info.vms / (1024 * 1024),
+                        "status": p.status(),
+                        "create_time": datetime.fromtimestamp(p.create_time()).isoformat()
+                    }
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    details["process_info"] = {"error": "Could not retrieve process stats"}
+                except Exception as e:
+                    details["process_info"] = {"error": f"Error retrieving stats: {e}"}
+
+        return details
+
+    async def reload_servers(self):
+        """Logic to reload server connections."""
+        log.info("Reloading servers via API request...")
+        # Close existing connections (reuse logic from cmd_reload/close)
+        if self.server_manager:
+             await self.server_manager.close() # Close handles sessions/processes
+
+        # Re-create manager or clear its state
+        self.server_manager = ServerManager(self.config, tool_cache=self.tool_cache, safe_printer=self.safe_print)
+
+        # Reconnect to enabled servers
+        await self.server_manager.connect_to_servers()
+        log.info("Server reload complete.")
+
+    async def apply_prompt_to_conversation(self, prompt_name: str) -> bool:
+        """Applies a prompt template to the current conversation."""
+        prompt = self.server_manager.prompts.get(prompt_name)
+        if not prompt:
+            return False
+        prompt_content = prompt.template
+        if not prompt_content and prompt.original_prompt:
+             # Example: If template needs fetching via get_prompt
+             # try:
+             #     get_result = await self.server_manager.active_sessions[prompt.server_name].get_prompt(prompt.original_prompt.name, {})
+             #     prompt_content = get_result.content
+             # except Exception:
+             #     log.error(f"Failed to fetch template content for prompt {prompt_name}")
+             #     return False
+             pass # Add fetching logic if needed
+        # Insert as system message (or adapt logic if needed)
+        self.conversation_graph.current_node.messages.insert(0, {
+            "role": "system",
+            "content": prompt_content
+        })
+        await self.conversation_graph.save(str(self.conversation_graph_file))
+        return True
+
+    async def reset_configuration(self):
+        """Resets the configuration to defaults."""
+        log.warning("Resetting configuration to defaults via API request.")
+        # Disconnect all servers first
+        if self.server_manager:
+             await self.server_manager.close()
+
+        # Create new default config and save
+        default_config = Config()
+        default_config.save() # Use synchronous save here for simplicity, or adapt
+
+        # Reload the client's config state
+        self.config = Config() # Re-initializes from the newly saved default file
+        # Re-create server manager with the new config
+        self.server_manager = ServerManager(self.config, tool_cache=self.tool_cache, safe_printer=self.safe_print)
+        # Optionally, re-run discovery and connect automatically?
+        # await self.setup(interactive_mode=False) # Re-run setup might be too broad
+        log.info("Configuration reset complete.")
+
+    def get_dashboard_data(self) -> Dict:
+         """Gets the data structure for the dashboard."""
+         # Servers Data
+         servers_data = []
+         for name, server_config in self.config.servers.items():
+             if not server_config.enabled: continue
+             metrics = server_config.metrics
+             is_connected = name in self.server_manager.active_sessions
+             health_score = 0
+             if is_connected:
+                 health_score = max(1, min(100, int(100 - (metrics.error_rate * 100) - max(0, (metrics.avg_response_time - 5.0) * 5))))
+
+             servers_data.append({
+                 "name": name,
+                 "type": server_config.type.value,
+                 "status": metrics.status.value,
+                 "is_connected": is_connected,
+                 "avg_response_ms": metrics.avg_response_time * 1000,
+                 "error_count": metrics.error_count,
+                 "request_count": metrics.request_count,
+                 "health_score": health_score,
+             })
+
+         # Tools Data (Top N)
+         tools_data = []
+         sorted_tools = sorted(self.server_manager.tools.values(), key=lambda t: t.call_count, reverse=True)[:15]
+         for tool in sorted_tools:
+             tools_data.append({
+                 "name": tool.name,
+                 "server_name": tool.server_name,
+                 "call_count": tool.call_count,
+                 "avg_execution_time_ms": tool.avg_execution_time,
+             })
+
+         # Client Info Data
+         client_info = {
+             "current_model": self.current_model,
+             "history_entries": len(self.history.entries),
+             "cache_entries_memory": len(self.tool_cache.memory_cache) if self.tool_cache else 0,
+             "current_branch_id": self.conversation_graph.current_node.id,
+             "current_branch_name": self.conversation_graph.current_node.name,
+         }
+
+         return {
+             "timestamp": datetime.now().isoformat(),
+             "client_info": client_info,
+             "servers": servers_data,
+             "tools": tools_data,
+         }
 
     # Helper method to process a content block delta event
     def _process_text_delta(self, delta_event: ContentBlockDeltaEvent, current_text: str) -> Tuple[str, str]:
@@ -8466,6 +8968,158 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 except Exception as e:
                     log.error(f"Error executing tool '{req.tool_name}' via API: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Tool execution failed: {str(e)}") from e
+
+            @app.post("/api/discover/trigger", status_code=202) # 202 Accepted
+            async def trigger_discovery_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                log.info("API triggered server discovery...")
+                # Run discovery in background to avoid blocking response
+                # Note: This doesn't guarantee completion before the next results call,
+                #       a more robust solution might use background tasks and status polling.
+                asyncio.create_task(mcp_client.server_manager.discover_servers())
+                return {"message": "Server discovery process initiated."}
+
+            @app.get("/api/discover/results", response_model=List[DiscoveredServer])
+            async def get_discovery_results_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                results = await mcp_client.server_manager.get_discovery_results()
+                # Convert internal dict structure to Pydantic model list
+                return [DiscoveredServer(**item) for item in results]
+
+            @app.post("/api/discover/connect") # Use request body instead of path param
+            async def connect_discovered_server_api(server_info: DiscoveredServer, mcp_client: MCPClient = Depends(get_mcp_client)):
+                 # Find the full info from the cache based on name/path match, or use provided data
+                 # For simplicity, assume server_info contains necessary details from GET /results
+                 if not server_info.name or not server_info.path_or_url or not server_info.type:
+                      raise HTTPException(status_code=400, detail="Incomplete server information provided.")
+                 # Convert back to dict for the helper method
+                 info_dict = server_info.model_dump()
+                 success, message = await mcp_client.server_manager.add_and_connect_discovered_server(info_dict)
+                 if success:
+                     return {"message": message}
+                 else:
+                     # Determine appropriate status code (409 Conflict? 500?)
+                     status_code = 409 if "already configured" in message else 500
+                     raise HTTPException(status_code=status_code, detail=message)
+
+            @app.get("/api/conversation/{conversation_id}/export")
+            async def export_conversation_api(conversation_id: str, mcp_client: MCPClient = Depends(get_mcp_client)):
+                data = await mcp_client.get_conversation_export_data(conversation_id)
+                if data is None:
+                    raise HTTPException(status_code=404, detail=f"Conversation ID '{conversation_id}' not found")
+                return data # Return the JSON data directly
+
+            @app.post("/api/conversation/import")
+            async def import_conversation_api(file: UploadFile = File(...), mcp_client: MCPClient = Depends(get_mcp_client)):
+                if not file.filename.endswith(".json"):
+                     raise HTTPException(status_code=400, detail="Invalid file type. Please upload a JSON file.")
+                try:
+                    content_bytes = await file.read()
+                    content_str = content_bytes.decode('utf-8')
+                    data = json.loads(content_str)
+                except json.JSONDecodeError as e:
+                    raise HTTPException(status_code=400, detail="Invalid JSON content in uploaded file.") from e
+                except Exception as e:
+                    log.error(f"Error reading uploaded file {file.filename}: {e}")
+                    raise HTTPException(status_code=500, detail="Error reading uploaded file.") from e
+
+                success, message, new_node_id = await mcp_client.import_conversation_from_data(data)
+                if success:
+                    return {"message": message, "newNodeId": new_node_id}
+                else:
+                    raise HTTPException(status_code=500, detail=f"Import failed: {message}")
+
+            @app.get("/api/cache/entries", response_model=List[CacheEntryDetail])
+            async def get_cache_entries_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                if not mcp_client.tool_cache: raise HTTPException(status_code=404, detail="Caching is disabled")
+                entries = mcp_client.get_cache_entries()
+                return [CacheEntryDetail(**entry) for entry in entries]
+
+            @app.delete("/api/cache/entries")
+            async def clear_cache_all_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                if not mcp_client.tool_cache: raise HTTPException(status_code=404, detail="Caching is disabled")
+                count = mcp_client.clear_cache()
+                return {"message": f"Cleared {count} cache entries."}
+
+            @app.delete("/api/cache/entries/{tool_name}")
+            async def clear_cache_tool_api(tool_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):
+                if not mcp_client.tool_cache: raise HTTPException(status_code=404, detail="Caching is disabled")
+                # Need to URL-decode the tool name if it contains special characters like ':'
+                import urllib.parse
+                decoded_tool_name = urllib.parse.unquote(tool_name)
+                count = mcp_client.clear_cache(tool_name=decoded_tool_name)
+                return {"message": f"Cleared {count} cache entries for tool '{decoded_tool_name}'."}
+
+            @app.post("/api/cache/clean")
+            async def clean_cache_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                if not mcp_client.tool_cache: raise HTTPException(status_code=404, detail="Caching is disabled")
+                count = mcp_client.clean_cache()
+                return {"message": f"Cleaned {count} expired cache entries."}
+
+            @app.get("/api/cache/dependencies", response_model=CacheDependencyInfo)
+            async def get_cache_dependencies_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                if not mcp_client.tool_cache: raise HTTPException(status_code=404, detail="Caching is disabled")
+                deps = mcp_client.get_cache_dependencies()
+                return CacheDependencyInfo(dependencies=deps)
+
+            @app.get("/api/tools/{tool_name}/schema")
+            async def get_tool_schema_api(tool_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):
+                import urllib.parse
+                decoded_tool_name = urllib.parse.unquote(tool_name)
+                schema = mcp_client.get_tool_schema(decoded_tool_name)
+                if schema is None:
+                    raise HTTPException(status_code=404, detail=f"Tool '{decoded_tool_name}' not found")
+                return schema # Return JSON schema directly
+
+            @app.get("/api/prompts/{prompt_name}/template")
+            async def get_prompt_template_api(prompt_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):
+                 import urllib.parse
+                 decoded_prompt_name = urllib.parse.unquote(prompt_name)
+                 template = mcp_client.get_prompt_template(decoded_prompt_name)
+                 if template is None:
+                     raise HTTPException(status_code=404, detail=f"Prompt '{decoded_prompt_name}' not found")
+                 return {"template": template} # Return as simple JSON object
+
+            @app.get("/api/servers/{server_name}/details", response_model=ServerDetail)
+            async def get_server_details_api(server_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):
+                 import urllib.parse
+                 decoded_server_name = urllib.parse.unquote(server_name)
+                 details = mcp_client.get_server_details(decoded_server_name)
+                 if details is None:
+                     raise HTTPException(status_code=404, detail=f"Server '{decoded_server_name}' not found")
+                 # Convert ServerType enum back for Pydantic validation if needed, or handle in model
+                 details_model = ServerDetail(**details) # Validate against Pydantic model
+                 return details_model # Return the validated model object
+
+            @app.post("/api/runtime/reload")
+            async def reload_servers_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                try:
+                    await mcp_client.reload_servers()
+                    return {"message": "Servers reloaded successfully."}
+                except Exception as e:
+                    log.error(f"Error reloading servers via API: {e}", exc_info=True)
+                    raise HTTPException(status_code=500, detail=f"Server reload failed: {e}") from e
+
+            @app.post("/api/conversation/apply_prompt")
+            async def apply_prompt_api(req: ApplyPromptRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
+                 success = await mcp_client.apply_prompt_to_conversation(req.prompt_name)
+                 if success:
+                     return {"message": f"Prompt '{req.prompt_name}' applied to current conversation."}
+                 else:
+                     raise HTTPException(status_code=404, detail=f"Prompt '{req.prompt_name}' not found.")
+
+            @app.post("/api/config/reset")
+            async def reset_config_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                 try:
+                     await mcp_client.reset_configuration()
+                     return {"message": "Configuration reset to defaults. Please restart client if necessary."}
+                 except Exception as e:
+                      log.error(f"Error resetting configuration via API: {e}", exc_info=True)
+                      raise HTTPException(status_code=500, detail=f"Configuration reset failed: {e}") from e
+
+            @app.get("/api/dashboard", response_model=DashboardData)
+            async def get_dashboard_data_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                 data = mcp_client.get_dashboard_data()
+                 # Pydantic model validation happens implicitly here if response_model is set
+                 return data
 
             # --- WebSocket Chat Endpoint ---
             @app.websocket("/ws/chat")
