@@ -7,7 +7,6 @@
 #     "typer>=0.9.0",
 #     "rich>=13.6.0",
 #     "httpx>=0.25.0",
-#     "httpx-sse>=0.4.0",
 #     "pyyaml>=6.0.1",
 #     "python-dotenv>=1.0.0",
 #     "colorama>=0.4.6",
@@ -4401,13 +4400,12 @@ class MCPClient:
     @with_tool_error_handling
     async def execute_tool(self, server_name, tool_name, tool_args, request_timeout=None):
         """Execute a tool with retry and circuit breaker logic.
-        Passes a longer default timeout for tool execution compared to standard config timeout.
+        Timeouts are handled by the session's default read timeout.
 
         Args:
             server_name: Name of the server to execute the tool on
             tool_name: Name of the tool to execute
             tool_args: Arguments for the tool
-            request_timeout: Optional timeout override in seconds (used by retry logic)
 
         Returns:
             The tool execution result
@@ -4420,24 +4418,13 @@ class MCPClient:
         if not tool:
             raise RuntimeError(f"Tool {tool_name} not found")
 
-        # Use the timeout provided by the retry decorator if available, otherwise use a longer default for tool calls (e.g., 120s),
-        # falling back to server config timeout if others are None.
-        server_config = self.config.servers.get(server_name)
-        base_timeout = server_config.timeout if server_config else 30.0
-        # Give potentially long-running tools more time by default
-        tool_execution_default_timeout = 120.0
-        # Prioritize explicit timeout from retry logic, then tool default, then server default
-        final_timeout = request_timeout if request_timeout is not None else tool_execution_default_timeout
-        log.debug(f"Using timeout {final_timeout:.1f}s for tool call {tool_name} (RetryTO: {request_timeout}, DefaultToolTO: {tool_execution_default_timeout}, ServerTO: {base_timeout})")
-
         try:
             with safe_stdout():
                 async with self.tool_execution_context(tool_name, tool_args, server_name):
-                    # Pass the calculated final_timeout to the underlying session call
+                    # *** REMOVE response_timeout argument from the call ***
                     result = await session.call_tool(
-                        tool.original_tool.name,
-                        tool_args,
-                        response_timeout=final_timeout # Pass timeout here
+                        tool.original_tool.name, # Use the name from the original Tool object
+                        tool_args
                     )
 
                     # Dependency check (unchanged)
@@ -4448,7 +4435,7 @@ class MCPClient:
 
                     return result
         finally:
-            pass
+            pass # Context managers handle exit
 
     def completer(self, text, state):
         """Tab completion for commands"""
