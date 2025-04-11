@@ -40,6 +40,10 @@
             }
         }
     </script>
+    <!-- Tabulator CSS (choose a theme, e.g., tabulator_modern.min.css) -->
+    <link href="https://unpkg.com/tabulator-tables@5.6.1/dist/css/tabulator_modern.min.css" rel="stylesheet">
+    <!-- Tabulator JS -->
+    <script type="text/javascript" src="https://unpkg.com/tabulator-tables@5.6.1/dist/js/tabulator.min.js"></script>
     <!-- JS Libraries -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
@@ -59,8 +63,7 @@
 
     <style>
         :root {
-            --sidebar-width: 20rem;
-            /* 320px */
+            --sidebar-width: 30rem;
         }
 
         .sidebar {
@@ -297,6 +300,112 @@
             display: block;
             /* Treat icon as a block */
         }
+
+        .tabulator {
+            border: 1px solid hsl(var(--b3) / 0.4);
+            background-color: hsl(var(--b1));
+            /* Explicit base background */
+            color: hsl(var(--bc));
+            /* Explicit base text color */
+            border-radius: var(--rounded-box, 0.5rem);
+            /* Use DaisyUI variable or fallback */
+            font-size: 0.75rem;
+            /* text-xs */
+            overflow: hidden;
+            /* Prevents weird overlaps */
+        }
+
+        .tabulator .tabulator-header {
+            background-color: hsl(var(--b2));
+            /* Base-200 for header */
+            border-bottom: 1px solid hsl(var(--b3) / 0.4);
+            color: hsl(var(--bc));
+            font-weight: 600;
+            /* Make header text bolder */
+        }
+
+        /* Ensure header columns inherit background */
+        .tabulator .tabulator-header .tabulator-col {
+            background-color: inherit;
+        }
+
+        /* Ensure header filter inputs match theme */
+        .tabulator .tabulator-header .tabulator-col .tabulator-header-filter input,
+        .tabulator .tabulator-header .tabulator-col .tabulator-header-filter select {
+            background-color: hsl(var(--b1));
+            border: 1px solid hsl(var(--b3) / 0.5);
+            border-radius: var(--rounded-input, 0.25rem);
+            /* Use DaisyUI variable or fallback */
+            padding: 0.1rem 0.4rem;
+            font-size: 0.7rem;
+            color: hsl(var(--bc));
+            margin-top: 2px;
+            /* Add slight margin */
+        }
+
+        /* Style rows */
+        .tabulator .tabulator-tableholder .tabulator-table {
+            background-color: hsl(var(--b1));
+            /* Ensure table background */
+            color: hsl(var(--bc));
+        }
+
+        .tabulator .tabulator-row {
+            background-color: hsl(var(--b1));
+            color: hsl(var(--bc));
+            border-bottom: 1px solid hsl(var(--b3) / 0.2) !important;
+            /* Ensure border */
+            min-height: 28px;
+            /* Ensure rows have some min height */
+        }
+
+        .tabulator .tabulator-row.tabulator-row-odd {
+            background-color: hsl(var(--b2) / 0.4);
+            /* Slightly different odd row */
+        }
+
+        .tabulator .tabulator-row:hover {
+            background-color: hsl(var(--b3) / 0.3);
+            /* Use base-300 for hover */
+        }
+
+        /* Style the placeholder text when table is empty */
+        .tabulator .tabulator-placeholder {
+            display: flex;
+            /* Use flexbox for centering */
+            justify-content: center;
+            align-items: center;
+            color: hsl(var(--bc) / 0.5);
+            /* Base content color, semi-transparent */
+            font-style: italic;
+            background-color: hsl(var(--b1) / 0.7);
+            /* Semi-transparent base background */
+            width: 100%;
+            /* Ensure it spans the width */
+            min-height: 60px;
+            /* Give placeholder some height */
+        }
+
+        /* Remove potential extra span wrapper styling if Tabulator adds one */
+        .tabulator .tabulator-placeholder span {
+            color: inherit;
+            font-style: inherit;
+            background-color: transparent;
+        }
+
+        /* Adjust button padding in table cells */
+        .tabulator .tabulator-row .tabulator-cell button.btn-xs {
+            padding-left: 0.4rem;
+            padding-right: 0.4rem;
+            min-height: 1.2rem;
+            height: 1.2rem;
+            line-height: 1;
+        }
+
+        .tabulator .tabulator-row .tabulator-cell i.fas {
+            font-size: 0.7rem;
+            margin-right: 0 !important;
+        }
     </style>
 </head>
 
@@ -387,14 +496,31 @@
 
             <!-- Tab Content -->
             <div class="flex-1 p-3 overflow-y-auto space-y-5">
+
                 <!-- Servers Tab -->
                 <div x-show="activeTab === 'servers'" x-transition.opacity>
+                    <!-- MODIFIED Header Section -->
                     <div class="flex justify-between items-center mb-3">
                         <h2 class="text-base font-semibold flex items-center"><i
                                 class="fas fa-server mr-2 text-primary"></i>Servers</h2>
-                        <button class="btn btn-xs btn-outline btn-primary" @click="showAddServerModal = true"><i
-                                class="fas fa-plus mr-1"></i> Add</button>
+                        <!-- Wrap buttons in a div for grouping -->
+                        <div class="flex gap-2">
+                            <!-- NEW Reload Button -->
+                            <button class="btn btn-xs btn-outline btn-warning" @click="reloadAllServers()"
+                                :disabled="isLoadingServers"
+                                data-tippy-content="Disconnect & Reload All Configured Servers">
+                                <i class="fas fa-sync" :class="{'fa-spin': isLoadingServers}"></i>
+                                <!-- Icon spins when loading -->
+                            </button>
+                            <!-- Existing Add Button (UNTOUCHED) -->
+                            <button class="btn btn-xs btn-outline btn-primary" @click="showAddServerModal = true">
+                                <i class="fas fa-plus mr-1"></i> Add
+                            </button>
+                        </div>
                     </div>
+                    <!-- End MODIFIED Header Section -->
+
+                    <!-- Server List Section (UNTOUCHED FROM YOUR ORIGINAL) -->
                     <div class="space-y-2.5">
                         <div x-show="isLoadingServers" class="text-center p-4"><span
                                 class="loading loading-dots loading-md"></span></div>
@@ -407,14 +533,13 @@
                                             :class="server.type === 'stdio' ? 'fas fa-terminal text-accent' : 'fas fa-network-wired text-info'"></i>
                                         <span x-text="server.name"></span>
                                     </span>
+
                                     <div class="flex items-center gap-2">
                                         <!-- Server Status/Health Indicator -->
                                         <span class="tooltip tooltip-left text-xs"
                                             :data-tip="server.statusText || (server.isConnected ? 'Connected' : 'Disconnected')">
                                             <!-- Simple icon based on connectivity/loading -->
                                             <i :class="serverStatusIcon(server)" class="text-lg"></i>
-                                            <!-- Optional: Progress bar for health (if health data available) -->
-                                            <!-- <progress class="progress w-8 h-1" :class="serverHealthColor(server)" :value="server.health || (server.isConnected ? 100 : 0)" max="100"></progress> -->
                                         </span>
                                         <input type="checkbox" class="toggle toggle-xs toggle-success"
                                             title="Connect/Disconnect" :checked="server.isConnected"
@@ -432,6 +557,11 @@
                                                 @change="toggleServerEnabled(server)" title="Enable/Disable" />
                                         </span>
                                         <button
+                                            class="btn btn-xs btn-ghost text-info/70 hover:text-info hover:bg-info/10 p-1"
+                                            @click="fetchServerDetails(server.name)" data-tippy-content="View Details">
+                                            <i class="fas fa-info-circle fa-fw"></i>
+                                        </button>
+                                        <button
                                             class="btn btn-xs btn-ghost text-error/70 hover:text-error hover:bg-error/10 p-1"
                                             @click="removeServer(server.name)" data-tippy-content="Remove Server">
                                             <i class="fas fa-trash-alt fa-fw"></i>
@@ -445,133 +575,182 @@
                         <div x-show="servers.length === 0 && !isLoadingServers"
                             class="text-center text-base-content/50 py-4 text-sm">No servers configured.</div>
                     </div>
+                    <!-- End Server List Section -->
 
-                    <!-- Discovery Section -->
-                    <h3 class="text-base font-semibold mt-6 mb-2 border-t border-base-300/50 pt-3"><i
-                            class="fas fa-search-location mr-2 text-primary"></i>Discovery</h3>
-                    <div class="flex gap-2 mb-3">
-                        <button class="btn btn-xs btn-outline flex-1" @click="discoverServers('local')"
-                            :disabled="isLoadingDiscovery" :class="{'loading': isLoadingDiscovery}">Local</button>
-                        <button class="btn btn-xs btn-outline flex-1" @click="discoverServers('registry')"
-                            :disabled="isLoadingDiscovery" :class="{'loading': isLoadingDiscovery}">Registry</button>
-                        <button class="btn btn-xs btn-outline flex-1" @click="discoverServers('mdns')"
-                            :disabled="isLoadingDiscovery || !config.enableLocalDiscovery"
-                            :class="{'loading': isLoadingDiscovery}"
-                            data-tippy-content="Requires mDNS to be enabled in Settings">mDNS</button>
+                    <!-- Discovery Section (INSIDE Servers Tab) -->
+                    <div class="mt-6 border-t border-base-300/50 pt-4">
+                        <div class="flex justify-between items-center mb-3">
+                            <h3 class="text-base font-semibold flex items-center"><i
+                                    class="fas fa-search-location mr-2 text-primary"></i>Discovery</h3>
+                            <button class="btn btn-xs btn-outline btn-primary" @click="triggerDiscovery()"
+                                :disabled="isLoadingDiscovery" :class="{'loading': isLoadingDiscovery}"
+                                data-tippy-content="Scan filesystem, registry, mDNS, and ports based on settings">
+                                <i class="fas fa-sync mr-1" x-show="!isLoadingDiscovery"></i> Scan Network
+                            </button>
+                        </div>
+                        <div x-show="isLoadingDiscovery" class="text-center p-4"><span
+                                class="loading loading-dots loading-sm"></span> Scanning...</div>
+                        <div id="discovered-servers-table" class="mt-2 text-xs border border-base-300/30 rounded"
+                            x-show="!isLoadingDiscovery && discoveredServers.length >= 0">
+                            <!-- Tabulator populates this -->
+                        </div>
+                        <div x-show="!isLoadingDiscovery && discoveredServers.length < 0"
+                            class="text-center text-base-content/40 text-xs py-3 italic">Click 'Scan Network' to find
+                            servers.</div>
                     </div>
-                    <div x-show="discoveredServers.length > 0" class="space-y-1 max-h-32 overflow-y-auto pr-1">
-                        <p class="text-xs font-medium mb-1 sticky top-0 bg-base-100 py-1">Discovered:</p>
-                        <template x-for="dServer in discoveredServers" :key="dServer.id || dServer.name">
-                            <div
-                                class="flex justify-between items-center p-1.5 bg-base-200/60 hover:bg-base-200 rounded text-xs sidebar-list-item">
-                                <span class="flex items-center gap-1 truncate">
-                                    <i class="fas fa-network-wired text-info opacity-70"
-                                        x-show="dServer.type !== 'stdio'"></i>
-                                    <i class="fas fa-terminal text-accent opacity-70"
-                                        x-show="dServer.type === 'stdio'"></i>
-                                    <span class="font-medium" x-text="dServer.name"></span>
-                                    <span class="text-base-content/50 ml-1 truncate"
-                                        x-text="dServer.path || dServer.url"></span>
-                                </span>
-                                <button class="btn btn-xs btn-outline btn-success p-1"
-                                    @click="addDiscoveredServer(dServer)" :disabled="serverExists(dServer)">
-                                    <i class="fas fa-plus"></i>
-                                </button>
-                            </div>
-                        </template>
-                    </div>
-                    <div x-show="discoveredServers.length === 0 && !isLoadingDiscovery"
-                        class="text-center text-base-content/40 text-xs py-2">Click discovery buttons.</div>
+                    <!-- End Discovery Section -->
                 </div>
+                <!-- End Servers Tab -->
 
-                <!-- Tools Tab (Capabilities) -->
-                <div x-show="activeTab === 'tools'" x-transition.opacity>
-                    <h2 class="text-base font-semibold mb-3 flex items-center"><i
-                            class="fas fa-puzzle-piece mr-2 text-primary"></i>Capabilities</h2>
+                <!-- Tools Tab (Capabilities - Grouped Layout) -->
+                <div x-show="activeTab === 'tools'" x-transition.opacity class="space-y-4">
+                    <!-- Tab Header -->
+                    <div class="flex justify-between items-center">
+                        <h2 class="text-base font-semibold flex items-center"><i
+                                class="fas fa-puzzle-piece mr-2 text-primary"></i>Capabilities</h2>
+                        <span class="text-xs text-base-content/60" x-text="`(${totalCapabilities} total)`"></span>
+                    </div>
+
                     <!-- Filter Input -->
-                    <div class="mb-3 relative">
-                        <input type="text" placeholder="Filter capabilities..."
-                            class="input input-sm input-bordered w-full pr-8" x-model.debounce.300ms="toolSearchTerm">
-                        <i class="fas fa-search absolute right-3 top-1/2 -translate-y-1/2 text-base-content/40"></i>
-                    </div>
-                    <!-- Tool List -->
-                    <h3 class="text-sm font-semibold mb-2 flex items-center gap-1 opacity-80"><i
-                            class="fas fa-hammer fa-fw"></i> Tools (<span x-text="filteredTools.length"></span>)</h3>
-                    <div class="max-h-48 overflow-y-auto space-y-1.5 mb-4 pr-1">
-                        <div x-show="isLoadingTools" class="text-center p-4"><span
-                                class="loading loading-dots loading-sm"></span></div>
-                        <template x-for="tool in filteredTools" :key="tool.name + tool.server_name">
-                            <!-- Ensure unique key -->
-                            <div class="p-2 bg-base-200/60 hover:bg-base-200 rounded text-xs cursor-pointer transition-colors sidebar-list-item"
-                                @click="showToolDetails(tool)">
-                                <div class="flex justify-between items-center">
-                                    <span class="font-medium truncate" x-text="tool.name"
-                                        :data-tippy-content="tool.name"></span>
-                                    <span class="badge badge-outline badge-xs opacity-70"
-                                        x-text="tool.server_name"></span>
-                                </div>
-                                <p class="text-xs text-base-content/60 truncate mt-0.5" x-text="tool.description"
-                                    :data-tippy-content="tool.description"></p>
-                            </div>
-                        </template>
-                        <div x-show="filteredTools.length === 0 && !isLoadingTools && tools.length > 0"
-                            class="text-center text-base-content/50 py-4 text-sm">No matching tools found.</div>
-                        <div x-show="tools.length === 0 && !isLoadingTools"
-                            class="text-center text-base-content/50 py-4 text-sm">No tools available.</div>
+                    <div class="sticky top-0 bg-base-100 py-2 z-10 -mt-2 -mx-3 px-3">
+                        <div class="relative">
+                            <input type="text" placeholder="Filter by server, name, or description..."
+                                class="input input-sm input-bordered w-full pr-8 text-xs"
+                                x-model.debounce.300ms="capabilitySearchTerm">
+                            <i class="fas fa-search absolute right-3 top-1/2 -translate-y-1/2 text-base-content/40"></i>
+                        </div>
                     </div>
 
-                    <!-- Resource List -->
-                    <h3 class="text-sm font-semibold mb-2 flex items-center gap-1 opacity-80"><i
-                            class="fas fa-book fa-fw"></i> Resources (<span x-text="filteredResources.length"></span>)
-                    </h3>
-                    <div class="max-h-32 overflow-y-auto space-y-1.5 mb-4 pr-1">
-                        <div x-show="isLoadingTools" class="text-center p-4"><span
-                                class="loading loading-dots loading-sm"></span></div>
-                        <template x-for="resource in filteredResources" :key="resource.name + resource.server_name">
-                            <!-- Ensure unique key -->
-                            <div class="p-2 bg-base-200/60 hover:bg-base-200 rounded text-xs sidebar-list-item"
-                                :data-tippy-content="resource.description">
-                                <div class="flex justify-between items-center">
-                                    <span class="font-medium truncate" x-text="resource.name"></span>
-                                    <span class="badge badge-outline badge-xs opacity-70"
-                                        x-text="resource.server_name"></span>
-                                </div>
-                                <p class="text-xs text-info truncate mt-0.5" x-text="resource.template"
-                                    :data-tippy-content="'Template/URI: ' + resource.template"></p>
-                            </div>
+                    <!-- Loading Indicator -->
+                    <div x-show="isLoadingTools" class="text-center p-4"><span
+                            class="loading loading-dots loading-md"></span> Loading Capabilities...</div>
+
+                    <!-- Server Group Iteration -->
+                    <div x-show="!isLoadingTools && filteredServerCapabilities.length > 0" class="space-y-4">
+                        <template x-for="serverGroup in filteredServerCapabilities" :key="serverGroup.serverName">
+                            <div class="card card-compact bg-base-200/50 border border-base-300/30 shadow-sm">
+                                <div class="card-body p-3">
+                                    <!-- Server Header -->
+                                    <div class="flex items-center gap-2 mb-2 border-b border-base-300/20 pb-1.5">
+                                        <i :class="serverStatusIcon(getServerByName(serverGroup.serverName))"
+                                            class="text-lg"
+                                            :data-tippy-content="getServerByName(serverGroup.serverName)?.isConnected ? 'Connected' : 'Disconnected'"></i>
+                                        <h3 class="card-title text-sm font-semibold" x-text="serverGroup.serverName">
+                                        </h3>
+                                        <span class="text-xs opacity-60">
+                                            (<span x-text="serverGroup.tools.length"></span> <i
+                                                class="fas fa-hammer fa-xs"></i>,
+                                            <span x-text="serverGroup.resources.length"></span> <i
+                                                class="fas fa-book fa-xs"></i>,
+                                            <span x-text="serverGroup.prompts.length"></span> <i
+                                                class="fas fa-lightbulb fa-xs"></i>)
+                                        </span>
+                                    </div>
+
+                                    <!-- Tools Section -->
+                                    <template x-if="serverGroup.tools.length > 0">
+                                        <div class="collapse collapse-arrow bg-base-100/50 border border-base-300/20 rounded-md text-xs"
+                                            x-data="{ open: true }">
+                                            <input type="checkbox" x-model="open" class="!min-h-0 peer" />
+                                            <div class="collapse-title text-xs font-medium min-h-0 py-1.5 px-3 peer-checked:bg-base-300/10 peer-checked:border-b peer-checked:border-base-300/30 cursor-pointer"
+                                                @click.prevent="open = !open">
+                                                <i class="fas fa-hammer fa-fw mr-1 opacity-70"></i> Tools (<span
+                                                    x-text="serverGroup.tools.length"></span>)
+                                            </div>
+                                            <div class="collapse-content !p-0">
+                                                <div class="p-2 space-y-1.5 max-h-60 overflow-y-auto">
+                                                    <template x-for="tool in serverGroup.tools" :key="tool.name">
+                                                        <div class="p-1.5 bg-base-100 hover:bg-primary/10 rounded cursor-pointer transition-colors sidebar-list-item"
+                                                            @click="showToolDetails(tool)">
+                                                            <div class="flex justify-between items-center">
+                                                                <span class="font-medium truncate text-xs"
+                                                                    x-text="tool.shortName"
+                                                                    :data-tippy-content="tool.name"></span>
+                                                                <i class="fas fa-info-circle text-info/60 hover:text-info text-xs"
+                                                                    data-tippy-content="View Details & Execute"></i>
+                                                            </div>
+                                                            <p class="text-xs text-base-content/60 truncate mt-0.5"
+                                                                x-text="tool.description"
+                                                                :data-tippy-content="tool.description || 'No description'">
+                                                            </p>
+                                                        </div>
+                                                    </template>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </template>
+
+                                    <!-- Resources Section -->
+                                    <template x-if="serverGroup.resources.length > 0">
+                                        <div class="collapse collapse-arrow bg-base-100/50 border border-base-300/20 rounded-md text-xs"
+                                            x-data="{ open: false }">
+                                            <input type="checkbox" x-model="open" class="!min-h-0 peer" />
+                                            <div class="collapse-title text-xs font-medium min-h-0 py-1.5 px-3 peer-checked:bg-base-300/10 peer-checked:border-b peer-checked:border-base-300/30 cursor-pointer"
+                                                @click.prevent="open = !open">
+                                                <i class="fas fa-book fa-fw mr-1 opacity-70"></i> Resources (<span
+                                                    x-text="serverGroup.resources.length"></span>)
+                                            </div>
+                                            <div class="collapse-content !p-0">
+                                                <div class="p-2 space-y-1.5 max-h-40 overflow-y-auto">
+                                                    <template x-for="resource in serverGroup.resources"
+                                                        :key="resource.name">
+                                                        <div class="p-1.5 bg-base-100 hover:bg-secondary/10 rounded sidebar-list-item"
+                                                            :data-tippy-content="resource.description || 'No description'">
+                                                            <div class="font-medium truncate text-xs"
+                                                                x-text="resource.shortName"></div>
+                                                            <p class="text-xs text-info truncate mt-0.5"
+                                                                x-text="resource.template"
+                                                                :data-tippy-content="'Template/URI: ' + resource.template">
+                                                            </p>
+                                                        </div>
+                                                    </template>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </template>
+
+                                    <!-- Prompts Section -->
+                                    <template x-if="serverGroup.prompts.length > 0">
+                                        <div class="collapse collapse-arrow bg-base-100/50 border border-base-300/20 rounded-md text-xs"
+                                            x-data="{ open: false }">
+                                            <input type="checkbox" x-model="open" class="!min-h-0 peer" />
+                                            <div class="collapse-title text-xs font-medium min-h-0 py-1.5 px-3 peer-checked:bg-base-300/10 peer-checked:border-b peer-checked:border-base-300/30 cursor-pointer"
+                                                @click.prevent="open = !open">
+                                                <i class="fas fa-lightbulb fa-fw mr-1 opacity-70"></i> Prompts (<span
+                                                    x-text="serverGroup.prompts.length"></span>)
+                                            </div>
+                                            <div class="collapse-content !p-0">
+                                                <div class="p-2 space-y-1.5 max-h-40 overflow-y-auto">
+                                                    <template x-for="prompt in serverGroup.prompts" :key="prompt.name">
+                                                        <div class="p-1.5 bg-base-100 hover:bg-accent/10 rounded cursor-pointer transition-colors sidebar-list-item"
+                                                            @click="applyPrompt(prompt.name)"
+                                                            data-tippy-content="Apply Prompt">
+                                                            <div class="font-medium truncate text-xs"
+                                                                x-text="prompt.shortName"></div>
+                                                            <p class="text-xs text-base-content/60 truncate mt-0.5"
+                                                                x-text="prompt.description"
+                                                                :data-tippy-content="prompt.description || 'No description'">
+                                                            </p>
+                                                        </div>
+                                                    </template>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </template>
+
+                                </div> <!-- End card-body -->
+                            </div> <!-- End server card -->
                         </template>
-                        <div x-show="filteredResources.length === 0 && !isLoadingTools && resources.length > 0"
-                            class="text-center text-base-content/50 py-4 text-sm">No matching resources found.</div>
-                        <div x-show="resources.length === 0 && !isLoadingTools"
-                            class="text-center text-base-content/50 py-4 text-sm">No resources available.</div>
                     </div>
 
-                    <!-- Prompt List -->
-                    <h3 class="text-sm font-semibold mb-2 flex items-center gap-1 opacity-80"><i
-                            class="fas fa-lightbulb fa-fw"></i> Prompts (<span x-text="filteredPrompts.length"></span>)
-                    </h3>
-                    <div class="max-h-32 overflow-y-auto space-y-1.5 pr-1">
-                        <div x-show="isLoadingTools" class="text-center p-4"><span
-                                class="loading loading-dots loading-sm"></span></div>
-                        <template x-for="prompt in filteredPrompts" :key="prompt.name + prompt.server_name">
-                            <!-- Ensure unique key -->
-                            <div class="p-2 bg-base-200/60 hover:bg-base-200 rounded text-xs cursor-pointer transition-colors sidebar-list-item"
-                                @click="applyPrompt(prompt.name)" data-tippy-content="Apply Prompt">
-                                <div class="flex justify-between items-center">
-                                    <span class="font-medium truncate" x-text="prompt.name"></span>
-                                    <span class="badge badge-outline badge-xs opacity-70"
-                                        x-text="prompt.server_name"></span>
-                                </div>
-                                <p class="text-xs text-base-content/60 truncate mt-0.5" x-text="prompt.description"
-                                    :data-tippy-content="prompt.description"></p>
-                            </div>
-                        </template>
-                        <div x-show="filteredPrompts.length === 0 && !isLoadingTools && prompts.length > 0"
-                            class="text-center text-base-content/50 py-4 text-sm">No matching prompts found.</div>
-                        <div x-show="prompts.length === 0 && !isLoadingTools"
-                            class="text-center text-base-content/50 py-4 text-sm">No prompts available.</div>
+                    <!-- No Results Message -->
+                    <div x-show="!isLoadingTools && filteredServerCapabilities.length === 0"
+                        class="text-center text-base-content/50 py-6 text-sm">
+                        <span x-show="!capabilitySearchTerm">No capabilities found.</span>
+                        <span x-show="capabilitySearchTerm">No capabilities match filter.</span>
                     </div>
                 </div>
+                <!-- END Tools Tab -->
 
                 <!-- Conversation Tab -->
                 <div x-show="activeTab === 'conversation'" x-transition.opacity>
@@ -587,14 +766,18 @@
                         <button class="btn btn-sm btn-block btn-outline btn-warning" @click="clearConversation"
                             :disabled="isLoading"><i class="fas fa-eraser mr-1.5"></i> Clear Context</button>
                         <div class="flex gap-2">
-                            <button class="btn btn-sm flex-1 btn-outline btn-info" @click="exportConversation"
-                                :disabled="isLoading || currentConversation.length === 0"><i
-                                    class="fas fa-file-export mr-1.5"></i> Export</button>
+                            <button class="btn btn-sm flex-1 btn-outline btn-info" @click="exportConversationAPI()"
+                                :disabled="isLoading || !currentNodeId || (currentNodeId === 'root' &&
+                            currentConversation.length === 0)" data-tippy-content="Export current branch">
+                                <i class="fas fa-file-export mr-1.5"></i> Export
+                            </button>
                             <label class="btn btn-sm flex-1 btn-outline btn-accent"
-                                :class="{'loading': isLoadingImport, 'btn-disabled': isLoadingImport}">
+                                :class="{'loading': isLoadingImport, 'btn-disabled': isLoadingImport || isLoading}"
+                                data-tippy-content="Import conversation as a new branch under current node">
                                 <i class="fas fa-file-import mr-1.5" x-show="!isLoadingImport"></i> Import
                                 <input type="file" class="hidden" accept=".json"
-                                    @change="importConversation($event.target.files[0])" :disabled="isLoadingImport">
+                                    @change="importConversationAPI($event.target.files[0])"
+                                    :disabled="isLoadingImport || isLoading">
                             </label>
                         </div>
 
@@ -608,25 +791,24 @@
                                     <div id="branch-node-template">
                                         <li x-data="{ open: $el.dataset.nodeid === $store.conversation.currentNodeId || ($el.dataset.nodeid === 'root' && $store.conversation.conversationNodes.length > 1) }"
                                             :style="{'--indent-level': ($el.dataset.level || 0) * 1 + 'em'}">
-                                            <div @click="checkoutBranch($el.dataset.nodeid)" ...>
-                                                class="flex items-center gap-1 cursor-pointer hover:bg-base-300/80
-                                                rounded p-1"
-                                                :class="{ 'bg-primary/10 text-primary font-semibold': $el.dataset.nodeid
-                                                === $store.conversation.currentNodeId }">
+                                            <div @click="checkoutBranch($el.dataset.nodeid)"
+                                                class="flex items-center gap-1 cursor-pointer hover:bg-base-300/80 rounded p-1"
+                                                :class="{ 'bg-primary/10 text-primary font-semibold': $el.dataset.nodeid === $store.conversation.currentNodeId }">
                                                 <!-- Toggle Icon -->
                                                 <i x-show="$el.dataset.haschildren === 'true'"
                                                     class="fas fa-fw text-xs opacity-50 cursor-pointer hover:opacity-100 w-4 text-center"
                                                     :class="open ? 'fa-chevron-down' : 'fa-chevron-right'"
                                                     @click.stop="open = !open"></i>
                                                 <i x-show="$el.dataset.haschildren !== 'true'"
-                                                    class="fas fa-fw text-xs w-4"></i> <!-- Placeholder -->
+                                                    class="fas fa-fw fa-circle-dot text-xs w-4 opacity-40"></i>
+                                                <!-- Placeholder dot -->
                                                 <!-- Node Icon & Name -->
                                                 <i class="fas fa-code-branch text-xs opacity-60"
                                                     x-show="$el.dataset.level > 0"></i>
                                                 <span class="truncate"
                                                     x-text="$el.dataset.nodename || 'Unnamed'"></span>
                                                 <span class="text-base-content/50 ml-1"
-                                                    x-text="' (...'+($el.dataset.nodeid?.slice(-5) ?? 'ERR')+')'"></span>
+                                                    x-text="$el.dataset.nodeid ? ' (...'+($el.dataset.nodeid.slice(-5))+')'  : ''"></span>
                                             </div>
                                             <!-- Children -->
                                             <ul x-show="open" x-transition.opacity
@@ -643,91 +825,141 @@
                                 </template>
                                 <!-- Initial Root Render -->
                                 <li x-html="renderBranchNode('root', 0)"></li>
-                                <div x-show="conversationNodes.length <= 1"
-                                    class="text-center text-base-content/50 py-2 text-xs">No branches yet. Fork to
-                                    create more.</div>
-
                             </ul>
+                            <!-- No branches message that only shows when there are truly no branches -->
+                            <div x-show="$store.conversation.conversationNodes.length <= 1 || ($store.conversation.conversationNodes.length === 1 && $store.conversation.conversationNodes[0].id === 'root' && !$store.conversation.conversationNodes[0].childrenIds.length)"
+                                class="text-center text-base-content/50 py-2 text-xs">No branches yet. Fork to create
+                                more.</div>
                         </div>
                         <!-- Container for the teleported template -->
                         <div id="branch-node-template-container" class="hidden"></div>
                     </div>
-                </div>
+                    <!-- End Conversation Tab -->
 
-                <!-- Config Tab -->
-                <div x-show="activeTab === 'config'" x-transition.opacity>
-                    <h2 class="text-base font-semibold mb-3 flex items-center"><i
-                            class="fas fa-cog mr-2 text-primary"></i>Settings</h2>
-                    <div class="space-y-3 text-sm">
-                        <div class="form-control">
-                            <label class="label py-1"><span class="label-text text-xs font-medium"
-                                    data-tippy-content="Your Anthropic API Key (Keep Secret!)">Anthropic API
-                                    Key</span></label>
-                            <input type="password" placeholder="sk-ant-..." class="input input-bordered input-sm"
-                                x-model="config.apiKey"
-                                @input.debounce.500ms="saveConfigField('apiKey', $event.target.value)">
+                    <!-- Config Tab -->
+                    <div x-show="activeTab === 'config'" x-transition.opacity>
+                        <h2 class="text-base font-semibold mb-3 flex items-center"><i
+                                class="fas fa-cog mr-2 text-primary"></i>Settings
+                        </h2>
+                        <div class="space-y-3 text-sm">
+                            <div class="form-control">
+                                <label class="label py-1"><span class="label-text text-xs font-medium"
+                                        data-tippy-content="Your Anthropic API Key (Keep Secret!)">Anthropic API
+                                        Key</span></label>
+                                <input type="password" placeholder="sk-ant-..." class="input input-bordered input-sm"
+                                    x-model="config.apiKey"
+                                    @input.debounce.500ms="saveConfigField('apiKey', $event.target.value)">
+                            </div>
+                            <div class="form-control">
+                                <label class="label py-1"><span class="label-text text-xs font-medium"
+                                        data-tippy-content="Default model for new conversations">Default
+                                        Model</span></label>
+                                <input type="text" placeholder="claude-3-..." class="input input-bordered input-sm"
+                                    x-model="config.defaultModel"
+                                    @input.debounce.500ms="saveConfigField('defaultModel', $event.target.value); setModel($event.target.value)">
+                            </div>
+                            <div class="form-control">
+                                <label class="label py-1"><span class="label-text text-xs font-medium"
+                                        data-tippy-content="Max tokens for Claude's response">Max Tokens</span></label>
+                                <input type="number" class="input input-bordered input-sm w-24"
+                                    x-model.number="config.maxTokens"
+                                    @input.debounce.500ms="saveConfigField('maxTokens', $event.target.value)">
+                            </div>
+                            <div class="form-control">
+                                <label class="label py-1"><span class="label-text text-xs font-medium"
+                                        data-tippy-content="Response creativity (0=deterministic, 1=max creative)">Temperature
+                                        (<span class="font-mono"
+                                            x-text="config.temperature?.toFixed(1)"></span>)</span></label>
+                                <input type="range" min="0" max="1" step="0.1" class="range range-xs range-primary"
+                                    x-model.number="config.temperature"
+                                    @change="saveConfigField('temperature', $event.target.value)" />
+                            </div>
+                            <div class="grid grid-cols-2 gap-x-4">
+                                <label class="cursor-pointer label justify-start gap-2 py-1"
+                                    data-tippy-content="Stream responses word by word"><input type="checkbox"
+                                        class="toggle toggle-primary toggle-sm" x-model="config.enableStreaming"
+                                        @change="saveConfigField('enableStreaming', $event.target.checked)"><span
+                                        class="label-text text-xs">Streaming</span></label>
+                                <label class="cursor-pointer label justify-start gap-2 py-1"
+                                    data-tippy-content="Cache tool results locally"><input type="checkbox"
+                                        class="toggle toggle-primary toggle-sm" x-model="config.enableCaching"
+                                        @change="saveConfigField('enableCaching', $event.target.checked)"><span
+                                        class="label-text text-xs">Caching</span></label>
+                                <label class="cursor-pointer label justify-start gap-2 py-1"
+                                    data-tippy-content="Automatically look for servers at startup"><input
+                                        type="checkbox" class="toggle toggle-primary toggle-sm"
+                                        x-model="config.autoDiscover"
+                                        @change="saveConfigField('autoDiscover', $event.target.checked)"><span
+                                        class="label-text text-xs">Auto Discover</span></label>
+                                <label class="cursor-pointer label justify-start gap-2 py-1"
+                                    data-tippy-content="Look for servers on local network via mDNS/Zeroconf"><input
+                                        type="checkbox" class="toggle toggle-primary toggle-sm"
+                                        x-model="config.enableLocalDiscovery"
+                                        @change="saveConfigField('enableLocalDiscovery', $event.target.checked)"><span
+                                        class="label-text text-xs">mDNS</span></label>
+                            </div>
+                            <div class="form-control">
+                                <label class="label py-1"><span class="label-text text-xs font-medium"
+                                        data-tippy-content="How often to refresh server status (seconds)">Dashboard
+                                        Refresh
+                                        (s)</span></label>
+                                <input type="number" class="input input-bordered input-sm w-24"
+                                    x-model.number="config.dashboardRefreshRate"
+                                    @input.debounce.500ms="saveConfigField('dashboardRefreshRate', $event.target.value)"
+                                    min="0.5" step="0.1">
+                            </div>
+                            <button class="btn btn-xs btn-outline btn-error mt-4" @click="resetConfig"><i
+                                    class="fas fa-undo mr-1"></i>
+                                Reset Settings</button>
                         </div>
-                        <div class="form-control">
-                            <label class="label py-1"><span class="label-text text-xs font-medium"
-                                    data-tippy-content="Default model for new conversations">Default
-                                    Model</span></label>
-                            <input type="text" placeholder="claude-3-..." class="input input-bordered input-sm"
-                                x-model="config.defaultModel"
-                                @input.debounce.500ms="saveConfigField('defaultModel', $event.target.value); setModel($event.target.value)">
+
+                        <div class="mt-6 border-t border-base-300/50 pt-4">
+                            <h2 class="text-base font-semibold mb-3 flex items-center"><i
+                                    class="fas fa-database mr-2 text-primary"></i>Cache Management</h2>
+
+                            <div class="flex flex-wrap gap-2 mb-4">
+                                <button class="btn btn-xs btn-outline" @click="fetchCacheData()"
+                                    :disabled="isLoadingCache" :class="{'loading': isLoadingCache}">
+                                    <i class="fas fa-sync mr-1" x-show="!isLoadingCache"></i> Refresh Cache Info
+                                </button>
+                                <button class="btn btn-xs btn-outline btn-warning" @click="cleanCacheAPI()"
+                                    :disabled="isLoadingCache">
+                                    <i class="fas fa-broom mr-1"></i> Clean Expired
+                                </button>
+                                <button class="btn btn-xs btn-outline btn-error" @click="clearAllCacheAPI()"
+                                    :disabled="isLoadingCache">
+                                    <i class="fas fa-trash-alt mr-1"></i> Clear All Cache
+                                </button>
+                            </div>
+
+                            <!-- Cache Entries Table -->
+                            <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-list-ul mr-1.5"></i>
+                                Cached
+                                Entries</h3>
+                            <div x-show="isLoadingCache && cacheEntries.length === 0" class="text-center p-4"><span
+                                    class="loading loading-dots loading-sm"></span> Loading Cache...</div>
+                            <div id="cache-entries-table" class="text-xs border border-base-300/30 rounded mb-4"
+                                x-show="!isLoadingCache">
+                            </div>
+
+                            <!-- Cache Dependencies Table -->
+                            <h3 class="text-sm font-semibold mb-2 opacity-80"><i
+                                    class="fas fa-project-diagram mr-1.5"></i>
+                                Tool Dependencies</h3>
+                            <div x-show="isLoadingCache && Object.keys(cacheDependencies).length === 0"
+                                class="text-center p-4">
+                                <span class="loading loading-dots loading-sm"></span> Loading
+                                Dependencies...
+                            </div>
+                            <div id="cache-dependencies-table" class="text-xs border border-base-300/30 rounded"
+                                x-show="!isLoadingCache">
+                            </div>
                         </div>
-                        <div class="form-control">
-                            <label class="label py-1"><span class="label-text text-xs font-medium"
-                                    data-tippy-content="Max tokens for Claude's response">Max Tokens</span></label>
-                            <input type="number" class="input input-bordered input-sm w-24"
-                                x-model.number="config.maxTokens"
-                                @input.debounce.500ms="saveConfigField('maxTokens', $event.target.value)">
-                        </div>
-                        <div class="form-control">
-                            <label class="label py-1"><span class="label-text text-xs font-medium"
-                                    data-tippy-content="Response creativity (0=deterministic, 1=max creative)">Temperature
-                                    (<span class="font-mono"
-                                        x-text="config.temperature?.toFixed(1)"></span>)</span></label>
-                            <input type="range" min="0" max="1" step="0.1" class="range range-xs range-primary"
-                                x-model.number="config.temperature"
-                                @change="saveConfigField('temperature', $event.target.value)" />
-                        </div>
-                        <div class="grid grid-cols-2 gap-x-4">
-                            <label class="cursor-pointer label justify-start gap-2 py-1"
-                                data-tippy-content="Stream responses word by word"><input type="checkbox"
-                                    class="toggle toggle-primary toggle-sm" x-model="config.enableStreaming"
-                                    @change="saveConfigField('enableStreaming', $event.target.checked)"><span
-                                    class="label-text text-xs">Streaming</span></label>
-                            <label class="cursor-pointer label justify-start gap-2 py-1"
-                                data-tippy-content="Cache tool results locally"><input type="checkbox"
-                                    class="toggle toggle-primary toggle-sm" x-model="config.enableCaching"
-                                    @change="saveConfigField('enableCaching', $event.target.checked)"><span
-                                    class="label-text text-xs">Caching</span></label>
-                            <label class="cursor-pointer label justify-start gap-2 py-1"
-                                data-tippy-content="Automatically look for servers at startup"><input type="checkbox"
-                                    class="toggle toggle-primary toggle-sm" x-model="config.autoDiscover"
-                                    @change="saveConfigField('autoDiscover', $event.target.checked)"><span
-                                    class="label-text text-xs">Auto Discover</span></label>
-                            <label class="cursor-pointer label justify-start gap-2 py-1"
-                                data-tippy-content="Look for servers on local network via mDNS/Zeroconf"><input
-                                    type="checkbox" class="toggle toggle-primary toggle-sm"
-                                    x-model="config.enableLocalDiscovery"
-                                    @change="saveConfigField('enableLocalDiscovery', $event.target.checked)"><span
-                                    class="label-text text-xs">mDNS</span></label>
-                        </div>
-                        <div class="form-control">
-                            <label class="label py-1"><span class="label-text text-xs font-medium"
-                                    data-tippy-content="How often to refresh server status (seconds)">Dashboard Refresh
-                                    (s)</span></label>
-                            <input type="number" class="input input-bordered input-sm w-24"
-                                x-model.number="config.dashboardRefreshRate"
-                                @input.debounce.500ms="saveConfigField('dashboardRefreshRate', $event.target.value)"
-                                min="0.5" step="0.1">
-                        </div>
-                        <button class="btn btn-xs btn-outline btn-error mt-4" @click="resetConfig"><i
-                                class="fas fa-undo mr-1"></i> Reset Settings</button>
                     </div>
+                    <!-- End Config Tab -->
+
                 </div>
-            </div> <!-- End Tab Content -->
+                <!-- End Tab Content -->
         </aside>
 
         <!-- Chat Area -->
@@ -909,6 +1141,131 @@
         </form>
     </dialog>
 
+
+    <!-- Server Details Modal -->
+    <dialog id="serverDetailsModal" class="modal" :class="{ 'modal-open': showServerDetailsModal }"
+        @keydown.escape.window="showServerDetailsModal = false">
+        <div class="modal-box w-11/12 max-w-xl bg-base-100">
+            <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2"
+                @click="showServerDetailsModal = false">✕</button>
+            <h3 class="font-bold text-lg mb-4 flex items-center gap-2">
+                <i class="fas fa-server text-primary"></i>Server Details: <span class="font-mono"
+                    x-text="selectedServerDetails?.name || 'Loading...'"></span>
+            </h3>
+
+            <div x-show="isLoadingServerDetails" class="text-center p-6"><span
+                    class="loading loading-spinner loading-lg"></span></div>
+
+            <!-- ***** START x-if WRAPPER ***** -->
+            <template x-if="selectedServerDetails">
+                <div class="space-y-3 text-sm" x-transition>
+                    <!-- Basic Info -->
+                    <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs border-b border-base-300/30 pb-2 mb-2">
+                        <!-- All the <span> and <code> elements displaying server details -->
+                        <div><strong>Status:</strong> <span class="badge badge-sm"
+                                :class="selectedServerDetails.is_connected ? 'badge-success' : 'badge-error'"
+                                x-text="selectedServerDetails.is_connected ? 'Connected' : 'Disconnected'"></span></div>
+                        <div><strong>Type:</strong> <span class="badge badge-sm badge-outline"
+                                x-text="selectedServerDetails.type"></span></div>
+                        <div><strong>Enabled:</strong> <span
+                                x-text="selectedServerDetails.enabled ? 'Yes' : 'No'"></span></div>
+                        <div><strong>Trusted:</strong> <span
+                                x-text="selectedServerDetails.trusted ? 'Yes' : 'No'"></span></div>
+                        <div class="col-span-2"><strong>Path/URL:</strong> <code class="text-xs break-all"
+                                x-text="selectedServerDetails.path"></code></div>
+                        <div class="col-span-2" x-show="selectedServerDetails.args?.length > 0"><strong>Args:</strong>
+                            <code class="text-xs" x-text="selectedServerDetails.args?.join(' ')"></code>
+                        </div>
+                        <div class="col-span-2"><strong>Description:</strong> <span class="opacity-80"
+                                x-text="selectedServerDetails.description || 'N/A'"></span></div>
+                        <div x-show="selectedServerDetails.version"><strong>Version:</strong> <span
+                                x-text="selectedServerDetails.version"></span></div>
+                        <div x-show="selectedServerDetails.registry_url"><strong>Registry:</strong> <a
+                                :href="selectedServerDetails.registry_url" target="_blank"
+                                class="link link-info text-xs" x-text="selectedServerDetails.registry_url"></a></div>
+                        <div><strong>Timeout:</strong> <span x-text="selectedServerDetails.timeout + 's'"></span></div>
+                        <div><strong>Retries:</strong> <span x-text="selectedServerDetails.retry_count"></span></div>
+                    </div>
+
+                    <!-- Metrics -->
+                    <details
+                        class="collapse collapse-arrow border border-base-300/30 bg-base-200/50 rounded-md text-xs">
+                        <summary class="collapse-title text-xs font-medium py-1.5 min-h-0">Metrics</summary>
+                        <div class="collapse-content !px-0 !pb-0">
+                            <div class="p-2 grid grid-cols-2 gap-x-3 gap-y-1">
+                                <!-- ... all the spans displaying metrics ... -->
+                                <div><strong>Health:</strong> <span class="uppercase font-semibold"
+                                        :class="{ 'text-success': selectedServerDetails.metrics?.status === 'healthy', 'text-warning': selectedServerDetails.metrics?.status === 'degraded', 'text-error': selectedServerDetails.metrics?.status === 'error' }"
+                                        x-text="selectedServerDetails.metrics?.status || 'Unknown'"></span></div>
+                                <div><strong>Avg Resp:</strong> <span
+                                        x-text="(selectedServerDetails.metrics?.avg_response_time_ms || 0).toFixed(1) + ' ms'"></span>
+                                </div>
+                                <div><strong>Requests:</strong> <span
+                                        x-text="selectedServerDetails.metrics?.request_count || 0"></span></div>
+                                <div><strong>Errors:</strong> <span class="font-semibold"
+                                        :class="{'text-error': (selectedServerDetails.metrics?.error_count || 0) > 0}"
+                                        x-text="selectedServerDetails.metrics?.error_count || 0"></span></div>
+                                <div><strong>Error Rate:</strong> <span
+                                        x-text="(selectedServerDetails.metrics?.error_rate || 0).toFixed(2) * 100 + '%'"></span>
+                                </div>
+                                <div><strong>Uptime:</strong> <span
+                                        x-text="(selectedServerDetails.metrics?.uptime_minutes || 0).toFixed(1) + ' min'"></span>
+                                </div>
+                                <div class="col-span-2"><strong>Last Check:</strong> <span
+                                        x-text="formatTimestamp(selectedServerDetails.metrics?.last_checked)"></span>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <!-- Process Info (STDIO Only) -->
+                    <details x-show="selectedServerDetails.type === 'stdio' && selectedServerDetails.process_info"
+                        class="collapse collapse-arrow border border-base-300/30 bg-base-200/50 rounded-md text-xs">
+                        <summary class="collapse-title text-xs font-medium py-1.5 min-h-0">Process Info (STDIO)
+                        </summary>
+                        <div class="collapse-content !px-0 !pb-0">
+                            <div class="p-2 grid grid-cols-2 gap-x-3 gap-y-1"
+                                x-show="!selectedServerDetails.process_info?.error">
+                                <!-- ... all the spans displaying process info ... -->
+                                <div><strong>PID:</strong> <span
+                                        x-text="selectedServerDetails.process_info?.pid"></span></div>
+                                <div><strong>Status:</strong> <span
+                                        x-text="selectedServerDetails.process_info?.status"></span></div>
+                                <div><strong>CPU:</strong> <span
+                                        x-text="(selectedServerDetails.process_info?.cpu_percent || 0).toFixed(1) + '%'"></span>
+                                </div>
+                                <div><strong>Memory (RSS):</strong> <span
+                                        x-text="(selectedServerDetails.process_info?.memory_rss_mb || 0).toFixed(1) + ' MB'"></span>
+                                </div>
+                                <div class="col-span-2"><strong>Created:</strong> <span
+                                        x-text="formatTimestamp(selectedServerDetails.process_info?.create_time)"></span>
+                                </div>
+                            </div>
+                            <div class="p-2 text-error" x-show="selectedServerDetails.process_info?.error">
+                                <strong>Error:</strong> <span x-text="selectedServerDetails.process_info?.error"></span>
+                            </div>
+                        </div>
+                    </details>
+                </div> <!-- This is the closing div for the main content -->
+            </template>
+            <!-- ***** END x-if WRAPPER ***** -->
+
+            <div x-show="!isLoadingServerDetails && !selectedServerDetails" class="text-center text-error p-4">Failed to
+                load server details.</div>
+
+            <div class="modal-action mt-4">
+                <!-- ... modal buttons ... -->
+                <button class="btn btn-sm btn-ghost" @click="showServerDetailsModal = false">Close</button>
+                <button class="btn btn-sm btn-outline" @click="fetchServerDetails(selectedServerDetails?.name)"
+                    :disabled="isLoadingServerDetails">
+                    <i class="fas fa-sync mr-1" :class="{'fa-spin': isLoadingServerDetails}"></i> Refresh
+                </button>
+            </div>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button @click="showServerDetailsModal = false">close</button>
+        </form>
+    </dialog>
+
     <!-- Notifications Area -->
     <div
         class="toast toast-bottom toast-center md:toast-top md:toast-end z-[100] w-full md:w-auto max-w-xs md:max-w-sm">
@@ -955,15 +1312,34 @@
         const originalCodeRenderer = markedRenderer.code; // Optional: keep if needed elsewhere, but not used in the override below
         markedRenderer.code = (code, language, isEscaped) => {
             const lang = hljs.getLanguage(language) ? language : 'plaintext';
+            let codeToHighlight = ''; // Initialize
+            let originalCodeForCopy = code; // Preserve original for copy button if possible
+
+            if (typeof code === 'string') {
+                codeToHighlight = code;
+                originalCodeForCopy = code; // It's already a string
+            } else if (code && typeof code === 'object' && typeof code.text === 'string') {
+                // If it's an object with a text property (like from the log)
+                codeToHighlight = code.text;
+                originalCodeForCopy = code.text; // Use the extracted text for copy too
+            } else {
+                // Fallback: attempt stringification if it's not a string or the expected object structure
+                console.warn("Marked 'code' received unexpected type, attempting stringification:", code);
+                codeToHighlight = String(code); // This might result in [object Object]
+                originalCodeForCopy = codeToHighlight; // Copy the stringified version
+            }
+
             try {
-                const highlightedCode = hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
-                const copyButtonHtml = createCopyButton(code);
+                const highlightedCode = hljs.highlight(codeToHighlight, { language: lang, ignoreIllegals: true }).value;
+                // Use originalCodeForCopy for the copy button to get the best representation
+                const copyButtonHtml = createCopyButton(originalCodeForCopy);
                 // Wrap in a div for positioning context and add hljs class for styling
                 return `<div class="relative group"><pre><code class="hljs language-${lang}">${highlightedCode}</code></pre>${copyButtonHtml}</div>`;
             } catch (e) {
                 console.error("Highlighting error:", e);
-                // Fallback to non-highlighted code
-                return `<div class="relative group"><pre><code class="hljs language-${lang}">${code}</code></pre>${createCopyButton(code)}</div>`;
+                // Fallback: Ensure code is stringified before sanitizing if error occurred
+                const safeCode = DOMPurify.sanitize(codeToHighlight); // Sanitize the extracted/stringified code
+                return `<div class="relative group"><pre><code class="hljs language-${lang}">${safeCode}</code></pre>${createCopyButton(safeCode)}</div>`;
             }
         };
 
@@ -1003,13 +1379,15 @@
         };
 
         document.addEventListener('alpine:init', () => {
-            // Setup Alpine store first
+
+            // Setup Alpine store first (KEEP THIS)
             Alpine.store('conversation', {
                 currentNodeId: 'root',
                 conversationNodes: [{ id: 'root', name: 'Root', parentId: null, childrenIds: [] }],
                 setCurrentNodeId(id) { this.currentNodeId = id; },
                 setNodes(nodes) { this.conversationNodes = nodes; }
             });
+
 
             // Define the main component data
             Alpine.data('mcpClientUI', () => ({
@@ -1039,15 +1417,27 @@
                 notifications: [],
                 availableThemes: ["light", "dark", "cupcake", "bumblebee", "emerald", "corporate", "synthwave", "retro", "cyberpunk", "valentine", "halloween", "garden", "forest", "aqua", "lofi", "pastel", "fantasy", "wireframe", "black", "luxury", "dracula", "cmyk", "autumn", "business", "acid", "lemonade", "night", "coffee", "winter"],
                 currentTheme: 'light',
-                toolSearchTerm: '',
+                capabilitySearchTerm: '',
                 // --- WebSocket State ---
                 ws: null, wsConnected: false, wsConnecting: false, wsStatus: 'Disconnected', wsReconnectAttempts: 0,
                 currentStatusMessage: null, currentAssistantMessageId: null,
                 // --- Direct Tool Execution ---
                 directToolParams: '{}', directToolResult: null, directToolError: null, isLoadingDirectTool: false,
+                // --- Discovery State ---
+                discoveredServers: [], // Array to hold raw data fetched from API
+                discoveredServersTable: null, // Will hold the Tabulator table instance                
                 // --- Misc ---
                 saveConfigTimer: null,
                 stopController: null, // AbortController for stopping generation
+                // --- Cache State ---
+                cacheEntries: [],
+                cacheDependencies: {},
+                isLoadingCache: false,
+                cacheEntriesTable: null,
+                cacheDepsTable: null,
+                showServerDetailsModal: false,
+                isLoadingServerDetails: false,
+                selectedServerDetails: null,
 
                 // --- COMPUTED PROPERTIES ---
                 get connectedServersCount() { return this.servers.filter(s => s.isConnected).length; },
@@ -1057,22 +1447,90 @@
                 get conversationNodes() { return Alpine.store('conversation').conversationNodes; },
                 get currentNodeId() { return Alpine.store('conversation').currentNodeId; },
 
-                // Filtered lists based on toolSearchTerm
-                get filteredTools() { return this._filterCapabilities(this.tools); },
-                get filteredResources() { return this._filterCapabilities(this.resources); },
-                get filteredPrompts() { return this._filterCapabilities(this.prompts); },
+                get filteredServerCapabilities() {
+                    const searchTerm = this.capabilitySearchTerm.toLowerCase().trim();
+                    // Combine all capabilities, adding type and shortName
+                    const allCapabilities = [
+                        ...(this.tools || []).map(t => ({ ...t, type: 'tool', shortName: t.name.split(':').pop() })),
+                        ...(this.resources || []).map(r => ({ ...r, type: 'resource', shortName: r.name.split(':').pop() })),
+                        ...(this.prompts || []).map(p => ({ ...p, type: 'prompt', shortName: p.name.split(':').pop() }))
+                    ];
 
-                _filterCapabilities(items) {
-                    if (!this.toolSearchTerm.trim()) return items;
-                    const searchTermLower = this.toolSearchTerm.toLowerCase();
-                    // Ensure items is an array before filtering
-                    if (!Array.isArray(items)) return [];
-                    return items.filter(item =>
-                        (item.name && item.name.toLowerCase().includes(searchTermLower)) ||
-                        (item.description && item.description.toLowerCase().includes(searchTermLower)) ||
-                        (item.server_name && item.server_name.toLowerCase().includes(searchTermLower)) ||
-                        (item.template && item.template.toLowerCase().includes(searchTermLower)) // Include template for resources
-                    );
+                    const grouped = {};
+
+                    // Group by server name
+                    allCapabilities.forEach(cap => {
+                        const serverName = cap.server_name;
+                        if (!serverName) { // Handle potential missing server_name
+                            console.warn("Capability missing server_name:", cap);
+                            return;
+                        }
+                        if (!grouped[serverName]) {
+                            grouped[serverName] = { serverName: serverName, tools: [], resources: [], prompts: [] };
+                        }
+                        // Add to the correct array within the group
+                        if (cap.type === 'tool') grouped[serverName].tools.push(cap);
+                        else if (cap.type === 'resource') grouped[serverName].resources.push(cap);
+                        else if (cap.type === 'prompt') grouped[serverName].prompts.push(cap);
+                    });
+
+                    // Apply filtering to groups
+                    const filteredGroups = Object.values(grouped).filter(group => {
+                        if (!searchTerm) return true; // Keep group if no search term
+
+                        // Keep group if server name matches
+                        if (group.serverName.toLowerCase().includes(searchTerm)) {
+                            return true;
+                        }
+
+                        // Keep group if any capability within it matches
+                        const capabilitiesInGroup = [...group.tools, ...group.resources, ...group.prompts];
+                        return capabilitiesInGroup.some(cap =>
+                            (cap.name && cap.name.toLowerCase().includes(searchTerm)) ||
+                            (cap.shortName && cap.shortName.toLowerCase().includes(searchTerm)) ||
+                            (cap.description && cap.description.toLowerCase().includes(searchTerm)) ||
+                            (cap.template && typeof cap.template === 'string' && cap.template.toLowerCase().includes(searchTerm)) // Check resource template
+                        );
+                    }).map(group => {
+                        // If filtering, also filter capabilities *within* the matching group
+                        if (searchTerm) {
+                            const filterFn = cap =>
+                                (cap.name && cap.name.toLowerCase().includes(searchTerm)) ||
+                                (cap.shortName && cap.shortName.toLowerCase().includes(searchTerm)) ||
+                                (cap.description && cap.description.toLowerCase().includes(searchTerm)) ||
+                                (cap.template && typeof cap.template === 'string' && cap.template.toLowerCase().includes(searchTerm)); // Also check template here
+
+                            return {
+                                ...group,
+                                tools: group.tools.filter(filterFn),
+                                resources: group.resources.filter(filterFn),
+                                prompts: group.prompts.filter(filterFn)
+                            };
+                        }
+                        return group; // Return unmodified group if no search term
+                    });
+
+                    // Sort server groups alphabetically
+                    filteredGroups.sort((a, b) => a.serverName.localeCompare(b.serverName));
+
+                    // Sort capabilities within each group alphabetically by short name
+                    filteredGroups.forEach(group => {
+                        group.tools.sort((a, b) => a.shortName.localeCompare(b.shortName));
+                        group.resources.sort((a, b) => a.shortName.localeCompare(b.shortName));
+                        group.prompts.sort((a, b) => a.shortName.localeCompare(b.shortName));
+                    });
+
+                    return filteredGroups;
+                },
+
+                // Utility to get total capabilities count for display
+                get totalCapabilities() {
+                    return (this.tools?.length || 0) + (this.resources?.length || 0) + (this.prompts?.length || 0);
+                },
+
+                // Helper to get server object by name (used for status icon in capabilities tab)
+                getServerByName(name) {
+                    return this.servers.find(s => s.name === name);
                 },
 
                 // --- LIFECYCLE & INITIALIZATION ---
@@ -1086,24 +1544,41 @@
 
                         this.fetchInitialData();
                         this.connectWebSocket();
-
                         this.initTippy(); // Initialize Tippy globally
 
                         // Watchers for dynamic content updates needing Tippy/Highlighting
                         this.$watch('servers', () => this.$nextTick(() => this.initTippy()));
-                        this.$watch('filteredTools', () => this.$nextTick(() => this.initTippy())); // Watch filtered list
-                        this.$watch('filteredResources', () => this.$nextTick(() => this.initTippy()));
-                        this.$watch('filteredPrompts', () => this.$nextTick(() => this.initTippy()));
-                        this.$watch('activeTab', () => this.$nextTick(() => this.initTippy()));
-                        // Use a ref on the modal dialog itself for scoping highlighting
-                        this.$watch('showToolDetailsModal', (value) => {
-                            if (value) {
-                                this.$nextTick(() => {
-                                    const modalElement = document.getElementById('toolDetailsModal');
-                                    if (modalElement) this.initHighlighting(modalElement);
-                                });
+                        this.$watch('activeTab', (newTab) => {
+                            this.$nextTick(() => this.initTippy());
+                            if (newTab === 'config' && !this.isLoadingCache) { // <<< ADD THIS CONDITION
+                                this.fetchCacheData(); // Fetch cache data when switching to config tab
                             }
                         });
+                        this.$watch('activeTab', (newTab) => {
+                            console.log(`Tab changed to: ${newTab}`); // Debug log
+                            this.$nextTick(() => {
+                                this.initTippy(); // Re-init tippy for any tab change
+                                // Fetch data and initialize/update tables ONLY when config tab is selected
+                                if (newTab === 'config' && !this.isLoadingCache) {
+                                    console.log("Config tab active, fetching cache data...");
+                                    this.fetchCacheData(); // Fetch cache data which will then init/update tables
+                                } else if (newTab !== 'config') {
+                                    // Optional: Destroy tables when navigating away to free resources?
+                                    // if (this.cacheEntriesTable) { this.cacheEntriesTable.destroy(); this.cacheEntriesTable = null; }
+                                    // if (this.cacheDepsTable) { this.cacheDepsTable.destroy(); this.cacheDepsTable = null; }
+                                }
+                            });
+                        });
+                        this.$el.addEventListener('checkout-branch', (event) => {
+                            // Add log to confirm listener fires
+                            console.log('checkout-branch event received, ID:', event.detail?.id);
+                            if (event.detail?.id) {
+                                this.checkoutBranch(event.detail.id);
+                            } else {
+                                console.error("checkout-branch event received without ID in detail.");
+                            }
+                        });
+
                         // Watch conversation changes for highlighting new messages
                         this.$watch('currentConversation', (newVal, oldVal) => {
                             // Only highlight if the length changed or last message content updated significantly
@@ -1440,6 +1915,7 @@
                             if (message.payload.prompts) this.prompts = message.payload.prompts;
                             if (message.payload.conversation) {
                                 this.currentConversation = message.payload.conversation.messages || [];
+                                console.log('WS state_update is SETTING nodes:', JSON.stringify(message.payload.conversation.nodes || []));
                                 Alpine.store('conversation').setNodes(message.payload.conversation.nodes || [{ id: 'root', name: 'Root', parentId: null, childrenIds: [] }]);
                                 Alpine.store('conversation').setCurrentNodeId(message.payload.conversation.currentNodeId || 'root');
                                 this.currentModel = message.payload.conversation.model || this.config.defaultModel;
@@ -1482,6 +1958,7 @@
                     // Ensure the list reference updates for Alpine's reactivity if modifying nested props
                     this.currentConversation = [...this.currentConversation];
                 },
+
 
                 // --- DATA FETCHING ---
                 async fetchInitialData() {
@@ -1536,6 +2013,445 @@
                     }
                 }, // Added comma
 
+                async fetchServerDetails(serverName) {
+                    if (!serverName) return;
+                    console.log(`Fetching details for server: ${serverName}`);
+                    this.isLoadingServerDetails = true;
+                    this.selectedServerDetails = null; // Clear previous details
+                    this.showServerDetailsModal = true; // Open modal immediately
+
+                    try {
+                        const details = await this.apiFetch(`/servers/${encodeURIComponent(serverName)}/details`);
+                        this.selectedServerDetails = details;
+                        // Re-init Tippy if needed after modal content updates
+                        this.$nextTick(() => this.initTippy());
+                    } catch (e) {
+                        this.addNotification(`Failed to load details for ${serverName}: ${e.message}`, 'error');
+                        this.selectedServerDetails = null; // Ensure it's null on error
+                        // Keep modal open to show error message inside? Or close it? Let's keep it open.
+                    } finally {
+                        this.isLoadingServerDetails = false;
+                    }
+                },
+
+                // --- NEW: DISCOVERY METHODS ---
+                async triggerDiscovery() {
+                    // This now triggers the consolidated backend discovery
+                    if (this.isLoadingDiscovery) return;
+                    console.log(`Triggering consolidated server discovery via API...`);
+                    this.isLoadingDiscovery = true;
+                    this.discoveredServers = []; // Clear previous results immediately
+                    if (this.discoveredServersTable) {
+                        this.discoveredServersTable.clearData(); // Clear Tabulator table
+                        this.discoveredServersTable.setPlaceholder("Scanning network..."); // Update placeholder
+                    }
+                    this.addNotification('Starting network server discovery scan...', 'info', 2500);
+                    try {
+                        // Call the single trigger endpoint
+                        await this.apiFetch('/discover/trigger', { method: 'POST' });
+                        // Wait a reasonable time for discovery to finish on backend.
+                        // Adjust delay based on typical scan time (mDNS/Port Scan can take longer)
+                        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+                        await this.fetchDiscoveryResults(); // Fetch results after waiting
+                    } catch (e) {
+                        this.addNotification(`Failed to initiate discovery scan: ${e.message}`, 'error');
+                        this.isLoadingDiscovery = false; // Ensure loading stops on trigger error
+                        if (this.discoveredServersTable) {
+                            this.discoveredServersTable.setPlaceholder("Discovery failed.");
+                        }
+                    }
+                    // isLoadingDiscovery is set to false by fetchDiscoveryResults' finally block
+                },
+
+                async fetchDiscoveryResults() {
+                    console.log("Fetching discovery results for Tabulator...");
+                    try {
+                        const results = await this.apiFetch('/discover/results');
+                        // Store raw data - Tabulator will use this
+                        this.discoveredServers = results || [];
+                        console.log(`Found ${this.discoveredServers.length} discovered servers.`);
+
+                        // Initialize or update Tabulator table using the data
+                        this.initOrUpdateDiscoveredTable();
+
+                    } catch (e) {
+                        this.addNotification(`Failed to fetch discovery results: ${e.message}`, 'error');
+                        this.discoveredServers = []; // Clear data on error
+                        if (this.discoveredServersTable) {
+                            this.discoveredServersTable.clearData(); // Clear table too
+                            this.discoveredServersTable.setPlaceholder("Error fetching results.");
+                        }
+                    } finally {
+                        this.isLoadingDiscovery = false; // Stop loading indicator *after* fetching/rendering
+                    }
+                },
+
+                // Tabulator Initialization/Update Function
+                initOrUpdateDiscoveredTable() {
+                    const tableElement = document.getElementById('discovered-servers-table');
+                    if (!tableElement) {
+                        console.warn("Tabulator container '#discovered-servers-table' not found in DOM yet.");
+                        return;
+                    }
+
+                    // --- Define Tabulator Columns ---
+                    const columns = [
+                        { // Icon column
+                            title: "", hozAlign: "center", width: 40, headerSort: false, cssClass: "p-1", frozen: true,
+                            formatter: (cell) => `<i class="${this.serverTypeIcon(cell.getRow().getData().type)} opacity-80 text-base"></i>`
+                        },
+                        { title: "Name", field: "name", minWidth: 120, sorter: "string", headerFilter: "input", cssClass: "p-1 font-medium", tooltip: (cell) => cell.getValue() },
+                        { title: "Path / URL", field: "path_or_url", minWidth: 180, sorter: "string", headerFilter: "input", cssClass: "p-1 text-base-content/70", tooltip: (cell) => cell.getValue() },
+                        { // Source Badge column
+                            title: "Source", field: "source", sorter: "string", headerFilter: "select", headerFilterParams: { values: ["", "filesystem", "registry", "mdns", "portscan"] }, width: 90, hozAlign: "center", cssClass: "p-1",
+                            formatter: (cell) => `<span class="badge badge-xs capitalize ${this.discoverySourceColor(cell.getValue())}">${cell.getValue() || 'N/A'}</span>`
+                        },
+                        { // Action Button column
+                            title: "Action", hozAlign: "center", width: 70, headerSort: false, cssClass: "p-1",
+                            formatter: (cell) => {
+                                const serverData = cell.getRow().getData();
+                                const isDisabled = serverData.is_configured;
+                                const uniqueId = `add-disc-btn-${cell.getRow().getIndex()}`;
+                                // Use data attributes to store necessary info for the click handler
+                                return `
+                                    <button id="${uniqueId}"
+                                            class="btn btn-xs btn-outline btn-success p-1"
+                                            ${isDisabled ? 'disabled' : ''}
+                                            data-tippy-content="${serverData.is_configured ? 'Already Configured' : 'Add & Connect'}"
+                                            data-server-info="${encodeURIComponent(JSON.stringify(serverData))}"
+                                            >
+                                        <i class="fas fa-plus"></i>
+                                    </button>
+                                `;
+                            },
+                            cellClick: (e, cell) => { // Handle clicks within the cell
+                                const button = e.target.closest('button'); // Find the clicked button
+                                if (button && !button.disabled) { // If a non-disabled button was clicked
+                                    const serverInfoEncoded = button.getAttribute('data-server-info');
+                                    if (serverInfoEncoded) {
+                                        try {
+                                            const serverData = JSON.parse(decodeURIComponent(serverInfoEncoded));
+                                            // Call the Alpine method, passing the button for state changes
+                                            this.addAndConnectDiscoveredServer(serverData, button);
+                                        } catch (parseError) {
+                                            console.error("Error parsing server data from button:", parseError);
+                                            this.addNotification("Internal UI error processing discovered server.", "error");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]; // End columns definition
+
+                    // --- Initialize or Update Table ---
+                    const placeholderText = this.isLoadingDiscovery ? "Scanning..." : "No new servers found.";
+                    if (this.discoveredServersTable) {
+                        console.log("Tabulator: Updating data");
+                        this.discoveredServersTable.setPlaceholder(placeholderText);
+                        this.discoveredServersTable.setData(this.discoveredServers)
+                            .then(() => { this.$nextTick(() => this.initTippy()); }) // Re-init tippy after data update
+                            .catch(err => console.error("Tabulator setData error:", err));
+                    } else {
+                        console.log("Tabulator: Initializing new table");
+                        try {
+                            this.discoveredServersTable = new Tabulator("#discovered-servers-table", {
+                                data: this.discoveredServers,
+                                layout: "fitDataStretch",
+                                placeholder: placeholderText,
+                                height: "12rem",
+                                // virtualDom: true, // Enable if expecting many results
+                                // virtualDomBuffer: 300,
+                                responsiveLayout: "hide", // Hide columns that don't fit
+                                columns: columns,
+                                initialSort: [{ column: "name", dir: "asc" }],
+                                tableBuilt: () => { this.$nextTick(() => this.initTippy()); },
+                            });
+                        } catch (err) {
+                            console.error("Failed to initialize Tabulator:", err);
+                            this.addNotification("Error initializing discovery table.", "error");
+                        }
+                    }
+                    // Ensure tippy runs after table potentially renders/updates outside the promises too
+                    this.$nextTick(() => this.initTippy());
+                }, // End initOrUpdateDiscoveredTable
+
+                // Modified addAndConnect to handle button loading state
+                async addAndConnectDiscoveredServer(dServer, buttonElement = null) {
+                    if (!dServer || dServer.is_configured) return;
+
+                    this.addNotification(`Adding & connecting to ${dServer.name}...`, 'info');
+
+                    let originalButtonContent = null;
+                    if (buttonElement) {
+                        originalButtonContent = buttonElement.innerHTML;
+                        buttonElement.classList.add('loading');
+                        buttonElement.disabled = true;
+                        buttonElement.innerHTML = ''; // Clear icon
+                    } else {
+                        this.isLoading = true; // Fallback global loading
+                    }
+
+                    try {
+                        // Construct payload carefully matching the Pydantic model on backend
+                        const payload = {
+                            name: dServer.name,
+                            type: dServer.type,
+                            path_or_url: dServer.path_or_url, // Ensure this matches backend expectation
+                            source: dServer.source,
+                            description: dServer.description,
+                            version: dServer.version,
+                            categories: dServer.categories || [],
+                            is_configured: dServer.is_configured // Send current state
+                        };
+                        const result = await this.apiFetch('/discover/connect', {
+                            method: 'POST',
+                            body: JSON.stringify(payload)
+                        });
+                        this.addNotification(result.message || `Successfully processed ${dServer.name}.`, 'success');
+
+                        // Refresh main server list, capabilities, AND discovery results
+                        await this.fetchServers();
+                        await this.fetchCapabilities();
+                        // Re-fetch discovery results - this will update the table and disable the button
+                        await this.fetchDiscoveryResults();
+
+                    } catch (e) {
+                        this.addNotification(`Failed to add/connect ${dServer.name}: ${e.message}`, 'error');
+                        // Reset button state on error only if element was passed
+                        if (buttonElement) {
+                            buttonElement.classList.remove('loading');
+                            // Re-enable button only if it wasn't already configured
+                            buttonElement.disabled = dServer.is_configured;
+                            buttonElement.innerHTML = originalButtonContent;
+                        }
+                    } finally {
+                        // Ensure global loading is reset if it was used
+                        this.isLoading = false;
+                        // Button state is reset on error above, or implicitly handled by
+                        // fetchDiscoveryResults on success (which rebuilds the table)
+                    }
+                },
+
+                async reloadAllServers() {
+                    if (this.isLoadingServers) return;
+                    if (confirm("This will disconnect and attempt to reconnect all configured servers, reloading their capabilities. Proceed?")) {
+                        console.log("Reloading all servers via API...");
+                        this.isLoadingServers = true; // Use server loading flag
+                        this.addNotification("Reloading all servers...", "info");
+                        // Clear current UI state immediately for better feedback
+                        this.servers = [];
+                        this.tools = [];
+                        this.resources = [];
+                        this.prompts = [];
+                        try {
+                            const result = await this.apiFetch('/runtime/reload', { method: 'POST' });
+                            this.addNotification(result.message || "Server reload complete.", "success");
+                        } catch (e) {
+                            this.addNotification(`Server reload failed: ${e.message}`, "error");
+                        } finally {
+                            // Always refresh state after attempt
+                            await this.fetchServers();
+                            await this.fetchCapabilities();
+                            this.isLoadingServers = false;
+                        }
+                    }
+                },
+
+                // Utility function for server type icons (ADD this or ensure it exists)
+                serverTypeIcon(type) {
+                    switch (type?.toLowerCase()) {
+                        case 'stdio': return 'fas fa-terminal text-accent';
+                        case 'sse': return 'fas fa-network-wired text-info';
+                        default: return 'fas fa-question-circle text-base-content/40';
+                    }
+                },
+
+                // Utility function for discovery source badge colors (ADD this or ensure it exists)
+                discoverySourceColor(source) {
+                    switch (source?.toLowerCase()) {
+                        case 'filesystem': return 'badge-neutral';
+                        case 'registry': return 'badge-secondary';
+                        case 'mdns': return 'badge-accent';
+                        case 'portscan': return 'badge-warning';
+                        default: return 'badge-ghost';
+                    }
+                },
+
+                async fetchCacheData() {
+                    if (this.isLoadingCache) return;
+                    // Ensure the tab is actually active before fetching/rendering
+                    if (this.activeTab !== 'config') {
+                        console.log("fetchCacheData called but config tab not active. Skipping.");
+                        return;
+                    }
+                    console.log("Fetching cache data...");
+                    this.isLoadingCache = true;
+                    // Clear tables immediately while loading (Tabulator handles placeholder)
+                    if (this.cacheEntriesTable) this.cacheEntriesTable.clearData();
+                    if (this.cacheDepsTable) this.cacheDepsTable.clearData();
+
+                    try {
+                        const results = await Promise.allSettled([
+                            this.apiFetch('/cache/entries'),
+                            this.apiFetch('/cache/dependencies')
+                        ]);
+
+                        if (results[0].status === 'fulfilled') {
+                            this.cacheEntries = results[0].value || [];
+                            this.initOrUpdateCacheEntriesTable(); // Update/init table
+                        } else {
+                            this.addNotification('Failed to fetch cache entries.', 'error');
+                            this.cacheEntries = [];
+                            // No setPlaceholder here
+                        }
+
+                        if (results[1].status === 'fulfilled' && results[1].value?.dependencies) {
+                            this.cacheDependencies = results[1].value.dependencies;
+                            this.initOrUpdateCacheDepsTable(); // Update/init table
+                        } else {
+                            if (results[1].status === 'rejected') {
+                                this.addNotification('Failed to fetch cache dependencies.', 'error');
+                            }
+                            this.cacheDependencies = {};
+                            // No setPlaceholder here
+                        }
+                    } catch (e) {
+                        console.error("Unexpected error fetching cache data:", e);
+                        this.addNotification('Failed to fetch cache data.', 'error');
+                    } finally {
+                        this.isLoadingCache = false;
+                        // Ensure placeholders are set correctly after loading (Tabulator does this)
+                        if (this.cacheEntriesTable) this.cacheEntriesTable.setPlaceholder("No cache entries found.");
+                        if (this.cacheDepsTable) this.cacheDepsTable.setPlaceholder("No dependencies found.");
+                    }
+                },
+
+                initOrUpdateCacheEntriesTable() {
+                    // Ensure tab is active before trying to init/update
+                    if (this.activeTab !== 'config') {
+                        console.warn("Attempted to init/update Cache Entries table when tab not active.");
+                        return;
+                    }
+                    const tableId = 'cache-entries-table';
+                    const tableElement = document.getElementById(tableId);
+                    if (!tableElement) { console.warn(`Tabulator container '#${tableId}' not found.`); return; }
+
+                    const columns = [
+                        { title: "Tool Name", field: "tool_name", minWidth: 150, sorter: "string", headerFilter: "input", cssClass: "p-1 font-medium", tooltip: true },
+                        { title: "Created At", field: "created_at", width: 140, sorter: "datetime", hozAlign: "center", cssClass: "p-1 text-base-content/70", sorterParams: { format: "iso" }, formatter: "datetime", formatterParams: { outputFormat: "MM/DD HH:mm:ss" }, tooltip: (cell) => { try { return new Date(cell.getValue()).toLocaleString(); } catch { return cell.getValue(); } } },
+                        {
+                            title: "Expires At", field: "expires_at", width: 140, sorter: "datetime", hozAlign: "center", cssClass: "p-1 text-base-content/70", sorterParams: { format: "iso" },
+                            formatter: (cell) => {
+                                const value = cell.getValue(); if (!value) return '<span class="italic opacity-50">Never</span>';
+                                try { const table = cell.getTable(); if (table && table.modules.format) { return table.modules.format.formatters.datetime(cell, { outputFormat: "MM/DD HH:mm:ss" }); } return new Date(value).toLocaleTimeString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch { return value; }
+                            },
+                            tooltip: (cell) => { try { return cell.getValue() ? new Date(cell.getValue()).toLocaleString() : 'Never'; } catch { return cell.getValue(); } }
+                        },
+                        { title: "Key Hash", field: "key", minWidth: 100, sorter: "string", headerFilter: "input", cssClass: "p-1 font-mono text-xs opacity-60", formatter: (cell) => cell.getValue().split(':').pop()?.substring(0, 10) + '...' || '', tooltip: (cell) => cell.getValue() },
+                        {
+                            title: "Clear", hozAlign: "center", width: 60, headerSort: false, cssClass: "p-1",
+                            formatter: (cell) => { const toolName = cell.getRow().getData().tool_name; return `<button class="btn btn-xs btn-ghost text-error/70 hover:text-error p-1" data-tool-name="${encodeURIComponent(toolName)}" data-tippy-content="Clear all for '${toolName}'"><i class="fas fa-times"></i></button>`; },
+                            cellClick: (e, cell) => { const button = e.target.closest('button'); if (button) { const toolNameEncoded = button.getAttribute('data-tool-name'); if (toolNameEncoded) { this.clearCacheByToolName(decodeURIComponent(toolNameEncoded)); } } }
+                        }
+                    ];
+                    const placeholderText = "No cache entries found.";
+
+                    if (this.cacheEntriesTable) {
+                        console.log("Tabulator (Cache Entries): Updating data");
+                        this.cacheEntriesTable.setData(this.cacheEntries)
+                            .then(() => { this.$nextTick(() => this.initTippy()); })
+                            .catch(err => console.error("Tabulator setData (cache entries) error:", err));
+                    } else {
+                        console.log("Tabulator (Cache Entries): Initializing new table");
+                        try {
+                            this.cacheEntriesTable = new Tabulator(`#${tableId}`, { data: this.cacheEntries, layout: "fitDataStretch", placeholder: placeholderText, height: "5rem", columns: columns, initialSort: [{ column: "created_at", dir: "desc" }], tableBuilt: () => { this.$nextTick(() => this.initTippy()); }, });
+                        } catch (err) { console.error("Failed to initialize Cache Entries Tabulator:", err); this.addNotification("Error initializing cache table.", "error"); }
+                    }
+                    this.$nextTick(() => this.initTippy());
+                },
+
+                initOrUpdateCacheDepsTable() {
+                    // Ensure tab is active before trying to init/update
+                    if (this.activeTab !== 'config') {
+                        console.warn("Attempted to init/update Cache Deps table when tab not active.");
+                        return;
+                    }
+                    const tableId = 'cache-dependencies-table';
+                    const tableElement = document.getElementById(tableId);
+                    if (!tableElement) { console.warn(`Tabulator container '#${tableId}' not found.`); return; }
+
+                    const tableData = Object.entries(this.cacheDependencies).map(([tool, deps]) => ({ tool: tool, depends_on: Array.isArray(deps) ? deps.join(', ') : '' }));
+                    const columns = [{ title: "Tool", field: "tool", minWidth: 180, sorter: "string", headerFilter: "input", cssClass: "p-1 font-medium", tooltip: true }, { title: "Depends On", field: "depends_on", minWidth: 200, sorter: "string", headerFilter: "input", cssClass: "p-1 text-base-content/80", tooltip: true }];
+                    const placeholderText = "No dependencies found.";
+
+                    if (this.cacheDepsTable) {
+                        console.log("Tabulator (Cache Deps): Updating data");
+                        this.cacheDepsTable.setData(tableData)
+                            .then(() => { this.$nextTick(() => this.initTippy()); })
+                            .catch(err => console.error("Tabulator setData (cache deps) error:", err));
+                    } else {
+                        console.log("Tabulator (Cache Deps): Initializing new table");
+                        try {
+                            this.cacheDepsTable = new Tabulator(`#${tableId}`, { data: tableData, layout: "fitDataStretch", placeholder: placeholderText, height: "4rem", columns: columns, initialSort: [{ column: "tool", dir: "asc" }], tableBuilt: () => { this.$nextTick(() => this.initTippy()); }, });
+                        } catch (err) { console.error("Failed to initialize Cache Dependencies Tabulator:", err); this.addNotification("Error initializing dependencies table.", "error"); }
+                    }
+                    this.$nextTick(() => this.initTippy());
+                },
+
+                async clearAllCacheAPI() {
+                    if (confirm("Are you sure you want to clear the ENTIRE tool result cache?")) {
+                        this.isLoadingCache = true;
+                        try {
+                            const result = await this.apiFetch('/cache/entries', { method: 'DELETE' });
+                            this.addNotification(result.message || 'Cache cleared successfully.', 'success');
+                            await this.fetchCacheData(); // Refresh view
+                        } catch (e) {
+                            this.addNotification(`Failed to clear cache: ${e.message}`, 'error');
+                        } finally {
+                            this.isLoadingCache = false;
+                        }
+                    }
+                },
+
+                async clearSingleCacheEntry(cacheKey) {
+                    // Note: The API currently supports clearing by tool_name, not specific key hash.
+                    // We'll extract the tool_name from the key.
+                    const toolName = cacheKey.split(':')[0];
+                    if (!toolName) {
+                        this.addNotification('Invalid cache key format.', 'error');
+                        return;
+                    }
+
+                    if (confirm(`Clear all cache entries for tool "${toolName}"? (Cannot clear single entry via API yet)`)) {
+                        this.isLoadingCache = true;
+                        try {
+                            const endpoint = `/cache/entries/${encodeURIComponent(toolName)}`;
+                            const result = await this.apiFetch(endpoint, { method: 'DELETE' });
+                            this.addNotification(result.message || `Cache cleared for tool '${toolName}'.`, 'success');
+                            await this.fetchCacheData(); // Refresh view
+                        } catch (e) {
+                            this.addNotification(`Failed to clear cache for '${toolName}': ${e.message}`, 'error');
+                        } finally {
+                            this.isLoadingCache = false;
+                        }
+                    }
+                },
+
+                async cleanCacheAPI() {
+                    if (confirm("Clean expired entries from the cache?")) {
+                        this.isLoadingCache = true;
+                        try {
+                            const result = await this.apiFetch('/cache/clean', { method: 'POST' });
+                            this.addNotification(result.message || 'Expired cache entries cleaned.', 'success');
+                            await this.fetchCacheData(); // Refresh view
+                        } catch (e) {
+                            this.addNotification(`Failed to clean cache: ${e.message}`, 'error');
+                        } finally {
+                            this.isLoadingCache = false;
+                        }
+                    }
+                },
+
                 async fetchCapabilities() {
                     this.isLoadingTools = true; // Use this flag for all capabilities
                     try {
@@ -1566,7 +2482,9 @@
                 async fetchConversation() {
                     try {
                         const data = await this.apiFetch('/conversation');
+                        console.log('fetchConversation received data:', JSON.stringify(data));
                         if (data) {
+                            console.log('fetchConversation is SETTING nodes:', JSON.stringify(data.nodes || []));
                             Alpine.store('conversation').setCurrentNodeId(data.currentNodeId || 'root');
                             this.currentConversation = data.messages || [];
                             Alpine.store('conversation').setNodes(data.nodes || [{ id: 'root', name: 'Root', parentId: null, childrenIds: [] }]);
@@ -1576,6 +2494,7 @@
                             this.$nextTick(() => this.initHighlighting(this.$refs.chatbox));
                         } else {
                             // Handle case where API returns ok but no data (e.g., new session)
+                            console.log('fetchConversation received NULL data, resetting nodes.');
                             Alpine.store('conversation').setCurrentNodeId('root');
                             this.currentConversation = [];
                             Alpine.store('conversation').setNodes([{ id: 'root', name: 'Root', parentId: null, childrenIds: [] }]);
@@ -1612,14 +2531,26 @@
                             .catch(() => { this.addNotification(`Failed to save setting '${key}'.`, 'error'); });
                     }, 750);
                 },
-                resetConfig() {
-                    if (confirm('Are you sure you want to reset settings in the UI to defaults? (Server config file is not changed by this action)')) {
-                        console.warn("Reset Config: UI cannot directly reset server file. Reloading defaults to UI.");
-                        const defaults = { apiKey: '', defaultModel: 'claude-3-5-sonnet-20240620', maxTokens: 4096, temperature: 0.7, enableStreaming: true, enableCaching: true, autoDiscover: true, enableLocalDiscovery: true, dashboardRefreshRate: 2.0 };
-                        Object.keys(defaults).forEach(key => { this.config[key] = defaults[key]; });
-                        this.currentModel = this.config.defaultModel;
-                        this.addNotification('UI settings reset to defaults.', 'warning');
-                        this.apiFetch('/config', { method: 'PUT', body: JSON.stringify(defaults) }).then(() => this.addNotification('Attempted to push defaults to server.', 'info')).catch(e => console.error("Failed to push default config to server", e));
+                async resetConfig() { // Make async
+                    if (confirm('Are you sure you want to reset the configuration TO DEFAULTS? This affects the server and cannot be undone easily.')) {
+                        console.warn("Resetting configuration via API...");
+                        this.isLoading = true; // Use global loading
+                        this.addNotification("Resetting configuration to defaults...", "warning");
+                        try {
+                            // Call the API endpoint
+                            const result = await this.apiFetch('/config/reset', { method: 'POST' });
+                            this.addNotification(result.message || "Configuration reset successfully.", "success");
+                            // Reload UI config state from server (which should now be default)
+                            await this.loadConfig();
+                            // Reload servers and capabilities as config changed drastically
+                            await this.fetchServers();
+                            await this.fetchCapabilities();
+                            // Consider reloading the page or forcing a full state refresh if needed
+                        } catch (e) {
+                            this.addNotification(`Configuration reset failed: ${e.message}`, 'error');
+                        } finally {
+                            this.isLoading = false;
+                        }
                     }
                 },
                 loadConfigFromLocalStorage() {
@@ -1746,14 +2677,31 @@
                     } catch (e) { this.directToolError = `Execution request failed: ${e.message}`; this.directToolResult = null; this.addNotification(`Failed to execute tool '${this.selectedTool.name}'.`, 'error'); }
                     finally { this.isLoadingDirectTool = false; this.$nextTick(() => this.initHighlighting(document.getElementById('toolDetailsModal'))); }
                 },
-                applyPrompt(promptName) {
+                async applyPrompt(promptName) { // Make it async
+                    if (!promptName) return;
                     const selectedPrompt = this.prompts.find(p => p.name === promptName);
-                    if (!selectedPrompt) { console.error(`Prompt ${promptName} not found.`); return; }
-                    console.warn(`Applying prompt ${promptName} - current implementation prepends to input.`);
-                    const promptText = selectedPrompt.prompt || selectedPrompt.description || `Applying prompt: ${promptName}`;
-                    this.userInput = `${promptText}\n\n---\n\n${this.userInput}`;
-                    this.$nextTick(() => { this.$refs.inputarea.focus(); this.adjustTextareaHeight(this.$refs.inputarea); });
-                    this.addNotification(`Prompt '${promptName}' added to input.`, 'info');
+                    if (!selectedPrompt) { console.error(`Prompt ${promptName} not found.`); this.addNotification(`Prompt '${promptName}' not found.`, 'error'); return; }
+
+                    // Optional: Ask for confirmation?
+                    // if (!confirm(`Apply system prompt '${selectedPrompt.shortName}' to the current conversation? This modifies the history.`)) return;
+
+                    console.log(`Applying prompt '${promptName}' via API...`);
+                    this.isLoading = true; // Indicate activity
+
+                    try {
+                        // Call the new API endpoint
+                        const result = await this.apiFetch('/conversation/apply_prompt', {
+                            method: 'POST',
+                            body: JSON.stringify({ prompt_name: promptName }) // Send the full name
+                        });
+                        this.addNotification(result.message || `Prompt '${selectedPrompt.shortName}' applied successfully.`, 'success');
+                        // Optionally, refresh the conversation view immediately, though the next query will use it
+                        // await this.fetchConversation();
+                    } catch (e) {
+                        this.addNotification(`Failed to apply prompt '${selectedPrompt.shortName}': ${e.message}`, 'error');
+                    } finally {
+                        this.isLoading = false;
+                    }
                 },
 
                 // --- CHAT ---
@@ -2185,67 +3133,76 @@
                 },
 
                 renderUserProvidedToolResult(block, message) {
-                    // block is message.content[0] which has { type: 'tool_result', content: 'JSON_STRING', ... }
+                    // block is message.content[0] which has { type: 'tool_result', content: 'STRING_OR_JSON_STRING', ... }
                     const toolUseId = block.tool_use_id || 'Unknown Tool Call';
-                    let contentData;
-                    // Start with Tool Result styling (e.g., blueish info background)
-                    let html = `<div class="not-prose my-2 p-3 bg-info text-info-content rounded-lg border border-info/20">`;
-                    html += `<div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 font-medium text-sm mb-1.5">
-                                <span class="flex items-center gap-1.5"><i class="fas fa-database fa-fw"></i>Tool Data Received</span>
-                                <span class="text-xs opacity-70">(for <code class="text-xs font-mono">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>
-                             </div>`;
+                    let contentData = block.content; // Default to original content string
+                    let parsedSuccessfully = false;
+                    let isLikelyJson = false;
+                    let displayAsJson = false; // Flag to decide rendering format
 
-                    try {
-                        // *** THE KEY FIX: Parse the nested JSON string ***
-                        contentData = JSON.parse(block.content);
+                    // Start with Tool Result styling (info background, may change if error detected)
+                    let containerClasses = "not-prose my-2 p-3 bg-info text-info-content rounded-lg border border-info/20";
+                    let headerText = '<span class="flex items-center gap-1.5"><i class="fas fa-database fa-fw"></i>Tool Data Received</span>';
 
-                        // Now, format the PARSED data (contentData)
-                        // Example: Displaying Marqo results nicely
-                        if (contentData && Array.isArray(contentData.results)) {
-                            html += `<details class="bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md group mt-2" open>`;
-                            html += `<summary class="text-xs cursor-pointer select-none font-medium text-info-content/80 group-open:border-b group-open:border-info/40 pb-1 mb-1">Parsed Results (${contentData.results.length})</summary>`;
-                            html += `<div class="mt-1 space-y-2 max-h-72 overflow-y-auto text-xs">`; // Increased max-height slightly
+                    // --- MODIFIED PARSING LOGIC ---
+                    if (typeof block.content === 'string') {
+                        contentData = block.content; // Keep the raw string
+                        isLikelyJson = this.isProbablyJsonString(block.content); // Check if it looks like JSON
 
-                            // Display a limited number of results to prevent huge bubbles
-                            contentData.results.slice(0, 5).forEach((hit, index) => {
-                                const score = hit.score ? ` (Score: ${hit.score.toFixed(4)})` : '';
-                                // Attempt to clean up the content string
-                                let hitContent = (hit.content || '[No content snippet]')
-                                    .replace(/^search_document:\s*/, '') // Remove prefix if present
-                                    .replace(/\\n/g, '\n'); // Replace escaped newlines
-                                // Sanitize the final snippet for display
-                                hitContent = DOMPurify.sanitize(hitContent);
-
-                                html += `<div class="p-1.5 bg-base-100/50 rounded shadow-sm">
-                                            <p class="font-semibold opacity-90 mb-0.5">Result ${index + 1}${score}:</p>
-                                            <pre class="text-xs whitespace-pre-wrap break-words font-sans">${hitContent}</pre> <!-- Use pre for formatting -->
-                                         </div>`;
-                            });
-
-                            if (contentData.results.length > 5) {
-                                html += `<p class="text-center text-xs opacity-70 mt-2">... and ${contentData.results.length - 5} more results.</p>`;
+                        if (isLikelyJson) {
+                            try {
+                                // Try to parse, but keep the original string if it fails
+                                contentData = JSON.parse(block.content);
+                                parsedSuccessfully = true;
+                                displayAsJson = true; // Parsed successfully, display as JSON
+                                console.log("Parsed user tool result string as JSON");
+                            } catch (e) {
+                                console.warn("Expected JSON string in user tool result, but parsing failed:", e, block.content);
+                                // Keep contentData as the original string
+                                parsedSuccessfully = false;
+                                displayAsJson = false; // Display as raw string
                             }
-                            html += `</div></details>`; // Close details content and details tag
-
-                            // Optionally display aggregate stats if needed
-                            // if(contentData.aggregate_stats) { ... }
-
                         } else {
-                            // Parsed OK, but not the expected Marqo structure. Show as formatted JSON.
-                            html += `<p class="text-xs font-semibold mt-1 mb-1">Parsed Data (JSON):</p>`;
-                            html += `<div class="mt-1 bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md relative group">
-                                          <pre class="overflow-auto max-h-60"><code class="language-json hljs whitespace-pre-wrap break-all">${hljs.highlight(JSON.stringify(contentData, null, 2), { language: 'json', ignoreIllegals: true }).value}</code></pre>
-                                          ${this.createCopyButton(JSON.stringify(contentData, null, 2), 'result')}
-                                      </div>`;
+                            // It's a string, but doesn't look like JSON. Check if it's an error message.
+                            parsedSuccessfully = false;
+                            displayAsJson = false;
+                            if (contentData.toLowerCase().startsWith('error:')) {
+                                containerClasses = "not-prose my-2 p-3 bg-error text-error-content rounded-lg border border-error/20"; // Change style for error
+                                headerText = '<span class="flex items-center gap-1.5"><i class="fas fa-exclamation-triangle fa-fw"></i>Tool Error Received</span>';
+                            }
                         }
+                    } else {
+                        // If content was not a string (e.g., already an object/array from backend?)
+                        contentData = block.content;
+                        parsedSuccessfully = true; // Assume structure is valid if not string
+                        displayAsJson = true; // Display as JSON
+                        console.warn("Received non-string content in user tool_result block:", contentData);
+                    }
+                    // --- END MODIFIED PARSING LOGIC ---
 
-                    } catch (e) {
-                        console.error("Error parsing/rendering user tool result content string:", e, block.content);
-                        // Parsing failed. Display the original (problematic) string safely, styled as an error.
-                        html += `<div class="mt-2 bg-error/10 p-2 rounded-md text-error-content">
-                                     <p class="font-semibold text-xs mb-1"><i class="fas fa-exclamation-triangle mr-1"></i>Error parsing result data.</p>
-                                     <pre class="text-xs whitespace-pre-wrap break-all">${DOMPurify.sanitize(block.content)}</pre>
-                                 </div>`;
+                    // Build HTML container
+                    let html = `<div class="${containerClasses}">`;
+                    html += `<div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 font-medium text-sm mb-1.5">
+                    ${headerText}
+                    <span class="text-xs opacity-70">(for <code class="text-xs font-mono">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>
+                 </div>`;
+
+                    // Render based on whether we should display as JSON or raw string
+                    if (displayAsJson) {
+                        // Parsed successfully or was already an object/array
+                        // Render the potentially complex object/array as formatted JSON
+                        html += `<p class="text-xs font-semibold mt-1 mb-1">Parsed Data (JSON):</p>`;
+                        html += `<div class="mt-1 bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md relative group">
+                           <pre class="overflow-auto max-h-60"><code class="language-json hljs whitespace-pre-wrap break-all">${hljs.highlight(JSON.stringify(contentData, null, 2), { language: 'json', ignoreIllegals: true }).value}</code></pre>
+                           ${this.createCopyButton(JSON.stringify(contentData, null, 2), 'result')}
+                       </div>`;
+                    } else {
+                        // Display as raw string (might be an error message or non-JSON string)
+                        html += `<p class="text-xs font-semibold mt-1 mb-1">Raw Data Received:</p>`;
+                        html += `<div class="mt-1 bg-base-200/80 dark:bg-base-300/50 p-2 rounded-md relative group">
+                         <pre class="text-xs whitespace-pre-wrap break-all">${DOMPurify.sanitize(contentData)}</pre>
+                         ${this.createCopyButton(contentData, 'result')}
+                      </div>`;
                     }
 
                     html += `</div>`; // Close the main container
@@ -2788,28 +3745,72 @@
 
                 // --- CONVERSATION MGMT ---
                 renderBranchNode(nodeId, level) {
-                    const node = Alpine.store('conversation').conversationNodes.find(n => n.id === nodeId);
-                    // *** ADDED CHECKS ***
+                    // Get node safely
+                    const node = this.getNodeById(nodeId);
+
+                    // If node not found, return empty string instead of throwing error
                     if (!node || typeof node.id === 'undefined') {
-                        console.warn(`renderBranchNode: Node or Node ID is invalid for ID: ${nodeId}`);
-                        return `<!-- Invalid Node Data for ${nodeId} -->`;
+                        console.error(`Node not found: ${nodeId}`);
+                        return ''; // Return empty instead of showing an error
                     }
-                    // *** END ADDED CHECKS ***
+
                     const template = document.getElementById('branch-node-template')?.innerHTML;
-                    if (!template) return '<!-- Branch template missing -->';
-                    // ... rest of the function (ensure replacements use node.id which is now verified)
+                    if (!template) {
+                        console.error("Branch template missing!");
+                        return '';
+                    }
+
+                    // Safely get node properties with fallbacks
+                    const nodeName = (node.name || 'Unnamed').replace(/"/g, '&quot;'); // Escape quotes for HTML
+                    const children = node.childrenIds || [];
+                    const childrenJson = JSON.stringify(children).replace(/"/g, '&quot;'); // Escape quotes  
+                    const hasChildren = children.length > 0;
+
+                    // Create safe data attributes
                     let rendered = template
-                        .replace(/"\$store\.conversation\.currentNodeId"/g, `"${Alpine.store('conversation').currentNodeId}"`)
-                        .replace(/'\$store\.conversation\.currentNodeId'/g, `'${Alpine.store('conversation').currentNodeId}'`)
-                        .replace(/\$store\.conversation\.conversationNodes\.length/g, Alpine.store('conversation').conversationNodes.length)
-                        // Use verified node.id
-                        .replace('data-nodeid=""', `data-nodeid="${node.id}"`)
-                        .replace('data-nodename=""', `data-nodename="${node.name || 'Unnamed'}"`)
-                        .replace('data-level=""', `data-level="${level}"`)
-                        .replace('data-haschildren=""', `data-haschildren="${(node.childrenIds || []).length > 0}"`)
-                        .replace('data-children="[]"', `data-children="${JSON.stringify(node.childrenIds || []).replace(/"/g, '"')}"`);
+                        .replace('<li ', `<li data-nodeid="${node.id}" data-nodename="${nodeName}" data-level="${level}" data-haschildren="${hasChildren}" data-children="${childrenJson}" `);
+
                     return rendered;
                 },
+
+                // Improved helper to find node data with better error handling
+                getNodeById(id) {
+                    if (!id) return null;
+
+                    const nodes = Alpine.store('conversation')?.conversationNodes || [];
+                    if (!Array.isArray(nodes) || nodes.length === 0) {
+                        return null;
+                    }
+
+                    return nodes.find(n => n.id === id) || null;
+                },
+                // Ensure checkoutBranch is correctly defined in the main component scope
+                async checkoutBranch(nodeId) {
+                    // Check if event detail was dispatched (might be redundant now but safe)
+                    if (typeof nodeId === 'object' && nodeId !== null && nodeId.id) {
+                        nodeId = nodeId.id;
+                    }
+                    if (!nodeId || typeof nodeId !== 'string' || nodeId === this.currentNodeId) return;
+
+                    // Add log before API call
+                    console.log(`Executing checkoutBranch for Node ID: ${nodeId}`);
+
+                    this.isLoading = true;
+                    try {
+                        await this.apiFetch('/conversation/checkout', { method: 'POST', body: JSON.stringify({ node_id: nodeId }) });
+                        const node = this.getNodeById(nodeId); // Use helper
+                        this.addNotification(`Switched to branch: ${node?.name || nodeId.slice(0, 8)}...`, 'success');
+                        await this.fetchConversation(); // Refresh chat and potentially node list
+                    }
+                    catch (e) {
+                        this.addNotification(`Failed to checkout branch ${nodeId.slice(0, 8)}...: ${e.message}`, 'error');
+                        console.error(`Error in checkoutBranch API call for ${nodeId}:`, e); // Log error details
+                    }
+                    finally {
+                        this.isLoading = false;
+                    }
+                },
+
                 async forkConversation() {
                     if (this.currentConversation.length === 0 && this.currentNodeId === 'root') { this.addNotification("Cannot fork an empty root conversation.", "warning"); return; }
                     const forkName = prompt("Enter name for new branch (optional):", `Fork of ${this.conversationNodes.find(n => n.id === this.currentNodeId)?.name || this.currentNodeId.slice(-6)}`);
@@ -2818,9 +3819,21 @@
                     catch (e) { this.addNotification('Failed to fork conversation.', 'error'); } finally { this.isLoading = false; }
                 },
                 async checkoutBranch(nodeId) {
-                    if (!nodeId || nodeId === this.currentNodeId) return; this.isLoading = true;
-                    try { await this.apiFetch('/conversation/checkout', { method: 'POST', body: JSON.stringify({ node_id: nodeId }) }); const node = Alpine.store('conversation').conversationNodes.find(n => n.id === nodeId); this.addNotification(`Switched to branch: ${node?.name || nodeId.slice(0, 8)}...`, 'success'); await this.fetchConversation(); }
-                    catch (e) { this.addNotification(`Failed to checkout branch ${nodeId.slice(0, 8)}...`, 'error'); } finally { this.isLoading = false; }
+                    // Check if event detail was dispatched
+                    if (typeof nodeId === 'object' && nodeId !== null && nodeId.id) {
+                        nodeId = nodeId.id; // Extract ID if dispatched as detail object
+                    }
+                    if (!nodeId || typeof nodeId !== 'string' || nodeId === this.currentNodeId) return;
+                    console.log(`Checking out branch: ${nodeId}`); // Add log
+                    this.isLoading = true;
+                    try {
+                        await this.apiFetch('/conversation/checkout', { method: 'POST', body: JSON.stringify({ node_id: nodeId }) });
+                        const node = this.getNodeById(nodeId); // Use helper
+                        this.addNotification(`Switched to branch: ${node?.name || nodeId.slice(0, 8)}...`, 'success');
+                        await this.fetchConversation(); // Refresh chat and potentially node list
+                    }
+                    catch (e) { this.addNotification(`Failed to checkout branch ${nodeId.slice(0, 8)}...: ${e.message}`, 'error'); }
+                    finally { this.isLoading = false; }
                 },
                 async optimizeConversation() {
                     if (this.currentConversation.length < 2) { this.addNotification("Not enough messages to optimize.", "warning"); return; }
@@ -2835,18 +3848,83 @@
                         catch (e) { this.addNotification('Failed to clear conversation.', 'error'); } finally { this.isLoading = false; }
                     }
                 },
-                exportConversation() {
-                    if (this.currentConversation.length === 0 && this.currentNodeId === 'root') { this.addNotification("Cannot export an empty root conversation.", "warning"); return; }
-                    console.log('Exporting conversation...');
-                    try { const node = Alpine.store('conversation').conversationNodes.find(n => n.id === this.currentNodeId); const dataToExport = { id: this.currentNodeId, name: node?.name || 'Unnamed', messages: this.currentConversation, model: this.currentModel, exported_at: new Date().toISOString(), _format: "mcp_client_export_v1" }; const blob = new Blob([JSON.stringify(dataToExport, null, 2)], { type: "application/json;charset=utf-8" }); const sanitizedName = (node?.name || this.currentNodeId.slice(0, 6)).replace(/[^a-z0-9_-]/gi, '_').toLowerCase(); const timestamp = new Date().toISOString().replace(/[:.]/g, '-'); const filename = `mcp-convo-${sanitizedName}-${timestamp}.json`; saveAs(blob, filename); this.addNotification(`Conversation exported as ${filename}.`, 'success'); }
-                    catch (e) { console.error("Export failed:", e); this.addNotification('Failed to export conversation.', 'error'); }
+                async exportConversationAPI() {
+                    if (!this.currentNodeId || (this.currentNodeId === 'root' && this.currentConversation.length === 0)) {
+                        this.addNotification("Cannot export an empty root conversation.", "warning");
+                        return;
+                    }
+                    this.isLoading = true; // Use global loading for export fetch
+                    this.addNotification(`Exporting branch '${this.currentNodeId.slice(0, 8)}...'`, 'info');
+                    try {
+                        const endpoint = `/conversation/${encodeURIComponent(this.currentNodeId)}/export`;
+                        // Fetch the data as JSON first
+                        const dataToExport = await this.apiFetch(endpoint); // apiFetch handles loading state reset on finish/error
+
+                        if (!dataToExport) {
+                            throw new Error("Received no data from export endpoint.");
+                        }
+
+                        // Now create the blob and save using FileSaver.js
+                        const blob = new Blob([JSON.stringify(dataToExport, null, 2)], { type: "application/json;charset=utf-8" });
+                        const nodeName = dataToExport.name || this.currentNodeId.slice(0, 6);
+                        const sanitizedName = nodeName.replace(/[^a-z0-9_-]/gi, '_').toLowerCase();
+                        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                        const filename = `mcp-convo-${sanitizedName}-${timestamp}.json`;
+                        saveAs(blob, filename); // External FileSaver.js function
+                        this.addNotification(`Conversation exported as ${filename}.`, 'success');
+
+                    } catch (e) {
+                        console.error("Export failed:", e);
+                        this.addNotification(`Failed to export conversation: ${e.message}`, 'error');
+                        this.isLoading = false; // Ensure loading is off if apiFetch didn't handle it
+                    }
+                    // isLoading is reset by apiFetch's finally block if successful
                 },
-                async importConversation(file) {
-                    if (!file) return; if (!file.type.match('application/json')) { this.addNotification('Import failed: Please select a valid JSON file.', 'error'); return; }
-                    console.log('Importing conversation via API...', file.name); this.isLoadingImport = true; const formData = new FormData(); formData.append('file', file);
-                    try { const response = await fetch(`${API_BASE_URL}/conversation/import`, { method: 'POST', body: formData, signal: this.stopController?.signal }); if (!response.ok) { let errorDetail = `Import failed (HTTP ${response.status})`; try { const errJson = await response.json(); errorDetail = errJson.detail || errorDetail; } catch (e) { /* Ignore */ } throw new Error(errorDetail); } const data = await response.json(); this.addNotification(`Conversation imported successfully${data.newNodeName ? ': ' + data.newNodeName : ''}`, 'success'); await this.fetchConversation(); }
-                    catch (error) { console.error("Import failed:", error); this.addNotification(`Import failed: ${error.message}`, 'error'); }
-                    finally { this.isLoadingImport = false; const fileInput = this.$el.querySelector('input[type="file"][accept=".json"]'); if (fileInput) { fileInput.value = ''; } }
+
+                async importConversationAPI(file) {
+                    if (!file) return;
+                    if (!file.type.match('application/json')) {
+                        this.addNotification('Import failed: Please select a valid JSON file.', 'error');
+                        return;
+                    }
+                    const fileInput = this.$el.querySelector('input[type="file"][accept=".json"]'); // Find the input element
+
+                    console.log('Importing conversation via API...', file.name);
+                    this.isLoadingImport = true; // Use specific loading flag
+                    const formData = new FormData();
+                    formData.append('file', file);
+
+                    try {
+                        // Use standard fetch for FormData upload
+                        const response = await fetch(`${API_BASE_URL}/conversation/import`, {
+                            method: 'POST',
+                            body: formData,
+                            // signal: this.stopController?.signal // Optional signal
+                        });
+
+                        if (!response.ok) {
+                            let errorDetail = `Import failed (HTTP ${response.status})`;
+                            try {
+                                const errJson = await response.json();
+                                errorDetail = errJson.detail || errorDetail;
+                            } catch (e) { /* Ignore JSON parsing error on failed response */ }
+                            throw new Error(errorDetail);
+                        }
+
+                        const data = await response.json(); // Get success message and new node ID
+                        this.addNotification(data.message || `Conversation imported successfully.`, 'success');
+                        await this.fetchConversation(); // Refresh the conversation state to show the new branch
+
+                    } catch (error) {
+                        console.error("Import failed:", error);
+                        this.addNotification(`Import failed: ${error.message}`, 'error');
+                    } finally {
+                        this.isLoadingImport = false;
+                        // Reset the file input visually
+                        if (fileInput) {
+                            fileInput.value = '';
+                        }
+                    }
                 },
 
                 // --- UTILS ---
