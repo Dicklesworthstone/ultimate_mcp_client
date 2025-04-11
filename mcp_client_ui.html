@@ -2211,8 +2211,7 @@
                         <template x-for="(message, index) in currentConversation" :key="message.id || index">
                             <!-- ## START: Single Message Render Block ## -->
                             <div :id="`message-${message.id || index}`" class="chat relative group/message" :class="{
-                                'chat-end': message.role === 'user',
-                                'chat-start': message.role !== 'user',
+                                'chat-start': message.role === 'user', 'chat-end': message.role !== 'user',
                                 'compact-mode': uiSettings.compactMode
                                 // Animation handled by shouldAnimate check in bubble
                                 }">
@@ -2242,7 +2241,7 @@
 
                                 <!-- Header -->
                                 <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
-                                    :class="{'text-right mr-1': message.role === 'user'}">
+                                    :class="{'text-left mr-1': message.role === 'user'}">
                                     <span x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
                                     <span x-show="message.model" class="opacity-70"
                                         x-text="message.model ? (' (' + message.model + ')') : ''"></span>
@@ -2401,10 +2400,12 @@
                         @keydown.shift.enter.exact.prevent="userInput += '\n'; adjustTextareaHeight($el)"
                         @input="adjustTextareaHeight($event.target)" x-ref="inputarea"
                         :disabled="isSendingMessage && !config.enableStreaming"></textarea>
-                    <button x-show="isSendingMessage" class="btn btn-warning btn-square btn-sm" @click="stopGeneration"
-                        data-tippy-content="Stop Generation">
-                        <i class="fas fa-stop"></i>
-                    </button>
+                        <button x-show="isSendingMessage"
+                        class="btn btn-warning btn-square btn-sm animate__animated animate__faster animate__fadeIn"
+                        @click="abortQuery"
+                        data-tippy-content="Stop Generation (Esc)">
+                    <i class="fas fa-stop"></i>
+                </button>
                     <button class="btn btn-ghost btn-square btn-sm" @click="showTemplatesModal = true"
                         data-tippy-content="Message Templates">
                         <i class="fas fa-clipboard-list"></i>
@@ -6427,14 +6428,59 @@
                     this.addMessageToConversation('user', text);
                     this.isSendingMessage = true; this.currentStatusMessage = "Sending to Claude..."; this.currentAssistantMessageId = null;
                     const messagePayload = { type: 'query', payload: text, model: this.currentModel, config: { max_tokens: this.config.maxTokens, temperature: this.config.temperature, stream: this.config.enableStreaming } };
-                    this.stopController = new AbortController(); this.sendWebSocketMessage(messagePayload);
+                    this.stopController = new AbortController();
+                    this.sendWebSocketMessage(messagePayload);
                 },
-                stopGeneration() {
+                async abortQuery() {
+                    console.log("UI requesting query abort...");
+                    if (!this.isSendingMessage) {
+                        console.warn("abortQuery called but no message is being sent.");
+                        return;
+                    }
+
+                    this.addNotification("Attempting to abort query...", "warning", 2000);
+
+                    try {
+                        // Call the backend API endpoint to signal cancellation
+                        const result = await this.apiFetch('/query/abort', { method: 'POST' });
+                        console.log("Abort API response:", result);
+                        // Even if the API call succeeds, the stream might take a moment to stop.
+                        // The primary state change (isSendingMessage=false) should happen
+                        // when the WebSocket receives query_complete or closes.
+                        // However, we can update the status message immediately for feedback.
+                        this.currentStatusMessage = "Query abort requested...";
+                        this.addNotification(result.message || "Abort signal sent.", "info");
+
+                        // Optionally, force UI state update sooner rather than waiting for WS close/complete
+                        // Uncomment the following lines if immediate UI feedback is desired,
+                        // but be aware the backend might still be processing briefly.
+                        // this.isSendingMessage = false;
+                        // this.isLoading = false;
+                        // this.currentAssistantMessageId = null; // Reset stream tracking
+                        // if (this.currentConversation.length > 0) {
+                        //     const lastMsg = this.currentConversation[this.currentConversation.length - 1];
+                        //     if (lastMsg.role === 'assistant') {
+                        //         lastMsg.content += "\n\n[Aborted by User]"; // Append to partial message
+                        //         this.currentConversation = [...this.currentConversation]; // Trigger reactivity
+                        //     }
+                        // }
+
+                    } catch (error) {
+                        // Error notification is handled by apiFetch
+                        console.error("Failed to send abort signal:", error);
+                        // Don't necessarily change isSendingMessage here, as the query might still be running
+                        this.addNotification(`Failed to send abort signal: ${error.message || 'Unknown error'}`, 'error');
+                    }
+                    // Note: No 'finally' block setting isSendingMessage = false here.
+                    // Rely on WebSocket 'query_complete', 'stream_end', or 'onclose' event
+                    // to definitively reset the sending state.
+                },
+                // --- End new function ---
+
+                stopGeneration() { // Keep this one for the ESC key functionality for now
                     if (this.isSendingMessage) {
-                        console.log("Attempting to stop generation..."); this.addNotification("Attempting to stop generation...", "warning");
-                        this.sendWebSocketMessage({ type: 'stop_generation' });
-                        if (this.stopController) { this.stopController.abort(); }
-                        this.isSendingMessage = false; this.isLoading = false; this.currentStatusMessage = "Generation stopped by user."; this.currentAssistantMessageId = null;
+                        console.log("stopGeneration (likely ESC key) triggered, calling abortQuery...");
+                        this.abortQuery(); // Delegate to the new function
                     }
                 },
                 toggleDataView(messageId) {

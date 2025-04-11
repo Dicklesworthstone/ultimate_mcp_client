@@ -832,6 +832,7 @@ STATUS_EMOJI = {
     "config": Emoji("gear"),
     "history": Emoji("scroll"),
     "search": Emoji("magnifying_glass_tilted_right"),
+    "port": Emoji("electric_plug"),
     "success": Emoji("party_popper"),
     "failure": Emoji("collision"),
     "warning": Emoji("warning"),
@@ -846,8 +847,8 @@ HISTORY_FILE = CONFIG_DIR / "history.json"
 SERVER_DIR = CONFIG_DIR / "servers"
 CACHE_DIR = CONFIG_DIR / "cache"
 REGISTRY_DIR = CONFIG_DIR / "registry"
-DEFAULT_MODEL = "claude-3-7-sonnet-20250219"
-MAX_HISTORY_ENTRIES = 100
+DEFAULT_MODEL = "claude-3-7-sonnet-latest"
+MAX_HISTORY_ENTRIES = 300
 REGISTRY_URLS = [
     # Leave empty by default - users can add their own registries later
 ]
@@ -990,7 +991,7 @@ class ServerConfig:
     version: Optional[ServerVersion] = None
     rating: float = 5.0  # 1-5 star rating
     retry_count: int = 3  # Number of retries on failure
-    timeout: float = 90.0  # Timeout in seconds
+    timeout: float = 250.0  # Timeout in seconds
     metrics: ServerMetrics = field(default_factory=ServerMetrics)
     registry_url: Optional[str] = None  # URL of registry where found
     last_updated: datetime = field(default_factory=datetime.now)
@@ -1678,7 +1679,7 @@ class Config:
         self.api_key: Optional[str] = os.environ.get("ANTHROPIC_API_KEY")
         self.default_model: str = DEFAULT_MODEL
         self.servers: Dict[str, ServerConfig] = {}
-        self.default_max_tokens: int = 1024
+        self.default_max_tokens: int = 8000
         self.history_size: int = MAX_HISTORY_ENTRIES
         self.auto_discover: bool = True
         self.discovery_paths: List[str] = [
@@ -1708,7 +1709,7 @@ class Config:
 
         # Use synchronous load for initialization since __init__ can't be async
         self.load()
-    
+        
     def _prepare_config_data(self):
         """Prepare configuration data for saving"""
         return {
@@ -2534,7 +2535,7 @@ class RobustStdioSession(ClientSession):
         try: return ListToolsResult(**result)
         except Exception as e: raise RuntimeError(f"Invalid list_tools response format: {e}") from e
 
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any], response_timeout: float = 30.0) -> CallToolResult:
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any], response_timeout: float = 250.0) -> CallToolResult:
         log.debug(f"[{self._server_name}] Calling call_tool: {tool_name}")
         params = {"name": tool_name, "arguments": arguments}
         result = await self._send_request("tools/call", params, response_timeout=response_timeout) # Correct method name
@@ -3354,7 +3355,7 @@ class ServerManager:
             # --- Port Scanning Discovery ---
             if self.config.enable_port_scanning:
                 steps.append(self._discover_port_scan)
-                descriptions.append(f"{STATUS_EMOJI['search']} Scanning local ports [{self.config.port_scan_range_start}-{self.config.port_scan_range_end}]...")
+                descriptions.append(f"{STATUS_EMOJI['port']} Scanning local ports [{self.config.port_scan_range_start}-{self.config.port_scan_range_end}]...")
             else:
                 log.debug("Skipping port scanning discovery (disabled by config).")
 
@@ -4498,6 +4499,13 @@ class MCPClient:
         # For tracking the current query task (for dealing with aborting of long running queries)
         self.current_query_task: Optional[asyncio.Task] = None
 
+        # Extract actual emoji characters, escaping any potential regex special chars
+        self._emoji_chars = [re.escape(str(emoji)) for emoji in STATUS_EMOJI.values()]
+        # Create a pattern that matches any of these emojis followed by a non-whitespace char
+        # (?:...) is a non-capturing group for the alternation
+        # Capturing group 1: the emoji | Capturing group 2: the non-whitespace character
+        self._emoji_space_pattern = re.compile(f"({'|'.join(self._emoji_chars)})" + r"(\S)")
+
         # Command handlers
         self.commands = {
             'exit': self.cmd_exit,
@@ -4528,19 +4536,50 @@ class MCPClient:
         readline.set_completer(self.completer)
         readline.parse_and_bind("tab: complete")
     
+    def _estimate_string_tokens(self, text: str) -> int:
+        """Estimate token count for a given string using tiktoken."""
+        if not text:
+            return 0
+        try:
+            # Use the same encoding as Claude models
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except Exception as e:
+            log.warning(f"Could not estimate tokens: {e}")
+            # Fallback: approximate based on characters
+            return len(text) // 4    
+
     @staticmethod
-    def safe_print(message, **kwargs):
-        """Print using the appropriate console based on active stdio servers.
-        
-        This helps prevent stdout pollution when stdio servers are connected.
-        Use this method for all user-facing output instead of direct console.print() calls.
-        
-        Args:
-            message: The message to print
-            **kwargs: Additional arguments to pass to print
-        """
-        safe_console = get_safe_console()
-        safe_console.print(message, **kwargs)
+    def safe_print(message, **kwargs): # No self parameter
+            """Print using the appropriate console based on active stdio servers.
+
+            Applies automatic spacing after known emojis defined in STATUS_EMOJI.
+
+            Args:
+                message: The message to print (can be string or other Rich renderable)
+                **kwargs: Additional arguments to pass to print
+            """
+            safe_console = get_safe_console()
+            processed_message = message
+            # Apply spacing logic ONLY if the message is a string
+            if isinstance(message, str) and message: # Also check if message is not empty
+                try:
+                    # Extract actual emoji characters, escaping any potential regex special chars
+                    # Note: Accessing STATUS_EMOJI (global) is fine from static method
+                    emoji_chars = [re.escape(str(emoji)) for emoji in STATUS_EMOJI.values()]
+                    if emoji_chars: # Only compile if there are emojis
+                        # Create a pattern that matches any of these emojis followed by a non-whitespace char
+                        # (?:...) is a non-capturing group for the alternation
+                        # Capturing group 1: the emoji | Capturing group 2: the non-whitespace character
+                        emoji_space_pattern = re.compile(f"({'|'.join(emoji_chars)})" + r"(\S)")
+                        # Apply the substitution
+                        processed_message = emoji_space_pattern.sub(r"\1 \2", message)
+                except Exception as e:
+                    # Log error if regex fails, but proceed with original message
+                    log.warning(f"Failed to apply emoji spacing regex: {e}")
+                    processed_message = message # Fallback to original message
+            # Print the processed (or original) message
+            safe_console.print(processed_message, **kwargs)
     
     @staticmethod
     def ensure_safe_console(func):
@@ -4856,11 +4895,8 @@ class MCPClient:
                     # Duplicate found based on identifier
                     duplicates_found = True
                     kept_name = canonical_map[identifier]
-                    log.warning(f"Duplicate server config detected for identifier {identifier}. Removing entry '{name}', keeping '{kept_name}'.")
+                    log.debug(f"Duplicate server config detected for identifier {identifier}. Removing entry '{name}', keeping '{kept_name}'.")
                     # We simply don't add 'name' to cleaned_servers
-                    # Optional advanced logic: could compare 'name' vs 'kept_name' and potentially
-                    # replace the entry in cleaned_servers if 'name' is "better" (e.g., not generated)
-                    # but keeping the first encountered is simpler and robust.
 
         # Update config if duplicates were removed
         if duplicates_found:
@@ -5324,7 +5360,6 @@ class MCPClient:
             # --- Main Streaming Loop ---
             while True: # Loop handles potential multi-turn tool use
                 # --- Check for cancellation before API call ---
-                # Use asyncio.current_task() assuming Python 3.7+
                 if asyncio.current_task().cancelled():
                     log.debug("Streaming query cancelled before API call.")
                     # Yield status message
@@ -5473,8 +5508,6 @@ class MCPClient:
                 except TimeoutError:
                     log.error("Timeout waiting for or processing message stream from Anthropic API.")
                     yield "@@STATUS@@\n[Error: Timed out waiting for Claude's response]"
-                    # Decide how to handle this - perhaps break the outer loop?
-                    # For now, just yield error and let the loop check stop_reason
                 except asyncio.CancelledError:
                     log.debug("Anthropic API stream iteration cancelled.")
                     # Re-raise to be caught by the outer handler in this function
@@ -5500,9 +5533,10 @@ class MCPClient:
                 # Check if the reason for stopping was tool use
                 if stop_reason == "tool_use":
                     tool_results_for_api: List[MessageParam] = []
+                    total_tools_in_turn = len(tool_calls_this_turn) # Get total count for this turn
 
                     # Execute the completed tool calls collected during this stream iteration
-                    for tool_call_block in tool_calls_this_turn:
+                    for i, tool_call_block in enumerate(tool_calls_this_turn): # Add index 'i'
                         # --- Check for cancellation inside tool loop ---
                         if asyncio.current_task().cancelled():
                             log.debug("Streaming query cancelled during tool processing loop.")
@@ -5512,10 +5546,12 @@ class MCPClient:
                         tool_name_sanitized = tool_call_block["name"]
                         tool_args = tool_call_block["input"] # Already parsed or contains error marker
                         tool_use_id = tool_call_block["id"]
+                        tool_start_time = time.time() # Start timer for this specific tool call
 
-                        log.debug(f"Processing completed tool call. Name: {tool_name_sanitized}, ID: {tool_use_id}, Args: {repr(tool_args)}")
+                        log.debug(f"Processing completed tool call {i+1}/{total_tools_in_turn}. Name: {tool_name_sanitized}, ID: {tool_use_id}, Args: {repr(tool_args)}")
 
                         original_tool_name = self.server_manager.sanitized_to_original.get(tool_name_sanitized, tool_name_sanitized)
+                        tool_short_name = original_tool_name.split(':')[-1] # Get short name
 
                         # Initialize vars for this tool call
                         api_content_for_claude: str = "Error: Tool execution failed unexpectedly."
@@ -5529,7 +5565,7 @@ class MCPClient:
                              api_content_for_claude = f"Error: {error_text}"
                              log_content_for_history = {"error": error_text, "raw_json": tool_args.get('_raw_json')}
                              is_error = True
-                             yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Input Error: {error_text}\n"
+                             yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Input Error for [bold]{tool_short_name}[/]: {error_text}"
                              log.error(error_text)
                         else:
                             # Proceed if input was valid
@@ -5540,7 +5576,7 @@ class MCPClient:
                                 api_content_for_claude = f"Error: {error_text}"
                                 log_content_for_history = {"error": error_text}
                                 is_error = True
-                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: {error_text}\n"
+                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: {error_text}"
                                 log.warning(f"Tool mapping/not found. Sanitized: '{tool_name_sanitized}', Original: '{original_tool_name}'")
                             else:
                                 servers_used.add(tool.server_name)
@@ -5552,7 +5588,7 @@ class MCPClient:
                                     api_content_for_claude = f"Error: {error_text}"
                                     log_content_for_history = {"error": error_text}
                                     is_error = True
-                                    yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: {error_text}\n"
+                                    yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: {error_text}"
                                 else:
                                     # Check cache
                                     cached_result = None
@@ -5575,54 +5611,83 @@ class MCPClient:
                                                 is_error = False # Cached non-error is success
                                                 cache_used = True
                                                 cache_hits_during_query += 1
-                                                yield f"@@STATUS@@\n{STATUS_EMOJI['cached']} Using cached result for {original_tool_name}\n"
+                                                # Add token estimate to cache message
+                                                cached_tokens = self._estimate_string_tokens(api_content_for_claude)
+                                                # Use markdown bold
+                                                yield (f"@@STATUS@@\n{STATUS_EMOJI['cached']} Using cached result for [bold]{tool_short_name}[/] "
+                                                       f"({cached_tokens} tokens)")
                                                 log.info(f"Using cached result for {original_tool_name}")
 
                                     # Execute if not cached
                                     if not cache_used:
-                                        yield f"@@STATUS@@\n{STATUS_EMOJI['tool']} Executing {original_tool_name}...\n"
+                                        # Update status - Remove redundant server name
+                                        # Use markdown bold
+                                        yield (f"@@STATUS@@\n{STATUS_EMOJI['server']} Executing [bold]{tool_short_name}[/] via {tool.server_name}...")
                                         try:
-                                            # --- Check for cancellation just before execution ---
+                                            # Check for cancellation just before execution
                                             if asyncio.current_task().cancelled():
                                                 log.debug(f"Streaming query cancelled just before executing tool {original_tool_name}.")
                                                 raise asyncio.CancelledError(f"Query cancelled before executing tool {original_tool_name}")
 
                                             with safe_stdout():
-                                                # Note: execute_tool should ideally also check for cancellation if it involves waits
-                                                tool_call_outcome: Optional[CallToolResult] = await self.execute_tool(
+                                                # This await will either return a CallToolResult or raise an exception
+                                                tool_call_outcome: CallToolResult = await self.execute_tool(
                                                     tool.server_name, original_tool_name, tool_args
                                                 )
 
-                                            if tool_call_outcome is None:
-                                                error_text = f"Tool '{original_tool_name}' returned no result."
-                                                api_content_for_claude = f"Error: {error_text}"
-                                                log_content_for_history = {"error": error_text}
-                                                is_error = True
-                                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Tool Execution Error: {error_text}\n"
+                                            tool_latency = time.time() - tool_start_time # Calculate latency
 
-                                            elif tool_call_outcome.isError:
+                                            # Directly check isError, as tool_call_outcome cannot be None here
+                                            if tool_call_outcome.isError:
                                                 error_text = "Tool execution failed."
+                                                # Attempt to extract more specific error from content
                                                 extracted_error = "Unknown server error"
-                                                # Attempt to extract more specific error from content (unchanged)
                                                 if tool_call_outcome.content:
-                                                     # ... (existing error extraction logic) ...
-                                                     extracted_error = str(tool_call_outcome.content) # Simplified for example
+                                                    if isinstance(tool_call_outcome.content, str):
+                                                        extracted_error = tool_call_outcome.content
+                                                    elif isinstance(tool_call_outcome.content, dict) and 'error' in tool_call_outcome.content:
+                                                        extracted_error = str(tool_call_outcome.content['error'])
+                                                    elif isinstance(tool_call_outcome.content, list) and tool_call_outcome.content:
+                                                        # Try to get text from the first block if it's a common structure
+                                                        first_block = tool_call_outcome.content[0]
+                                                        if isinstance(first_block, dict) and first_block.get('type') == 'text':
+                                                            extracted_error = first_block.get('text', 'Unknown error structure')
+                                                        else:
+                                                            extracted_error = str(tool_call_outcome.content) # Fallback
+                                                    else:
+                                                         extracted_error = str(tool_call_outcome.content) # Fallback
+
                                                 error_text = f"Tool execution failed: {extracted_error}"
                                                 api_content_for_claude = f"Error: {error_text}"
                                                 log_content_for_history = {"error": error_text, "raw_content": tool_call_outcome.content}
                                                 is_error = True
-                                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Tool Execution Error: {error_text[:100]}...\n" # Truncate long errors
+                                                # Use markdown bold
+                                                yield (f"@@STATUS@@\n{STATUS_EMOJI['failure']} Error executing [bold]{tool_short_name}[/] ({tool_latency:.1f}s): "
+                                                       f"{error_text[:100]}...")
 
                                             else: # Success case
-                                                # Process success content into a string for API (unchanged)
+                                                # Process success content into a string for API
                                                 if tool_call_outcome.content is None:
                                                     api_content_for_claude = "Tool executed successfully with no content returned."
-                                                # ... (existing content processing logic) ...
-                                                else: api_content_for_claude = str(tool_call_outcome.content)
+                                                elif isinstance(tool_call_outcome.content, str):
+                                                    api_content_for_claude = tool_call_outcome.content
+                                                elif isinstance(tool_call_outcome.content, (dict, list)):
+                                                    try:
+                                                        # Attempt to serialize complex objects nicely
+                                                        api_content_for_claude = json.dumps(tool_call_outcome.content, indent=2)
+                                                    except TypeError:
+                                                        # Fallback for non-serializable objects
+                                                        api_content_for_claude = str(tool_call_outcome.content)
+                                                else:
+                                                    # Fallback for other types
+                                                    api_content_for_claude = str(tool_call_outcome.content)
 
                                                 log_content_for_history = tool_call_outcome.content # Log original success content
                                                 is_error = False
-                                                yield f"@@STATUS@@\n{STATUS_EMOJI['success']} Tool result received.\n"
+                                                # Add token estimate and latency to success status
+                                                result_tokens = self._estimate_string_tokens(api_content_for_claude)
+                                                yield (f"@@STATUS@@\n{STATUS_EMOJI['success']} Result from [bold]{tool_short_name}[/] "
+                                                       f"({result_tokens:,} tokens, {tool_latency:.1f}s)")
 
                                             # Cache result if successful and cache enabled (but not error results)
                                             if self.tool_cache and not is_error:
@@ -5641,17 +5706,21 @@ class MCPClient:
                                             api_content_for_claude = f"Error: {error_text}"
                                             log_content_for_history = {"error": error_text}
                                             is_error = True
-                                            yield f"@@STATUS@@\n[yellow]Tool '{original_tool_name}' execution aborted.[/]"
+                                            yield f"@@STATUS@@\n[yellow]Tool [bold]{tool_short_name}[/] execution aborted.[/]"
                                             # Re-raise CancelledError to stop the entire query process
                                             raise
 
                                         except Exception as exec_err:
+                                            tool_latency = time.time() - tool_start_time
                                             log.error(f"Client error during tool execution {original_tool_name}: {exec_err}", exc_info=True)
                                             error_text = f"Client error: {str(exec_err)}"
                                             api_content_for_claude = f"Error: {error_text}"
                                             log_content_for_history = {"error": error_text}
                                             is_error = True
-                                            yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Tool Execution Client Error: {str(exec_err)}\n"
+                                            # Use markdown bold
+                                            yield (f"@@STATUS@@\n{STATUS_EMOJI['failure']} Client Error during [bold]{tool_short_name}[/] ({tool_latency:.2f}s): "
+                                                   f"{str(exec_err)}")
+
 
                         # Append result (or error) for the *next* API call
                         tool_results_for_api.append({
@@ -5663,6 +5732,8 @@ class MCPClient:
                             "tool_name": original_tool_name, "tool_use_id": tool_use_id,
                             "content": log_content_for_history, "is_error": is_error, "cache_used": cache_used
                         })
+                        # Yield brief pause after processing each tool result
+                        await asyncio.sleep(0.05)
 
                     # Add tool results to messages and continue the outer loop
                     messages.extend(tool_results_for_api)
@@ -5714,9 +5785,6 @@ class MCPClient:
         except asyncio.CancelledError as ce:
             # --- Handle cancellation cleanly ---
             log.debug(f"process_streaming_query caught CancelledError: {ce}")
-            # Yield final status if not already done
-            # Check message content? Might be redundant if checks above worked.
-            # yield "@@STATUS@@\n[bold yellow]Request Aborted.[/]" # Maybe not needed if yielded inside loop
             # Finalize Span with cancelled status
             if span:
                 span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
@@ -6143,23 +6211,22 @@ class MCPClient:
             # Directly iterate the stream generator provided by process_streaming_query
             async for chunk in self.process_streaming_query(query):
                  if chunk.startswith("@@STATUS@@"):
-                     status_message = chunk[len("@@STATUS@@"):].strip()
-                     # Add styling based on content (simple example)
-                     style = "yellow"
-                     if "Error" in status_message or "failed" in status_message or "💥" in status_message:
-                         style = "red"
-                     elif "success" in status_message or "received" in status_message or "🎉" in status_message or "✓" in status_message:
-                         style = "green"
-                     elif "cached" in status_message or "package" in status_message:
-                          style = "cyan"
-                     # Append new status message as a Text object
-                     status_lines.append(Text(status_message, style=style))
+                     status_message_markup = chunk[len("@@STATUS@@"):].strip()
+                     try:
+                         status_text_object = Text.from_markup(status_message_markup)
+                         # Add a newline Text object first for spacing
+                         status_lines.append(Text("\n"))
+                         status_lines.append(status_text_object) # Now append the actual status
+                     except Exception as parse_err:
+                         log.warning(f"Failed to parse status markup '{status_message_markup}': {parse_err}")
+                         # Fallback: append raw string but maybe style it as warning
+                         status_lines.append(Text("\n"))
+                         status_lines.append(Text(f"[RAW] {status_message_markup}", style="bright_red"))
                  else:
                      # It's a regular text chunk from Claude
-                     # Check cancellation *before* potentially long string op? Minor optimization.
                      if asyncio.current_task().cancelled(): raise asyncio.CancelledError()
                      self._current_query_text += chunk
-                 # Yield control briefly to allow other tasks (like the display loop) to run
+                 # Yield control briefly
                  await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             log.debug("Streaming query iteration cancelled internally.")
@@ -6178,19 +6245,13 @@ class MCPClient:
 
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print("Type your query to Claude, or a command (type 'help' for available commands)")
-        self.safe_print("[italic]Press Ctrl+C once to abort request, twice quickly to force exit[/italic]") # Updated help text
-
-        # Track Ctrl+C attempts for force exit (logic handled in sigint_handler)
+        self.safe_print("[italic]Press Ctrl+C once to abort request, twice quickly to force exit[/italic]")
 
         while True:
             live_display: Optional[Live] = None # To manage the Live instance
-            # --- Reset query task reference at the start of each loop ---
             self.current_query_task = None
-            # --- End Reset ---
             try:
                 user_input = Prompt.ask("\n[bold blue]>>[/]", console=interactive_console)
-
-                # Reset Ctrl+C counter on successful input (handled in sigint_handler context now)
 
                 # Check if it's a command
                 if user_input.startswith('/'):
@@ -6212,28 +6273,27 @@ class MCPClient:
                 elif not user_input.strip():
                     continue
 
-                # --- Process as a query to Claude with task management ---
+                # Process as a query to Claude with task management
                 else:
-                    # Keep track of the last few status messages
-                    status_lines = deque(maxlen=5) # Adjust maxlen as needed
+                    status_lines = deque(maxlen=10) # Keep track of recent status lines
                     abort_message = Text("Press Ctrl+C once to abort...", style="dim yellow")
                     first_response_received = False
                     initial_status = Status("Claude is thinking...", spinner="dots", console=interactive_console)
-                    initial_panel = Panel(initial_status, title="Claude", border_style="dim green") # Start dim
 
-                    initial_panel = Panel("", title="Claude", border_style="green")
-                    REFRESH_RATE = 4.0 # Refresh rate for the Live display
+                    # Initialize Live display with an initial Panel holding the status spinner
+                    initial_panel = Panel(initial_status, title="Claude", border_style="dim green")
+
+                    REFRESH_RATE = 4.0
                     live_display = Live(
-                        initial_panel,
+                        initial_panel, # Start Live with the initial panel
                         console=interactive_console,
                         refresh_per_second=REFRESH_RATE,
-                        transient=False, # Keep the final output
-                        vertical_overflow="visible" # Allow panel to grow
+                        transient=False, # Keep final output
+                        vertical_overflow="visible" # Allow panel to grow vertically
                     )
-                    live_display.start() # Start the Live display
+                    live_display.start()
 
                     try:
-                        # --- Create and store the query task ---
                         log.debug("Creating query task...")
                         query_task = asyncio.create_task(
                             self._iterate_streaming_query(user_input, status_lines),
@@ -6241,73 +6301,67 @@ class MCPClient:
                         )
                         self.current_query_task = query_task
                         log.debug(f"Query task {self.current_query_task.get_name()} started.")
-                        # --- End task creation ---
 
-                        # Loop while task is running to update display
+                        # Update loop while the query task is running
                         while not self.current_query_task.done():
-                            # Get latest accumulated text from the helper function
                             claude_text_content = getattr(self, "_current_query_text", "")
-
-                            # --- Check if first response piece arrived ---
                             if not first_response_received and (claude_text_content or status_lines):
                                 first_response_received = True
-                            # --- End Check ---
 
-                            # --- Build the renderable based on state ---
+                            # Build the renderable content (Spinner or combined Markdown/Status)
                             renderable_content: Union[Group, Status]
                             panel_border_style = "green" # Default
 
                             if not first_response_received:
-                                # Still waiting for the first chunk, show spinner
-                                renderable_content = initial_status # Reuse the status object
+                                # Still waiting for the first chunk, show spinner status
+                                renderable_content = initial_status
                                 panel_border_style = "dim green"
                             else:
-                                # Received content, show Markdown + Status lines
+                                # Combine Markdown response and status lines into a Group
                                 md = Markdown(claude_text_content)
                                 status_group = Group(*list(status_lines))
                                 display_items = [md, status_group]
-                                if self.current_query_task and not self.current_query_task.done():
+                                abort_needed = self.current_query_task and not self.current_query_task.done()
+                                if abort_needed:
                                     display_items.append(abort_message)
                                 renderable_content = Group(*display_items)
 
-                            panel = Panel(renderable_content, title="Claude", border_style=panel_border_style)
-                            # --- End Build Renderable ---
+                            # Create the single Panel containing the combined content
+                            panel_to_update = Panel(renderable_content, title="Claude", border_style=panel_border_style)
 
-                            # Update the Live display
-                            live_display.update(panel, refresh=False) # Refresh less eagerly
+                            # Update the Live display with the single Panel
+                            live_display.update(panel_to_update, refresh=False)
 
-                            # Wait briefly or until the task finishes/is cancelled
+                            # Wait briefly or until task is done/cancelled
                             try:
                                 await asyncio.wait_for(asyncio.shield(self.current_query_task), timeout=0.1)
                             except asyncio.TimeoutError:
-                                # Task still running, update spinner if needed
                                 if not first_response_received:
-                                     initial_status.update() # Advance spinner manually if no content yet
+                                     initial_status.update() # Keep spinner going if no response yet
                                 pass
                             except asyncio.CancelledError:
                                 log.debug("Query task cancelled while display loop was waiting.")
-                                break # Exit display loop
+                                break # Exit this display loop
 
-                        # --- Task finished or was cancelled ---
-                        # Await the task result/exception to ensure cleanup and raise errors
+                        # Await task completion to handle exceptions
                         await self.current_query_task
 
-                        # --- Final update after successful completion ---
-                        if not first_response_received: # Handle case where task finishes with no output
+                        # Final update after successful completion
+                        if not first_response_received:
                             final_panel = Panel("[dim]No response received.[/dim]", title="Claude", border_style="yellow")
                         else:
                             claude_text_content = getattr(self, "_current_query_text", "")
                             md = Markdown(claude_text_content)
-                            status_group = Group(*list(status_lines))
-                            renderable_group = Group(md, status_group) # No abort message
+                            status_group = Group(*list(status_lines)) # No abort message
+                            renderable_group = Group(md, status_group)
                             final_panel = Panel(renderable_group, title="Claude", border_style="green")
 
                         if live_display.is_started:
                             live_display.update(final_panel, refresh=True) # Final refresh
 
                     except asyncio.CancelledError:
-                        # Handle cancellation triggered by SIGINT or API
-                        log.debug("Query task processing caught CancelledError in interactive_loop.") # Changed level
+                        # Handle cancellation (SIGINT or API trigger)
+                        log.debug("Query task processing caught CancelledError in interactive_loop.")
                         claude_text_content = getattr(self, "_current_query_text", "") # Get partial text
                         status_lines.append(Text("[bold yellow]Request Aborted.[/]", style="yellow"))
 
@@ -6316,6 +6370,7 @@ class MCPClient:
                         status_group = Group(*list(status_lines))
                         renderable_group = Group(md, status_group)
                         panel = Panel(renderable_group, title="Claude - Aborted", border_style="yellow")
+
                         if live_display.is_started:
                             live_display.update(panel, refresh=True)
 
@@ -6323,13 +6378,14 @@ class MCPClient:
                          # Handle other errors during query processing
                          log.error(f"Error during query task execution: {stream_err}", exc_info=True)
                          claude_text_content = getattr(self, "_current_query_text", "") # Get partial text
-                         status_lines.append(Text(f"[bold red]Error: {stream_err}[/]", style="red"))
+                         status_lines.append(Text.from_markup(f"[bold red]Error: {stream_err}[/]"))
 
                          # Update the display one last time with the error
                          md = Markdown(claude_text_content)
                          status_group = Group(*list(status_lines))
                          renderable_group = Group(md, status_group)
                          panel = Panel(renderable_group, title="Claude - ERROR", border_style="red")
+
                          if live_display.is_started:
                              live_display.update(panel, refresh=True)
 
@@ -6368,11 +6424,11 @@ class MCPClient:
             finally:
                 # Final cleanup check
                 if live_display and live_display.is_started:
-                    live_display.stop()
+                    live_display.stop() # Ensure stopped
+                    live_display = None
                 self.current_query_task = None
                 if hasattr(self, "_current_query_text"):
                     delattr(self, "_current_query_text")
-
 
     async def count_tokens(self, messages=None) -> int:
         """Count the number of tokens in the current conversation context"""
@@ -8143,7 +8199,7 @@ class MCPClient:
 
         try:
             # Use safe_print for user-facing status messages
-            self.safe_print(f"{STATUS_EMOJI['config']} Found Claude desktop config file, processing...")
+            self.safe_print(f"{STATUS_EMOJI['config'] }  Found Claude desktop config file, processing...")
 
             # Read the file content asynchronously
             async with aiofiles.open(config_path, 'r') as f:
@@ -8444,66 +8500,78 @@ class MCPClient:
         """Print current status of servers, tools, and capabilities with progress bars"""
         # Use the stored safe console instance to prevent multiple calls
         safe_console = self._current_safe_console
-        
+
+        # Helper function using the pre-compiled pattern (still needed for progress bar)
+        def apply_emoji_spacing(text: str) -> str:
+             if isinstance(text, str) and text and hasattr(self, '_emoji_space_pattern'):
+                 try: # Add try-except for robustness
+                     return self._emoji_space_pattern.sub(r"\1 \2", text)
+                 except Exception as e:
+                     log.warning(f"Failed to apply emoji spacing regex in helper: {e}")
+             return text # Return original text if not string, empty, pattern missing, or error
+
         # Count connected servers, available tools/resources
         connected_servers = len(self.server_manager.active_sessions)
         total_servers = len(self.config.servers)
         total_tools = len(self.server_manager.tools)
         total_resources = len(self.server_manager.resources)
         total_prompts = len(self.server_manager.prompts)
-        
+
         # Print basic info table
-        status_table = Table(title="MCP Client Status")
-        status_table.add_column("Item")
+        status_table = Table(title="MCP Client Status", box=box.ROUNDED) # Use a box style
+        status_table.add_column("Item", style="dim") # Apply style to column
         status_table.add_column("Status", justify="right")
-        
+
+        # --- Use Text.assemble for the first column ---
         status_table.add_row(
-            f"{STATUS_EMOJI['model']} Model",
+            Text.assemble(str(STATUS_EMOJI['model']), " Model"), # Note the space before "Model"
             self.current_model
         )
         status_table.add_row(
-            f"{STATUS_EMOJI['server']} Servers",
+            Text.assemble(str(STATUS_EMOJI['server']), " Servers"), # Note the space before "Servers"
             f"{connected_servers}/{total_servers} connected"
         )
         status_table.add_row(
-            f"{STATUS_EMOJI['tool']} Tools",
+            Text.assemble(str(STATUS_EMOJI['tool']), " Tools"), # Note the space before "Tools"
             str(total_tools)
         )
         status_table.add_row(
-            f"{STATUS_EMOJI['resource']} Resources",
+            Text.assemble(str(STATUS_EMOJI['resource']), " Resources"), # Note the space before "Resources"
             str(total_resources)
         )
         status_table.add_row(
-            f"{STATUS_EMOJI['prompt']} Prompts",
+            Text.assemble(str(STATUS_EMOJI['prompt']), " Prompts"), # Note the space before "Prompts"
             str(total_prompts)
         )
-        
-        safe_console.print(status_table)
-        
+        # --- End Text.assemble usage ---
+
+        safe_console.print(status_table) # Use the regular safe_print
+
         # Only show server progress if we have servers
         if total_servers > 0:
-            # Create server status tasks for _run_with_progress
             server_tasks = []
             for name, server in self.config.servers.items():
                 if name in self.server_manager.active_sessions:
-                    # Add a task to show server status with prettier progress
+                    # Apply spacing to progress description (keep using helper here)
+                    task_description = apply_emoji_spacing(
+                        f"{STATUS_EMOJI['server']} {name} ({server.type.value})"
+                    )
                     server_tasks.append(
-                        (self._display_server_status, 
-                        f"{STATUS_EMOJI['server']} {name} ({server.type.value})", 
+                        (self._display_server_status,
+                        task_description,
                         (name, server))
                     )
-            
-            # If we have any connected servers, show their status with progress bars
+
             if server_tasks:
                 await self._run_with_progress(
                     server_tasks,
                     "Server Status",
-                    transient=False,  # Keep this visible
-                    use_health_scores=True  # Use health scores for progress display
+                    transient=False,
+                    use_health_scores=True
                 )
-        
-        safe_console.print("[green]Ready to process queries![/green]")
-        
+
+        # Use safe_print for this final message too, in case emojis are added later
+        self.safe_print("[green]Ready to process queries![/green]")
         
     async def _display_server_status(self, server_name, server_config):
         """Helper to display server status in a progress bar
