@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="cupcake">
+<html lang="en" data-theme="coporate">
 
 <head>
     <meta charset="UTF-8">
@@ -85,38 +85,6 @@
         .sidebar {
             width: var(--sidebar-width);
             transition: transform 0.25s ease-in-out;
-        }
-
-        [data-theme="nord"] {
-            --p: 218 34% 54%;
-            --s: 189 25% 65%;
-            --a: 355 25% 65%;
-            --n: 226 16% 30%;
-            --b1: 219 17% 94%;
-            --b2: 219 17% 92%;
-            --b3: 219 17% 87%;
-            --bc: 217 19% 27%;
-
-            --pc: 217 19% 95%;
-            --sc: 217 19% 95%;
-            --ac: 217 19% 95%;
-            --nc: 218 15% 85%;
-        }
-
-        [data-theme="slate"] {
-            --p: 215 28% 45%;
-            --s: 215 14% 34%;
-            --a: 215 28% 60%;
-            --n: 215 14% 20%;
-            --b1: 215 14% 95%;
-            --b2: 215 14% 90%;
-            --b3: 215 14% 85%;
-            --bc: 215 14% 15%;
-
-            --pc: 215 14% 95%;
-            --sc: 215 14% 95%;
-            --ac: 215 14% 95%;
-            --nc: 215 14% 90%;
         }
 
         @media (max-width: 768px) {
@@ -367,7 +335,10 @@
         }
 
         /* Code block styling */
-        .chat-bubble.prose pre {
+        .chat-bubble.prose pre,
+        /* Style for potentially non-Marked pre tags */
+        .chat-bubble.prose div.relative.group>pre {
+            /* MORE SPECIFIC selector for Marked's pre tags */
             position: relative;
             border-radius: 0.375rem;
             padding: 0.75rem 1rem;
@@ -376,17 +347,26 @@
             max-height: 400px;
             overflow-y: auto;
             background-color: var(--tw-prose-pre-bg) !important;
+            /* Correct BG for code blocks */
             color: var(--tw-prose-pre-code) !important;
+            /* Correct TEXT color for code blocks - MUST override bubble */
         }
 
-        .chat-bubble.prose pre code.hljs {
+        /* Ensure code inside the correctly styled pre tag inherits the color */
+        .chat-bubble.prose pre code.hljs,
+        .chat-bubble.prose div.relative.group>pre code.hljs {
+            /* Match specificity */
             background-color: transparent !important;
-            color: inherit !important;
+            /* Code tag itself is transparent */
+            color: inherit;
+            /* Inherit color from the parent <pre> tag */
             padding: 0;
         }
 
+        /* Styling for inline code (not inside pre) */
         .chat-bubble.prose code:not(pre *) {
             color: var(--tw-prose-code);
+            /* Different color/bg for inline code */
             background-color: hsl(var(--b2));
             padding: 0.1em 0.3em;
             border-radius: 0.25rem;
@@ -397,15 +377,15 @@
         .chat-bubble {
             /* Ensure text has sufficient contrast with background */
             --min-contrast-ratio: 4.5;
-            color: hsl(var(--bc) / 0.95) !important;
+            color: hsl(var(--bc) / 0.95);
         }
 
         .chat-bubble.chat-bubble-primary {
-            color: hsl(var(--pc) / 0.95) !important;
+            color: hsl(var(--pc) / 0.95);
         }
 
         .chat-bubble.bg-neutral {
-            color: hsl(var(--nc) / 0.95) !important;
+            color: hsl(var(--nc) / 0.95);
         }
 
         /* Improve code readability */
@@ -414,13 +394,6 @@
             color: hsl(var(--bc) / 0.9);
             padding: 0.2em 0.4em;
             border-radius: 0.25rem;
-        }
-
-        /* Better text contrast in dark themes */
-        [data-theme="dark"] .chat-bubble,
-        [data-theme="nord"] .chat-bubble,
-        [data-theme="slate"] .chat-bubble {
-            text-shadow: 0 1px 1px rgba(0, 0, 0, 0.2);
         }
 
         .prose code {
@@ -434,8 +407,6 @@
             border: 1px solid hsl(var(--b3) / 0.2);
         }
 
-
-        /* Copy button styling */
         .copy-code-btn {
             position: absolute;
             top: 0.5rem;
@@ -1116,24 +1087,79 @@
             opacity: 0.8;
         }
 
-        /* Tool Data Bubble Styling */
-        .tool-data-bubble {
-            background-color: hsl(var(--b2) / 0.4);
-            /* Lighter version of base-200 */
+        /* Target the wrapper DIV we added in JS */
+        .tool-content-wrapper {
+            position: relative;
+            border: 1px solid hsl(var(--b3) / 0.4);
+            border-radius: var(--rounded-md, 0.375rem);
+            margin-top: 0.5rem;
+            overflow: hidden;
+            /* Important for child background */
         }
 
-        /* Raw Text within Tool Data */
-        .tool-data-raw-text {
-            color: hsl(var(--bc) / 0.75) !important;
-            /* Darker text color (adjust opacity as needed) */
+        .chat-bubble .tool-content-wrapper>pre {
+            background-color: hsl(var(--b2) / 0.7) !important;
+            /* Base-200 with slight transparency */
+            color: hsl(var(--bc)) !important;
+            /* Base text color */
+            padding: 0.6rem 0.85rem !important;
+            margin: 0 !important;
+            /* Reset margin */
+            border: none !important;
+            /* Reset border */
+            border-radius: 0 !important;
+            /* Reset radius - wrapper has it */
+            white-space: pre-wrap !important;
+            /* Ensure wrapping */
+            word-break: break-all !important;
+            /* Break long words */
+            /* Ensure it fills the wrapper if needed, though padding usually handles this */
+            display: block;
         }
 
-        /* Ensure sufficient contrast in dark themes for raw text */
-        [data-theme="dark"] .tool-data-raw-text,
-        [data-theme="nord"] .tool-data-raw-text,
-        [data-theme="slate"] .tool-data-raw-text {
-            color: hsl(var(--nc) / 0.85) !important;
-            /* Lighter text for dark backgrounds */
+        .chat-bubble .tool-content-wrapper>pre>code.hljs {
+            background-color: transparent !important;
+            color: inherit !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            display: block;
+        }
+
+        .chat-bubble .tool-content-wrapper>pre.tool-data-raw-text {
+            font-family: var(--font-mono, monospace);
+            font-size: 0.8rem;
+            color: hsl(var(--bc) / 0.85) !important;
+        }
+
+        .tool-content-wrapper .copy-code-btn {
+            top: 0.3rem;
+            right: 0.3rem;
+            background-color: hsl(var(--b3) / 0.6);
+            color: hsl(var(--bc) / 0.9);
+            border: 1px solid hsl(var(--b3) / 0.4);
+            z-index: 11;
+        }
+
+        .tool-content-wrapper .copy-code-btn:hover {
+            background-color: hsl(var(--b3) / 0.8);
+            color: hsl(var(--bc));
+        }
+
+        .chat-bubble details>summary {
+            background-color: hsl(var(--b1)/0.4);
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            transition: background-color 0.2s;
+            display: inline-flex;
+            /* Fix alignment */
+            align-items: center;
+            /* Fix alignment */
+            gap: 0.25rem;
+            /* Add gap */
+        }
+
+        .chat-bubble details>summary:hover {
+            background-color: hsl(var(--b2)/0.6);
         }
 
         [x-cloak] {
@@ -1163,13 +1189,7 @@
                 <input type="checkbox" class="toggle toggle-xs toggle-success" x-model="uiSettings.showToolDataMessages"
                     @change="saveUiSetting('showToolDataMessages', $event.target.checked)">
             </div>
-            <div class="tooltip tooltip-bottom" :data-tip="wsStatus">
-                <i class="fas fa-circle text-xs transition-colors duration-500" :class="{
-                     'text-success animate-pulse': wsConnected,
-                     'text-warning': !wsConnected && wsConnecting,
-                     'text-error': !wsConnected && !wsConnecting
-                     }"></i>
-            </div>
+
             <div class="tooltip tooltip-bottom" data-tip="Servers">
                 <i class="fas fa-server fa-fw"></i> <span x-text="`${connectedServersCount}/${servers.length}`"></span>
             </div>
@@ -1194,6 +1214,13 @@
                             @change="setCustomModel($event.target.value)"
                             @keyup.enter="setCustomModel($event.target.value); $event.target.blur()"></li>
                 </ul>
+            </div>
+            <div class="tooltip tooltip-bottom" :data-tip="wsStatus">
+                <i class="fas fa-circle text-xs transition-colors duration-500" :class="{
+                     'text-success animate-pulse': wsConnected,
+                     'text-warning': !wsConnected && wsConnecting,
+                     'text-error': !wsConnected && !wsConnecting
+                     }"></i>
             </div>
             <div class="dropdown dropdown-end">
                 <label tabindex="0" class="btn btn-xs btn-ghost px-1" data-tippy-content="Change Theme">
@@ -1291,28 +1318,28 @@
 
                 <!-- Servers Tab -->
                 <div x-show="activeTab === 'servers'" x-transition.opacity>
-                    <!-- MODIFIED Header Section -->
+                    <!-- Header Section -->
                     <div class="flex justify-between items-center mb-3">
                         <h2 class="text-base font-semibold flex items-center"><i
                                 class="fas fa-server mr-2 text-primary"></i>Servers</h2>
                         <!-- Wrap buttons in a div for grouping -->
                         <div class="flex gap-2">
-                            <!-- NEW Reload Button -->
+                            <!-- Reload Button -->
                             <button class="btn btn-xs btn-outline btn-warning" @click="reloadAllServers()"
                                 :disabled="isLoadingServers"
                                 data-tippy-content="Disconnect & Reload All Configured Servers">
                                 <i class="fas fa-sync" :class="{'fa-spin': isLoadingServers}"></i>
                                 <!-- Icon spins when loading -->
                             </button>
-                            <!-- Existing Add Button (UNTOUCHED) -->
+                            <!-- Add Button -->
                             <button class="btn btn-xs btn-outline btn-primary" @click="showAddServerModal = true">
                                 <i class="fas fa-plus mr-1"></i> Add
                             </button>
                         </div>
                     </div>
-                    <!-- End MODIFIED Header Section -->
+                    <!-- End Header Section -->
 
-                    <!-- Server List Section (UNTOUCHED FROM YOUR ORIGINAL) -->
+                    <!-- Server List Section -->
                     <div class="space-y-2.5">
                         <div x-show="isLoadingServers" class="text-center p-4"><span
                                 class="loading loading-dots loading-md"></span></div>
@@ -1400,10 +1427,10 @@
                     <div class="flex justify-between items-center">
                         <h2 class="text-base font-semibold flex items-center"><i
                                 class="fas fa-puzzle-piece mr-2 text-primary"></i>Capabilities</h2>
-                        <span class="text-xs text-base-content/60" x-text="`(${totalCapabilities} total)`"></span>
+                        <span class="text-xs" x-text="`(${totalCapabilities} total)`"></span>
                     </div>
 
-                    <!-- NEW: Favorites Section -->
+                    <!-- Favorites Section -->
                     <div class="favorites-container" x-show="favoriteTools.length > 0">
                         <div class="flex justify-between items-center mb-2">
                             <h3 class="text-sm font-semibold"><i class="fas fa-star text-warning mr-1"></i> Favorites
@@ -1430,13 +1457,13 @@
                                             </button>
                                         </div>
                                     </div>
-                                    <p class="text-xs opacity-70 truncate" x-text="tool.description"></p>
+                                    <p class="text-xs truncate" x-text="tool.description"></p>
                                 </div>
                             </template>
                         </div>
                     </div>
 
-                    <!-- NEW: Recent Tools Section -->
+                    <!-- Recent Tools Section -->
                     <div class="recent-tools-container" x-show="recentTools.length > 0">
                         <div class="flex justify-between items-center mb-2">
                             <h3 class="text-sm font-semibold"><i class="fas fa-history text-info mr-1"></i> Recently
@@ -1618,7 +1645,7 @@
                     </h2>
 
                     <!-- View toggle buttons for conversation manager -->
-                    <div class="flex gap-1">
+                    <div class="flex gap-1 my-2"> <!-- Added margin -->
                         <button class="btn btn-xs btn-ghost" :class="{'btn-active': conversationView === 'branches'}"
                             @click="conversationView = 'branches'" data-tippy-content="Branch View">
                             <i class="fas fa-code-branch"></i>
@@ -1630,6 +1657,10 @@
                         <button class="btn btn-xs btn-ghost" :class="{'btn-active': conversationView === 'search'}"
                             @click="conversationView = 'search'" data-tippy-content="Search">
                             <i class="fas fa-search"></i>
+                        </button>
+                        <button class="btn btn-xs btn-ghost" @click="openMessageBookmarks()"
+                            data-tippy-content="Bookmarks">
+                            <i class="fas fa-bookmark"></i>
                         </button>
                     </div>
 
@@ -1818,7 +1849,7 @@
 
                                     <template x-for="result in searchResults" :key="result.messageId">
                                         <div class="bg-base-200 p-2 rounded hover:bg-base-300 cursor-pointer transition-colors"
-                                            @click="checkoutBranchAndScrollToMessage(result.nodeId, result.messageId)">
+                                            @click="checkoutBranchAndScrollToMessage(result.nodeId, result.timestamp)">
                                             <div class="flex items-center justify-between text-xs mb-1">
                                                 <div>
                                                     <span class="opacity-70"
@@ -1845,6 +1876,7 @@
 
                 <!-- Config Tab -->
                 <div x-show="activeTab === 'config'" x-transition.opacity>
+                    <!-- Original Settings Content -->
                     <h2 class="text-base font-semibold mb-3 flex items-center"><i
                             class="fas fa-cog mr-2 text-primary"></i>Settings
                     </h2>
@@ -1929,201 +1961,269 @@
                                 <span class="label-text text-xs">Send on Enter</span>
                             </label>
                         </div>
-                    </div>
 
-                    <div class="divider text-xs">Communication</div>
+                        <div class="divider text-xs">Communication</div>
 
-                    <div class="grid grid-cols-2 gap-x-4">
-                        <label class="cursor-pointer label justify-start gap-2 py-1"
-                            data-tippy-content="Stream responses word by word"><input type="checkbox"
-                                class="toggle toggle-primary toggle-sm" x-model="config.enableStreaming"
-                                @change="saveConfigField('enableStreaming', $event.target.checked)"><span
-                                class="label-text text-xs">Streaming</span></label>
-                        <label class="cursor-pointer label justify-start gap-2 py-1"
-                            data-tippy-content="Cache tool results locally"><input type="checkbox"
-                                class="toggle toggle-primary toggle-sm" x-model="config.enableCaching"
-                                @change="saveConfigField('enableCaching', $event.target.checked)"><span
-                                class="label-text text-xs">Caching</span></label>
-                        <label class="cursor-pointer label justify-start gap-2 py-1"
-                            data-tippy-content="Automatically look for servers at startup"><input type="checkbox"
-                                class="toggle toggle-primary toggle-sm" x-model="config.autoDiscover"
-                                @change="saveConfigField('autoDiscover', $event.target.checked)"><span
-                                class="label-text text-xs">Auto Discover</span></label>
-                        <label class="cursor-pointer label justify-start gap-2 py-1"
-                            data-tippy-content="Look for servers on local network via mDNS/Zeroconf"><input
-                                type="checkbox" class="toggle toggle-primary toggle-sm"
-                                x-model="config.enableLocalDiscovery"
-                                @change="saveConfigField('enableLocalDiscovery', $event.target.checked)"><span
-                                class="label-text text-xs">mDNS</span></label>
-                    </div>
-                    <div class="form-control">
-                        <label class="label py-1"><span class="label-text text-xs font-medium"
-                                data-tippy-content="How often to refresh server status (seconds)">Dashboard
-                                Refresh
-                                (s)</span></label>
-                        <input type="number" class="input input-bordered input-sm w-24"
-                            x-model.number="config.dashboardRefreshRate"
-                            @input.debounce.500ms="saveConfigField('dashboardRefreshRate', $event.target.value)"
-                            min="0.5" step="0.1">
-                    </div>
-                    <button class="btn btn-xs btn-outline btn-error mt-4" @click="resetConfig"><i
-                            class="fas fa-undo mr-1"></i>
-                        Reset Settings</button>
-                </div>
-
-                <div class="mt-6 border-t border-base-300/50 pt-4">
-                    <h2 class="text-base font-semibold mb-3 flex items-center"><i
-                            class="fas fa-database mr-2 text-primary"></i>Cache Management</h2>
-
-                    <div class="flex flex-wrap gap-2 mb-4">
-                        <button class="btn btn-xs btn-outline" @click="fetchCacheData()" :disabled="isLoadingCache"
-                            :class="{'loading': isLoadingCache}">
-                            <i class="fas fa-sync mr-1" x-show="!isLoadingCache"></i> Refresh Cache Info
-                        </button>
-                        <button class="btn btn-xs btn-outline btn-warning" @click="cleanCacheAPI()"
-                            :disabled="isLoadingCache">
-                            <i class="fas fa-broom mr-1"></i> Clean Expired
-                        </button>
-                        <button class="btn btn-xs btn-outline btn-error" @click="clearAllCacheAPI()"
-                            :disabled="isLoadingCache">
-                            <i class="fas fa-trash-alt mr-1"></i> Clear All Cache
-                        </button>
-                    </div>
-
-                    <!-- Cache Entries Table -->
-                    <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-list-ul mr-1.5"></i>
-                        Cached
-                        Entries</h3>
-                    <div x-show="isLoadingCache && cacheEntries.length === 0" class="text-center p-4">
-                        <span class="loading loading-dots loading-sm"></span> Loading Cache...
-                    </div>
-                    <div id="cache-entries-table" class="text-xs border border-base-300/30 rounded mb-4"
-                        x-show="!isLoadingCache">
-                    </div>
-
-                    <!-- Cache Dependencies Table -->
-                    <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-project-diagram mr-1.5"></i>
-                        Tool Dependencies</h3>
-                    <div x-show="isLoadingCache && Object.keys(cacheDependencies).length === 0" class="text-center p-4">
-                        <span class="loading loading-dots loading-sm"></span> Loading
-                        Dependencies...
-                    </div>
-                    <div id="cache-dependencies-table" class="text-xs border border-base-300/30 rounded"
-                        x-show="!isLoadingCache">
-                    </div>
-                </div>
-            </div>
-            <!-- End Config Tab -->
-
-            <!-- NEW: Dashboard Tab -->
-            <div x-show="activeTab === 'dashboard'" x-transition.opacity>
-                <div class="flex justify-between items-center mb-3">
-                    <h2 class="text-base font-semibold flex items-center">
-                        <i class="fas fa-chart-bar mr-2 text-primary"></i>Dashboard
-                    </h2>
-                    <button class="btn btn-xs btn-outline" @click="refreshDashboardData()"
-                        :disabled="isLoadingDashboard" :class="{'loading': isLoadingDashboard}">
-                        <i class="fas fa-sync mr-1" x-show="!isLoadingDashboard"></i> Refresh
-                    </button>
-                </div>
-
-                <!-- Loading indicator for dashboard -->
-                <div x-show="isLoadingDashboard" class="text-center p-4">
-                    <span class="loading loading-dots loading-md"></span>
-                    <p class="text-sm mt-2">Loading dashboard data...</p>
-                </div>
-                <!-- Dashboard content -->
-
-                <div x-show="!isLoadingDashboard" class="space-y-4">
-                    <!-- Quick stats -->
-                    <div class="dashboard-card">
-                        <div class="dashboard-card-header">
-                            <h3 class="dashboard-card-title">
-                                <i class="fas fa-chart-line mr-1.5 text-info"></i> System Overview
-                            </h3>
-                            <span class="text-xs opacity-70">Last updated: <span
-                                    x-text="formatTimestamp(dashboardLastUpdated)"></span></span>
+                        <div class="grid grid-cols-2 gap-x-4">
+                            <label class="cursor-pointer label justify-start gap-2 py-1"
+                                data-tippy-content="Stream responses word by word"><input type="checkbox"
+                                    class="toggle toggle-primary toggle-sm" x-model="config.enableStreaming"
+                                    @change="saveConfigField('enableStreaming', $event.target.checked)"><span
+                                    class="label-text text-xs">Streaming</span></label>
+                            <label class="cursor-pointer label justify-start gap-2 py-1"
+                                data-tippy-content="Cache tool results locally"><input type="checkbox"
+                                    class="toggle toggle-primary toggle-sm" x-model="config.enableCaching"
+                                    @change="saveConfigField('enableCaching', $event.target.checked)"><span
+                                    class="label-text text-xs">Caching</span></label>
+                            <label class="cursor-pointer label justify-start gap-2 py-1"
+                                data-tippy-content="Automatically look for servers at startup"><input type="checkbox"
+                                    class="toggle toggle-primary toggle-sm" x-model="config.autoDiscover"
+                                    @change="saveConfigField('autoDiscover', $event.target.checked)"><span
+                                    class="label-text text-xs">Auto Discover</span></label>
+                            <label class="cursor-pointer label justify-start gap-2 py-1"
+                                data-tippy-content="Look for servers on local network via mDNS/Zeroconf"><input
+                                    type="checkbox" class="toggle toggle-primary toggle-sm"
+                                    x-model="config.enableLocalDiscovery"
+                                    @change="saveConfigField('enableLocalDiscovery', $event.target.checked)"><span
+                                    class="label-text text-xs">mDNS</span></label>
                         </div>
-                        <div class="stats-grid dashboard-card-content">
-                            <div class="stat-item">
-                                <div class="stat-value" x-text="dashboardStats.activeServers"></div>
-                                <div class="stat-label">Active Servers</div>
-                            </div>
-                            <div class="stat-item">
-                                <div class="stat-value" x-text="dashboardStats.totalTools"></div>
-                                <div class="stat-label">Available Tools</div>
-                            </div>
-                            <div class="stat-item">
-                                <div class="stat-value" x-text="dashboardStats.totalConversations"></div>
-                                <div class="stat-label">Conversations</div>
-                            </div>
-                            <div class="stat-item">
-                                <div class="stat-value" x-text="dashboardStats.totalMessages"></div>
-                                <div class="stat-label">Total Messages</div>
-                            </div>
-                            <div class="stat-item">
-                                <div class="stat-value" x-text="dashboardStats.cacheHitRate + '%'"></div>
-                                <div class="stat-label">Cache Hit Rate</div>
-                            </div>
-                            <div class="stat-item">
-                                <div class="stat-value" x-text="dashboardStats.systemUptime"></div>
-                                <div class="stat-label">System Uptime</div>
-                            </div>
+                        <div class="form-control">
+                            <label class="label py-1"><span class="label-text text-xs font-medium"
+                                    data-tippy-content="How often to refresh server status (seconds)">Dashboard
+                                    Refresh
+                                    (s)</span></label>
+                            <input type="number" class="input input-bordered input-sm w-24"
+                                x-model.number="config.dashboardRefreshRate"
+                                @input.debounce.500ms="saveConfigField('dashboardRefreshRate', $event.target.value)"
+                                min="0.5" step="0.1">
+                        </div>
+                        <button class="btn btn-xs btn-outline btn-error mt-4" @click="resetConfig"><i
+                                class="fas fa-undo mr-1"></i>
+                            Reset Settings</button>
+                    </div> <!-- End original settings content -->
+
+                    <!-- START: Moved Cache Management Section HERE -->
+                    <div class="mt-6 border-t border-base-300/50 pt-4">
+                        <h2 class="text-base font-semibold mb-3 flex items-center"><i
+                                class="fas fa-database mr-2 text-primary"></i>Cache Management</h2>
+
+                        <div class="flex flex-wrap gap-2 mb-4">
+                            <button class="btn btn-xs btn-outline" @click="fetchCacheData()" :disabled="isLoadingCache"
+                                :class="{'loading': isLoadingCache}">
+                                <i class="fas fa-sync mr-1" x-show="!isLoadingCache"></i> Refresh Cache Info
+                            </button>
+                            <button class="btn btn-xs btn-outline btn-warning" @click="cleanCacheAPI()"
+                                :disabled="isLoadingCache">
+                                <i class="fas fa-broom mr-1"></i> Clean Expired
+                            </button>
+                            <button class="btn btn-xs btn-outline btn-error" @click="clearAllCacheAPI()"
+                                :disabled="isLoadingCache">
+                                <i class="fas fa-trash-alt mr-1"></i> Clear All Cache
+                            </button>
+                        </div>
+
+                        <!-- Cache Entries Table -->
+                        <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-list-ul mr-1.5"></i>
+                            Cached
+                            Entries</h3>
+                        <div x-show="isLoadingCache && cacheEntries.length === 0" class="text-center p-4">
+                            <span class="loading loading-dots loading-sm"></span> Loading Cache...
+                        </div>
+                        <div id="cache-entries-table" class="text-xs border border-base-300/30 rounded mb-4"
+                            x-show="!isLoadingCache">
+                            <!-- Tabulator for Cache Entries will populate here -->
+                        </div>
+
+                        <!-- Cache Dependencies Table -->
+                        <h3 class="text-sm font-semibold mb-2 opacity-80"><i class="fas fa-project-diagram mr-1.5"></i>
+                            Tool Dependencies</h3>
+                        <div x-show="isLoadingCache && Object.keys(cacheDependencies).length === 0"
+                            class="text-center p-4">
+                            <span class="loading loading-dots loading-sm"></span> Loading
+                            Dependencies...
+                        </div>
+                        <div id="cache-dependencies-table" class="text-xs border border-base-300/30 rounded"
+                            x-show="!isLoadingCache">
+                            <!-- Tabulator for Cache Dependencies will populate here -->
                         </div>
                     </div>
+                    <!-- END: Moved Cache Management Section HERE -->
 
-                    <!-- Tool usage stats -->
-                    <div class="dashboard-card">
-                        <div class="dashboard-card-header">
-                            <h3 class="dashboard-card-title">
-                                <i class="fas fa-tools mr-1.5 text-accent"></i> Tool Usage
-                            </h3>
-                            <div class="flex items-center gap-2">
-                                <select class="select select-xs select-bordered bg-base-100 text-base-content"
-                                    x-model="toolUsageTimeframe">
-                                    <option value="day">Last 24 Hours</option>
-                                    <option value="week">Last Week</option>
-                                    <option value="month">Last Month</option>
-                                    <option value="all">All Time</option>
-                                </select>
+                </div>
+                <!-- End Config Tab -->
+
+                <!-- Dashboard Tab -->
+                <div x-show="activeTab === 'dashboard'" x-transition.opacity>
+                    <div class="flex justify-between items-center mb-3">
+                        <h2 class="text-base font-semibold flex items-center">
+                            <i class="fas fa-chart-bar mr-2 text-primary"></i>Dashboard
+                        </h2>
+                        <button class="btn btn-xs btn-outline" @click="refreshDashboardData()"
+                            :disabled="isLoadingDashboard" :class="{'loading': isLoadingDashboard}">
+                            <i class="fas fa-sync mr-1" x-show="!isLoadingDashboard"></i> Refresh
+                        </button>
+                    </div>
+
+                    <!-- Loading indicator for dashboard -->
+                    <div x-show="isLoadingDashboard" class="text-center p-4">
+                        <span class="loading loading-dots loading-md"></span>
+                        <p class="text-sm mt-2">Loading dashboard data...</p>
+                    </div>
+                    <!-- Dashboard content -->
+
+                    <div x-show="!isLoadingDashboard" class="space-y-4">
+                        <!-- Quick stats -->
+                        <div class="dashboard-card">
+                            <div class="dashboard-card-header">
+                                <h3 class="dashboard-card-title">
+                                    <i class="fas fa-chart-line mr-1.5 text-info"></i> System Overview
+                                </h3>
+                                <span class="text-xs opacity-70">Last updated: <span
+                                        x-text="formatTimestamp(dashboardLastUpdated)"></span></span>
+                            </div>
+                            <div class="stats-grid dashboard-card-content">
+                                <div class="stat-item">
+                                    <div class="stat-value" x-text="dashboardStats.activeServers"></div>
+                                    <div class="stat-label">Active Servers</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" x-text="dashboardStats.totalTools"></div>
+                                    <div class="stat-label">Available Tools</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" x-text="dashboardStats.totalConversations"></div>
+                                    <div class="stat-label">Conversations</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" x-text="dashboardStats.totalMessages"></div>
+                                    <div class="stat-label">Total Messages</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" x-text="dashboardStats.cacheHitRate + '%'"></div>
+                                    <div class="stat-label">Cache Hit Rate</div>
+                                </div>
+                                <div class="stat-item">
+                                    <div class="stat-value" x-text="dashboardStats.systemUptime"></div>
+                                    <div class="stat-label">System Uptime</div>
+                                </div>
                             </div>
                         </div>
-                        <div class="dashboard-card-content">
-                            <div class="text-center text-sm p-4" x-show="!dashboardStats.topTools?.length">
-                                <i class="fas fa-info-circle text-info mr-1"></i> No
-                                tool usage data available for
-                                the selected timeframe.
-                            </div>
 
-                            <!-- Tool usage bar chart (placeholder for visualization) -->
-                            <div id="tool-usage-chart" class="h-64 w-full bg-base-200/50 rounded-md my-4"
-                                x-show="dashboardStats.topTools?.length > 0">
-                                <!-- Chart would render here -->
+                        <!-- Tool usage stats -->
+                        <div class="dashboard-card">
+                            <div class="dashboard-card-header">
+                                <h3 class="dashboard-card-title">
+                                    <i class="fas fa-tools mr-1.5 text-accent"></i> Tool Usage
+                                </h3>
+                                <div class="flex items-center gap-2">
+                                    <select class="select select-xs select-bordered bg-base-100 text-base-content"
+                                        x-model="toolUsageTimeframe">
+                                        <option value="day">Last 24 Hours</option>
+                                        <option value="week">Last Week</option>
+                                        <option value="month">Last Month</option>
+                                        <option value="all">All Time</option>
+                                    </select>
+                                </div>
                             </div>
+                            <div class="dashboard-card-content">
+                                <div class="text-center text-sm p-4" x-show="!dashboardStats.topTools?.length">
+                                    <i class="fas fa-info-circle text-info mr-1"></i> No
+                                    tool usage data available for
+                                    the selected timeframe.
+                                </div>
 
-                            <!-- Most used tools -->
-                            <div class="mt-4 overflow-x-auto" x-show="dashboardStats.topTools?.length > 0">
-                                <h4 class="text-sm font-medium mb-2">Most Used Tools</h4>
+                                <!-- Tool usage bar chart (placeholder for visualization) -->
+                                <div id="tool-usage-chart" class="h-64 w-full bg-base-200/50 rounded-md my-4"
+                                    x-show="dashboardStats.topTools?.length > 0">
+                                    <!-- Chart would render here -->
+                                </div>
+
+                                <!-- Most used tools -->
+                                <div class="mt-4 overflow-x-auto" x-show="dashboardStats.topTools?.length > 0">
+                                    <h4 class="text-sm font-medium mb-2">Most Used Tools</h4>
+                                    <table class="table table-xs w-full">
+                                        <thead>
+                                            <tr class="bg-base-200">
+                                                <th class="text-left">Tool</th>
+                                                <th class="text-left">Server</th>
+                                                <th class="text-right">Usage Count</th>
+                                                <th class="text-right">Success Rate</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <template x-for="tool in dashboardStats.topTools.slice(0, 5)"
+                                                :key="tool.name">
+                                                <tr class="hover:bg-base-200/50">
+                                                    <td class="font-medium" x-text="tool.shortName"></td>
+                                                    <td x-text="tool.server"></td>
+                                                    <td class="text-right" x-text="tool.count"></td>
+                                                    <td class="text-right">
+                                                        <span
+                                                            :class="tool.successRate > 90 ? 'text-success font-medium' : (tool.successRate > 70 ? 'text-warning font-medium' : 'text-error font-medium')"
+                                                            x-text="tool.successRate + '%'"></span>
+                                                    </td>
+                                                </tr>
+                                            </template>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Server health -->
+                        <div class="dashboard-card">
+                            <div class="dashboard-card-header">
+                                <h3 class="dashboard-card-title">
+                                    <i class="fas fa-server mr-1.5 text-success"></i> Server Health
+                                </h3>
+                                <button class="btn btn-xs btn-outline bg-base-100" @click="checkAllServerHealth()"
+                                    :disabled="isCheckingServerHealth" :class="{'loading': isCheckingServerHealth}">
+                                    <i class="fas fa-heartbeat" x-show="!isCheckingServerHealth"></i> Check
+                                    Health
+                                </button>
+                            </div>
+                            <div class="dashboard-card-content overflow-x-auto">
                                 <table class="table table-xs w-full">
                                     <thead>
                                         <tr class="bg-base-200">
-                                            <th class="text-left">Tool</th>
                                             <th class="text-left">Server</th>
-                                            <th class="text-right">Usage Count</th>
-                                            <th class="text-right">Success Rate</th>
+                                            <th class="text-left">Status</th>
+                                            <th class="text-right">Response Time</th>
+                                            <th class="text-right">Error Rate</th>
+                                            <th class="text-right">Uptime</th>
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        <template x-for="tool in dashboardStats.topTools.slice(0, 5)" :key="tool.name">
+                                        <template x-for="server in dashboardStats.serverHealth" :key="server.name">
                                             <tr class="hover:bg-base-200/50">
-                                                <td class="font-medium" x-text="tool.shortName"></td>
-                                                <td x-text="tool.server"></td>
-                                                <td class="text-right" x-text="tool.count"></td>
-                                                <td class="text-right">
-                                                    <span
-                                                        :class="tool.successRate > 90 ? 'text-success font-medium' : (tool.successRate > 70 ? 'text-warning font-medium' : 'text-error font-medium')"
-                                                        x-text="tool.successRate + '%'"></span>
+                                                <td>
+                                                    <div class="flex items-center gap-1.5 font-medium">
+                                                        <i
+                                                            :class="server.type === 'stdio' ? 'fas fa-terminal text-accent' : 'fas fa-network-wired text-info'"></i>
+                                                        <span x-text="server.name"></span>
+                                                    </div>
                                                 </td>
+                                                <td>
+                                                    <div>
+                                                        <span class="badge badge-sm font-medium" :class="{
+                                            'badge-success': server.status === 'healthy',
+                                            'badge-warning': server.status === 'degraded',
+                                            'badge-error': server.status === 'error',
+                                            'badge-ghost': server.status === 'unknown'
+                                        }">
+                                                            <span x-text="server.status"></span>
+                                                        </span>
+                                                    </div>
+                                                </td>
+                                                <td class="text-right" x-text="server.responseTime + ' ms'"></td>
+                                                <td class="text-right">
+                                                    <span :class="{
+                                        'text-success font-medium': server.errorRate < 1,
+                                        'text-warning font-medium': server.errorRate >= 1 && server.errorRate < 5,
+                                        'text-error font-medium': server.errorRate >= 5
+                                    }" x-text="server.errorRate + '%'"></span>
+                                                </td>
+                                                <td class="text-right" x-text="server.uptime"></td>
                                             </tr>
                                         </template>
                                     </tbody>
@@ -2131,312 +2231,268 @@
                             </div>
                         </div>
                     </div>
-
-                    <!-- Server health -->
-                    <div class="dashboard-card">
-                        <div class="dashboard-card-header">
-                            <h3 class="dashboard-card-title">
-                                <i class="fas fa-server mr-1.5 text-success"></i> Server Health
-                            </h3>
-                            <button class="btn btn-xs btn-outline bg-base-100" @click="checkAllServerHealth()"
-                                :disabled="isCheckingServerHealth" :class="{'loading': isCheckingServerHealth}">
-                                <i class="fas fa-heartbeat" x-show="!isCheckingServerHealth"></i> Check
-                                Health
-                            </button>
-                        </div>
-                        <div class="dashboard-card-content overflow-x-auto">
-                            <table class="table table-xs w-full">
-                                <thead>
-                                    <tr class="bg-base-200">
-                                        <th class="text-left">Server</th>
-                                        <th class="text-left">Status</th>
-                                        <th class="text-right">Response Time</th>
-                                        <th class="text-right">Error Rate</th>
-                                        <th class="text-right">Uptime</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <template x-for="server in dashboardStats.serverHealth" :key="server.name">
-                                        <tr class="hover:bg-base-200/50">
-                                            <td>
-                                                <div class="flex items-center gap-1.5 font-medium">
-                                                    <i
-                                                        :class="server.type === 'stdio' ? 'fas fa-terminal text-accent' : 'fas fa-network-wired text-info'"></i>
-                                                    <span x-text="server.name"></span>
-                                                </div>
-                                            </td>
-                                            <td>
-                                                <div>
-                                                    <span class="badge badge-sm font-medium" :class="{
-                                        'badge-success': server.status === 'healthy',
-                                        'badge-warning': server.status === 'degraded',
-                                        'badge-error': server.status === 'error',
-                                        'badge-ghost': server.status === 'unknown'
-                                    }">
-                                                        <span x-text="server.status"></span>
-                                                    </span>
-                                                </div>
-                                            </td>
-                                            <td class="text-right" x-text="server.responseTime + ' ms'"></td>
-                                            <td class="text-right">
-                                                <span :class="{
-                                    'text-success font-medium': server.errorRate < 1,
-                                    'text-warning font-medium': server.errorRate >= 1 && server.errorRate < 5,
-                                    'text-error font-medium': server.errorRate >= 5
-                                }" x-text="server.errorRate + '%'"></span>
-                                            </td>
-                                            <td class="text-right" x-text="server.uptime"></td>
-                                        </tr>
-                                    </template>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
                 </div>
                 <!-- End Dashboard Tab -->
+
             </div>
             <!-- End Tab Content -->
-    </aside>
+        </aside>
 
-    <!-- Chat Area -->
-    <main class="flex-1 flex flex-col h-full bg-gradient-to-b from-base-200 to-base-300/50">
-        <!-- Message Search Container (hidden by default, shown when activated) -->
-        <div class="message-search-container" :class="{'active': isMessageSearchActive}">
-            <input type="text" placeholder="Search in conversation..." class="input input-sm input-bordered flex-1"
-                x-model="messageSearchQuery" @keyup.enter="findNextSearchMatch"
-                @keyup.esc="isMessageSearchActive = false">
-            <button class="btn btn-sm btn-ghost" @click="findPreviousSearchMatch"
-                :disabled="currentSearchMatchIndex <= 0">
-                <i class="fas fa-chevron-up"></i>
-            </button>
-            <button class="btn btn-sm btn-ghost" @click="findNextSearchMatch"
-                :disabled="currentSearchMatchIndex >= searchMatches.length - 1">
-                <i class="fas fa-chevron-down"></i>
-            </button>
-            <button class="btn btn-sm btn-ghost" @click="isMessageSearchActive = false">
-                <i class="fas fa-times"></i>
-            </button>
-            <span class="text-xs opacity-70" x-show="searchMatches.length > 0">
-                <span x-text="currentSearchMatchIndex + 1"></span>/<span x-text="searchMatches.length"></span>
-            </span>
-        </div>
+        <!-- Chat Area -->
+        <main class="flex-1 flex flex-col h-full bg-gradient-to-b from-base-200 to-base-300/50">
+            <!-- Message Search Container (hidden by default, shown when activated) -->
+            <div class="message-search-container" :class="{'active': isMessageSearchActive}">
+                <input type="text" placeholder="Search in conversation..." class="input input-sm input-bordered flex-1"
+                    x-model="messageSearchQuery" @keyup.enter="findNextSearchMatch"
+                    @keyup.esc="isMessageSearchActive = false">
+                <button class="btn btn-sm btn-ghost" @click="findPreviousSearchMatch"
+                    :disabled="currentSearchMatchIndex <= 0">
+                    <i class="fas fa-chevron-up"></i>
+                </button>
+                <button class="btn btn-sm btn-ghost" @click="findNextSearchMatch"
+                    :disabled="currentSearchMatchIndex >= searchMatches.length - 1">
+                    <i class="fas fa-chevron-down"></i>
+                </button>
+                <button class="btn btn-sm btn-ghost" @click="isMessageSearchActive = false">
+                    <i class="fas fa-times"></i>
+                </button>
+                <span class="text-xs opacity-70" x-show="searchMatches.length > 0">
+                    <span x-text="currentSearchMatchIndex + 1"></span>/<span x-text="searchMatches.length"></span>
+                </span>
+            </div>
+            <!-- Messages Display -->
+            <div class="flex-1 p-4 overflow-y-auto chat-messages"
+                :class="{'virtual-scroll-container': uiSettings.virtualScrolling}" x-ref="chatbox">
+                <div :class="{'virtual-scroll-content': uiSettings.virtualScrolling}"
+                    :style="uiSettings.virtualScrolling ? `height: ${virtualScrollHeight}px` : ''">
 
-        <!-- Messages Display -->
-        <div class="flex-1 p-4 overflow-y-auto chat-messages"
-            :class="{'virtual-scroll-container': uiSettings.virtualScrolling}" x-ref="chatbox">
-            <div :class="{'virtual-scroll-content': uiSettings.virtualScrolling}"
-                :style="uiSettings.virtualScrolling ? `height: ${virtualScrollHeight}px` : ''">
+                    <!-- Non-Grouped View -->
+                    <template x-if="!uiSettings.groupMessagesByDate">
+                        <template x-for="(message, index) in currentConversation" :key="message.id || index">
+                            <!-- THE CONDITION (Revised to use helper function) -->
+                            <template x-if="!shouldHideToolMessage(message)">
+                                <!-- ## START: Single Message Render Block ## -->
+                                <div :id="`message-${message.id || index}`" class="chat relative group/message" :class="{
+                                                'chat-start': message.role === 'user', 'chat-end': message.role !== 'user',
+                                                'compact-mode': uiSettings.compactMode
+                                             }">
+                                    <!-- Bookmark Indicator -->
+                                    <div class="bookmark-indicator" x-show="isMessageBookmarked(message.timestamp)">
+                                        <i class="fas fa-bookmark"></i>
+                                    </div>
 
-                <!-- Non-Grouped View -->
-                <template x-if="!uiSettings.groupMessagesByDate">
-                    <template x-for="(message, index) in currentConversation" :key="message.id || index">
-                        <!-- ## START: Single Message Render Block ## -->
-                        <div :id="`message-${message.id || index}`" class="chat relative group/message" :class="{
-                                'chat-start': message.role === 'user', 'chat-end': message.role !== 'user',
-                                'compact-mode': uiSettings.compactMode
-                                // Animation handled by shouldAnimate check in bubble
-                                }">
-                            <!-- Bookmark Indicator -->
-                            <div class="bookmark-indicator" x-show="isMessageBookmarked(message.id || index)">
-                                <i class="fas fa-bookmark"></i>
-                            </div>
+                                    <!-- Avatar -->
+                                    <div class="chat-image avatar" x-show="message.role !== 'user'">
+                                        <div class="w-8 rounded-full flex items-center justify-center" :class="{
+                                                                    'bg-secondary text-secondary-content': message.role === 'assistant',
+                                                                    'bg-neutral text-neutral-content': message.role === 'system',
+                                                                    'bg-info text-info-content': (message.content_type === 'tool_result' || message.content_type === 'tool_use' || (Array.isArray(message.content) && message.content.some(b => b.type==='tool_use' || b.type==='tool_result'))) && !message.is_error, /* More robust class check */
+                                                                    'bg-warning text-warning-content': (message.content_type === 'tool_result' || message.content_type === 'tool_use' || (Array.isArray(message.content) && message.content.some(b => b.type==='tool_use' || b.type==='tool_result'))) && message.is_error
+                                                                  }">
+                                            <i :class="messageRoleIcon(message.role, message.content_type)"
+                                                class="text-sm m-0 p-0"></i>
+                                        </div>
+                                    </div>
+                                    <div class="chat-image avatar" x-show="message.role === 'user'">
+                                        <div
+                                            class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
+                                            <i :class="messageRoleIcon(message.role)" class="text-sm m-0 p-0"></i>
+                                        </div>
+                                    </div>
 
-                            <!-- Avatar -->
-                            <div class="chat-image avatar" x-show="message.role !== 'user'">
-                                <div class="w-8 rounded-full flex items-center justify-center" :class="{
-                                            'bg-secondary text-secondary-content': message.role === 'assistant',
-                                            'bg-neutral text-neutral-content': message.role === 'system',
-                                            'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
-                                            'bg-warning text-warning-content': message.content_type === 'tool_result' && message.is_error
-                                          }">
-                                    <i :class="messageRoleIcon(message.role, message.content_type)"
-                                        class="text-sm m-0 p-0"></i>
-                                </div>
-                            </div>
-                            <div class="chat-image avatar" x-show="message.role === 'user'">
-                                <div
-                                    class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
-                                    <i :class="messageRoleIcon(message.role)" class="text-sm m-0 p-0"></i>
-                                </div>
-                            </div>
+                                    <!-- Header -->
+                                    <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
+                                        :class="{'text-right mr-1': message.role === 'user'}">
+                                        <span
+                                            x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
+                                        <span x-show="message.model" class="opacity-70"
+                                            x-text="message.model ? (' (' + message.model + ')') : ''"></span>
+                                        <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
+                                            x-text="formatTimestamp(message.timestamp)"></time>
+                                        <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
+                                            :class="isMessageBookmarked(message.timestamp) ? 'text-warning opacity-100' : 'text-base-content/30 hover:text-warning/70'"
+                                            @click="toggleBookmark(message.timestamp)"
+                                            data-tippy-content="Toggle Bookmark"></i>
+                                    </div>
 
-                            <!-- Header -->
-                            <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
-                                :class="{'text-left mr-1': message.role === 'user'}">
-                                <span x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
-                                <span x-show="message.model" class="opacity-70"
-                                    x-text="message.model ? (' (' + message.model + ')') : ''"></span>
-                                <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
-                                    x-text="formatTimestamp(message.timestamp)"></time>
-                                <!-- Bookmark Toggle Icon -->
-                                <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
-                                    :class="isMessageBookmarked(message.timestamp) ? 'text-warning opacity-100' : 'text-base-content/30 hover:text-warning/70'"
-                                    @click="toggleBookmark(message.timestamp)" data-tippy-content="Toggle Bookmark"></i>
-                            </div>
-
-                            <!-- Chat Bubble (integrates search highlighting) -->
-                            <div class="chat-bubble prose prose-sm max-w-none" :class="{
-                                        'chat-bubble-primary text-primary-content': message.role === 'user' && message.content_type !== 'tool_result',
-                                        'bg-neutral text-neutral-content': message.role === 'assistant' && !message.current_status && message.content_type !== 'tool_result',
-                                        'chat-bubble-info text-info-content': message.role === 'system',
-                                        'chat-bubble-info text-info-content': message.role === 'assistant' && message.current_status,
-                                        'chat-bubble-warning text-warning-content': message.content_type === 'tool_result' && message.is_error,
-                                        'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
+                                    <!-- Chat Bubble -->
+                                    <div class="chat-bubble prose prose-sm max-w-none" :class="{
+                                        /* Highest Priority: Errors */
+                                        'chat-bubble-warning text-warning-content': message.is_error,
+                                    
+                                        /* User Messages */
+                                        'chat-bubble-primary text-primary-content': !message.is_error && message.role === 'user',
+                                    
+                                        /* Assistant Messages (Default) */
+                                        'bg-neutral text-neutral-content': !message.is_error && message.role === 'assistant' && !message.current_status,
+                                    
+                                        /* System Messages & Assistant Status Updates */
+                                        'chat-bubble-info text-info-content': !message.is_error && (message.role === 'system' || (message.role === 'assistant' && message.current_status)),
+                                    
+                                        /* Animation */
                                         'animate__animated animate__fadeInUp animate__faster': shouldAnimate(message.id || index)
-                                     }"
-                                x-html="isMessageSearchActive ? renderMessageWithHighlight(message) : renderMessageContent(message)">
-                                <!-- Content rendered by x-html -->
-                            </div>
+                                    }"
+                                        x-html="isMessageSearchActive ? renderMessageWithHighlight(message) : renderMessageContent(message)">
+                                        <!-- Content rendered by x-html -->
+                                    </div>
 
-                            <!-- Status Updates -->
-                            <div class="chat-footer" x-show="message.role === 'assistant' && message.current_status">
-                                <span class="streaming-status opacity-70" x-text="message.current_status"></span>
-                            </div>
-                        </div>
-                        <!-- ## END: Single Message Render Block ## -->
-                    </template>
-                </template>
-
-                <!-- Grouped View -->
-                <template x-if="uiSettings.groupMessagesByDate">
-                    <!-- Sort dates: Oldest first. Convert keys to Date objects for proper sorting. -->
-                    <template x-for="date in Object.keys(groupedMessages).sort((a, b) => new Date(a) - new Date(b))"
-                        :key="date">
-                        <!-- Date Divider -->
-                        <div class="message-date-divider">
-                            <span x-text="formatMessageDate(date)"></span>
-                        </div>
-                        <!-- Messages in this date group -->
-                        <template x-for="(message, index) in groupedMessages[date]" :key="message.id || index">
-                            <!-- ## START: Single Message Render Block (Pasted) ## -->
-                            <div :id="`message-${message.id || index}`" class="chat relative group/message" <!-- Add
-                                group/message -->
-                                :class="{
-                                'chat-end': message.role === 'user',
-                                'chat-start': message.role !== 'user',
-                                'compact-mode': uiSettings.compactMode
-                                // Animation handled by shouldAnimate check in bubble
-                                }">
-                                <!-- Bookmark Indicator -->
-                                <div class="bookmark-indicator" x-show="isMessageBookmarked(message.timestamp)">
-                                    <i class="fas fa-bookmark"></i>
-                                </div>
-
-                                <!-- Avatar -->
-                                <div class="chat-image avatar" x-show="message.role !== 'user'">
-                                    <div class="w-8 rounded-full flex items-center justify-center" :class="{
-                                                 'bg-secondary text-secondary-content': message.role === 'assistant',
-                                                 'bg-neutral text-neutral-content': message.role === 'system',
-                                                 'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
-                                                 'bg-warning text-warning-content': message.content_type === 'tool_result' && message.is_error
-                                               }">
-                                        <i :class="messageRoleIcon(message.role, message.content_type)"
-                                            class="text-sm"></i>
+                                    <!-- Status Updates -->
+                                    <div class="chat-footer"
+                                        x-show="message.role === 'assistant' && message.current_status">
+                                        <span class="streaming-status opacity-70"
+                                            x-text="message.current_status"></span>
                                     </div>
                                 </div>
-                                <div class="chat-image avatar" x-show="message.role === 'user'">
-                                    <div
-                                        class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
-                                        <i :class="messageRoleIcon(message.role)" class="text-sm"></i>
-                                    </div>
-                                </div>
+                                <!-- ## END: Single Message Render Block ## -->
+                            </template> <!-- End inner template with x-if -->
+                        </template> <!-- End outer template x-for -->
+                    </template> <!-- End template x-if non-grouped -->
 
-                                <!-- Header -->
-                                <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
-                                    :class="{'text-right mr-1': message.role === 'user'}">
-                                    <span x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
-                                    <span x-show="message.model" class="opacity-70"
-                                        x-text="message.model ? (' (' + message.model + ')') : ''"></span>
-                                    <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
-                                        x-text="formatTimestamp(message.timestamp)"></time>
-                                    <!-- Timestamp toggle -->
-                                    <!-- Bookmark Toggle Icon -->
-                                    <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
-                                        <!-- Add group hover -->
-                                        :class="isMessageBookmarked(message.timestamp) ? 'text-warning
-                                        opacity-100' : 'text-base-content/30 hover:text-warning/70'"
-                                        @click="toggleBookmark(message.timestamp)"
-                                        data-tippy-content="Toggle Bookmark"></i>
-                                </div>
+                    <!-- Grouped View -->
+                    <template x-if="uiSettings.groupMessagesByDate">
+                        <template x-for="date in Object.keys(groupedMessages).sort((a, b) => new Date(a) - new Date(b))"
+                            :key="date">
+                            <!-- Date Divider -->
+                            <div class="message-date-divider">
+                                <span x-text="formatMessageDate(date)"></span>
+                            </div>
+                            <!-- Messages in this date group -->
+                            <template x-for="(message, index) in groupedMessages[date]" :key="message.id || index">
+                                <!-- THE CONDITION (Revised to use helper function) -->
+                                <template x-if="!shouldHideToolMessage(message)">
+                                    <!-- ## START: Single Message Render Block (Pasted) ## -->
+                                    <div :id="`message-${message.id || index}`" class="chat relative group/message"
+                                        :class="{
+                                                    'chat-end': message.role === 'user',
+                                                    'chat-start': message.role !== 'user',
+                                                    'compact-mode': uiSettings.compactMode
+                                                 }">
+                                        <!-- Bookmark Indicator -->
+                                        <div class="bookmark-indicator" x-show="isMessageBookmarked(message.timestamp)">
+                                            <i class="fas fa-bookmark"></i>
+                                        </div>
 
-                                <!-- Chat Bubble (integrates search highlighting) -->
-                                <div class="chat-bubble prose prose-sm max-w-none" :class="{
-                                            'chat-bubble-primary text-primary-content': message.role === 'user' && message.content_type !== 'tool_result',
-                                            'bg-neutral text-neutral-content': message.role === 'assistant' && !message.current_status && message.content_type !== 'tool_result',
-                                            'chat-bubble-info text-info-content': message.role === 'system',
-                                            'chat-bubble-info text-info-content': message.role === 'assistant' && message.current_status,
-                                            'chat-bubble-warning text-warning-content': message.content_type === 'tool_result' && message.is_error,
-                                            'bg-info text-info-content': message.content_type === 'tool_result' && !message.is_error, /* Adjusted from accent */
+                                        <!-- Avatar -->
+                                        <div class="chat-image avatar" x-show="message.role !== 'user'">
+                                            <div class="w-8 rounded-full flex items-center justify-center" :class="{
+                                                                                     'bg-secondary text-secondary-content': message.role === 'assistant',
+                                                                                     'bg-neutral text-neutral-content': message.role === 'system',
+                                                                                     'bg-info text-info-content': (message.content_type === 'tool_result' || message.content_type === 'tool_use' || (Array.isArray(message.content) && message.content.some(b => b.type==='tool_use' || b.type==='tool_result'))) && !message.is_error, /* More robust class check */
+                                                                                     'bg-warning text-warning-content': (message.content_type === 'tool_result' || message.content_type === 'tool_use' || (Array.isArray(message.content) && message.content.some(b => b.type==='tool_use' || b.type==='tool_result'))) && message.is_error
+                                                                                   }">
+                                                <i :class="messageRoleIcon(message.role, message.content_type)"
+                                                    class="text-sm"></i>
+                                            </div>
+                                        </div>
+                                        <div class="chat-image avatar" x-show="message.role === 'user'">
+                                            <div
+                                                class="w-8 rounded-full bg-primary text-primary-content flex items-center justify-center">
+                                                <i :class="messageRoleIcon(message.role)" class="text-sm"></i>
+                                            </div>
+                                        </div>
+
+                                        <!-- Header -->
+                                        <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
+                                            :class="{'text-right mr-1': message.role === 'user'}">
+                                            <span
+                                                x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
+                                            <span x-show="message.model" class="opacity-70"
+                                                x-text="message.model ? (' (' + message.model + ')') : ''"></span>
+                                            <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
+                                                x-text="formatTimestamp(message.timestamp)"></time>
+                                            <i class="fas fa-bookmark ml-2 cursor-pointer opacity-0 group-hover/message:opacity-100 transition-opacity duration-150"
+                                                :class="isMessageBookmarked(message.timestamp) ? 'text-warning opacity-100' : 'text-base-content/30 hover:text-warning/70'"
+                                                @click="toggleBookmark(message.timestamp)"
+                                                data-tippy-content="Toggle Bookmark"></i>
+                                        </div>
+
+                                        <!-- Chat Bubble -->
+                                        <div class="chat-bubble prose prose-sm max-w-none" :class="{
+                                            /* Highest Priority: Errors */
+                                            'chat-bubble-warning text-warning-content': message.is_error,
+                                        
+                                            /* User Messages */
+                                            'chat-bubble-primary text-primary-content': !message.is_error && message.role === 'user',
+                                        
+                                            /* Assistant Messages (Default) */
+                                            'bg-neutral text-neutral-content': !message.is_error && message.role === 'assistant' && !message.current_status,
+                                        
+                                            /* System Messages & Assistant Status Updates */
+                                            'chat-bubble-info text-info-content': !message.is_error && (message.role === 'system' || (message.role === 'assistant' && message.current_status)),
+                                        
+                                            /* Animation */
                                             'animate__animated animate__fadeInUp animate__faster': shouldAnimate(message.id || index)
-                                         }"
-                                    x-html="isMessageSearchActive ? renderMessageWithHighlight(message) : renderMessageContent(message)">
-                                    <!-- Content rendered by x-html -->
-                                </div>
+                                        }"
+                                            x-html="isMessageSearchActive ? renderMessageWithHighlight(message) : renderMessageContent(message)">
+                                            <!-- Content rendered by x-html -->
+                                        </div>
 
-                                <!-- Status Updates -->
-                                <div class="chat-footer"
-                                    x-show="message.role === 'assistant' && message.current_status">
-                                    <span class="streaming-status opacity-70" x-text="message.current_status"></span>
-                                </div>
+                                        <!-- Status Updates -->
+                                        <div class="chat-footer"
+                                            x-show="message.role === 'assistant' && message.current_status">
+                                            <span class="streaming-status opacity-70"
+                                                x-text="message.current_status"></span>
+                                        </div>
+                                    </div>
+                                    <!-- ## END: Single Message Render Block ## -->
+                                </template> <!-- End inner template with x-if -->
+                            </template> <!-- End inner template x-for message -->
+                        </template> <!-- End outer template x-for date -->
+                    </template> <!-- End template x-if grouped -->
+
+                    <!-- Loading Indicator & Scroll Target -->
+                    <div x-show="isSendingMessage && !currentStatusMessage" class="chat chat-start">
+                        <div class="chat-image avatar">
+                            <div
+                                class="w-8 rounded-full bg-secondary text-secondary-content flex items-center justify-center">
+                                <i class="fas fa-robot text-sm"></i>
                             </div>
-                            <!-- ## END: Single Message Render Block ## -->
-                        </template>
-                    </template>
-                </template>
-
-                <!-- Loading Indicator & Scroll Target (Remain outside templates) -->
-                <div x-show="isSendingMessage && !currentStatusMessage" class="chat chat-start">
-                    <div class="chat-image avatar">
-                        <div
-                            class="w-8 rounded-full bg-secondary text-secondary-content flex items-center justify-center">
-                            <i class="fas fa-robot text-sm"></i>
                         </div>
+                        <div class="chat-bubble chat-bubble-secondary animate-pulse"><span
+                                class="loading loading-dots loading-sm"></span></div>
                     </div>
-                    <div class="chat-bubble chat-bubble-secondary animate-pulse"><span
-                            class="loading loading-dots loading-sm"></span></div>
+                    <div x-ref="endofchat" class="h-1 m-0 p-0"></div> <!-- Scroll target -->
+
+                </div> <!-- End virtual-scroll-content / main message container -->
+            </div> <!-- End chat-messages -->
+
+            <!-- Input Area -->
+            <div class="p-3 border-t border-base-300/50 bg-base-100 flex-shrink-0 shadow-inner drop-zone"
+                :class="{'drag-over': isDraggingOverDropZone}" @dragover.prevent="isDraggingOverDropZone = true"
+                @dragleave.prevent="isDraggingOverDropZone = false" @drop.prevent="handleDrop($event)">
+                <!-- Status Message -->
+                <div x-show="currentStatusMessage"
+                    class="text-xs text-info mb-1.5 flex items-center gap-1.5 animate__animated animate__fadeIn animate__faster">
+                    <i :class="currentStatusIcon()"></i> <span x-text="currentStatusMessage"></span>
                 </div>
-                <div x-ref="endofchat" class="h-1 m-0 p-0"></div> <!-- Scroll target -->
-
-            </div> <!-- End virtual-scroll-content -->
-        </div> <!-- End chat-messages -->
-
-        <!-- Input Area -->
-        <div class="p-3 border-t border-base-300/50 bg-base-100 flex-shrink-0 shadow-inner drop-zone"
-            :class="{'drag-over': isDraggingOverDropZone}" @dragover.prevent="isDraggingOverDropZone = true"
-            @dragleave.prevent="isDraggingOverDropZone = false" @drop.prevent="handleDrop($event)">
-            <!-- Status Message -->
-            <div x-show="currentStatusMessage"
-                class="text-xs text-info mb-1.5 flex items-center gap-1.5 animate__animated animate__fadeIn animate__faster">
-                <i :class="currentStatusIcon()"></i> <span x-text="currentStatusMessage"></span>
+                <!-- Input -->
+                <div class="flex items-end gap-2">
+                    <textarea class="textarea textarea-bordered w-full resize-none text-sm leading-tight pt-2 pb-2"
+                        placeholder="Ask Claude anything... (Shift+Enter for newline)" rows="1" x-model="userInput"
+                        @keydown.enter="if (uiSettings.sendOnEnter && !$event.shiftKey && !$event.ctrlKey && !$event.metaKey) { $event.preventDefault(); sendMessage(); } else if (!uiSettings.sendOnEnter && ($event.ctrlKey || $event.metaKey) && !$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
+                        @keydown.shift.enter.exact.prevent="userInput += '\n'; adjustTextareaHeight($el)"
+                        @input="adjustTextareaHeight($event.target)" x-ref="inputarea"
+                        :disabled="isSendingMessage && !config.enableStreaming"></textarea>
+                    <button x-show="isSendingMessage"
+                        class="btn btn-warning btn-square btn-sm animate__animated animate__faster animate__fadeIn"
+                        @click="abortQuery" data-tippy-content="Stop Generation (Esc)">
+                        <i class="fas fa-stop"></i>
+                    </button>
+                    <button class="btn btn-ghost btn-square btn-sm" @click="showTemplatesModal = true"
+                        data-tippy-content="Message Templates">
+                        <i class="fas fa-clipboard-list"></i>
+                    </button>
+                    <label class="btn btn-ghost btn-square btn-sm cursor-pointer" data-tippy-content="Upload File">
+                        <i class="fas fa-paperclip"></i>
+                        <input type="file" class="hidden" @change="handleFileUpload($event)">
+                    </label>
+                    <button x-show="!isSendingMessage" class="btn btn-primary btn-square btn-sm" @click="sendMessage"
+                        :disabled="!userInput.trim()">
+                        <i class="fas fa-paper-plane"></i>
+                    </button>
+                </div>
             </div>
-            <!-- Input -->
-            <div class="flex items-end gap-2">
-                <textarea class="textarea textarea-bordered w-full resize-none text-sm leading-tight pt-2 pb-2"
-                    placeholder="Ask Claude anything... (Shift+Enter for newline)" rows="1" x-model="userInput"
-                    @keydown.enter="if (uiSettings.sendOnEnter && !$event.shiftKey && !$event.ctrlKey && !$event.metaKey) { $event.preventDefault(); sendMessage(); } else if (!uiSettings.sendOnEnter && ($event.ctrlKey || $event.metaKey) && !$event.shiftKey) { $event.preventDefault(); sendMessage(); }"
-                    @keydown.shift.enter.exact.prevent="userInput += '\n'; adjustTextareaHeight($el)"
-                    @input="adjustTextareaHeight($event.target)" x-ref="inputarea"
-                    :disabled="isSendingMessage && !config.enableStreaming"></textarea>
-                <button x-show="isSendingMessage"
-                    class="btn btn-warning btn-square btn-sm animate__animated animate__faster animate__fadeIn"
-                    @click="abortQuery" data-tippy-content="Stop Generation (Esc)">
-                    <i class="fas fa-stop"></i>
-                </button>
-                <button class="btn btn-ghost btn-square btn-sm" @click="showTemplatesModal = true"
-                    data-tippy-content="Message Templates">
-                    <i class="fas fa-clipboard-list"></i>
-                </button>
-                <label class="btn btn-ghost btn-square btn-sm cursor-pointer" data-tippy-content="Upload File">
-                    <i class="fas fa-paperclip"></i>
-                    <input type="file" class="hidden" @change="handleFileUpload($event)">
-                </label>
-                <button x-show="!isSendingMessage" class="btn btn-primary btn-square btn-sm" @click="sendMessage"
-                    :disabled="!userInput.trim()">
-                    <i class="fas fa-paper-plane"></i>
-                </button>
-            </div>
-        </div>
-    </main>
+        </main>
 
     </div>
 
@@ -3185,15 +3241,11 @@
                 availableThemes: [
                     "cupcake",   // Soft, pleasant default
                     "light",     // Clean light theme
-                    "dark",      // Professional dark theme
                     "corporate", // Business-friendly
                     "emerald",   // Calm green-based theme
-                    "nord",      // Subtle blue-gray palette (new custom theme)
-                    "slate",     // Modern neutral theme (new custom theme)
-                    "lofi",      // Minimalist design
                     "winter"     // Cool blue theme
                 ],
-                currentTheme: 'light',
+                currentTheme: 'winter',
                 capabilitySearchTerm: '',
                 // --- WebSocket State ---
                 ws: null,
@@ -4912,10 +4964,10 @@
                         // Prefer DaisyUI theme's setting over OS setting
                         lightThemeLink.disabled = isDaisyDark;
                         darkThemeLink.disabled = !isDaisyDark;
-                        // console.log(`HighlightJS theme set to: ${isDaisyDark ? 'dark' : 'light'}`);
+                        console.log(`HighlightJS theme set to: ${isDaisyDark ? 'dark' : 'light'}`);
                     };
                     // Listen to OS changes (optional, as we primarily follow DaisyUI theme)
-                    // matcher.addEventListener('change', e => updateHljsTheme(e.matches));
+                    matcher.addEventListener('change', e => updateHljsTheme(e.matches));
                     // Initial check based on current theme
                     updateHljsTheme(matcher.matches);
                 }, // Added comma
@@ -4940,41 +4992,229 @@
                         }
                     });
                 }, // Added comma
+                // --- START: Replace the entire parseColor function ---
+                /**
+                 * Parses common color formats (rgb, rgba, hex, oklch) into {r, g, b, a}.
+                 * Returns null if parsing fails.
+                 * Note: oklch to RGB conversion is a rough approximation for luminance.
+                 */
+                parseColor(colorString) {
+                    if (!colorString) return null;
+                    colorString = colorString.trim().toLowerCase();
+
+                    // Handle transparent
+                    if (colorString === 'transparent' || colorString === 'rgba(0, 0, 0, 0)') {
+                        return { r: 0, g: 0, b: 0, a: 0 };
+                    }
+
+                    // Handle rgb/rgba
+                    let match = colorString.match(/^rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\)$/);
+                    if (match) {
+                        return {
+                            r: parseInt(match[1]),
+                            g: parseInt(match[2]),
+                            b: parseInt(match[3]),
+                            a: match[4] !== undefined ? parseFloat(match[4]) : 1,
+                        };
+                    }
+
+                    // Handle hex (3, 4, 6, 8 digits)
+                    match = colorString.match(/^#([a-f0-9]{3,4}|[a-f0-9]{6}|[a-f0-9]{8})$/);
+                    if (match) {
+                        let hex = match[1];
+                        if (hex.length === 3 || hex.length === 4) {
+                            hex = hex.split('').map(char => char + char).join('');
+                        }
+                        const bigint = parseInt(hex, 16);
+                        // Adjust bit shifts based on length for optional alpha
+                        const r = (hex.length === 8 ? bigint >> 24 : bigint >> 16) & 255;
+                        const g = (hex.length === 8 ? bigint >> 16 : bigint >> 8) & 255;
+                        const b = (hex.length === 8 ? bigint >> 8 : bigint) & 255;
+                        const a = hex.length === 8 ? (bigint & 255) / 255 : 1;
+                        return { r, g, b, a };
+                    }
+
+                    // --- NEW: Handle oklch() ---
+                    // Example: oklch(0.881275 0.085888 214.515)
+                    // Example: oklch(0.881275 0.085888 214.515 / .5)
+                    match = colorString.match(/^oklch\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\s*\)$/);
+                    if (match) {
+                        const l = parseFloat(match[1]); // Lightness (0-1)
+                        // Note: Chroma and Hue aren't directly used in basic luminance calc
+                        const a = match[4] !== undefined ? parseFloat(match[4]) : 1;
+
+                        // VERY rough approximation for luminance check: Treat L as grayscale
+                        // A value closer to 1 is light, closer to 0 is dark.
+                        // Convert L (0-1) to an approximate RGB grayscale value (0-255)
+                        const gray = Math.round(l * 255);
+                        return { r: gray, g: gray, b: gray, a: a };
+                    }
+                    // --- END NEW: Handle oklch() ---
+
+
+                    console.warn("Could not parse color:", colorString);
+                    return null; // Failed to parse
+                },
+
+                /**
+                 * Calculates perceived luminance from RGB values (0-1). Alpha ignored here.
+                 */
+                getLuminance(r, g, b) {
+                    if (r === undefined || g === undefined || b === undefined) return 0; // Handle parse failures
+                    const a = [r, g, b].map(v => {
+                        v /= 255;
+                        return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+                    });
+                    return a[0] * 0.2126 + a[1] * 0.7152 + a[2] * 0.0722;
+                },
+
+                /**
+                * Finds the effective background color by traversing up the DOM tree.
+                * Stops at the chat bubble or if a non-transparent background is found.
+                */
+                getEffectiveBackgroundColor(element, stopElement) {
+                    let current = element;
+                    while (current && current !== stopElement && current !== document.body) {
+                        const style = window.getComputedStyle(current);
+                        const bgColor = this.parseColor(style.backgroundColor);
+                        if (bgColor && bgColor.a > 0) { // Found a non-transparent background
+                            return bgColor;
+                        }
+                        current = current.parentElement;
+                    }
+                    // If loop finishes, use the stopElement's background or fallback
+                    const stopStyle = window.getComputedStyle(stopElement || document.body);
+                    return this.parseColor(stopStyle.backgroundColor) || { r: 255, g: 255, b: 255, a: 1 }; // Default white
+                },
+                /**
+        * Recursively checks and fixes contrast for an element and its children,
+        * stopping at a specified boundary element.
+        */
+                fixContrastRecursively(element, stopElement) {
+                    // Basic validation and exit condition
+                    if (!element || typeof window.getComputedStyle !== 'function' || element === stopElement.parentElement) {
+                        // console.log("Stopping recursion at boundary or invalid element:", element);
+                        return;
+                    }
+
+                    // --- Check the current element first ---
+                    // (checkAndFixElementContrast already has skips for SCRIPT, STYLE, BUTTON, invisible)
+                    this.checkAndFixElementContrast(element, stopElement);
+
+                    // --- Recurse into children ---
+                    // Use children collection for live updates if needed, or querySelectorAll for static list
+                    const children = element.children;
+                    if (children && children.length > 0) {
+                        for (let i = 0; i < children.length; i++) {
+                            // Make sure we don't get stuck in a weird loop (shouldn't happen with .children)
+                            if (children[i] !== element) {
+                                this.fixContrastRecursively(children[i], stopElement);
+                            }
+                        }
+                    }
+                },
+
+                /**
+                 * Checks a single element's contrast and applies a fix if needed.
+                 */
+                checkAndFixElementContrast(element, stopElement) {
+                    // --- ADDED Check: Don't modify the main chat bubble directly ---
+                    if (!element || element === stopElement || element.classList.contains('chat-bubble')) {
+                        return;
+                    }
+                    // --- End ADDED check ---
+
+                    // Skip invisible elements etc.
+                    if (!element.offsetParent || element.tagName === 'SCRIPT' || element.tagName === 'STYLE' || element.tagName === 'BUTTON') return;
+
+                    const style = window.getComputedStyle(element);
+                    const textColor = this.parseColor(style.color);
+                    // Pass the bubble (stopElement) to get its background if needed
+                    const effectiveBgColor = this.getEffectiveBackgroundColor(element, stopElement);
+
+                    if (!textColor || textColor.a === 0 || !effectiveBgColor) {
+                        // console.warn("Contrast check skipped: Transparent text or invalid BG", {el: element, text: style.color, bg: effectiveBgColor});
+                        return;
+                    }
+
+                    const textLuminance = this.getLuminance(textColor.r, textColor.g, textColor.b);
+                    const bgLuminance = this.getLuminance(effectiveBgColor.r, effectiveBgColor.g, effectiveBgColor.b);
+
+                    const contrastRatio = bgLuminance > textLuminance
+                        ? (bgLuminance + 0.05) / (textLuminance + 0.05)
+                        : (textLuminance + 0.05) / (bgLuminance + 0.05);
+
+                    const contrastThreshold = 3.0; // Lower threshold for fix trigger
+
+                    const safeDarkColor = '#1f2937'; // Dark gray
+                    const safeLightColor = '#f9fafb'; // Very light gray
+
+                    if (contrastRatio < contrastThreshold) {
+                        // Now this check should be more accurate because effectiveBgColor is parsed correctly
+                        // console.warn(`Low contrast detected (${contrastRatio.toFixed(2)}) for:`, element, `Text: ${style.color}`, `Effective BG: rgb(${effectiveBgColor.r}, ${effectiveBgColor.g}, ${effectiveBgColor.b})`);
+
+                        const targetColor = bgLuminance < 0.5 ? safeLightColor : safeDarkColor;
+                        element.style.setProperty('color', targetColor, 'important');
+                        // console.log(`Applied contrast fix: set color to ${targetColor}`);
+                    }
+                },
 
                 initHighlighting(container = document) {
                     this.$nextTick(() => { // Ensure DOM is updated
                         if (typeof hljs === 'undefined') {
+                            // --- Restored Check ---
                             console.warn("highlight.js not loaded.");
                             return;
                         }
                         // Use try-catch for safety during highlighting
                         try {
+                            // Find code blocks that haven't been processed by highlight.js yet
                             const blocks = container.querySelectorAll('pre code:not(.hljs)');
-                            // console.log(`Attempting to highlight ${blocks.length} blocks in:`, container);
+
                             blocks.forEach((block) => {
-                                // Prevent re-highlighting if it somehow still has the class
-                                if (!block.classList.contains('hljs')) {
-                                    hljs.highlightElement(block);
-                                    // Add copy button if missing (robust check)
-                                    const preElement = block.closest('pre');
-                                    if (preElement && !preElement.querySelector('.copy-code-btn')) {
-                                        const codeContent = block.textContent || "";
-                                        const copyBtnHtml = createCopyButton(codeContent); // Generate button HTML
-                                        if (copyBtnHtml !== '<!-- copy error -->') {
-                                            preElement.insertAdjacentHTML('beforeend', copyBtnHtml);
-                                        }
+                                // Get the parent bubble once
+                                const bubble = block.closest('.chat-bubble');
+
+                                // Highlight the block
+                                hljs.highlightElement(block); // This adds the .hljs class and inner <span> tags
+
+                                // --- Directly fix contrast for this block ---
+                                if (bubble) {
+                                    this.checkAndFixElementContrast(block, bubble);
+                                }
+                                // --- End direct fix ---
+
+                                // --- Restored: Add copy button if missing ---
+                                const preElement = block.closest('pre');
+                                if (preElement && !preElement.querySelector('.copy-code-btn')) {
+                                    const codeContent = block.textContent || "";
+                                    const copyBtnHtml = createCopyButton(codeContent); // Generate button HTML
+                                    if (copyBtnHtml !== '<!-- copy error -->') {
+                                        preElement.insertAdjacentHTML('beforeend', copyBtnHtml);
                                     }
                                 }
+                                // --- End Restored Copy Button Logic ---
                             });
+
+                            // Optional: Check already highlighted blocks too (e.g., if styles change)
+                            const alreadyHighlighted = container.querySelectorAll('pre code.hljs');
+                            alreadyHighlighted.forEach((block) => {
+                                const bubble = block.closest('.chat-bubble');
+                                if (bubble) {
+                                    this.checkAndFixElementContrast(block, bubble);
+                                }
+                            });
+
                         } catch (e) {
+                            // --- Restored Error Handling ---
                             console.error("Error during highlighting:", e);
                         }
                     });
-                }, // Added comma
+                }, // End initHighlighting
 
 
                 // --- THEME ---
-                loadTheme() { const savedTheme = localStorage.getItem('mcp_client_theme') || 'cupcake'; this.setTheme(savedTheme, false); },
+                loadTheme() { const savedTheme = localStorage.getItem('mcp_client_theme') || 'winter'; this.setTheme(savedTheme, false); },
                 setTheme(themeName, save = true) {
                     this.currentTheme = themeName;
                     document.documentElement.setAttribute('data-theme', themeName);
@@ -6496,6 +6736,43 @@
                     this.stopController = new AbortController();
                     this.sendWebSocketMessage(messagePayload);
                 },
+                shouldHideToolMessage(message) {
+                    // Always show if the toggle is ON
+                    if (this.uiSettings.showToolDataMessages) {
+                        return false;
+                    }
+
+                    // If toggle is OFF, check conditions to HIDE:
+
+                    // 1. Check explicit content_type
+                    if (message.content_type === 'tool_result' || message.content_type === 'tool_use') {
+                        // console.log(`Hiding message ${message.id} due to content_type: ${message.content_type}`);
+                        return true;
+                    }
+
+                    // 2. Check if message.content is an array containing ONLY tool-related blocks
+                    if (Array.isArray(message.content) && message.content.length > 0) {
+                        const containsOnlyToolBlocks = message.content.every(
+                            block => block && (block.type === 'tool_use' || block.type === 'tool_result')
+                        );
+                        if (containsOnlyToolBlocks) {
+                            // console.log(`Hiding message ${message.id} because it contains ONLY tool blocks.`);
+                            return true;
+                        }
+
+                        // 3. Check for the specific user message structure containing ONLY a tool_result block
+                        const isUserToolResult = message.role === 'user' &&
+                            message.content.length === 1 &&
+                            message.content[0]?.type === 'tool_result';
+                        if (isUserToolResult) {
+                            // console.log(`Hiding message ${message.id} because it's a user tool result message.`);
+                            return true;
+                        }
+                    }
+
+                    // If none of the above conditions to hide were met, DO NOT HIDE the message
+                    return false;
+                },
                 async abortQuery() {
                     console.log("UI requesting query abort...");
                     if (!this.isSendingMessage) {
@@ -6591,8 +6868,34 @@
                         this.currentConversation.push(newMessage);
                     } else {
                         this.currentConversation[existingIndex] = { ...this.currentConversation[existingIndex], ...newMessage };
-                        this.currentConversation = [...this.currentConversation]; // Force reactivity
+                        this.currentConversation = [...this.currentConversation];
                     }
+
+                    // --- MODIFY THIS PART ---
+                    this.$nextTick(() => {
+                        setTimeout(() => {
+                            const messageElement = document.getElementById(`message-${newMessage.id}`);
+
+                            // --- ADD THIS CHECK ---
+                            if (messageElement) {
+                                const bubbleElement = messageElement.querySelector('.chat-bubble');
+                                if (bubbleElement) {
+                                    // console.log("Running contrast fix for newly added/updated bubble:", bubbleElement); // Keep for debug if needed
+                                    this.fixContrastRecursively(bubbleElement, bubbleElement);
+                                } else {
+                                    // This specific warning is less likely if messageElement exists, but safe to keep
+                                    console.warn("Could not find BUBBLE element inside message element for contrast fix:", newMessage.id);
+                                }
+                            } else {
+                                // Element was removed before timeout - log gracefully, don't error
+                                console.log(`Message element ${newMessage.id} not found for contrast fix (likely removed before check).`);
+                            }
+                            // --- END ADDED CHECK ---
+
+                        }, 150); // 150ms delay
+                    });
+                    // --- END MODIFICATION ---
+
                     this.scrollToBottom();
 
                 }, // End addMessageToConversation
@@ -6663,24 +6966,29 @@
 
                 renderMixedMessageContent(content, message) {
                     if (!Array.isArray(content)) {
-                        // If not an array, stringify and render as text (Existing logic)
                         console.warn("renderMixedMessageContent called with non-array:", content);
-                        return `<pre class="whitespace-pre-wrap">${DOMPurify.sanitize(JSON.stringify(content, null, 2))}</pre>`;
+                        return this.renderJson(content);
                     }
 
-                    let html = '<div class="space-y-3">'; // Container for blocks
+                    // Remove the wrapper div with background styling that was causing issues
+                    let html = '';
 
                     // Process each block in the mixed content array
                     content.forEach((block, index) => {
-                        if (!block) return; // Skip null/undefined blocks
+                        if (!block) return;
 
                         // Add a divider between tool steps (usage/result pairs) for clarity
-                        // Placed before the block for better visual grouping
                         if (index > 0 && (block.type === 'tool_use' || block.type === 'tool_result')) {
                             const prevBlock = content[index - 1];
-                            if (prevBlock && ((prevBlock.type === 'tool_use' && block.type === 'tool_result') || (prevBlock.type === 'tool_result' && block.type === 'tool_use'))) {
+                            if (prevBlock && ((prevBlock.type === 'tool_use' && block.type === 'tool_result') ||
+                                (prevBlock.type === 'tool_result' && block.type === 'tool_use'))) {
                                 html += `<div class="divider my-3 text-xs opacity-50 font-sans">Tool Step</div>`;
-                            } else if (block.type === 'tool_use' && (!prevBlock || prevBlock.type !== 'text')) {
+                            }
+                        }
+
+                        // Add divider before a tool_use block unless it immediately follows text
+                        if (block.type === 'tool_use' && (index === 0 || (content[index - 1] && content[index - 1].type !== 'text'))) {
+                            if (index > 0 || content.length > 1) {
                                 html += `<div class="divider my-3 text-xs opacity-50 font-sans">Tool Step</div>`;
                             }
                         }
@@ -6694,7 +7002,7 @@
                             if (textContent === null || typeof textContent === 'undefined') {
                                 textContent = '';
                             }
-                            // Use a raw value to avoid [object Object] issues
+
                             let rawText;
                             if (typeof Alpine !== 'undefined' && Alpine.raw) {
                                 rawText = Alpine.raw(textContent);
@@ -6705,38 +7013,46 @@
                             html += this.renderMarkdown(block);
                         }
 
-                        // The rest of the block types (tool_use, tool_result, etc.) remain unchanged
                         // --- Tool Usage Block Rendering ---
                         else if (block.type === 'tool_use') {
                             const toolName = block.name || "Unknown Tool";
                             const inputData = block.input || {};
-                            const inputJson = JSON.stringify(inputData, null, 2);
+                            let inputJson = '{}';
+                            try {
+                                inputJson = JSON.stringify(inputData, null, 2);
+                            } catch (e) {
+                                console.error("Failed to stringify tool input:", e);
+                                inputJson = '{ "error": "Could not display input" }';
+                            }
                             const showInputBox = inputJson !== '{}';
 
-                            // Build the HTML for the tool usage block
+                            // Build the HTML for the tool usage block - REMOVED ALL BACKGROUND COLORS
                             html += `
-            <div class="my-2 p-3 bg-base-100/50 dark:bg-base-100/10 border border-base-300/20 rounded-lg shadow-sm">
-                <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-sm mb-1.5">
-                    <span class="flex items-center gap-1.5 text-base-content/80 font-medium">
-                        <i class="fas fa-terminal fa-fw text-info/80"></i>
-                        Using Tool:
-                    </span>
-                    <code class="text-sm font-semibold font-mono text-base-content bg-transparent px-1 py-0 rounded">
-                        ${DOMPurify.sanitize(toolName)}
-                    </code>
-                </div>
-                ${showInputBox ? `
-                <details class="bg-base-100 dark:bg-base-200/50 rounded group border border-base-300/20" open>
-                    <summary class="text-xs cursor-pointer select-none p-1.5 font-mono text-base-content/70 group-open:border-b group-open:border-base-300/40 hover:bg-base-200/30 transition-colors duration-150">Input Parameters</summary>
-                    <div class="p-2 max-h-60 overflow-y-auto relative">
-                         <pre><code class="language-json hljs">${hljs.highlight(inputJson, { language: 'json', ignoreIllegals: true }).value}</code></pre>
-                         ${this.createCopyButton(inputJson)}
-                    </div>
-                </details>
-                ` : `
-                <div class="text-xs italic text-base-content/60 mt-1 px-1">(No input parameters)</div>
-                `}
-            </div>`;
+<div class="not-prose my-2 p-3 border border-base-300/20 rounded-lg shadow-sm">
+    <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-sm mb-1.5">
+        <span class="flex items-center gap-1.5 font-medium">
+            <i class="fas fa-terminal fa-fw text-info/80"></i>
+            Using Tool:
+        </span>
+        <p class="text-sm font-semibold font-mono px-1 py-0.5 rounded bg-transparent">
+            ${DOMPurify.sanitize(toolName)}
+        </p>
+         ${block.id ? `<span class="text-xs text-base-content/60">(ID: ...${DOMPurify.sanitize(block.id.slice(-6))})</span>` : ''}
+    </div>
+    ${showInputBox ? `
+    <details class="rounded group border border-base-300/30 shadow-inner" open>
+         <summary class="list-none cursor-pointer select-none p-1.5 font-medium text-xs group-open:border-b group-open:border-base-300/40 transition-colors duration-150 flex items-center gap-1">
+            <i class="fas fa-caret-right transition-transform duration-150 group-open:rotate-90"></i>Input Parameters
+         </summary>
+         <div class="tool-content-wrapper max-h-60 overflow-y-auto group/codeblock">
+              <pre><p class="language-json hljs">${hljs.highlight(inputJson, { language: 'json', ignoreIllegals: true }).value}</p></pre>
+              ${this.createCopyButton(inputJson, 'code')}
+         </div>
+    </details>
+    ` : `
+    <div class="text-xs italic text-base-content/60 mt-1 px-1">(No input parameters)</div>
+    `}
+</div>`;
                         }
 
                         // --- Tool Result Block Rendering ---
@@ -6745,42 +7061,67 @@
                             const statusClass = isError ? 'text-error' : 'text-success';
                             const statusIcon = isError ? 'fa-exclamation-circle' : 'fa-check-circle';
                             const toolUseId = block.tool_use_id || "";
-                            const relatedToolName = message?.content?.find(b => b.type === 'tool_use' && b.id === toolUseId)?.name;
+                            const relatedToolUseBlock = content.find(b => b.type === 'tool_use' && b.id === toolUseId);
+                            const relatedToolName = relatedToolUseBlock?.name;
 
                             let rawResultContent = block.content;
                             let displayContent = "";
                             let language = 'plaintext';
+                            let rawContentForCopy = rawResultContent;
 
                             try {
-                                if (typeof rawResultContent === 'string' && this.isProbablyJsonString(rawResultContent)) {
-                                    displayContent = JSON.stringify(JSON.parse(rawResultContent), null, 2);
-                                    language = 'json';
-                                } else if (typeof rawResultContent === 'string') {
-                                    displayContent = rawResultContent;
+                                if (typeof rawResultContent === 'string') {
+                                    rawContentForCopy = rawResultContent;
+                                    if (this.isProbablyJsonString(rawResultContent)) {
+                                        displayContent = JSON.stringify(JSON.parse(rawResultContent), null, 2);
+                                        language = 'json';
+                                    } else {
+                                        displayContent = rawResultContent;
+                                    }
+                                } else if (typeof rawResultContent === 'object' && rawResultContent !== null) {
+                                    try {
+                                        displayContent = JSON.stringify(rawResultContent, null, 2);
+                                        rawContentForCopy = displayContent;
+                                        language = 'json';
+                                    } catch (stringifyError) {
+                                        displayContent = String(rawResultContent);
+                                        rawContentForCopy = displayContent;
+                                    }
                                 } else {
-                                    displayContent = JSON.stringify(rawResultContent, null, 2);
-                                    language = 'json';
+                                    displayContent = String(rawResultContent);
+                                    rawContentForCopy = displayContent;
                                 }
                             } catch (e) {
                                 console.error("Error processing tool result content:", e);
                                 displayContent = String(rawResultContent || (isError ? '[Error Content Processing Failed]' : '[Result Content Processing Failed]'));
+                                rawContentForCopy = displayContent;
                             }
 
-                            const highlightedContent = hljs.highlight(displayContent, { language: language, ignoreIllegals: true }).value;
+                            let highlightedContent = '';
+                            if (displayContent.length < 10000) {
+                                try {
+                                    highlightedContent = hljs.highlight(displayContent, { language: language, ignoreIllegals: true }).value;
+                                } catch (e) {
+                                    console.error("Highlighting error in renderMixedMessageContent (tool_result):", e);
+                                    highlightedContent = DOMPurify.sanitize(displayContent);
+                                }
+                            } else {
+                                highlightedContent = DOMPurify.sanitize(displayContent);
+                            }
 
-                            // Build the HTML for the tool result block
+                            // Build the HTML for the tool result block - REMOVED BG COLORS
                             html += `
-            <div class="my-2 p-3 ${isError ? 'bg-error/10 border-error/20' : 'bg-success/10 border-success/20'} rounded-lg border">
-                <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 ${statusClass} font-medium text-sm mb-1.5">
-                    <span class="flex items-center gap-1.5"><i class="fas ${statusIcon} fa-fw"></i>${isError ? 'Tool Error' : 'Tool Result'}</span>
-                     ${relatedToolName ? `<span class="text-xs text-base-content/70">(from <code class="text-xs font-semibold font-mono">${DOMPurify.sanitize(relatedToolName)}</code>)</span>` : ''}
-                    ${toolUseId ? `<span class="text-xs text-base-content/70">(for call <code class="text-xs font-mono">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>` : ''}
-                </div>
-                <div class="mt-2 bg-base-100/80 dark:bg-base-300/30 p-2 rounded-md relative group">
-                    <pre class="overflow-auto max-h-60"><code class="language-${language} hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
-                    ${this.createCopyButton(displayContent, 'result')}
-                </div>
-            </div>`;
+<div class="not-prose my-2 p-3 rounded-lg border ${isError ? 'border-error/30' : 'border-success/30'}">
+    <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 ${statusClass} font-medium text-sm mb-1.5">
+        <span class="flex items-center gap-1.5"><i class="fas ${statusIcon} fa-fw"></i>${isError ? 'Tool Error' : 'Tool Result'}</span>
+         ${relatedToolName ? `<span class="text-xs text-base-content/70">(from <code class="text-xs font-semibold font-mono bg-base-100/50 px-1 py-0.5 rounded">${DOMPurify.sanitize(relatedToolName)}</code>)</span>` : ''}
+        ${toolUseId ? `<span class="text-xs text-base-content/70">(for call <code class="text-xs font-mono bg-base-100/50 px-1 py-0.5 rounded">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>` : ''}
+    </div>
+     <div class="tool-content-wrapper group/codeblock">
+        <pre class="overflow-auto max-h-60"><p class="language-${language} hljs whitespace-pre-wrap break-all">${highlightedContent}</p></pre>
+        ${this.createCopyButton(rawContentForCopy, 'result')}
+    </div>
+</div>`;
                         }
 
                         // --- Unknown Block Type Handling ---
@@ -6790,77 +7131,57 @@
                             catch (e) { unknownContent = '[Error stringifying unknown block]'; }
 
                             html += `
-            <div class="bg-warning/10 p-2 rounded-lg my-2 opacity-70 border border-warning/30">
-                <div class="font-medium text-xs mb-1 text-warning-content/80">Unknown Content Block Type: <code class="text-xs font-bold">${block.type || 'N/A'}</code></div>
-                <pre class="text-xs">${DOMPurify.sanitize(unknownContent)}</pre>
-            </div>`;
+<div class="p-2 rounded-lg my-2 opacity-70 border border-warning/30">
+    <div class="font-medium text-xs mb-1 text-warning-content/80">Unknown Content Block Type: <code class="text-xs font-bold">${DOMPurify.sanitize(block.type || 'N/A')}</code></div>
+    <pre class="text-xs">${DOMPurify.sanitize(unknownContent)}</pre>
+</div>`;
                         }
-                    }); // End forEach block loop
+                    });
 
-                    html += '</div>'; // Close the main space-y-3 container
                     return html;
-                },
+                }, // End renderMixedMessageContent
 
-                // Render tool result
+                // Render tool result block (Typically called for Assistant results)
                 renderToolResult(result, message) {
-                    // Ensure result is an object
+                    // Ensure result is an object if possible (parsing JSON string)
                     if (typeof result === 'string') {
-                        try {
-                            result = JSON.parse(result);
-                        } catch (e) {
-                            // Keep as string if parsing fails
-                        }
+                        try { result = JSON.parse(result); } catch (e) { /* Keep as string if parsing fails */ }
                     }
 
-                    // Handle when result is still a string
-                    if (typeof result === 'string') {
-                        return this.renderMarkdown(result);
-                    }
+                    // Extract info
+                    const isError = message?.is_error || (typeof result === 'object' && result?.error) || false;
+                    const toolName = message?.tool_name || (typeof result === 'object' && result?.tool_name) || (typeof result === 'object' && result?.name) || "Tool Result";
+                    let resultContent = (typeof result === 'object' && result?.content !== undefined) ? result.content : result;
 
-                    // Extract information
-                    const isError = message?.is_error || result?.is_error || result?.error || false;
-                    const toolName = message?.tool_name || result?.tool_name || result?.name || "Tool Result";
-
-                    // Get the actual content (handle nested content structure)
-                    let resultContent = result;
-                    if (result && result.content !== undefined) {
-                        resultContent = result.content;
-                    }
-
-                    // Convert to formatted string representation
+                    // Format content for display
                     const contentStr = this.renderToolResultContent(resultContent);
+                    const language = typeof resultContent === 'object' ? 'json' : 'plaintext';
 
-                    // Use more accessible colors for dark themes
-                    const statusClass = isError ? 'bg-error/20 border-error/30 text-error-content' : 'bg-success/20 border-success/30 text-success-content';
+                    // Style based on error status - REMOVED BACKGROUND COLORS
+                    const borderClass = isError ? 'border-error/30' : 'border-success/30';
                     const iconClass = isError ? 'fa-exclamation-circle text-error' : 'fa-check-circle text-success';
 
+                    let highlightedContent = '';
                     try {
-                        const highlightedContent = hljs.highlight(contentStr, { language: 'json', ignoreIllegals: true }).value;
+                        highlightedContent = hljs.highlight(contentStr, { language: language, ignoreIllegals: true }).value;
+                    } catch (e) {
+                        console.error("Highlighting error in renderToolResult:", e);
+                        highlightedContent = DOMPurify.sanitize(contentStr);
+                    }
 
-                        return `
-<div class="my-2 p-3 rounded-md border ${statusClass}">
+                    // Construct HTML without background colors
+                    return `
+<div class="not-prose my-2 p-3 rounded-md border ${borderClass}">
     <div class="flex items-center gap-2 font-medium mb-2">
         <i class="fas ${iconClass} fa-fw"></i>
         <span>${isError ? 'Tool Error' : 'Tool Result'}: ${DOMPurify.sanitize(toolName)}</span>
     </div>
-    <div class="relative group mt-2 bg-base-100 p-2 rounded-md border border-base-300/30">
-        <pre class="overflow-auto max-h-60"><code class="language-json hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
+    <div class="tool-content-wrapper group">
+        <pre class="overflow-auto max-h-60"><code class="language-${language} hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
         ${this.createCopyButton(contentStr)}
     </div>
 </div>`;
-                    } catch (e) {
-                        console.error("Error rendering tool result:", e);
-                        return `<div class="p-3 ${isError ? 'bg-error/20' : 'bg-success/20'} rounded-md border ${isError ? 'border-error/30' : 'border-success/30'}">
-    <div class="${isError ? 'text-error' : 'text-success'} font-medium mb-1">
-        <i class="fas ${isError ? 'fa-exclamation-circle' : 'fa-check-circle'} fa-fw mr-1"></i>
-        ${isError ? 'Tool Error' : 'Tool Result'}: ${DOMPurify.sanitize(toolName)}
-    </div>
-    <pre class="text-xs bg-base-100 p-2 rounded whitespace-pre-wrap break-all border border-base-300/30">${DOMPurify.sanitize(contentStr)}</pre>
-</div>`;
-                    }
-                },
-
-
+                }, // End renderToolResult
 
                 // Add this custom renderer for structured reports
                 renderStructuredReport(content) {
@@ -6960,85 +7281,87 @@
                     return this.renderJson(content);
                 },
 
+                // Renders the specific structure when user provides a tool result back to the model
                 renderUserProvidedToolResult(block, message) {
                     if (!this.uiSettings.showToolDataMessages) {
-                        return '<!-- Tool data hidden by setting -->';
+                        return '<!-- User tool result hidden by setting -->';
                     }
+
                     const toolUseId = block.tool_use_id || 'Unknown Tool Call';
-                    let contentData = block.content; // Default to original content string
-                    let parsedSuccessfully = false;
-                    let isLikelyJson = false;
-                    let displayAsJson = false; // Flag to decide rendering format
-                    let isRawText = false; // ADDED: Flag for raw text content
+                    let contentData = block.content;
+                    let displayContent = '[Could not display content]';
+                    let language = 'plaintext';
+                    let isRawText = false;
 
-                    // Start with Tool Result styling (improved contrast colors)
-                    // Using a lighter background based on --b2
-                    let containerClasses = "tool-data-bubble not-prose my-2 p-3 border border-base-300/20 rounded-lg text-base-content";
-                    let headerIconClass = "fas fa-database fa-fw text-info";
-                    let headerText = 'Tool Data Received';
+                    // Style this distinctly but REMOVE THE BACKGROUND COLOR
+                    const containerClasses = "tool-data-bubble not-prose my-2 p-3 border border-primary/20 rounded-lg text-base-content";
+                    const headerIconClass = "fas fa-reply fa-fw text-primary";
+                    const headerText = 'Tool Data Provided';
 
-                    // --- PARSING LOGIC ---
-                    if (typeof block.content === 'string') {
-                        contentData = block.content; // Keep the raw string
-                        isLikelyJson = this.isProbablyJsonString(block.content); // Check if it looks like JSON
-
-                        if (isLikelyJson) {
-                            try {
-                                contentData = JSON.parse(block.content);
-                                parsedSuccessfully = true;
-                                displayAsJson = true; // Parsed successfully, display as JSON
-                            } catch (e) {
-                                console.warn("Expected JSON string in user tool result, but parsing failed:", e, block.content);
-                                parsedSuccessfully = false;
-                                displayAsJson = false; // Display as raw string
-                                isRawText = true; // ADDED: Mark as raw text
+                    // Process the content string
+                    try {
+                        if (typeof contentData === 'string') {
+                            if (this.isProbablyJsonString(contentData)) {
+                                try {
+                                    const parsedData = JSON.parse(contentData);
+                                    displayContent = JSON.stringify(parsedData, null, 2);
+                                    language = 'json';
+                                } catch (e) {
+                                    console.warn("User tool result looked like JSON but failed to parse:", e, contentData);
+                                    displayContent = contentData;
+                                    isRawText = true;
+                                }
+                            } else {
+                                // Just a plain string
+                                displayContent = contentData;
+                                isRawText = true;
                             }
                         } else {
-                            // It's a string, but doesn't look like JSON. Check if it's an error message.
-                            parsedSuccessfully = false;
-                            displayAsJson = false;
-                            isRawText = true; // ADDED: Mark as raw text
-                            if (contentData.toLowerCase().startsWith('error:')) {
-                                // Use error styling instead
-                                containerClasses = "tool-data-bubble not-prose my-2 p-3 bg-error/15 border border-error/30 rounded-lg text-base-content";
-                                headerIconClass = "fas fa-exclamation-triangle fa-fw text-error";
-                                headerText = 'Tool Error Received';
-                                isRawText = false; // Don't apply special text styling to errors
+                            // If it wasn't a string to begin with
+                            try {
+                                displayContent = JSON.stringify(contentData, null, 2);
+                                language = 'json';
+                            } catch (stringifyError) {
+                                console.error("Failed to stringify non-string user tool result:", stringifyError);
+                                displayContent = String(contentData);
+                                isRawText = true;
                             }
                         }
-                    } else {
-                        // If content was not a string (e.g., already an object/array from backend?)
-                        contentData = block.content;
-                        parsedSuccessfully = true; // Assume structure is valid if not string
-                        displayAsJson = true; // Display as JSON
-                        isRawText = false;
+                    } catch (e) {
+                        console.error("Error processing user tool result display:", e);
+                        displayContent = String(block.content || '[Error displaying content]');
+                        isRawText = true;
                     }
 
-                    // Build HTML container with improved contrast
+                    // Avoid highlighting if content is excessively long
+                    let highlightedContent = '';
+                    if (displayContent.length < 100000) {
+                        try {
+                            highlightedContent = hljs.highlight(displayContent, { language: language, ignoreIllegals: true }).value;
+                        } catch (highlightError) {
+                            console.error("Highlighting failed:", highlightError);
+                            highlightedContent = DOMPurify.sanitize(displayContent);
+                        }
+                    } else {
+                        highlightedContent = DOMPurify.sanitize(displayContent);
+                    }
+
+                    // Build the HTML
                     let html = `<div class="${containerClasses}">`;
                     html += `<div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 font-medium text-sm mb-1.5">
-    <span class="flex items-center gap-1.5"><i class="${headerIconClass}"></i>${headerText}</span>
-    <span class="text-xs opacity-80">(for <code class="text-xs font-mono bg-base-200/50 px-1 py-0.5 rounded">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>
- </div>`;
+         <span class="flex items-center gap-1.5"><i class="${headerIconClass}"></i>${headerText}</span>
+         <span class="text-xs opacity-80">(for <code class="text-xs font-mono bg-base-100/50 px-1 py-0.5 rounded">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>
+     </div>`;
 
-                    // Render based on whether we should display as JSON or raw string
-                    if (displayAsJson) {
-                        // Parsed successfully or was already an object/array
-                        html += `<div class="mt-1 bg-base-100 border border-base-300/30 p-2 rounded-md relative group">
-           <pre class="overflow-auto max-h-60"><code class="language-json hljs whitespace-pre-wrap break-all">${hljs.highlight(JSON.stringify(contentData, null, 2), { language: 'json', ignoreIllegals: true }).value}</code></pre>
-           ${this.createCopyButton(JSON.stringify(contentData, null, 2), 'result')}
-       </div>`;
-                    } else {
-                        // Display as raw string (might be an error message or non-JSON string)
-                        html += `<div class="mt-1 bg-base-100 border border-base-300/30 p-2 rounded-md relative group">
-         <pre class="tool-data-raw-text text-xs whitespace-pre-wrap break-all">${DOMPurify.sanitize(contentData)}</pre>
-         ${this.createCopyButton(contentData, 'result')}
-      </div>`;
-                    }
+                    // Apply the wrapper class to the div containing the pre
+                    html += `<div class="tool-content-wrapper group/codeblock">
+         <pre class="${isRawText ? 'tool-data-raw-text' : ''} text-sm overflow-auto max-h-60"><code class="language-${language} hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
+         ${this.createCopyButton(displayContent, 'result')}
+     </div>`;
 
-                    html += `</div>`; // Close the main container
+                    html += `</div>`;
                     return html;
-                },
+                }, // End renderUserProvidedToolResult
 
                 renderMessageContent(message) {
                     try {
@@ -7542,31 +7865,31 @@
                         console.error("Error in marked.parse:", e);
                     }
                 },
-                // Process tool result content
+                // Helper to render tool result content (potentially JSON or string)
                 renderToolResultContent(content) {
                     if (content === null || content === undefined) return '[No Content]';
-
-                    // Handle string content that might be JSON
                     if (typeof content === 'string') {
                         try {
-                            if ((content.startsWith('{') && content.endsWith('}')) ||
-                                (content.startsWith('[') && content.endsWith(']'))) {
+                            // Check if it's JSON, if so, pretty-print it
+                            if ((content.startsWith('{') && content.endsWith('}')) || (content.startsWith('[') && content.endsWith(']'))) {
                                 return JSON.stringify(JSON.parse(content), null, 2);
                             }
+                            // Otherwise, return the string as is
                             return content;
                         } catch {
+                            // If parsing fails, return the original string
                             return content;
                         }
                     }
-
-                    // Handle objects and arrays
+                    // If it's already an object/array, pretty-print JSON
                     try {
                         return JSON.stringify(content, null, 2);
                     } catch (e) {
-                        console.error("Error stringifying tool result:", e);
-                        return String(content);
+                        console.error("Error stringifying tool result content:", e);
+                        return String(content); // Fallback to basic string conversion
                     }
-                },
+                }, // End renderToolResultContent
+
                 messageRoleIcon(role, contentType = null) { if (contentType === 'tool_result') return 'fas fa-wrench'; switch (role) { case 'user': return 'fas fa-user'; case 'assistant': return 'fas fa-robot'; case 'system': return 'fas fa-info-circle'; default: return 'fas fa-question-circle'; } },
                 messageRoleDisplayName(role, contentType = null) { if (contentType === 'tool_result') return 'Tool Result'; switch (role) { case 'user': return 'User'; case 'assistant': return 'Claude'; case 'system': return 'System'; default: return role; } },
                 formatTimestamp(isoString) { if (!isoString) return ''; try { const date = new Date(isoString); if (isNaN(date.getTime())) return ''; return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch { return ''; } },
