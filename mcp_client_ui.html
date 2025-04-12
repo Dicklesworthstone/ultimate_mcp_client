@@ -3106,6 +3106,278 @@
         const API_BASE_URL = 'http://127.0.0.1:8017/api'; // Adjust if needed
         const WS_URL = 'ws://127.0.0.1:8017/ws/chat';   // Adjust if needed
 
+
+
+        class ContrastOptimizer {
+            constructor() {
+                // Initialize caches
+                this.colorCache = new Map();
+                this.effectiveBgCache = new WeakMap();
+
+                // Precompute gamma lookup table for lightning-fast luminance calculation
+                this.gammaTable = new Array(256);
+                for (let i = 0; i < 256; i++) {
+                    const v = i / 255;
+                    this.gammaTable[i] = v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+                }
+                console.log("ContrastOptimizer initialized."); // Added console log
+            }
+
+            /**
+             * Clear caches when styles change significantly
+             */
+            clearCaches() {
+                this.colorCache.clear();
+                this.effectiveBgCache = new WeakMap(); // Create new WeakMap for hard reset
+                console.log("Contrast optimizer caches cleared");
+            }
+
+            /**
+             * Optimized color parser with caching and fast-path checks
+             */
+            parseColor(colorString) {
+                if (!colorString) return null;
+
+                // Check cache first for massive performance gain
+                const normalized = colorString.trim().toLowerCase();
+                if (this.colorCache.has(normalized)) {
+                    return this.colorCache.get(normalized);
+                }
+
+                let result = null;
+
+                try {
+                    // Fast-path checks before more expensive operations
+                    if (normalized === 'transparent' || normalized === 'rgba(0, 0, 0, 0)') {
+                        result = { r: 0, g: 0, b: 0, a: 0 };
+                    }
+                    // Handle hex format with fast prefix check
+                    else if (normalized.startsWith('#')) {
+                        let hex = normalized.substring(1);
+                        const len = hex.length;
+
+                        if (len === 3 || len === 4) {
+                            // Faster expansion without split/join/map
+                            hex = hex[0] + hex[0] + hex[1] + hex[1] + hex[2] + hex[2] + (len === 4 ? hex[3] + hex[3] : '');
+                        }
+
+                        if (hex.length === 6 || hex.length === 8) {
+                            const bigint = Number(`0x${hex}`);
+                            if (!isNaN(bigint)) {
+                                const r = (hex.length === 8 ? bigint >> 24 : bigint >> 16) & 255;
+                                const g = (hex.length === 8 ? bigint >> 16 : bigint >> 8) & 255;
+                                const b = (hex.length === 8 ? bigint >> 8 : bigint) & 255;
+                                // Skip division if alpha is 255 (1.0)
+                                const a = hex.length === 8 ? ((bigint & 255) === 255 ? 1 : (bigint & 255) / 255) : 1;
+                                result = { r, g, b, a };
+                            }
+                        }
+                    }
+                    // Handle rgb/rgba with string splitting (faster than regex)
+                    else if (normalized.startsWith('rgb')) {
+                        const isRgba = normalized.startsWith('rgba');
+                        const start = isRgba ? 5 : 4;
+                        const end = normalized.lastIndexOf(')');
+
+                        if (end > start) {
+                            const inner = normalized.slice(start, end);
+                            const parts = inner.split(',').map(part => part.trim());
+
+                            if (parts.length >= 3) {
+                                // Use Number() and bitwise OR for fast integer conversion
+                                const r = Number(parts[0]) | 0;
+                                const g = Number(parts[1]) | 0;
+                                const b = Number(parts[2]) | 0;
+                                const a = parts.length > 3 ? Number(parts[3]) : 1;
+
+                                if (!isNaN(r) && !isNaN(g) && !isNaN(b) && !isNaN(a)) {
+                                    result = { r, g, b, a };
+                                }
+                            }
+                        }
+                    }
+                    // Handle oklch with string splitting
+                    else if (normalized.startsWith('oklch')) {
+                        const end = normalized.lastIndexOf(')');
+                        if (end > 6) {
+                            const inner = normalized.slice(6, end);
+                            // Split by whitespace
+                            const parts = inner.split(/\s+/);
+
+                            if (parts.length >= 3) {
+                                const l = parseFloat(parts[0]);
+
+                                // Handle various alpha formats
+                                let a = 1;
+                                if (parts.length > 3) {
+                                    if (parts[3] === '/' && parts.length > 4) {
+                                        a = parseFloat(parts[4]);
+                                    } else if (parts[3].startsWith('/')) {
+                                        a = parseFloat(parts[3].substring(1));
+                                    } else {
+                                        a = parseFloat(parts[3]);
+                                    }
+                                } else if (parts[2].includes('/')) {
+                                    const alphaPart = parts[2].split('/');
+                                    if (alphaPart.length === 2) a = parseFloat(alphaPart[1]);
+                                }
+
+                                if (!isNaN(l) && !isNaN(a)) {
+                                    const gray = Math.round(l * 255);
+                                    result = { r: gray, g: gray, b: gray, a };
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn("Error parsing color:", colorString, e);
+                }
+
+                // Cache the result (even if null) to avoid repeated failures
+                this.colorCache.set(normalized, result);
+
+                if (result === null && normalized !== 'transparent') {
+                    // console.warn("Could not parse color:", colorString); // Reduce console noise
+                }
+
+                return result;
+            }
+
+            /**
+             * Ultra-fast luminance calculation using lookup table
+             */
+            getLuminance(r, g, b) {
+                if (r === undefined || g === undefined || b === undefined) return 0;
+
+                // Ensure values are within range
+                r = Math.max(0, Math.min(255, r | 0));
+                g = Math.max(0, Math.min(255, g | 0));
+                b = Math.max(0, Math.min(255, b | 0));
+
+                // Use precomputed gamma values from lookup table (massive performance gain)
+                return this.gammaTable[r] * 0.2126 +
+                    this.gammaTable[g] * 0.7152 +
+                    this.gammaTable[b] * 0.0722;
+            }
+
+            /**
+             * Get effective background color with WeakMap caching
+             */
+            getEffectiveBackgroundColor(element, stopElement) {
+                // Early return for invalid elements
+                if (!element) return { r: 255, g: 255, b: 255, a: 1 };
+
+                // Check cache first (major performance win)
+                if (this.effectiveBgCache.has(element)) {
+                    return this.effectiveBgCache.get(element);
+                }
+
+                let current = element;
+                let bgColor = null;
+
+                // Traverse DOM upward looking for non-transparent background
+                while (current && current !== stopElement && current !== document.body) {
+                    const style = window.getComputedStyle(current);
+                    const parsedBg = this.parseColor(style.backgroundColor);
+
+                    if (parsedBg && parsedBg.a > 0) {
+                        bgColor = parsedBg;
+                        break;
+                    }
+
+                    current = current.parentElement;
+                }
+
+                // Fallback to stopElement or document.body if no background found
+                if (!bgColor) {
+                    const stopEl = stopElement || document.body;
+                    bgColor = this.parseColor(window.getComputedStyle(stopEl).backgroundColor) ||
+                        { r: 255, g: 255, b: 255, a: 1 };
+                }
+
+                // Cache result before returning
+                this.effectiveBgCache.set(element, bgColor);
+                return bgColor;
+            }
+
+            /**
+             * Recursively fix contrast with optimized traversal
+             */
+            fixContrastRecursively(element, stopElement) {
+                // Fast path for invalid cases
+                if (!element || typeof window.getComputedStyle !== 'function' ||
+                    element === stopElement?.parentElement) {
+                    return;
+                }
+
+                // Check current element first
+                this.checkAndFixElementContrast(element, stopElement);
+
+                // Efficiently traverse children
+                const children = element.children;
+                for (let i = 0; i < children.length; i++) {
+                    // Avoid potential infinite loops (unlikely with .children)
+                    if (children[i] !== element) {
+                        this.fixContrastRecursively(children[i], stopElement);
+                    }
+                }
+            }
+
+            /**
+             * Check and fix contrast with optimized calculations
+             */
+            checkAndFixElementContrast(element, stopElement) {
+                // Combined fast-path conditions for early return
+                if (!element || element === stopElement || element.classList.contains('chat-bubble') ||
+                    !element.offsetParent || element.tagName === 'SCRIPT' ||
+                    element.tagName === 'STYLE' || element.tagName === 'BUTTON') {
+                    return;
+                }
+
+                const style = window.getComputedStyle(element);
+                const textColor = this.parseColor(style.color);
+
+                // Early return for invalid text color
+                if (!textColor || textColor.a === 0) {
+                    return;
+                }
+
+                const effectiveBgColor = this.getEffectiveBackgroundColor(element, stopElement);
+
+                // Early return for invalid background color (unlikely with fallback)
+                if (!effectiveBgColor) {
+                    return;
+                }
+
+                // Fast luminance calculation using lookup table
+                const textLuminance = this.getLuminance(textColor.r, textColor.g, textColor.b);
+                const bgLuminance = this.getLuminance(effectiveBgColor.r, effectiveBgColor.g, effectiveBgColor.b);
+
+                // Add small epsilon to prevent potential division by zero
+                const epsilon = 1e-6;
+                const contrastRatio = bgLuminance > textLuminance
+                    ? (bgLuminance + 0.05 + epsilon) / (textLuminance + 0.05 + epsilon)
+                    : (textLuminance + 0.05 + epsilon) / (bgLuminance + 0.05 + epsilon);
+
+                const contrastThreshold = 3.0;
+                const safeDarkColor = '#1f2937';
+                const safeLightColor = '#f9fafb';
+
+                if (contrastRatio < contrastThreshold) {
+                    const targetColor = bgLuminance < 0.5 ? safeLightColor : safeDarkColor;
+
+                    // Skip if color is already set correctly (avoid unnecessary DOM updates)
+                    const currentColor = element.style.getPropertyValue('color');
+                    if (currentColor !== targetColor) {
+                        // Use requestAnimationFrame for DOM writes
+                        requestAnimationFrame(() => {
+                            element.style.setProperty('color', targetColor, 'important');
+                        });
+                    }
+                }
+            }
+        }
+
         const createCopyButton = (codeToCopy, type = 'code') => {
             // Encode the code to safely pass it as a string attribute literal
             // Using JSON.stringify deals with quotes, newlines etc. then encode that.
@@ -3483,6 +3755,7 @@
                 init() {
                     console.log('Enhanced MCP Client UI Initializing...');
                     try {
+                        this.contrastOptimizer = new ContrastOptimizer();
                         this.loadTheme();
                         this.initThemePreviews();
                         this.loadConfig();
@@ -4992,172 +5265,6 @@
                         }
                     });
                 }, // Added comma
-                // --- START: Replace the entire parseColor function ---
-                /**
-                 * Parses common color formats (rgb, rgba, hex, oklch) into {r, g, b, a}.
-                 * Returns null if parsing fails.
-                 * Note: oklch to RGB conversion is a rough approximation for luminance.
-                 */
-                parseColor(colorString) {
-                    if (!colorString) return null;
-                    colorString = colorString.trim().toLowerCase();
-
-                    // Handle transparent
-                    if (colorString === 'transparent' || colorString === 'rgba(0, 0, 0, 0)') {
-                        return { r: 0, g: 0, b: 0, a: 0 };
-                    }
-
-                    // Handle rgb/rgba
-                    let match = colorString.match(/^rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\)$/);
-                    if (match) {
-                        return {
-                            r: parseInt(match[1]),
-                            g: parseInt(match[2]),
-                            b: parseInt(match[3]),
-                            a: match[4] !== undefined ? parseFloat(match[4]) : 1,
-                        };
-                    }
-
-                    // Handle hex (3, 4, 6, 8 digits)
-                    match = colorString.match(/^#([a-f0-9]{3,4}|[a-f0-9]{6}|[a-f0-9]{8})$/);
-                    if (match) {
-                        let hex = match[1];
-                        if (hex.length === 3 || hex.length === 4) {
-                            hex = hex.split('').map(char => char + char).join('');
-                        }
-                        const bigint = parseInt(hex, 16);
-                        // Adjust bit shifts based on length for optional alpha
-                        const r = (hex.length === 8 ? bigint >> 24 : bigint >> 16) & 255;
-                        const g = (hex.length === 8 ? bigint >> 16 : bigint >> 8) & 255;
-                        const b = (hex.length === 8 ? bigint >> 8 : bigint) & 255;
-                        const a = hex.length === 8 ? (bigint & 255) / 255 : 1;
-                        return { r, g, b, a };
-                    }
-
-                    // --- NEW: Handle oklch() ---
-                    // Example: oklch(0.881275 0.085888 214.515)
-                    // Example: oklch(0.881275 0.085888 214.515 / .5)
-                    match = colorString.match(/^oklch\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\s*\)$/);
-                    if (match) {
-                        const l = parseFloat(match[1]); // Lightness (0-1)
-                        // Note: Chroma and Hue aren't directly used in basic luminance calc
-                        const a = match[4] !== undefined ? parseFloat(match[4]) : 1;
-
-                        // VERY rough approximation for luminance check: Treat L as grayscale
-                        // A value closer to 1 is light, closer to 0 is dark.
-                        // Convert L (0-1) to an approximate RGB grayscale value (0-255)
-                        const gray = Math.round(l * 255);
-                        return { r: gray, g: gray, b: gray, a: a };
-                    }
-                    // --- END NEW: Handle oklch() ---
-
-
-                    console.warn("Could not parse color:", colorString);
-                    return null; // Failed to parse
-                },
-
-                /**
-                 * Calculates perceived luminance from RGB values (0-1). Alpha ignored here.
-                 */
-                getLuminance(r, g, b) {
-                    if (r === undefined || g === undefined || b === undefined) return 0; // Handle parse failures
-                    const a = [r, g, b].map(v => {
-                        v /= 255;
-                        return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
-                    });
-                    return a[0] * 0.2126 + a[1] * 0.7152 + a[2] * 0.0722;
-                },
-
-                /**
-                * Finds the effective background color by traversing up the DOM tree.
-                * Stops at the chat bubble or if a non-transparent background is found.
-                */
-                getEffectiveBackgroundColor(element, stopElement) {
-                    let current = element;
-                    while (current && current !== stopElement && current !== document.body) {
-                        const style = window.getComputedStyle(current);
-                        const bgColor = this.parseColor(style.backgroundColor);
-                        if (bgColor && bgColor.a > 0) { // Found a non-transparent background
-                            return bgColor;
-                        }
-                        current = current.parentElement;
-                    }
-                    // If loop finishes, use the stopElement's background or fallback
-                    const stopStyle = window.getComputedStyle(stopElement || document.body);
-                    return this.parseColor(stopStyle.backgroundColor) || { r: 255, g: 255, b: 255, a: 1 }; // Default white
-                },
-                /**
-        * Recursively checks and fixes contrast for an element and its children,
-        * stopping at a specified boundary element.
-        */
-                fixContrastRecursively(element, stopElement) {
-                    // Basic validation and exit condition
-                    if (!element || typeof window.getComputedStyle !== 'function' || element === stopElement.parentElement) {
-                        // console.log("Stopping recursion at boundary or invalid element:", element);
-                        return;
-                    }
-
-                    // --- Check the current element first ---
-                    // (checkAndFixElementContrast already has skips for SCRIPT, STYLE, BUTTON, invisible)
-                    this.checkAndFixElementContrast(element, stopElement);
-
-                    // --- Recurse into children ---
-                    // Use children collection for live updates if needed, or querySelectorAll for static list
-                    const children = element.children;
-                    if (children && children.length > 0) {
-                        for (let i = 0; i < children.length; i++) {
-                            // Make sure we don't get stuck in a weird loop (shouldn't happen with .children)
-                            if (children[i] !== element) {
-                                this.fixContrastRecursively(children[i], stopElement);
-                            }
-                        }
-                    }
-                },
-
-                /**
-                 * Checks a single element's contrast and applies a fix if needed.
-                 */
-                checkAndFixElementContrast(element, stopElement) {
-                    // --- ADDED Check: Don't modify the main chat bubble directly ---
-                    if (!element || element === stopElement || element.classList.contains('chat-bubble')) {
-                        return;
-                    }
-                    // --- End ADDED check ---
-
-                    // Skip invisible elements etc.
-                    if (!element.offsetParent || element.tagName === 'SCRIPT' || element.tagName === 'STYLE' || element.tagName === 'BUTTON') return;
-
-                    const style = window.getComputedStyle(element);
-                    const textColor = this.parseColor(style.color);
-                    // Pass the bubble (stopElement) to get its background if needed
-                    const effectiveBgColor = this.getEffectiveBackgroundColor(element, stopElement);
-
-                    if (!textColor || textColor.a === 0 || !effectiveBgColor) {
-                        // console.warn("Contrast check skipped: Transparent text or invalid BG", {el: element, text: style.color, bg: effectiveBgColor});
-                        return;
-                    }
-
-                    const textLuminance = this.getLuminance(textColor.r, textColor.g, textColor.b);
-                    const bgLuminance = this.getLuminance(effectiveBgColor.r, effectiveBgColor.g, effectiveBgColor.b);
-
-                    const contrastRatio = bgLuminance > textLuminance
-                        ? (bgLuminance + 0.05) / (textLuminance + 0.05)
-                        : (textLuminance + 0.05) / (bgLuminance + 0.05);
-
-                    const contrastThreshold = 3.0; // Lower threshold for fix trigger
-
-                    const safeDarkColor = '#1f2937'; // Dark gray
-                    const safeLightColor = '#f9fafb'; // Very light gray
-
-                    if (contrastRatio < contrastThreshold) {
-                        // Now this check should be more accurate because effectiveBgColor is parsed correctly
-                        // console.warn(`Low contrast detected (${contrastRatio.toFixed(2)}) for:`, element, `Text: ${style.color}`, `Effective BG: rgb(${effectiveBgColor.r}, ${effectiveBgColor.g}, ${effectiveBgColor.b})`);
-
-                        const targetColor = bgLuminance < 0.5 ? safeLightColor : safeDarkColor;
-                        element.style.setProperty('color', targetColor, 'important');
-                        // console.log(`Applied contrast fix: set color to ${targetColor}`);
-                    }
-                },
 
                 initHighlighting(container = document) {
                     this.$nextTick(() => { // Ensure DOM is updated
@@ -5180,7 +5287,7 @@
 
                                 // --- Directly fix contrast for this block ---
                                 if (bubble) {
-                                    this.checkAndFixElementContrast(block, bubble);
+                                    if (this.contrastOptimizer) this.contrastOptimizer.checkAndFixElementContrast(block, bubble);
                                 }
                                 // --- End direct fix ---
 
@@ -5201,7 +5308,7 @@
                             alreadyHighlighted.forEach((block) => {
                                 const bubble = block.closest('.chat-bubble');
                                 if (bubble) {
-                                    this.checkAndFixElementContrast(block, bubble);
+                                    if (this.contrastOptimizer) this.contrastOptimizer.checkAndFixElementContrast(block, bubble);
                                 }
                             });
 
@@ -5221,7 +5328,9 @@
                     if (save) localStorage.setItem('mcp_client_theme', themeName);
                     // Update hljs theme link based on the chosen DaisyUI theme
                     this.setupHljsThemeSwitcher(); // Use the dedicated function
-
+                    if (this.contrastOptimizer) {
+                        this.contrastOptimizer.clearCaches();
+                    }
                     this.$nextTick(() => this.initTippy()); // Re-init tippy after theme change
                 }, // Added comma
 
@@ -6881,7 +6990,9 @@
                                 const bubbleElement = messageElement.querySelector('.chat-bubble');
                                 if (bubbleElement) {
                                     // console.log("Running contrast fix for newly added/updated bubble:", bubbleElement); // Keep for debug if needed
-                                    this.fixContrastRecursively(bubbleElement, bubbleElement);
+                                    if (this.contrastOptimizer) { // Add safety check
+                                        this.contrastOptimizer.fixContrastRecursively(bubbleElement, bubbleElement);
+                                    }
                                 } else {
                                     // This specific warning is less likely if messageElement exists, but safe to keep
                                     console.warn("Could not find BUBBLE element inside message element for contrast fix:", newMessage.id);
