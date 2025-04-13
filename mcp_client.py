@@ -184,6 +184,8 @@ from urllib.parse import urlparse
 
 import aiofiles  # For async file operations
 import anthropic
+import anyio
+
 # Additional utilities
 import colorama
 
@@ -213,10 +215,10 @@ from anthropic.types import (
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from mcp import ClientSession
 
 # MCP SDK imports
 from mcp.client.sse import sse_client
-from mcp import ClientSession
 from mcp.shared.exceptions import McpError
 from mcp.types import (
     CallToolResult,
@@ -230,7 +232,6 @@ from mcp.types import (
     Tool,
 )
 from mcp.types import Prompt as McpPromptType
-import anyio
 
 # Observability
 from opentelemetry import metrics, trace
