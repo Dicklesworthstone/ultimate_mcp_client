@@ -164,28 +164,33 @@ class AgentMasterLoop:
         self.logger = log
         self.agent_state_file = Path(agent_state_file)
 
-        # Add missing configuration attributes
+        # Add all required configuration attributes
         self.reflection_threshold = REFLECTION_SUCCESS_THRESHOLD
         self.consolidation_threshold = CONSOLIDATION_SUCCESS_THRESHOLD
         self.optimization_interval = OPTIMIZATION_LOOP_INTERVAL
         self.promotion_interval = MEMORY_PROMOTION_LOOP_INTERVAL
         
-        # Define reflection type sequence for cycling through different reflection types
+        # Define reflection type sequence
         self.reflection_type_sequence = ["summary", "progress", "gaps", "strengths", "plan"]
         
         # Define consolidation settings
         self.consolidation_memory_level = MemoryLevel.EPISODIC.value
-        self.consolidation_max_sources = 10  # Reasonable default for max memories to consolidate
+        self.consolidation_max_sources = 10
+        
+        # Auto-linking settings
+        self.auto_linking_threshold = 0.7
+        self.auto_linking_max_links = 3
         
         if not self.anthropic_client:
             self.logger.critical("Anthropic client unavailable! Agent cannot function.")
             raise ValueError("Anthropic client required.")
 
         self.state = AgentState()
+        if self.state.workflow_id and not self.state.context_id:
+            self.state.context_id = self.state.workflow_id
         self._shutdown_event = asyncio.Event()
         self.tool_schemas: List[Dict[str, Any]] = []
         self._active_tasks: Set[asyncio.Task] = set()  # Track all running tasks
-            
 
     async def initialize(self) -> bool:
         """Initializes loop state, loads previous state, verifies client setup."""
@@ -445,10 +450,12 @@ class AgentMasterLoop:
 
                             # Call the summarization tool
                             summary_result = await self._execute_tool_call_internal(
-                                 summarize_tool, {
-                                     "text_to_summarize": text_block,
-                                     "target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS # Target length
-                                 }, record_action=False
+                                TOOL_SUMMARIZE_TEXT, {
+                                    "text_to_summarize": text_block,
+                                    "target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS,
+                                    "workflow_id": current_workflow_id,  # Add this parameter
+                                    "record_summary": False  # Set to false for temporary summaries
+                                }, record_action=False
                             )
                             if summary_result.get("success"):
                                 # Replace older actions with summary note
@@ -672,6 +679,139 @@ Key Considerations:
         except Exception as e: msg = f"Unexpected LLM interaction error: {e}"; self.logger.error(msg, exc_info=True)
         return {"decision": "error", "message": msg}
 
+    async def _check_and_trigger_promotion(self, memory_id: str):
+        """Check if a memory meets criteria for promotion and trigger if it does."""
+        try:
+            if not memory_id:
+                return
+                
+            # Add a small delay to avoid overwhelming the system
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            
+            # Use the promote_memory_level tool
+            promotion_result = await self._execute_tool_call_internal(
+                TOOL_PROMOTE_MEM,
+                {
+                    "memory_id": memory_id,
+                    # Let the server decide if criteria are met based on defaults
+                    "min_access_count_episodic": 5,  # Example threshold
+                    "min_confidence_episodic": 0.8
+                },
+                record_action=False
+            )
+            
+            if promotion_result.get("success") and promotion_result.get("promoted"):
+                self.logger.info(
+                    f"Memory {memory_id[:8]} promoted from {promotion_result.get('previous_level')} to {promotion_result.get('new_level')}",
+                    emoji_key="arrow_up"
+                )
+                
+        except Exception as e:
+            self.logger.warning(f"Error in memory promotion check: {e}", exc_info=False)
+
+    async def _run_auto_linking(self, memory_id: str):
+        """Background task to automatically link a new memory to relevant existing memories."""
+        try:
+            if not memory_id or not self.state.workflow_id:
+                return
+                
+            # Add a small random delay to avoid overwhelming the system
+            await asyncio.sleep(random.uniform(*AUTO_LINKING_DELAY_SECS))
+            
+            # Use semantic search to find similar memories
+            self.logger.debug(f"Attempting auto-linking for memory {memory_id[:8]}...")
+            
+            # First, get the content of the memory to use as query
+            mem_details = await self._execute_tool_call_internal(
+                TOOL_GET_MEMORY_BY_ID,
+                {"memory_id": memory_id, "include_links": False},
+                record_action=False
+            )
+            
+            if not mem_details.get("success"):
+                self.logger.warning(f"Auto-linking failed: couldn't retrieve memory {memory_id}")
+                return
+                
+            # Prepare search query from memory content/description
+            query_text = mem_details.get("description", "") or mem_details.get("content", "")[:200]
+            if not query_text:
+                return
+                
+            # Search for similar memories (excluding self)
+            similar_results = await self._execute_tool_call_internal(
+                TOOL_SEMANTIC_SEARCH,
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "query": query_text,
+                    "limit": 3,  # Limit to top matches
+                    "threshold": 0.7  # Only high-quality matches
+                },
+                record_action=False
+            )
+            
+            if not similar_results.get("success"):
+                return
+                
+            # Create links to similar memories
+            for similar_mem in similar_results.get("memories", []):
+                similar_id = similar_mem.get("memory_id")
+                similarity = similar_mem.get("similarity", 0)
+                
+                # Skip self or if similarity too low
+                if similar_id == memory_id or similarity < 0.7:
+                    continue
+                    
+                # Create bidirectional links
+                await self._execute_tool_call_internal(
+                    TOOL_CREATE_LINK,
+                    {
+                        "source_memory_id": memory_id,
+                        "target_memory_id": similar_id,
+                        "link_type": "related",
+                        "strength": similarity,
+                        "description": "Auto-generated link based on semantic similarity"
+                    },
+                    record_action=False
+                )
+                
+                self.logger.debug(f"Auto-linked memory {memory_id[:8]} to {similar_id[:8]} (similarity: {similarity:.2f})")
+                
+        except Exception as e:
+            self.logger.warning(f"Error in auto-linking task: {e}", exc_info=False)
+
+    async def _check_prerequisites(self, dependency_ids: List[str]) -> Tuple[bool, str]:
+        """Check if all prerequisite actions are completed."""
+        if not dependency_ids:
+            return True, "No dependencies"
+            
+        try:
+            # Get details for all dependencies
+            dep_details_result = await self._execute_tool_call_internal(
+                TOOL_GET_ACTION_DETAILS,
+                {"action_ids": dependency_ids},
+                record_action=False
+            )
+            
+            if not dep_details_result.get("success"):
+                return False, f"Failed to check dependencies: {dep_details_result.get('error', 'Unknown error')}"
+                
+            # Check status of all dependencies
+            actions = dep_details_result.get("actions", [])
+            incomplete = []
+            
+            for action in actions:
+                if action.get("status") != ActionStatus.COMPLETED.value:
+                    incomplete.append(action.get("action_id", "unknown"))
+                    
+            if incomplete:
+                return False, f"Dependencies not completed: {', '.join(incomplete[:3])}" + (f" and {len(incomplete)-3} more" if len(incomplete) > 3 else "")
+                
+            return True, "All dependencies completed"
+            
+        except Exception as e:
+            self.logger.error(f"Error checking prerequisites: {e}", exc_info=False)
+            return False, f"Error checking prerequisites: {str(e)}"
+        
     # --- Enhanced Tool Execution Helper (#3, #7, #10, #12) ---
     async def _execute_tool_call_internal(
         self, tool_name: str, arguments: Dict[str, Any],
@@ -682,6 +822,13 @@ Key Considerations:
         tool_result_content = {"success": False, "error": "Execution error."}
         start_time = time.time()
 
+        if tool_name in [TOOL_CREATE_WORKFLOW, TOOL_UPDATE_WORKFLOW_STATUS, TOOL_RECORD_ACTION_START]:
+            if not tool_result_content.get("success"):
+                self.logger.error(f"Critical tool operation failed: {tool_name} - {tool_result_content.get('error')}")
+                # Possibly increase error count or take recovery action
+                if tool_name == TOOL_CREATE_WORKFLOW:
+                    self.logger.critical("Failed to create workflow - agent cannot continue without a valid workflow.")
+                    
         # 1. Find Server
         target_server = self._find_tool_server(tool_name)
         if not target_server:
@@ -736,13 +883,15 @@ Key Considerations:
                       self._start_background_task(self._run_auto_linking(tool_result_content["memory_id"]))
                  # Access-Triggered Promotion (#12)
                  if tool_name in [TOOL_GET_MEMORY_BY_ID, TOOL_QUERY_MEMORIES]:
-                      mem_ids_to_check = []
-                      if tool_name == TOOL_GET_MEMORY_BY_ID: mem_ids_to_check = [arguments.get("memory_id")]
-                      elif tool_name == TOOL_QUERY_MEMORIES:
-                           memories = tool_result_content.get("data", {}).get("memories", [])
-                           mem_ids_to_check = [m.get("memory_id") for m in memories[:3]] # Check top 3 query results
-                      for mem_id in filter(None, mem_ids_to_check):
-                           self._start_background_task(self._check_and_trigger_promotion(mem_id))
+                    mem_ids_to_check = []
+                    if tool_name == TOOL_GET_MEMORY_BY_ID: 
+                        mem_ids_to_check = [arguments.get("memory_id")]
+                    elif tool_name == TOOL_QUERY_MEMORIES:
+                        # Direct access to memories field, not through "data"
+                        memories = tool_result_content.get("memories", [])
+                        mem_ids_to_check = [m.get("memory_id") for m in memories[:3]]
+                    for mem_id in filter(None, mem_ids_to_check):
+                        self._start_background_task(self._check_and_trigger_promotion(mem_id))
 
         # (Error Handling Unchanged from v2.1)
         except (ToolError, ToolInputError) as e: err_str = str(e); self.logger.error(f"Tool Error executing {tool_name}: {e}", exc_info=False); tool_result_content = {"success": False, "error": err_str}; self.state.last_action_summary = f"Tool {tool_name} Error: {err_str[:100]}"; self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": type(e).__name__}; self.state.tool_usage_stats[tool_name]["failure"] += 1
@@ -906,32 +1055,52 @@ Key Considerations:
         trigger_reason = [] # Track why meta-cog is running
 
         # Adaptive Reflection Trigger (#12)
+        # Check tool availability first
+        reflection_tool_available = self._find_tool_server(TOOL_REFLECTION) is not None
+        consolidation_tool_available = self._find_tool_server(TOOL_CONSOLIDATION) is not None
+        optimize_wm_tool_available = self._find_tool_server(TOOL_OPTIMIZE_WM) is not None
+        auto_focus_tool_available = self._find_tool_server(TOOL_AUTO_FOCUS) is not None
+
+        # Add tasks only if tools are available
         if self.state.needs_replan or self.state.successful_actions_since_reflection >= self.reflection_threshold:
-             reflection_type = self.reflection_type_sequence[self.state.reflection_cycle_index % len(self.reflection_type_sequence)]
-             tasks_to_run.append((TOOL_REFLECTION, {"workflow_id": self.state.workflow_id, "reflection_type": reflection_type}))
-             trigger_reason.append(f"ReplanNeeded({self.state.needs_replan})" if self.state.needs_replan else f"SuccessCount({self.state.successful_actions_since_reflection})")
-             self.state.successful_actions_since_reflection = 0; self.state.reflection_cycle_index += 1
+            if reflection_tool_available:
+                reflection_type = self.reflection_type_sequence[self.state.reflection_cycle_index % len(self.reflection_type_sequence)]
+                tasks_to_run.append((TOOL_REFLECTION, {"workflow_id": self.state.workflow_id, "reflection_type": reflection_type}))
+                trigger_reason.append(f"ReplanNeeded({self.state.needs_replan})" if self.state.needs_replan else f"SuccessCount({self.state.successful_actions_since_reflection})")
+                self.state.successful_actions_since_reflection = 0
+                self.state.reflection_cycle_index += 1
+            else:
+                self.logger.warning(f"Skipping reflection: Tool {TOOL_REFLECTION} not available")
 
         # Adaptive Consolidation Trigger (#12)
         # Example: Trigger if many episodic action logs exist (requires stats or query)
         # For simplicity, retain success count trigger for now. Could enhance with TOOL_COMPUTE_STATS.
         if self.state.successful_actions_since_consolidation >= self.consolidation_threshold:
-             tasks_to_run.append((TOOL_CONSOLIDATION, {"workflow_id": self.state.workflow_id, "consolidation_type": "summary", "query_filter": {"memory_level": self.consolidation_memory_level}, "max_source_memories": self.consolidation_max_sources}))
-             trigger_reason.append(f"ConsolidateThreshold({self.state.successful_actions_since_consolidation})")
-             self.state.successful_actions_since_consolidation = 0
+             if consolidation_tool_available:
+                tasks_to_run.append((TOOL_CONSOLIDATION, {"workflow_id": self.state.workflow_id, "consolidation_type": "summary", "query_filter": {"memory_level": self.consolidation_memory_level}, "max_source_memories": self.consolidation_max_sources}))
+                trigger_reason.append(f"ConsolidateThreshold({self.state.successful_actions_since_consolidation})")
+                self.state.successful_actions_since_consolidation = 0
+             else:
+                self.logger.warning(f"Skipping consolidation: Tool {TOOL_CONSOLIDATION} not available")
 
         # Optimization Trigger (Unchanged - loop based)
         self.state.loops_since_optimization += 1
         if self.state.loops_since_optimization >= self.optimization_interval:
-             tasks_to_run.append((TOOL_OPTIMIZE_WM, {"context_id": self.state.context_id})); trigger_reason.append("OptimizeInterval")
-             tasks_to_run.append((TOOL_AUTO_FOCUS, {"context_id": self.state.context_id})); trigger_reason.append("FocusUpdate")
-             self.state.loops_since_optimization = 0
+             if optimize_wm_tool_available:
+                tasks_to_run.append((TOOL_OPTIMIZE_WM, {"context_id": self.state.context_id})); trigger_reason.append("OptimizeInterval")
+                tasks_to_run.append((TOOL_AUTO_FOCUS, {"context_id": self.state.context_id})); trigger_reason.append("FocusUpdate")
+                self.state.loops_since_optimization = 0
+             else:
+                 self.logger.warning(f"Skipping optimization: Tool {TOOL_OPTIMIZE_WM} not available")
 
         # Memory Promotion Check Trigger (Unchanged - loop based)
         self.state.loops_since_promotion_check += 1
         if self.state.loops_since_promotion_check >= self.promotion_interval:
-             tasks_to_run.append(("CHECK_PROMOTIONS", {})); trigger_reason.append("PromotionInterval")
-             self.state.loops_since_promotion_check = 0
+             if auto_focus_tool_available:
+                tasks_to_run.append(("CHECK_PROMOTIONS", {})); trigger_reason.append("PromotionInterval")
+                self.state.loops_since_promotion_check = 0
+             else:
+                self.logger.warning(f"Skipping promotion check: Tool {TOOL_AUTO_FOCUS} not available")
 
         if tasks_to_run:
             self.logger.info(f"Running {len(tasks_to_run)} periodic tasks (Triggers: {', '.join(trigger_reason)})...", emoji_key="brain")
@@ -1144,12 +1313,27 @@ Key Considerations:
     async def _update_workflow_status_internal(self, status: str, message: Optional[str] = None):
         """Internal helper to update workflow status via tool call."""
         if not self.state.workflow_id: return
+        
+        # Validate status against WorkflowStatus enum
+        try:
+            # Ensure status is a valid WorkflowStatus value
+            status_value = status
+            if not any(status == s.value for s in WorkflowStatus):
+                # Try to convert string to enum value
+                try:
+                    status_value = WorkflowStatus(status).value
+                except ValueError:
+                    self.logger.warning(f"Invalid workflow status: {status}. Using 'completed' as fallback.")
+                    status_value = WorkflowStatus.COMPLETED.value
+        except Exception:
+            status_value = WorkflowStatus.COMPLETED.value  # Fallback
+        
         tool_name = TOOL_UPDATE_WORKFLOW_STATUS
         try:
             await self._execute_tool_call_internal(
                 tool_name,
-                {"workflow_id": self.state.workflow_id, "status": status, "completion_message": message},
-                record_action=False # Status updates aren't primary actions
+                {"workflow_id": self.state.workflow_id, "status": status_value, "completion_message": message},
+                record_action=False  # Status updates aren't primary actions
             )
         except Exception as e:
             self.logger.error(f"Error marking workflow {self.state.workflow_id} as {status}: {e}", exc_info=False)
