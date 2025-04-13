@@ -1,16 +1,16 @@
-# Maestro: An Adaptive Cognitive Architecture Integrating Multi-Level Memory, Structured Orchestration, and Meta-Cognition for Advanced LLM Agents
+# EideticEngine: An Adaptive Cognitive Architecture Integrating Multi-Level Memory, Structured Orchestration, and Meta-Cognition for Advanced LLM Agents
 
 *By Jeffrey Emanuel, 4/13/2025*
 
 ## Abstract
 
-Large Language Models (LLMs) form the reasoning core of increasingly sophisticated autonomous agents. However, unlocking their full potential for complex, long-horizon tasks requires architectures that transcend reactive loops and shallow memory. We present **Maestro**, a novel cognitive architecture designed to imbue LLM agents with robust memory, structured planning, and adaptive self-management capabilities inspired by cognitive science. 
+Large Language Models (LLMs) form the reasoning core of increasingly sophisticated autonomous agents. However, unlocking their full potential for complex, long-horizon tasks requires architectures that transcend reactive loops and shallow memory. We present **EideticEngine**, a novel cognitive architecture designed to imbue LLM agents with robust memory, structured planning, and adaptive self-management capabilities inspired by cognitive science. 
 
-Maestro integrates two key components: 1) A **Unified Memory System (UMS)**, a persistent, multi-level cognitive workspace implemented on an optimized asynchronous database, featuring distinct memory types (working, episodic, semantic, procedural), rich metadata (importance, confidence, TTL), explicit typed linking, hybrid search (semantic, keyword, relational), and integrated workflow tracking (actions, artifacts, thoughts). 2) An **Agent Master Loop (AML)**, an adaptive orchestrator that directs an LLM using the UMS. The AML manages structured, dependency-aware plans (`PlanStep`), dynamically assembles comprehensive context from the UMS, handles errors resiliently, and crucially, orchestrates **agent-driven meta-cognition**. 
+EideticEngine integrates two key components: 1) A **Unified Memory System (UMS)**, a persistent, multi-level cognitive workspace implemented on an optimized asynchronous database, featuring distinct memory types (working, episodic, semantic, procedural), rich metadata (importance, confidence, TTL), explicit typed linking, hybrid search (semantic, keyword, relational), and integrated workflow tracking (actions, artifacts, thoughts). 2) An **Agent Master Loop (AML)**, an adaptive orchestrator that directs an LLM using the UMS. The AML manages structured, dependency-aware plans (`PlanStep`), dynamically assembles comprehensive context from the UMS, handles errors resiliently, and crucially, orchestrates **agent-driven meta-cognition**. 
 
-Through specific UMS tools, the agent actively reflects on its performance (`generate_reflection`), consolidates knowledge (`consolidate_memories`), promotes memories between cognitive levels (`promote_memory_level`), manages its attentional focus (`optimize_working_memory`, `auto_update_focus`), and even manages distinct reasoning threads (`create_thought_chain`). Furthermore, Maestro incorporates an **adaptive control layer** where meta-cognitive parameters (e.g., reflection frequency) are dynamically adjusted based on real-time operational statistics (`compute_memory_statistics`, `_adapt_thresholds`). 
+Through specific UMS tools, the agent actively reflects on its performance (`generate_reflection`), consolidates knowledge (`consolidate_memories`), promotes memories between cognitive levels (`promote_memory_level`), manages its attentional focus (`optimize_working_memory`, `auto_update_focus`), and even manages distinct reasoning threads (`create_thought_chain`). Furthermore, EideticEngine incorporates an **adaptive control layer** where meta-cognitive parameters (e.g., reflection frequency) are dynamically adjusted based on real-time operational statistics (`compute_memory_statistics`, `_adapt_thresholds`). 
 
-We provide detailed simulations and analysis demonstrating Maestro's ability to autonomously navigate complex analytical and creative tasks, exhibiting structured learning, error recovery, and adaptive behavior. Maestro represents a significant architectural advance, providing essential infrastructure for developing more capable, persistent, and introspective general-purpose AI agents.
+We provide detailed simulations and analysis demonstrating EideticEngine's ability to autonomously navigate complex analytical and creative tasks, exhibiting structured learning, error recovery, and adaptive behavior. EideticEngine represents a significant architectural advance, providing essential infrastructure for developing more capable, persistent, and introspective general-purpose AI agents.
 
 ## 1. Introduction: Towards Cognitive Autonomy in LLM Agents
 
@@ -21,33 +21,33 @@ The remarkable generative and reasoning abilities of Large Language Models (LLMs
 * **Adaptation & Learning:** Most agents lack mechanisms for reflecting on past actions, learning from errors (beyond simple retries), synthesizing experiences into general knowledge, or adapting their strategies based on performance [15].
 * **Cognitive Coherence:** Agents often lack a unified internal state representation that integrates perception, memory, reasoning, planning, and action within a consistent framework.
 
-To address these critical gaps, we introduce **Maestro**, a comprehensive cognitive architecture designed explicitly for orchestrating advanced LLM agents. Maestro is not merely an LLM wrapper or a collection of tools; it is an integrated system built upon two deeply interconnected components:
+To address these critical gaps, we introduce **EideticEngine**, a comprehensive cognitive architecture designed explicitly for orchestrating advanced LLM agents. EideticEngine is not merely an LLM wrapper or a collection of tools; it is an integrated system built upon two deeply interconnected components:
 
 1. **The Unified Memory System (UMS):** A persistent, multi-layered cognitive substrate. Inspired by human memory models [16, 17], the UMS provides distinct but interconnected stores for working, episodic, semantic, and procedural memory. Implemented using an optimized asynchronous SQLite backend (`aiosqlite`) with a detailed relational schema, it tracks not only memories with rich metadata but also the agent's entire operational history: workflows, hierarchical actions (with explicit dependencies), generated artifacts, and structured thought chains. It incorporates hybrid search mechanisms (vector, FTS5, relational filtering) and supports dynamic memory evolution through linking, consolidation, and promotion.
 
 2. **The Agent Master Loop (AML):** An adaptive control loop that orchestrates the agent's interaction with the UMS and the external world (via tools dispatched by an MCPClient). The AML directs a core LLM (e.g., Claude 3.7 Sonnet) by providing it with dynamically assembled, multi-faceted context drawn from the UMS. It manages structured plans (`PlanStep` objects) featuring explicit dependency tracking (`depends_on` fields validated via `_check_prerequisites`). Crucially, the AML empowers the LLM agent to engage in **meta-cognition** by providing specific UMS tools (`generate_reflection`, `consolidate_memories`, `promote_memory_level`, `update_memory`, etc.) that allow the agent to analyze its own performance, synthesize knowledge, manage its memory state, and refine its strategies. This meta-cognitive cycle is further enhanced by an **adaptive control mechanism** (`_adapt_thresholds`) that dynamically adjusts the frequency of reflection and consolidation based on runtime statistics computed from the UMS (`compute_memory_statistics`), enabling the agent to self-regulate its cognitive load.
 
-Maestro's core hypothesis is that by tightly integrating a structured, cognitive-inspired memory system with an adaptive, meta-cognitively capable control loop, we can create LLM agents that exhibit significantly greater autonomy, robustness, learning capability, and effectiveness on complex, real-world tasks. This paper details the architecture, illustrates its operation through granular simulations, and discusses its implications for the future of general-purpose AI agents.
+EideticEngine's core hypothesis is that by tightly integrating a structured, cognitive-inspired memory system with an adaptive, meta-cognitively capable control loop, we can create LLM agents that exhibit significantly greater autonomy, robustness, learning capability, and effectiveness on complex, real-world tasks. This paper details the architecture, illustrates its operation through granular simulations, and discusses its implications for the future of general-purpose AI agents.
 
 ## 2. Related Work: Building on and Departing From Existing Paradigms
 
-Maestro differentiates itself from several established lines of research:
+EideticEngine differentiates itself from several established lines of research:
 
-* **Standard LLM Agent Frameworks (LangChain [5], LlamaIndex [6], etc.):** While providing valuable abstractions for tool use and basic memory (often vector stores or simple buffers), these frameworks typically lack: (i) a deeply integrated, multi-level cognitive memory model with explicit linking and dynamic evolution (promotion, consolidation); (ii) structured planning with robust dependency checking enforced by the loop; (iii) agent-driven meta-cognitive tools for reflection and knowledge synthesis; (iv) adaptive control mechanisms adjusting agent behavior based on performance. Maestro offers a more opinionated and comprehensive *cognitive architecture* rather than a flexible toolkit.
+* **Standard LLM Agent Frameworks (LangChain [5], LlamaIndex [6], etc.):** While providing valuable abstractions for tool use and basic memory (often vector stores or simple buffers), these frameworks typically lack: (i) a deeply integrated, multi-level cognitive memory model with explicit linking and dynamic evolution (promotion, consolidation); (ii) structured planning with robust dependency checking enforced by the loop; (iii) agent-driven meta-cognitive tools for reflection and knowledge synthesis; (iv) adaptive control mechanisms adjusting agent behavior based on performance. EideticEngine offers a more opinionated and comprehensive *cognitive architecture* rather than a flexible toolkit.
 
-* **Early Autonomous Agents (AutoGPT [7], BabyAGI):** These pioneering efforts demonstrated the potential of LLM loops but suffered from unreliable planning, simplistic memory (often just text files or basic vector stores), lack of error recovery, and significant coherence issues over longer runs. Maestro addresses these directly with structured UMS, planning, dependency checks, and meta-cognition.
+* **Early Autonomous Agents (AutoGPT [7], BabyAGI):** These pioneering efforts demonstrated the potential of LLM loops but suffered from unreliable planning, simplistic memory (often just text files or basic vector stores), lack of error recovery, and significant coherence issues over longer runs. EideticEngine addresses these directly with structured UMS, planning, dependency checks, and meta-cognition.
 
-* **Memory-Augmented LLMs (MemGPT [8], RAG [9]):** These focus on enhancing LLM capabilities by providing access to external or specialized memory during generation. Maestro complements this by providing a persistent, structured *internal* memory system that tracks the agent's *own* experiences, thoughts, actions, and synthesized knowledge, enabling longitudinal learning and self-understanding beyond immediate context retrieval. The UMS serves as the agent's evolving world model and operational history.
+* **Memory-Augmented LLMs (MemGPT [8], RAG [9]):** These focus on enhancing LLM capabilities by providing access to external or specialized memory during generation. EideticEngine complements this by providing a persistent, structured *internal* memory system that tracks the agent's *own* experiences, thoughts, actions, and synthesized knowledge, enabling longitudinal learning and self-understanding beyond immediate context retrieval. The UMS serves as the agent's evolving world model and operational history.
 
-* **LLM Planning & Reasoning Techniques (ReAct [10], Chain-of-Thought [11], Tree-of-Thoughts [18]):** These enhance the LLM's internal reasoning process, often within a single prompt or short interaction sequence. Maestro operates at a higher architectural level, orchestrating these reasoning steps within a persistent framework. It externalizes the plan, memory, and workflow state into the UMS, allowing for much longer, more complex tasks, error recovery across loops, and persistent learning that influences future reasoning cycles. Maestro's `thought_chains` provide a structured way to manage and persist complex reasoning paths generated potentially using these techniques.
+* **LLM Planning & Reasoning Techniques (ReAct [10], Chain-of-Thought [11], Tree-of-Thoughts [18]):** These enhance the LLM's internal reasoning process, often within a single prompt or short interaction sequence. EideticEngine operates at a higher architectural level, orchestrating these reasoning steps within a persistent framework. It externalizes the plan, memory, and workflow state into the UMS, allowing for much longer, more complex tasks, error recovery across loops, and persistent learning that influences future reasoning cycles. EideticEngine's `thought_chains` provide a structured way to manage and persist complex reasoning paths generated potentially using these techniques.
 
-* **Classical Cognitive Architectures (SOAR [12], ACT-R [13], OpenCog):** These offer rich, theoretically grounded models of cognition, often based on symbolic rule systems or specialized memory structures. While highly influential, they are typically challenging to integrate directly with the sub-symbolic nature and generative flexibility of LLMs and are rarely deployed as practical, general-purpose agents. Maestro adopts key *principles* from cognitive architectures (e.g., memory levels, relevance decay, meta-cognition) but implements them within a practical, LLM-native framework built for autonomous task execution and tool use, leveraging the LLM itself for high-level reasoning and meta-cognitive tasks.
+* **Classical Cognitive Architectures (SOAR [12], ACT-R [13], OpenCog):** These offer rich, theoretically grounded models of cognition, often based on symbolic rule systems or specialized memory structures. While highly influential, they are typically challenging to integrate directly with the sub-symbolic nature and generative flexibility of LLMs and are rarely deployed as practical, general-purpose agents. EideticEngine adopts key *principles* from cognitive architectures (e.g., memory levels, relevance decay, meta-cognition) but implements them within a practical, LLM-native framework built for autonomous task execution and tool use, leveraging the LLM itself for high-level reasoning and meta-cognitive tasks.
 
-* **Meta-Reasoning and Reflection Research [14, 15]:** While the importance of meta-cognition is recognized, few practical LLM agent systems incorporate explicit, agent-driven reflection and knowledge consolidation loops tied to performance metrics. Maestro operationalizes this through dedicated tools (`generate_reflection`, `consolidate_memories`) and, significantly, makes the *frequency* of these operations adaptive (`_adapt_thresholds`) based on runtime UMS statistics, creating a dynamic feedback loop for self-improvement.
+* **Meta-Reasoning and Reflection Research [14, 15]:** While the importance of meta-cognition is recognized, few practical LLM agent systems incorporate explicit, agent-driven reflection and knowledge consolidation loops tied to performance metrics. EideticEngine operationalizes this through dedicated tools (`generate_reflection`, `consolidate_memories`) and, significantly, makes the *frequency* of these operations adaptive (`_adapt_thresholds`) based on runtime UMS statistics, creating a dynamic feedback loop for self-improvement.
 
 ## 3. The Unified Memory System (UMS): A Cognitive Substrate for Agents
 
-The foundation of the Maestro architecture is the Unified Memory System (UMS), a persistent and structured cognitive workspace designed to move beyond the limitations of simple memory buffers or isolated vector stores. It serves not just as a repository of information, but as an active substrate for the agent's learning, reasoning, and operational history. Its novelty and power stem from the deep integration of several key design principles:
+The foundation of the EideticEngine architecture is the Unified Memory System (UMS), a persistent and structured cognitive workspace designed to move beyond the limitations of simple memory buffers or isolated vector stores. It serves not just as a repository of information, but as an active substrate for the agent's learning, reasoning, and operational history. Its novelty and power stem from the deep integration of several key design principles:
 
 ### 3.1. Multi-Level Cognitive Memory Hierarchy
 
@@ -204,11 +204,11 @@ The AML actively manages the agent's reasoning focus:
 
 ## 5. The Ultimate MCP Client: Facilitating Cognitive Orchestration
 
-The Maestro architecture, while powerful conceptually, relies on a robust communication and interaction layer to bridge the Agent Master Loop (AML) with the Unified Memory System (UMS) and other potential external tools. The **Ultimate MCP Client** (`mcp_client.py`) provides this critical "glue," offering a feature-rich environment specifically designed to support the complex needs of advanced cognitive agents like Maestro. Its design choices significantly enable and simplify the implementation of Maestro's core functionalities.
+The EideticEngine architecture, while powerful conceptually, relies on a robust communication and interaction layer to bridge the Agent Master Loop (AML) with the Unified Memory System (UMS) and other potential external tools. The **Ultimate MCP Client** (`mcp_client.py`) provides this critical "glue," offering a feature-rich environment specifically designed to support the complex needs of advanced cognitive agents like EideticEngine. Its design choices significantly enable and simplify the implementation of EideticEngine's core functionalities.
 
 ### 5.1. Unified Access to Distributed Capabilities
 
-Maestro's power comes from leveraging diverse tools hosted potentially across different servers (UMS server, corpus search server, web browser server, etc.). The MCP Client abstracts this complexity:
+EideticEngine's power comes from leveraging diverse tools hosted potentially across different servers (UMS server, corpus search server, web browser server, etc.). The MCP Client abstracts this complexity:
 
 * **Server Management (`ServerManager`, `ServerConfig`):** It discovers (`discover_servers` using filesystem, registry, mDNS, *and* active port scanning), configures, connects (`connect_to_server`), monitors (`ServerMonitor`), and manages the lifecycle of multiple MCP servers (both STDIO and SSE types via `RobustStdioSession` and standard `sse_client` respectively). This allows the AML to seamlessly access tools without needing to know their physical location or connection type.
 
@@ -232,7 +232,7 @@ Interacting with potentially unreliable external processes or network services r
 
 ### 5.3. Enabling Advanced Agent Features
 
-The client provides specific features that directly support Maestro's cognitive capabilities:
+The client provides specific features that directly support EideticEngine's cognitive capabilities:
 
 * **Streaming Support (WebSockets & Internal):** The `process_streaming_query` method and the WebSocket endpoint (`/ws/chat`) allow for real-time streaming of LLM responses and tool status updates, crucial for interactive use cases and providing immediate feedback during long-running agent tasks. The internal stream processing logic (`_process_stream_event`) handles partial JSON accumulation for tool inputs.
 
@@ -262,7 +262,7 @@ The client provides specific features that directly support Maestro's cognitive 
 
 ## 6. The LLM Gateway Server: An Ecosystem of Tools for Cognitive Agents
 
-The Maestro architecture relies not only on its internal logic (AML) and its cognitive substrate (UMS) but also on a rich ecosystem of external capabilities accessible via the Model Context Protocol (MCP). The **Ultimate MCP Client** (`mcp_client.py`) acts as the bridge, connecting the AML to an **LLM Gateway Server** instance. This server, designed by the same author, hosts the UMS tools (implemented in `cognitive_and_agent_memory.py`) alongside a powerful suite of complementary tools, significantly expanding the agent's operational repertoire and enabling more complex, real-world workflows.
+The EideticEngine architecture relies not only on its internal logic (AML) and its cognitive substrate (UMS) but also on a rich ecosystem of external capabilities accessible via the Model Context Protocol (MCP). The **Ultimate MCP Client** (`mcp_client.py`) acts as the bridge, connecting the AML to an **LLM Gateway Server** instance. This server, designed by the same author, hosts the UMS tools (implemented in `cognitive_and_agent_memory.py`) alongside a powerful suite of complementary tools, significantly expanding the agent's operational repertoire and enabling more complex, real-world workflows.
 
 ### 6.1. Architecture: UMS as a Tool Suite within a Larger Gateway
 
@@ -274,7 +274,7 @@ It's crucial to understand that the **UMS is implemented as a collection of tool
 
 ### 6.2. Core LLM Gateway Capabilities (Beyond UMS)
 
-The Gateway server provides foundational services that the Maestro agent heavily relies upon, often invoked transparently by the UMS tools or directly by the AML:
+The Gateway server provides foundational services that the EideticEngine agent heavily relies upon, often invoked transparently by the UMS tools or directly by the AML:
 
 * **Multi-Provider LLM Access (`completion.py`, `providers/`):** Offers a standardized interface (`generate_completion`, `chat_completion`, `stream_completion`) to various LLM backends (OpenAI, Anthropic, Gemini, DeepSeek, OpenRouter). Handles API key management, request formatting, response parsing, error handling, and crucial cost/token tracking (`COST_PER_MILLION_TOKENS`, `ModelResponse`). This allows the AML and UMS tools (like `consolidate_memories`, `generate_reflection`) to easily leverage different LLMs.
 
@@ -286,9 +286,9 @@ The Gateway server provides foundational services that the Maestro agent heavily
 
 * **Prompt Management (`prompts/`):** Includes a `PromptRepository` and `PromptTemplate` system (using Jinja2) allowing pre-defined, reusable prompts to be stored, retrieved, and rendered, facilitating standardized interactions and complex prompt construction (`render_prompt_template`).
 
-### 6.3. Synergistic Tools Enhancing Maestro's Capabilities
+### 6.3. Synergistic Tools Enhancing EideticEngine's Capabilities
 
-Beyond the core UMS tools, the LLM Gateway server hosts other tool suites that the Maestro agent can leverage, often in conjunction with its memory:
+Beyond the core UMS tools, the LLM Gateway server hosts other tool suites that the EideticEngine agent can leverage, often in conjunction with its memory:
 
 * **Advanced Extraction Tools (`extraction.py`):**
   * `extract_json`: Extracts structured JSON, optionally validating against a schema. Crucial for processing tool outputs or structured text stored in memory (`ArtifactType.JSON`, `MemoryType.JSON`).
@@ -317,14 +317,14 @@ Beyond the core UMS tools, the LLM Gateway server hosts other tool suites that t
   * `get_tool_info`, `get_llm_instructions`: Allow the agent to introspect available capabilities and understand how best to use them.
 
 * **RAG & Knowledge Base Tools (`rag.py`, `knowledge_base/`):**
-  * While the UMS *is* a form of knowledge base, these tools likely implement more conventional RAG pipelines (vector store creation `create_knowledge_base`, document addition `add_documents`, context retrieval `retrieve_context`, and generation `generate_with_rag`). The Maestro agent could use these to interact with *external* vector stores or build specialized knowledge bases separate from its core UMS instance, perhaps storing references or summaries within the UMS. The feedback mechanisms (`RAGFeedbackService`) offer another layer of learning distinct from UMS reflection.
+  * While the UMS *is* a form of knowledge base, these tools likely implement more conventional RAG pipelines (vector store creation `create_knowledge_base`, document addition `add_documents`, context retrieval `retrieve_context`, and generation `generate_with_rag`). The EideticEngine agent could use these to interact with *external* vector stores or build specialized knowledge bases separate from its core UMS instance, perhaps storing references or summaries within the UMS. The feedback mechanisms (`RAGFeedbackService`) offer another layer of learning distinct from UMS reflection.
 
 * **Tournament Tools (`tournament.py`, `tournaments/`):**
   * Enable structured comparison and evolution of LLM outputs for specific tasks (code or text). The agent could initiate a tournament (`create_tournament`) to find the best way to formulate a specific `MemoryType.PROCEDURE` or refine a `MemoryType.SUMMARY`, monitor its progress (`get_tournament_status`), and store the winning result back into the UMS (`get_tournament_results` -> `store_memory`).
 
 ## 7. Evaluation & Case Studies: Demonstrating Cognitive Capabilities
 
-We evaluated Maestro's architecture through detailed simulations of two distinct, complex tasks, tracing the agent's internal state and UMS interactions.
+We evaluated EideticEngine's architecture through detailed simulations of two distinct, complex tasks, tracing the agent's internal state and UMS interactions.
 
 * **Case Study 1: Financial Market Analysis:** This task required the agent to:
   * **Structure:** Create and utilize separate thought chains (`tc-rates1`, `tc-equities1`) for distinct analysis streams.
@@ -341,13 +341,13 @@ We evaluated Maestro's architecture through detailed simulations of two distinct
   * **Utilize Context:** Retrieve character profiles/arc details from UMS when generating subsequent script scenes.
   * **Finalize:** Retrieve the full draft artifact (`get_artifact_by_id`), perform final formatting (simulated internal LLM step), and save the final output (`record_artifact(is_output=True)`).
 
-**Analysis:** Across both studies, the Maestro architecture facilitated successful completion of complex, multi-phase tasks. The UMS provided the necessary persistence and structure, while the AML successfully orchestrated the LLM, managed dependencies, recovered from simulated errors (not detailed above, but handled by the error logic), and utilized meta-cognitive tools. The adaptive thresholds demonstrated self-regulation of cognitive overhead. Trace logs (provided in Supplementary Material) clearly show the evolution of the UMS state and the agent's plan over time.
+**Analysis:** Across both studies, the EideticEngine architecture facilitated successful completion of complex, multi-phase tasks. The UMS provided the necessary persistence and structure, while the AML successfully orchestrated the LLM, managed dependencies, recovered from simulated errors (not detailed above, but handled by the error logic), and utilized meta-cognitive tools. The adaptive thresholds demonstrated self-regulation of cognitive overhead. Trace logs (provided in Supplementary Material) clearly show the evolution of the UMS state and the agent's plan over time.
 
-## 8. Discussion: Implications of the Maestro Architecture
+## 8. Discussion: Implications of the EideticEngine Architecture
 
-Maestro demonstrates a path towards more capable and autonomous LLM agents by integrating principles from cognitive science with robust software engineering. Key implications include:
+EideticEngine demonstrates a path towards more capable and autonomous LLM agents by integrating principles from cognitive science with robust software engineering. Key implications include:
 
-* **Beyond Reactive Agents:** Maestro moves agents from simple stimulus-response loops towards goal-directed, reflective, and adaptive behavior based on persistent internal state.
+* **Beyond Reactive Agents:** EideticEngine moves agents from simple stimulus-response loops towards goal-directed, reflective, and adaptive behavior based on persistent internal state.
 
 * **Scalability for Complex Tasks:** Structured planning, dependency management, and modular thought chains enable tackling problems that overwhelm simpler architectures due to context limitations or lack of coherence.
 
@@ -355,13 +355,13 @@ Maestro demonstrates a path towards more capable and autonomous LLM agents by in
 
 * **Introspection and Explainability:** The detailed logging in the UMS (`memory_operations`, thoughts, actions, etc.) and visualization tools provide unprecedented insight into the agent's "reasoning" process, aiding debugging and analysis.
 
-* **Foundation for General Capabilities:** By providing robust infrastructure for memory, planning, and self-management, Maestro lays groundwork that future, potentially more powerful AI reasoning cores could leverage to achieve broader intelligence. The architecture itself addresses fundamental bottlenecks.
+* **Foundation for General Capabilities:** By providing robust infrastructure for memory, planning, and self-management, EideticEngine lays groundwork that future, potentially more powerful AI reasoning cores could leverage to achieve broader intelligence. The architecture itself addresses fundamental bottlenecks.
 
-**Limitations:** Maestro still relies heavily on the quality of the core LLM's reasoning, planning, and tool-use abilities. The overhead of UMS interaction could be significant for highly real-time tasks (though `aiosqlite` and optimizations mitigate this). The heuristics for memory promotion and threshold adaptation are currently rule-based and could be further refined.
+**Limitations:** EideticEngine still relies heavily on the quality of the core LLM's reasoning, planning, and tool-use abilities. The overhead of UMS interaction could be significant for highly real-time tasks (though `aiosqlite` and optimizations mitigate this). The heuristics for memory promotion and threshold adaptation are currently rule-based and could be further refined.
 
 ## 9. Conclusion: A Cognitive Leap for Agent Architectures
 
-We introduced Maestro, an adaptive cognitive architecture enabling LLM agents to manage complex tasks through the tight integration of a Unified Memory System (UMS) and an Agent Master Loop (AML). By incorporating multi-level memory, structured planning with dependency checking, agent-driven meta-cognition (reflection, consolidation, promotion), and adaptive self-regulation of cognitive processes, Maestro demonstrates a significant advance over existing agent paradigms. Our simulations highlight its ability to support sustained, goal-directed, and introspective behavior on challenging analytical and creative tasks. Maestro offers a robust and extensible blueprint for the next generation of autonomous AI systems.
+We introduced EideticEngine, an adaptive cognitive architecture enabling LLM agents to manage complex tasks through the tight integration of a Unified Memory System (UMS) and an Agent Master Loop (AML). By incorporating multi-level memory, structured planning with dependency checking, agent-driven meta-cognition (reflection, consolidation, promotion), and adaptive self-regulation of cognitive processes, EideticEngine demonstrates a significant advance over existing agent paradigms. Our simulations highlight its ability to support sustained, goal-directed, and introspective behavior on challenging analytical and creative tasks. EideticEngine offers a robust and extensible blueprint for the next generation of autonomous AI systems.
 
 ## 10. Future Work
 
@@ -369,11 +369,11 @@ We introduced Maestro, an adaptive cognitive architecture enabling LLM agents to
 
 * **Advanced Adaptation & Learning:** Exploring reinforcement learning or other ML techniques to optimize adaptive thresholds, meta-cognitive strategy selection, and procedural skill derivation.
 
-* **Multi-Agent Systems:** Extending Maestro to support collaborative tasks with shared UMS spaces and coordinated planning protocols.
+* **Multi-Agent Systems:** Extending EideticEngine to support collaborative tasks with shared UMS spaces and coordinated planning protocols.
 
 * **Real-Time Interaction:** Investigating architectural adaptations for tighter perception-action loops in dynamic environments.
 
-* **Theoretical Grounding:** Further formalizing the Maestro loop and memory dynamics in relation to established cognitive science models and decision theory.
+* **Theoretical Grounding:** Further formalizing the EideticEngine loop and memory dynamics in relation to established cognitive science models and decision theory.
 
 * **Hybrid Reasoning:** Integrating symbolic planners or knowledge graph reasoning engines that can interact with the UMS and the LLM via the AML.
 
@@ -401,7 +401,7 @@ While the main paper details the architectural design of the UMS and AML, these 
 
 ## 2. Operational Statistics and Telemetry
 
-The Maestro implementation includes comprehensive telemetry options not detailed in the main paper:
+The EideticEngine implementation includes comprehensive telemetry options not detailed in the main paper:
 
 - **Performance Metrics:** The system tracks granular timing statistics for critical operations (`_measure_operation_time`), including per-tool-call latency, embedding generation time, memory access patterns, and query execution time.
 
@@ -443,11 +443,11 @@ Beyond the basic reflection and consolidation described in the main paper:
 
 ## 5. Micro-Task Case Studies
 
-These detailed micro-task examples reveal Maestro's operation at a granular level beyond the comprehensive simulations in the main paper:
+These detailed micro-task examples reveal EideticEngine's operation at a granular level beyond the comprehensive simulations in the main paper:
 
 ### 5.1 Knowledge Integration Challenge
 
-When presented with conflicting information about a technical topic, Maestro demonstrated sophisticated conflict resolution:
+When presented with conflicting information about a technical topic, EideticEngine demonstrated sophisticated conflict resolution:
 
 1. **Contradiction Detection:** The system identified semantic contradictions between new information and existing knowledge using bidirectional linking and relevance scoring.
 
@@ -459,7 +459,7 @@ When presented with conflicting information about a technical topic, Maestro dem
 
 ### 5.2 Dynamic Planning Adaptation
 
-Monitoring Maestro's handling of an unexpected mid-task constraint change revealed:
+Monitoring EideticEngine's handling of an unexpected mid-task constraint change revealed:
 
 1. **Impact Analysis:** Within 2 loops, the agent identified 8 affected plan steps through dependency graph traversal, distinguishing direct impacts from ripple effects.
 
@@ -471,7 +471,7 @@ Monitoring Maestro's handling of an unexpected mid-task constraint change reveal
 
 ### 5.3 Long-Duration Task Management
 
-For a task spanning multiple sessions over days, Maestro demonstrated: 
+For a task spanning multiple sessions over days, EideticEngine demonstrated: 
 
 1. **Hibernate/Resume Capability:** The system saved comprehensive workflow state, including working memory focus, active thought chains, and dependency status.
 
@@ -483,7 +483,7 @@ For a task spanning multiple sessions over days, Maestro demonstrated:
 
 ## 6. Implementation Architecture Variants
 
-Maestro's architecture allows for specialized variants not covered in the main paper:
+EideticEngine's architecture allows for specialized variants not covered in the main paper:
 
 - **Distributed UMS:** For high-throughput applications, the UMS can be horizontally scaled across multiple nodes, with memory sharding based on workflow ID or memory type, using consistent hashing for routing and a caching layer for frequent access patterns.
 
