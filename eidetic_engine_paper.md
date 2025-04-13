@@ -495,37 +495,54 @@ EideticEngine's architecture allows for specialized variants not covered in the 
 
 - **Human-in-the-Loop Orchestration:** A specialized AML variant enables explicit human checkpoints for reviewing and modifying plans, memories, or reflections before the agent proceeds to subsequent steps.
 
+# References
 
-**References:**
+Anderson, J. R. (1996). ACT: A simple theory of complex cognition. *American Psychologist, 51*(4), 355–365. [https://doi.org/10.1037/0003-066X.51.4.355](https://doi.org/10.1037/0003-066X.51.4.355)
 
-- Anderson, J. R., & Lebiere, C. (2003). *The Newell test for a theory of cognition.* **Behavioral and Brain Sciences, 26**(5), 587–601.
+Anderson, J. R., & Lebiere, C. (2003). The Newell test for a theory of cognition. *Behavioral and Brain Sciences, 26*(5), 587–601. [https://doi.org/10.1017/S0140525X0300013X](https://doi.org/10.1017/S0140525X0300013X)
 
-- Atkinson, R. C., & Shiffrin, R. M. (1968). *Human memory: A proposed system and its control processes.* In K. W. Spence & J. T. Spence (Eds.), **The psychology of learning and motivation** (Vol. 2, pp. 89–195). Academic Press.
+Atkinson, R. C., & Shiffrin, R. M. (1968). Human memory: A proposed system and its control processes. In K. W. Spence & J. T. Spence (Eds.), *The psychology of learning and motivation* (Vol. 2, pp. 89–195). Academic Press. [https://doi.org/10.1016/S0079-7421(08)60422-3](https://doi.org/10.1016/S0079-7421(08)60422-3)
 
-- Baddeley, A. D., & Hitch, G. (1974). *Working memory.* In G. H. Bower (Ed.), **The psychology of learning and motivation** (Vol. 8, pp. 47–89). Academic Press.
+Baddeley, A. D., & Hitch, G. J. (1974). Working memory. In G. H. Bower (Ed.), *The psychology of learning and motivation* (Vol. 8, pp. 47–89). Academic Press. [https://doi.org/10.1016/S0079-7421(08)60452-1](https://doi.org/10.1016/S0079-7421(08)60452-1)
 
-- Derbinsky, N., Li, J., & Laird, J. E. (2012). *A multi-domain evaluation of scaling in a general episodic memory.* In **Proceedings of the 26th AAAI Conference on Artificial Intelligence** (pp. 193–199).
+Brown, T. B., Mann, B., Ryder, N., Subbiah, M., Kaplan, J., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G., Henighan, T., Child, R., Ramesh, A., Ziegler, D. M., Wu, J., Winter, C., & Amodei, D. (2020). Language models are few-shot learners. *Advances in Neural Information Processing Systems, 33*, 1877–1901.
 
-- Laird, J. E., Newell, A., & Rosenbloom, P. S. (1987). *Soar: An architecture for general intelligence.* **Artificial Intelligence, 33**(1), 1–64.
+Chen, Y., Huang, P., Wang, S., Wang, Z., Chen, X., Liu, Z., Tang, J., & Sun, M. (2025). Second me: An AI-native memory offload system. *arXiv preprint arXiv:2503.08102*. [https://arxiv.org/abs/2503.08102](https://arxiv.org/abs/2503.08102)
 
-- Nuxoll, A. M., & Laird, J. E. (2007). *Extending cognitive architecture with episodic memory.* In **Proceedings of the 22nd AAAI Conference on Artificial Intelligence** (pp. 1560–1564).
+Derbinsky, N., Li, J., & Laird, J. E. (2012). A multi-domain evaluation of scaling in a general episodic memory. *Proceedings of the 26th AAAI Conference on Artificial Intelligence*, 193–199.
 
-- Packer, C., Wooders, S., Lin, K., Fang, V., Patil, S. G., Stoica, I., & Gonzalez, J. E. (2023). *MemGPT: Towards LLMs as Operating Systems.* arXiv preprint arXiv:2310.08560.
+Garg, D., Zeng, S., Ganesh, S., & Ardon, L. (2025). Generating structured plan representation of procedures with LLMs. *arXiv preprint arXiv:2504.00029*. [https://arxiv.org/abs/2504.00029](https://arxiv.org/abs/2504.00029)
 
-- Park, J. S., O’Brien, J. C., Cai, C. J., Morris, M. R., Liang, P., & Bernstein, M. S. (2023). *Generative Agents: Interactive Simulacra of Human Behavior.* In **Proceedings of the 36th ACM Symposium on User Interface Software and Technology (UIST 2023)**.
+Laird, J. E., Newell, A., & Rosenbloom, P. S. (1987). SOAR: An architecture for general intelligence. *Artificial Intelligence, 33*(1), 1–64. [https://doi.org/10.1016/0004-3702(87)90050-6](https://doi.org/10.1016/0004-3702(87)90050-6)
 
-- Richards, T. B. (2023). *AutoGPT: An autonomous GPT-4 experiment* [Computer software]. GitHub. Retrieved from **https://github.com/Significant-Gravitas/Auto-GPT**
+Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., Küttler, H., Ott, M., Chen, W., Smith, E., & Kiela, D. (2020). Retrieval-augmented generation for knowledge-intensive NLP tasks. *Advances in Neural Information Processing Systems, 33*, 9459–9474.
 
-- Shen, Y., Song, K., Tan, X., Li, D., Lu, W., & Zhuang, Y. (2023). *HuggingGPT: Solving AI tasks with ChatGPT and its friends in HuggingFace.* arXiv preprint arXiv:2303.17580.
+Nuxoll, A. M., & Laird, J. E. (2007). Extending cognitive architecture with episodic memory. *Proceedings of the 22nd AAAI Conference on Artificial Intelligence*, 1560–1564.
 
-- Shinn, N., Labash, B., & Gopinath, A. (2023). *Reflexion: An autonomous agent with dynamic memory and self-reflection.* arXiv preprint arXiv:2303.11366.
+Packer, C., Fang, V., Patil, S. G., Lin, K., Wooders, S., & Gonzalez, J. E. (2023). MemGPT: Towards LLMs as operating systems. *arXiv preprint arXiv:2310.08560*. [https://arxiv.org/abs/2310.08560](https://arxiv.org/abs/2310.08560)
 
-- Tulving, E. (1972). *Episodic and semantic memory.* In E. Tulving & W. Donaldson (Eds.), **Organization of Memory** (pp. 381–403). Academic Press.
+Park, J. S., O'Brien, J. C., Cai, C. J., Morris, M. R., Liang, P., & Bernstein, M. S. (2023). Generative agents: Interactive simulacra of human behavior. *Proceedings of the 36th ACM Symposium on User Interface Software and Technology (UIST 2023)*.
 
-- Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E., Le, Q., & Zhou, D. (2022). *Chain-of-thought prompting elicits reasoning in large language models.* In **Advances in Neural Information Processing Systems, 35** (NeurIPS 2022).
+Ramirez, A. J., Mondragon, O. F., Botti, V. J., & Julian, V. (2023). Self-adaptive agents using large language models. *arXiv preprint arXiv:2307.06187*. [https://arxiv.org/abs/2307.06187](https://arxiv.org/abs/2307.06187)
 
-- Weston, J., Chopra, S., & Bordes, A. (2014). *Memory networks.* arXiv preprint arXiv:1410.3916.
+Richards, T. B. (2023). AutoGPT: An autonomous GPT-4 experiment [Computer software]. GitHub. [https://github.com/Significant-Gravitas/Auto-GPT](https://github.com/Significant-Gravitas/Auto-GPT)
 
-- Yao, S., Yu, D., Zhao, J., Shafran, I., Griffiths, T. L., Cao, Y., & Narasimhan, K. (2023a). *Tree of Thoughts: Deliberate problem solving with large language models.* In **Advances in Neural Information Processing Systems, 36** (NeurIPS 2023).
+Shen, Y., Song, K., Tan, X., Li, D., Lu, W., & Zhuang, Y. (2023). HuggingGPT: Solving AI tasks with ChatGPT and its friends in HuggingFace. *arXiv preprint arXiv:2303.17580*. [https://arxiv.org/abs/2303.17580](https://arxiv.org/abs/2303.17580)
 
-- Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., & Cao, Y. (2023b). *ReAct: Synergizing reasoning and acting in language models.* In **Proceedings of the 11th International Conference on Learning Representations (ICLR 2023)**.
+Shinn, N., Labash, B., & Gopinath, A. (2023). Reflexion: Language agents with verbal reinforcement learning. *Advances in Neural Information Processing Systems, 36*. [https://arxiv.org/abs/2303.11366](https://arxiv.org/abs/2303.11366)
+
+Sumers, T. R., Vyas, S., Xiong, K., Ringshia, C., Prakash, B., & Van den Broeck, G. (2023). Cognitive architectures for language agents. *arXiv preprint arXiv:2309.02427*. [https://arxiv.org/abs/2309.02427](https://arxiv.org/abs/2309.02427)
+
+Tulving, E. (1972). Episodic and semantic memory. In E. Tulving & W. Donaldson (Eds.), *Organization of memory* (pp. 381–403). Academic Press.
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., & Polosukhin, I. (2017). Attention is all you need. *Advances in Neural Information Processing Systems, 30*, 5998–6008.
+
+Wang, L., Ma, C., Feng, X., Zhang, Z., Yang, H., Zhang, J., Chen, Z., Qiao, J., Hu, Z., & Wang, X. (2023). A survey on large language model based autonomous agents. *arXiv preprint arXiv:2308.11432*. [https://arxiv.org/abs/2308.11432](https://arxiv.org/abs/2308.11432)
+
+Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E., Le, Q., & Zhou, D. (2022). Chain-of-thought prompting elicits reasoning in large language models. *Advances in Neural Information Processing Systems, 35*, 24824–24837.
+
+Weston, J., Chopra, S., & Bordes, A. (2014). Memory networks. *arXiv preprint arXiv:1410.3916*. [https://arxiv.org/abs/1410.3916](https://arxiv.org/abs/1410.3916)
+
+Yao, S., Yu, D., Zhao, J., Shafran, I., Griffiths, T. L., Cao, Y., & Narasimhan, K. (2023). Tree of thoughts: Deliberate problem solving with large language models. *arXiv preprint arXiv:2305.10601*. [https://arxiv.org/abs/2305.10601](https://arxiv.org/abs/2305.10601)
+
+Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., & Cao, Y. (2023). ReAct: Synergizing reasoning and acting in language models. *International Conference on Learning Representations (ICLR 2023)*. [https://openreview.net/forum?id=6LNIBt1J-N](https://openreview.net/forum?id=6LNIBt1J-N)
