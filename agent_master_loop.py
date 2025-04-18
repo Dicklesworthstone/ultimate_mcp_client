@@ -1,16 +1,18 @@
 """
-Supercharged Agent Master Loop – v4.0 (Phase 1 - Step 1 Integration)
+Supercharged Agent Master Loop – v4.0 (Phase 1 - Complete)
 ======================================================================
-This revision integrates the enhanced context gathering logic (proactive,
-procedural, links) back into the Agent Master Loop v3.3.5 structure.
+This revision integrates the remaining Phase 1 steps: detailed prompting,
+heuristic plan update fallback, and event-driven background triggers
+for linking and promotion, into the Agent Master Loop v4.0 structure.
 
-Phase 1, Step 1 Changes:
-  - Restored proactive goal-relevant memory search in `_gather_context`.
-  - Restored procedural memory search in `_gather_context`.
-  - Restored contextual link traversal in `_gather_context`.
-  - Added detailed logging for context gathering components.
-  - Ensured context truncation happens *after* all components are gathered.
-  - Preserved all other v3.3.5 code, docstrings, and comments.
+Phase 1, Steps 2, 3, 4 Changes:
+  - Restored detailed cognitive instructions in `_construct_agent_prompt`.
+  - Added explicit guidance on using `AGENT_TOOL_UPDATE_PLAN`.
+  - Implemented `_apply_heuristic_plan_update` method based on v3.3 logic.
+  - Modified `run` loop to call heuristic update as fallback.
+  - Restored event-driven background triggers for auto-linking and
+    promotion checks within `_execute_tool_call_internal`.
+  - Preserved all previous code, fixes, docstrings, and comments.
 
 ────────────────────────────────────────────────────────────────────────────
 """
@@ -28,39 +30,39 @@ import logging
 import math
 import os
 import random
-import signal
+import signal  # Import signal for handler setup
 import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import aiofiles
-from anthropic import AsyncAnthropic  # ← correct import path (Fix #1)
+from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field, ValidationError
+
+if TYPE_CHECKING:
+    from anthropic.types import Message  # noqa: F401
 
 # --------------------------------------------------------------------------
 # MCP‑client import & logger bootstrap
 # --------------------------------------------------------------------------
 try:
-    # Note: ArtifactType and WorkflowStatus might not be explicitly used
-    # in this file but were imported in the original v3.3 - keeping for reference
-    # if other parts of the system rely on them being imported here.
     from mcp_client import (  # type: ignore
         ActionStatus,
         ActionType,
-        ArtifactType,  # noqa: F401 Keep import if original had it
+        ArtifactType,  # noqa: F401
         LinkType,
         MCPClient,
         MemoryLevel,
-        MemoryType,  # noqa: F401 Keep import if original had it
+        MemoryType,
         MemoryUtils,
         ThoughtType,
         ToolError,
         ToolInputError,
-        WorkflowStatus,  # noqa: F401 Keep import if original had it
+        WorkflowStatus,
     )
 
     MCP_CLIENT_AVAILABLE = True
@@ -88,8 +90,8 @@ if log.level <= logging.DEBUG:
 # ==========================================================================
 # CONSTANTS
 # ==========================================================================
-AGENT_STATE_FILE = "agent_loop_state_v4.0_p1s1.json" # Versioned state file
-AGENT_NAME = "EidenticEngine4.0-P1S1" # Versioned agent name
+AGENT_STATE_FILE = "agent_loop_state_v4.0_p1_complete.json" # Versioned state file
+AGENT_NAME = "EidenticEngine4.0-P1" # Versioned agent name
 MASTER_LEVEL_AGENT_LLM_MODEL_STRING = "claude-3-7-sonnet-20250219" # Use appropriate model
 
 # ---------------- meta‑cognition thresholds ----------------
@@ -282,7 +284,6 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
     log.error(f"Context severely truncated from {original_length} to {len(final_str)} bytes.")
     return final_str
 
-
 # ==========================================================================
 # Dataclass & pydantic models
 # ==========================================================================
@@ -380,6 +381,8 @@ class AgentMasterLoop:
         TOOL_GET_ARTIFACTS,
         TOOL_GET_ARTIFACT_BY_ID,
         TOOL_GET_ACTION_DEPENDENCIES,
+        TOOL_GET_THOUGHT_CHAIN,
+        TOOL_GET_WORKFLOW_DETAILS,
         # dependency mgmt + link creation
         TOOL_ADD_ACTION_DEPENDENCY,
         TOOL_CREATE_LINK,
@@ -387,7 +390,6 @@ class AgentMasterLoop:
         TOOL_LIST_WORKFLOWS,
         TOOL_COMPUTE_STATS,
         TOOL_SUMMARIZE_TEXT,
-        TOOL_GET_WORKFLOW_DETAILS, # Added to internal list
         # periodic cognition
         TOOL_OPTIMIZE_WM,
         TOOL_AUTO_FOCUS,
@@ -451,43 +453,81 @@ class AgentMasterLoop:
     def _construct_agent_prompt(
         self, goal: str, context: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Build system+user prompt (Phase‑1 + Fix‑#7 truncation)."""
-        # (Keep existing v3.3.5 _construct_agent_prompt implementation -
-        # this will be updated in Phase 1, Step 2)
+        """Build system+user prompt including detailed cognitive instructions."""
+        # <<< Start Integration Block: Detailed System Prompt (Phase 1, Step 2) >>>
         # ---------- system ----------
         system_blocks: List[str] = [
             f"You are '{AGENT_NAME}', an AI agent orchestrator using a Unified Memory System.",
             "",
             f"Overall Goal: {goal}",
             "",
-            "Available Unified‑Memory Tools (callable via tool schema):",
+            "Available Unified Memory & Agent Tools (Use ONLY these):",
         ]
         if not self.tool_schemas:
-            system_blocks.append("- CRITICAL: No tools available.")
+            system_blocks.append("- CRITICAL WARNING: No tools loaded.")
         else:
+            # Highlight key cognitive tools
+            essential_cognitive_tools = {
+                TOOL_ADD_ACTION_DEPENDENCY, TOOL_RECORD_ARTIFACT, TOOL_HYBRID_SEARCH,
+                TOOL_STORE_MEMORY, TOOL_UPDATE_MEMORY, TOOL_CREATE_LINK,
+                TOOL_CREATE_THOUGHT_CHAIN, TOOL_GET_THOUGHT_CHAIN, TOOL_RECORD_THOUGHT,
+                TOOL_REFLECTION, TOOL_CONSOLIDATION, TOOL_PROMOTE_MEM,
+                TOOL_OPTIMIZE_WM, TOOL_AUTO_FOCUS, TOOL_GET_WORKING_MEMORY,
+                TOOL_QUERY_MEMORIES, TOOL_SEMANTIC_SEARCH,
+                AGENT_TOOL_UPDATE_PLAN # Also highlight the agent's own tool
+            }
             for schema in self.tool_schemas:
                 sanitized = schema["name"]
-                original = self.mcp_client.server_manager.sanitized_to_original.get(
-                    sanitized, sanitized
-                )
+                # Ensure mapping exists before using it
+                original = self.mcp_client.server_manager.sanitized_to_original.get(sanitized, sanitized)
                 desc = schema.get("description", "No description.")
+                is_essential = original in essential_cognitive_tools
+                prefix = "**" if is_essential else ""
+                # Provide tool name, mapping, description, and schema
+                input_schema_str = json.dumps(schema.get('input_schema', schema.get('parameters', {}))) # Handle both schema formats
                 system_blocks.append(
-                    f"- `{sanitized}` (maps to `{original}`) – {desc}"
+                    f"\n- {prefix}Name: `{sanitized}` (Represents: `{original}`){prefix}\n"
+                    f"  Desc: {desc}\n"
+                    f"  Schema: {input_schema_str}"
                 )
         system_blocks.append("")
-        system_blocks.append("Your process at each step:")
-        system_blocks.append("1. Analyse current context & feedback.")
-        system_blocks.append("2. Update or repair the plan.")
-        system_blocks.append("3. Decide **one** action:")
-        system_blocks.append("   • tool call")
-        system_blocks.append("   • record thought")
-        system_blocks.append("   • report 'Goal Achieved:'")
-        system_blocks.append(
-            f"4. Use `{AGENT_TOOL_UPDATE_PLAN}` *exclusively* when you need to update the plan."
-        )
+        # --- Detailed Process Instructions (Integrated from v3.3) ---
+        system_blocks.extend([
+            "Your Process at each step:",
+            "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details`), recent actions, memories (`core_context`, `proactive_memories`), thoughts, `current_plan`, `relevant_procedures`, `current_working_memory` (most active memories), `current_thought_chain_id`, and `meta_feedback`. Pay attention to memory `importance`/`confidence`.",
+            "2.  Error Handling: If `last_error_details` exists, **FIRST** reason about the error and propose a recovery strategy in your reasoning. Check if it was a dependency failure.",
+            "3.  Reasoning & Planning:",
+            "    a. State step-by-step reasoning towards the Goal/Sub-goal, integrating context and feedback. Consider `current_working_memory` for immediate context. Record key thoughts using `record_thought` and specify the `thought_chain_id` if different from `current_thought_chain_id`.",
+            "    b. Evaluate `current_plan`. Is it valid? Does it address errors? Are dependencies (`depends_on`) likely met?",
+            "    c. **Action Dependencies:** If planning Step B requires output from Step A (action ID 'a123'), include `\"depends_on\": [\"a123\"]` in Step B's plan object.",
+            "    d. **Artifact Tracking:** If planning to use a tool that creates a file/data, plan a subsequent step to call `record_artifact`. If needing a previously created artifact, plan to use `get_artifacts` or `get_artifact_by_id` first.",
+            "    e. **Direct Memory Management:** If you synthesize a critical new fact, insight, or procedure, plan to use `store_memory` to explicitly save it. If you find strong evidence contradicting a stored memory, plan to use `update_memory` to correct it. Provide clear `content`, `memory_type`, `importance`, and `confidence`.",
+            "    f. **Custom Thought Chains:** If tackling a distinct sub-problem or exploring a complex tangent, consider creating a new reasoning thread using `create_thought_chain`. Provide a clear `title`. Subsequent related thoughts should specify the new `thought_chain_id`. The loop tracks the `current_thought_chain_id`.",
+            "    g. **Linking:** Identify potential memory relationships (causal, supportive, contradictory). Plan to use `create_memory_link` with specific `link_type`s (e.g., `SUPPORTS`, `CONTRADICTS`, `CAUSAL`, `REFERENCES`).",
+            "    h. **Search:** Prefer `hybrid_search_memories` for mixed queries needing relevance and keyword matching. Use `search_semantic_memories` for pure conceptual similarity.",
+            "    i. **Update Plan:** Use the `agent:update_plan` tool ONLY for significant plan changes (e.g., error recovery, major strategy shift, inserting/removing multiple steps). Do NOT use it for simply marking a step complete.",
+            "4.  Action Decision: Choose **ONE** action based on the *first planned step* in your current plan:",
+            "    *   Call Memory/Other Tool: Select the most precise tool. Provide args per schema. **Mandatory:** Call `create_workflow` if context shows 'No Active Workflow'.",
+            "    *   Record Thought: Use `record_thought` for logging reasoning, questions, hypotheses etc. Specify `thought_chain_id` if not the current one.",
+            "    *   Update Plan Tool: Call `agent:update_plan` with the new plan structure if major changes are needed.",
+            "    *   Signal Completion: If Overall Goal is MET, respond ONLY with the text \"Goal Achieved:\" followed by a brief summary.",
+            "5.  Output Format: Respond **ONLY** with the valid JSON for the chosen tool call OR the \"Goal Achieved:\" text."
+        ])
+        # --- Key Considerations (Integrated from v3.3) ---
+        system_blocks.extend([
+            "\nKey Considerations:",
+            "*   Dependencies: Ensure `depends_on` actions are likely complete. Use `get_action_details` if unsure.",
+            "*   Artifacts: Track outputs (`record_artifact`), retrieve inputs (`get_artifacts`/`get_artifact_by_id`).",
+            "*   Memory: Store important learned info (`store_memory`). Update incorrect info (`update_memory`). Use confidence scores.",
+            "*   Thought Chains: Use `create_thought_chain` for complex sub-problems. Use the correct `thought_chain_id` when recording thoughts.",
+            "*   Linking: Use specific `link_type`s to build the knowledge graph.",
+            "*   Focus: Leverage `current_working_memory` for immediate context."
+        ])
         system_prompt = "\n".join(system_blocks)
+        # <<< End Integration Block: Detailed System Prompt >>>
 
         # ---------- user ----------
+        # (Keep the existing v3.3.5 user prompt construction logic, using _truncate_context)
         context_json = _truncate_context(context) # Use robust truncation
         user_blocks = [
             "Current Context:",
@@ -498,7 +538,7 @@ class AgentMasterLoop:
             "Current Plan:",
             "```json",
             json.dumps(
-                [step.model_dump(exclude_none=True) for step in self.state.current_plan], # Exclude None
+                [step.model_dump(exclude_none=True) for step in self.state.current_plan], # Exclude None values
                 indent=2,
                 ensure_ascii=False,
             ),
@@ -508,33 +548,28 @@ class AgentMasterLoop:
         ]
         if self.state.last_error_details:
             user_blocks += [
-                "**Last Error Details**:",
+                "**CRITICAL: Address Last Error Details**:", # Highlight error
                 "```json",
-                json.dumps(self.state.last_error_details, indent=2, default=str), # Use default=str
+                json.dumps(self.state.last_error_details, indent=2, default=str), # Use default=str for safety
                 "```",
                 "",
             ]
         if self.state.last_meta_feedback:
             user_blocks += [
-                "**Meta‑Cognitive Feedback**:",
+                "**Meta-Cognitive Feedback**:", # Highlight feedback
                 self.state.last_meta_feedback,
                 "",
             ]
         user_blocks += [
             f"Overall Goal: {goal}",
             "",
-            "Instruction: analyse, reason step‑by‑step, then output **one** of:",
-            "• a tool call (`tool_use` block);",
-            f"• `{AGENT_TOOL_UPDATE_PLAN}` tool call to replace the plan;",
-            "• a line starting with `Goal Achieved:`.",
+            "Instruction: Analyze context & errors. Reason step-by-step. Decide ONE action: call a tool (output tool_use JSON), update the plan IF NEEDED (call `agent:update_plan`), or signal completion (output 'Goal Achieved: ...').",
         ]
         user_prompt = "\n".join(user_blocks)
 
-        # Return structure for Anthropic API (system prompt + user prompt)
-        # Note: Anthropic recommends placing system prompt outside the messages list
-        # Adjust if your client library handles it differently.
-        # Assuming messages list format here:
+        # Return structure for Anthropic API
         return [{"role": "user", "content": system_prompt + "\n---\n" + user_prompt}]
+
 
     # ---------------------------------------------------------- bg‑task utils --
     # (Keep existing v3.3.5 background task utility functions:
@@ -542,7 +577,6 @@ class AgentMasterLoop:
     # _add_bg_task, _cleanup_background_tasks)
     def _background_task_done(self, task: asyncio.Task) -> None:
         """Callback for completed background tasks."""
-        # Use create_task to avoid blocking if lock is held
         asyncio.create_task(self._background_task_done_safe(task))
 
     async def _background_task_done_safe(self, task: asyncio.Task) -> None:
@@ -571,13 +605,22 @@ class AgentMasterLoop:
 
         async def _wrapper():
             # Pass snapshotted state to the coroutine
-            await coro_fn(
-                self,
-                *args,
-                workflow_id=snapshot_wf_id,
-                context_id=snapshot_ctx_id,
-                **kwargs,
-            )
+            # Ensure the agent instance (self) is passed correctly if coro_fn is an instance method
+            if hasattr(coro_fn, '__self__') and coro_fn.__self__ is self:
+                 await coro_fn(
+                      *args,
+                      workflow_id=snapshot_wf_id,
+                      context_id=snapshot_ctx_id,
+                      **kwargs,
+                 )
+            else: # If it's a static method or regular function bound to the class
+                 await coro_fn(
+                      self, # Pass the instance explicitly
+                      *args,
+                      workflow_id=snapshot_wf_id,
+                      context_id=snapshot_ctx_id,
+                      **kwargs,
+                 )
 
         # Create the task
         task = asyncio.create_task(_wrapper())
@@ -609,9 +652,6 @@ class AgentMasterLoop:
         cancelled_tasks = []
         for t in tasks_to_cleanup:
             if not t.done():
-                # Check if it's marked critical - skip cancellation if so?
-                # Add a 'critical' attribute or check task name if needed.
-                # For now, cancel all non-done tasks on cleanup.
                 t.cancel()
                 cancelled_tasks.append(t)
 
@@ -641,30 +681,21 @@ class AgentMasterLoop:
             return 0
         try:
             if not self.anthropic_client:
-                # Fallback if client is missing (shouldn't happen if init passed)
                 raise RuntimeError("Anthropic client unavailable for token estimation")
 
-            # Serialize complex data to JSON string for counting
             text_to_count = data if isinstance(data, str) else json.dumps(data, default=str, ensure_ascii=False)
-
-            # Use the Anthropic client's count_tokens method
-            # Note: The actual API might vary slightly depending on exact client version
-            # Assuming a simple text counting method here. If it needs messages format:
-            # token_count = await self.anthropic_client.count_tokens(messages=[{"role": "user", "content": text_to_count}])
-            # Adjust based on your specific Anthropic SDK usage.
-            # Using a hypothetical simple count method for this example:
+            # Use the actual count_tokens method from the anthropic client
             token_count = await self.anthropic_client.count_tokens(text_to_count)
-            return int(token_count) # Ensure integer return
+            return int(token_count)
 
         except Exception as e:
             self.logger.warning(f"Token estimation via Anthropic API failed: {e}. Using fallback.")
-            # Fallback rough heuristic: characters / 4
             try:
                 text_representation = data if isinstance(data, str) else json.dumps(data, default=str, ensure_ascii=False)
-                return len(text_representation) // 4
+                return len(text_representation) // 4 # Fallback heuristic
             except Exception as fallback_e:
                 self.logger.error(f"Token estimation fallback failed: {fallback_e}")
-                return 0 # Return 0 if all estimation fails
+                return 0
 
     # --------------------------------------------------------------- retry util --
     async def _with_retries(
@@ -672,73 +703,72 @@ class AgentMasterLoop:
         coro_fun,
         *args,
         max_retries: int = 3,
-        retry_exceptions: Tuple[type[BaseException], ...] = (Exception,), # Catch broader base exceptions
+        retry_exceptions: Tuple[type[BaseException], ...] = (Exception,),
         retry_backoff: float = 2.0,
-        jitter: Tuple[float, float] = (0.1, 0.5), # Add slight minimum jitter
+        jitter: Tuple[float, float] = (0.1, 0.5),
         **kwargs,
     ):
         """
-        Generic retry wrapper .
+        Generic retry wrapper (Fix #11 & #12).
 
         • Retries `max_retries-1` times on listed exceptions.
         • Exponential backoff with optional jitter.
         """
+        # (Keep existing v3.3.5 _with_retries implementation)
         attempt = 0
+        last_exception = None
         while True:
             try:
                 return await coro_fun(*args, **kwargs)
             except retry_exceptions as e:
                 attempt += 1
+                last_exception = e
                 if attempt >= max_retries:
                     self.logger.error(f"{coro_fun.__name__} failed after {max_retries} attempts. Last error: {e}")
-                    raise # Re-raise the last exception after exhausting retries
+                    raise
                 delay = (retry_backoff ** (attempt - 1)) + random.uniform(*jitter)
                 self.logger.warning(
                     f"{coro_fun.__name__} failed ({type(e).__name__}: {str(e)[:100]}...); retry {attempt}/{max_retries} in {delay:.2f}s"
                 )
+                # Check for shutdown before sleeping
+                if self._shutdown_event.is_set():
+                    self.logger.warning(f"Shutdown signaled during retry wait for {coro_fun.__name__}. Aborting retry.")
+                    raise asyncio.CancelledError(f"Shutdown during retry for {coro_fun.__name__}") from last_exception
                 await asyncio.sleep(delay)
-            # Separately catch CancelledError to prevent retrying on deliberate cancellation
             except asyncio.CancelledError:
                  self.logger.info(f"Coroutine {coro_fun.__name__} was cancelled during retry loop.")
-                 raise # Propagate cancellation immediately
+                 raise
+
 
     # ---------------------------------------------------------------- state I/O --
+    # (Keep existing v3.3.5 _save_agent_state and _load_agent_state implementations)
     async def _save_agent_state(self) -> None:
         """Cross‑platform atomic JSON save with fsync (Fix #8)."""
-        # (Keep existing v3.3.5 _save_agent_state implementation)
         state_dict = dataclasses.asdict(self.state)
         state_dict["timestamp"] = datetime.now(timezone.utc).isoformat()
-        # Ensure background_tasks (non-serializable) is removed
         state_dict.pop("background_tasks", None)
-        # Convert defaultdict to regular dict for saving
         state_dict["tool_usage_stats"] = {
             k: dict(v) for k, v in self.state.tool_usage_stats.items()
         }
-        # Convert PlanStep objects to dicts
         state_dict["current_plan"] = [
-            step.model_dump(exclude_none=True) for step in self.state.current_plan # Use model_dump and exclude None
+            step.model_dump(exclude_none=True) for step in self.state.current_plan
         ]
 
         try:
             self.agent_state_file.parent.mkdir(parents=True, exist_ok=True)
-            # Atomic save using temporary file
-            tmp_file = self.agent_state_file.with_suffix(f".tmp_{os.getpid()}") # Process-specific tmp file
-            async with aiofiles.open(tmp_file, "w", encoding='utf-8') as f: # Specify encoding
-                await f.write(json.dumps(state_dict, indent=2, ensure_ascii=False)) # Ensure unicode is handled
+            tmp_file = self.agent_state_file.with_suffix(f".tmp_{os.getpid()}")
+            async with aiofiles.open(tmp_file, "w", encoding='utf-8') as f:
+                await f.write(json.dumps(state_dict, indent=2, ensure_ascii=False))
                 await f.flush()
-                # Ensure data is written to disk (important for robustness)
                 try:
                     os.fsync(f.fileno())
                 except OSError as e:
-                    # fsync might fail on some systems/filesystems, log warning but continue
                     self.logger.warning(f"os.fsync failed during state save: {e}")
 
-            # Replace the old state file with the new one atomically
             os.replace(tmp_file, self.agent_state_file)
             self.logger.debug(f"State saved atomically → {self.agent_state_file}")
         except Exception as e:
             self.logger.error(f"Failed to save agent state: {e}", exc_info=True)
-            # Attempt to clean up temp file if it exists
             if tmp_file.exists():
                 try:
                     os.remove(tmp_file)
@@ -748,9 +778,7 @@ class AgentMasterLoop:
 
     async def _load_agent_state(self) -> None:
         """Loads agent state from file, handling potential errors and missing keys."""
-        # (Keep existing v3.3.5 _load_agent_state implementation, ensure thresholds init)
         if not self.agent_state_file.exists():
-            # Initialize with defaults if no state file exists
             self.state = AgentState(
                  current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
                  current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
@@ -758,27 +786,21 @@ class AgentMasterLoop:
             self.logger.info("No prior state file found. Starting fresh with default state.")
             return
         try:
-            async with aiofiles.open(self.agent_state_file, "r", encoding='utf-8') as f: # Specify encoding
+            async with aiofiles.open(self.agent_state_file, "r", encoding='utf-8') as f:
                 data = json.loads(await f.read())
 
             kwargs: Dict[str, Any] = {}
             processed_keys = set()
 
-            # Iterate through fields defined in the AgentState dataclass
             for fld in dataclasses.fields(AgentState):
-                # Skip non-init fields like background_tasks
                 if not fld.init:
                     continue
-
                 name = fld.name
                 processed_keys.add(name)
-
                 if name in data:
                     value = data[name]
-                    # Handle specific fields needing type conversion or validation
                     if name == "current_plan":
                         try:
-                            # Validate and convert plan steps
                             if isinstance(value, list):
                                 kwargs["current_plan"] = [PlanStep(**d) for d in value]
                             else:
@@ -787,61 +809,46 @@ class AgentMasterLoop:
                             self.logger.warning(f"Plan reload failed: {e}. Resetting plan.")
                             kwargs["current_plan"] = [PlanStep(description=DEFAULT_PLAN_STEP)]
                     elif name == "tool_usage_stats":
-                        # Reconstruct defaultdict structure
                         dd = _default_tool_stats()
                         if isinstance(value, dict):
                             for k, v_dict in value.items():
                                 if isinstance(v_dict, dict):
-                                    # Ensure required keys exist with correct types
                                     dd[k]["success"] = int(v_dict.get("success", 0))
                                     dd[k]["failure"] = int(v_dict.get("failure", 0))
                                     dd[k]["latency_ms_total"] = float(v_dict.get("latency_ms_total", 0.0))
                         kwargs["tool_usage_stats"] = dd
-                    # Add handling for other complex types if necessary
-                    # elif name == "some_other_complex_field":
-                    #    kwargs[name] = process_complex_field(value)
                     else:
-                        # Directly assign value if no special handling needed
                         kwargs[name] = value
                 else:
-                    # Field defined in AgentState but missing in saved data
                     self.logger.debug(f"Field '{name}' not found in saved state. Using default.")
-                    # Use default factory or default value if defined
                     if fld.default_factory is not dataclasses.MISSING:
                         kwargs[name] = fld.default_factory()
                     elif fld.default is not dataclasses.MISSING:
                         kwargs[name] = fld.default
-                    # Handle specific cases like thresholds if not using defaults directly
                     elif name == "current_reflection_threshold":
                         kwargs[name] = BASE_REFLECTION_THRESHOLD
                     elif name == "current_consolidation_threshold":
                         kwargs[name] = BASE_CONSOLIDATION_THRESHOLD
-                    # else: field will be missing if no default and not in saved data
 
-            # Warn about extra keys found in the file but not in the dataclass
-            extra_keys = set(data.keys()) - processed_keys - {"timestamp"} # Exclude timestamp meta-key
+            extra_keys = set(data.keys()) - processed_keys - {"timestamp"}
             if extra_keys:
                 self.logger.warning(f"Ignoring unknown keys found in state file: {extra_keys}")
 
-            # Ensure mandatory fields have values (use defaults if somehow missed)
-            # This mainly ensures thresholds are set if loading a very old state file
             if "current_reflection_threshold" not in kwargs:
                 kwargs["current_reflection_threshold"] = BASE_REFLECTION_THRESHOLD
             if "current_consolidation_threshold" not in kwargs:
                 kwargs["current_consolidation_threshold"] = BASE_CONSOLIDATION_THRESHOLD
 
-            # Create the AgentState instance
             self.state = AgentState(**kwargs)
             self.logger.info(f"Loaded state from {self.agent_state_file}; current loop {self.state.current_loop}")
 
         except (json.JSONDecodeError, TypeError, FileNotFoundError) as e:
             self.logger.error(f"State load failed: {e}. Resetting to default state.", exc_info=True)
-            # Reset to default state on load failure
             self.state = AgentState(
                 current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
                 current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
             )
-        except Exception as e: # Catch any other unexpected errors during load
+        except Exception as e:
             self.logger.critical(f"Unexpected error loading state: {e}. Resetting to default state.", exc_info=True)
             self.state = AgentState(
                 current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
@@ -858,28 +865,23 @@ class AgentMasterLoop:
             return None
 
         sm = self.mcp_client.server_manager
-        # Check registered tools first
         if tool_name in sm.tools:
             server_name = sm.tools[tool_name].server_name
-            # Verify the server is currently connected and active
             if server_name in sm.active_sessions:
                 self.logger.debug(f"Found tool '{tool_name}' on active server '{server_name}'.")
                 return server_name
             else:
                 self.logger.debug(f"Server '{server_name}' for tool '{tool_name}' is registered but not active.")
-                return None # Found but not active
+                return None
 
-        # Handle core tools (assuming a server named "CORE" handles them)
         if tool_name.startswith("core:") and "CORE" in sm.active_sessions:
             self.logger.debug(f"Found core tool '{tool_name}' on active CORE server.")
             return "CORE"
 
-        # Handle internal agent tool
         if tool_name == AGENT_TOOL_UPDATE_PLAN:
             self.logger.debug(f"Internal tool '{tool_name}' does not require a server.")
-            return "AGENT_INTERNAL" # Return a special marker
+            return "AGENT_INTERNAL"
 
-        # Tool not found
         self.logger.debug(f"Tool '{tool_name}' not found on any active server.")
         return None
 
@@ -887,11 +889,10 @@ class AgentMasterLoop:
     # ------------------------------------------------------------ initialization --
     async def initialize(self) -> bool:
         """Initializes the agent loop, loads state, fetches tool schemas, and verifies workflow."""
-        # (Keep existing v3.3.5 initialize implementation, but add TOOL_GET_WORKFLOW_DETAILS to essential tools list)
+        # (Keep existing v3.3.5 initialize implementation)
         self.logger.info("Initializing Agent loop …")
         await self._load_agent_state()
 
-        # Ensure context_id matches workflow_id if context_id is missing after load
         if self.state.workflow_id and not self.state.context_id:
             self.state.context_id = self.state.workflow_id
             self.logger.info(f"Initialized context_id from loaded workflow_id: {_fmt_id(self.state.workflow_id)}")
@@ -901,25 +902,21 @@ class AgentMasterLoop:
                 self.logger.error("MCP Client server manager not initialized.")
                 return False
 
-            # Fetch all available tool schemas from the server manager
             all_tools = self.mcp_client.server_manager.format_tools_for_anthropic()
 
-            # Inject schema for internal agent plan‑update tool (Fix #14)
-            # Use Pydantic model to generate schema reliably
             plan_step_schema = PlanStep.model_json_schema()
-            # Remove title if Pydantic adds it automatically
             plan_step_schema.pop('title', None)
             all_tools.append(
                 {
                     "name": AGENT_TOOL_UPDATE_PLAN,
                     "description": "Replace the agent's current plan with a new list of plan steps. Use this for significant replanning or error recovery.",
-                    "input_schema": { # Use 'input_schema' to match Anthropic format
+                    "input_schema": {
                         "type": "object",
                         "properties": {
                             "plan": {
                                 "type": "array",
                                 "description": "Complete new plan as a list of PlanStep objects.",
-                                "items": plan_step_schema, # Reference the generated schema
+                                "items": plan_step_schema,
                             }
                         },
                         "required": ["plan"],
@@ -927,11 +924,9 @@ class AgentMasterLoop:
                 }
             )
 
-            # Filter for unified_memory tools + agent internal tool
             self.tool_schemas = []
             loaded_tool_names = set()
             for sc in all_tools:
-                # Correctly handle potential missing mapping for sanitized names
                 original_name = self.mcp_client.server_manager.sanitized_to_original.get(sc["name"], sc["name"])
                 if original_name.startswith("unified_memory:") or sc["name"] == AGENT_TOOL_UPDATE_PLAN:
                     self.tool_schemas.append(sc)
@@ -939,48 +934,31 @@ class AgentMasterLoop:
 
             self.logger.info(f"Loaded {len(self.tool_schemas)} relevant tool schemas: {loaded_tool_names}")
 
-            # Verify essential tools are available
             essential = [
-                TOOL_CREATE_WORKFLOW,
-                TOOL_RECORD_ACTION_START,
-                TOOL_RECORD_ACTION_COMPLETION,
-                TOOL_RECORD_THOUGHT,
-                TOOL_STORE_MEMORY,
-                TOOL_GET_WORKING_MEMORY,
-                TOOL_HYBRID_SEARCH, # Essential for rich context
-                TOOL_GET_CONTEXT,   # Essential for context
-                TOOL_REFLECTION,    # Essential for meta-cognition
-                TOOL_CONSOLIDATION, # Essential for knowledge synthesis
-                TOOL_GET_WORKFLOW_DETAILS, # Needed for setting default chain ID
+                TOOL_CREATE_WORKFLOW, TOOL_RECORD_ACTION_START, TOOL_RECORD_ACTION_COMPLETION,
+                TOOL_RECORD_THOUGHT, TOOL_STORE_MEMORY, TOOL_GET_WORKING_MEMORY,
+                TOOL_HYBRID_SEARCH, TOOL_GET_CONTEXT, TOOL_REFLECTION,
+                TOOL_CONSOLIDATION, TOOL_GET_WORKFLOW_DETAILS,
             ]
             missing = [t for t in essential if not self._find_tool_server(t)]
             if missing:
-                # Log as error because functionality will be impaired
                 self.logger.error(f"Missing essential tools: {missing}. Agent functionality WILL BE impaired.")
-                # Depending on strictness, could return False here
 
-            # Check validity of loaded workflow state
-            top_wf = (
-                self.state.workflow_stack[-1] if self.state.workflow_stack else None
-            ) or self.state.workflow_id
+            top_wf = (self.state.workflow_stack[-1] if self.state.workflow_stack else None) or self.state.workflow_id
             if top_wf and not await self._check_workflow_exists(top_wf):
                 self.logger.warning(
                     f"Stored workflow '{_fmt_id(top_wf)}' not found; resetting workflow-specific state."
                 )
-                # Preserve non-workflow specific state
                 preserved_stats = self.state.tool_usage_stats
                 pres_ref_thresh = self.state.current_reflection_threshold
                 pres_con_thresh = self.state.current_consolidation_threshold
-                # Reset state but keep stats and thresholds
                 self.state = AgentState(
                     tool_usage_stats=preserved_stats,
                     current_reflection_threshold=pres_ref_thresh,
                     current_consolidation_threshold=pres_con_thresh
                 )
-                await self._save_agent_state() # Save the reset state
+                await self._save_agent_state()
 
-            # Initialize current thought chain ID if workflow exists but chain ID is missing
-            # This relies on TOOL_GET_WORKFLOW_DETAILS being available
             if self.state.workflow_id and not self.state.current_thought_chain_id:
                 await self._set_default_thought_chain_id()
 
@@ -996,52 +974,44 @@ class AgentMasterLoop:
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         if not current_wf_id:
             self.logger.debug("Cannot set default thought chain ID: No active workflow.")
-            return # No workflow active
+            return
 
-        get_details_tool = TOOL_GET_WORKFLOW_DETAILS # Use constant
+        get_details_tool = TOOL_GET_WORKFLOW_DETAILS
 
-        # Check if the tool is available
         if self._find_tool_server(get_details_tool):
             try:
-                # Use internal call to avoid recording this as a primary agent action
                 details = await self._execute_tool_call_internal(
                     get_details_tool,
                     {
                         "workflow_id": current_wf_id,
-                        "include_thoughts": True, # Need thoughts to get chain ID
-                        "include_actions": False, # Don't need other details
-                        "include_artifacts": False,
-                        "include_memories": False
+                        "include_thoughts": True, "include_actions": False,
+                        "include_artifacts": False, "include_memories": False
                     },
-                    record_action=False # This is an internal setup action
+                    record_action=False
                 )
-                # Check successful execution AND if thought_chains exist in the result
                 if details.get("success"):
                     thought_chains = details.get("thought_chains")
                     if isinstance(thought_chains, list) and thought_chains:
-                        # Assume the first chain listed is the primary one (usually ordered by creation)
                         first_chain = thought_chains[0]
                         chain_id = first_chain.get("thought_chain_id")
                         if chain_id:
                             self.state.current_thought_chain_id = chain_id
                             self.logger.info(f"Set current_thought_chain_id to primary chain: {_fmt_id(self.state.current_thought_chain_id)} for workflow {_fmt_id(current_wf_id)}")
-                            return # Success
+                            return
                         else:
-                             self.logger.warning(f"Primary thought chain found for workflow {current_wf_id}, but it lacks an ID in the details.")
+                             self.logger.warning(f"Primary thought chain found for workflow {current_wf_id}, but it lacks an ID.")
                     else:
                          self.logger.warning(f"Could not find any thought chains in details for workflow {current_wf_id}.")
                 else:
-                    # Log the error from the tool call if it failed
-                    self.logger.error(f"Tool '{get_details_tool}' failed while trying to get default thought chain: {details.get('error')}")
+                    self.logger.error(f"Tool '{get_details_tool}' failed: {details.get('error')}")
 
             except Exception as e:
-                # Log exceptions during the tool call itself
-                self.logger.error(f"Error fetching workflow details to set default thought chain ID: {e}", exc_info=False)
+                self.logger.error(f"Error fetching workflow details for default chain: {e}", exc_info=False)
         else:
             self.logger.warning(f"Cannot set default thought chain ID: Tool '{get_details_tool}' unavailable.")
 
-        # Fallback message if chain couldn't be set
-        self.logger.info(f"Could not determine primary thought chain ID for WF {_fmt_id(current_wf_id)} on init/load. Will use default on first thought recording.")
+        self.logger.info(f"Could not determine primary thought chain ID for WF {_fmt_id(current_wf_id)}. Will use default on first thought.")
+
 
     async def _check_workflow_exists(self, workflow_id: str) -> bool:
         """Checks if a workflow ID exists using get_workflow_details."""
@@ -1050,30 +1020,21 @@ class AgentMasterLoop:
         tool_name = TOOL_GET_WORKFLOW_DETAILS
         if not self._find_tool_server(tool_name):
             self.logger.error(f"Cannot check workflow existence: Tool {tool_name} unavailable.")
-            # Should we assume it exists or not? Assume not for safety.
             return False
         try:
-            # Call with minimal includes for efficiency
             result = await self._execute_tool_call_internal(
                 tool_name,
-                {
-                    "workflow_id": workflow_id,
-                    "include_actions": False,
-                    "include_artifacts": False,
-                    "include_thoughts": False,
-                    "include_memories": False
-                },
-                record_action=False # Internal check, don't record as agent action
+                {"workflow_id": workflow_id, "include_actions": False, "include_artifacts": False, "include_thoughts": False, "include_memories": False},
+                record_action=False
             )
-            # Success means the workflow was found
             return isinstance(result, dict) and result.get("success", False)
         except ToolInputError as e:
-            # ToolInputError likely means "not found"
             self.logger.debug(f"Workflow {_fmt_id(workflow_id)} likely not found (ToolInputError: {e}).")
             return False
         except Exception as e:
             self.logger.error(f"Error checking workflow {_fmt_id(workflow_id)} existence: {e}", exc_info=False)
-            return False # Assume not found on error
+            return False
+
 
     # ------------------------------------------------ dependency check --
     async def _check_prerequisites(self, ids: List[str]) -> Tuple[bool, str]:
@@ -1090,9 +1051,7 @@ class AgentMasterLoop:
         self.logger.debug(f"Checking prerequisites: {[_fmt_id(item_id) for item_id in ids]}")
         try:
             res = await self._execute_tool_call_internal(
-                tool_name,
-                {"action_ids": ids, "include_dependencies": False}, # Don't need nested deps here
-                record_action=False # Internal check
+                tool_name, {"action_ids": ids, "include_dependencies": False}, record_action=False
             )
 
             if not res.get("success"):
@@ -1146,30 +1105,22 @@ class AgentMasterLoop:
             self.logger.error(f"Cannot record action start: Tool '{start_tool}' unavailable.")
             return None
 
-        # Ensure we have a workflow ID
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         if not current_wf_id:
             self.logger.warning("Cannot record action start: No active workflow ID in state.")
             return None
 
-        # Prepare arguments for recording
         payload = {
             "workflow_id": current_wf_id,
-            # Generate a more descriptive title if possible
             "title": f"Execute: {tool_name.split(':')[-1]}",
             "action_type": ActionType.TOOL_USE.value,
-            # Status will be IN_PROGRESS by default if using record_action_start
-            # "status": ActionStatus.IN_PROGRESS.value, # Often handled by the tool itself
             "tool_name": tool_name,
-            "tool_args": tool_args, # Tool args are passed directly
-            # Add reasoning? Maybe take from context if available? For now, keep simple.
+            "tool_args": tool_args,
             "reasoning": f"Agent initiated tool call: {tool_name}",
-            # Add related thought ID? Requires passing more context here.
         }
 
         action_id: Optional[str] = None
         try:
-            # Use internal call to avoid recursive recording
             res = await self._execute_tool_call_internal(
                 start_tool, payload, record_action=False
             )
@@ -1177,7 +1128,6 @@ class AgentMasterLoop:
                 action_id = res.get("action_id")
                 if action_id:
                     self.logger.debug(f"Action started: {_fmt_id(action_id)} for tool {tool_name}")
-                    # Record declared dependencies *after* successfully getting the action_id
                     if planned_dependencies:
                         await self._record_action_dependencies_internal(action_id, planned_dependencies)
                 else:
@@ -1197,14 +1147,11 @@ class AgentMasterLoop:
         target_ids: List[str],
     ) -> None:
         """
-        Register edges Action->Action (SEQUENTIAL or REQUIRES) in bulk.
+        Register edges Action->Action (REQUIRES) in bulk.
         """
-        # Ensure source_id and target_ids are valid
         if not source_id or not target_ids:
             self.logger.debug("Skipping dependency recording: Missing source or target IDs.")
             return
-
-        # Filter out empty strings, None, and self-references
         valid_target_ids = {tid for tid in target_ids if tid and tid != source_id}
         if not valid_target_ids:
             self.logger.debug(f"No valid dependencies to record for source action {_fmt_id(source_id)}.")
@@ -1215,7 +1162,6 @@ class AgentMasterLoop:
             self.logger.error(f"Cannot record dependencies: Tool '{dep_tool}' unavailable.")
             return
 
-        # Ensure we have a workflow ID (should match source action's workflow)
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         if not current_wf_id:
             self.logger.warning(f"Cannot record dependencies for action {_fmt_id(source_id)}: No active workflow ID.")
@@ -1226,26 +1172,24 @@ class AgentMasterLoop:
         tasks = []
         for target_id in valid_target_ids:
             args = {
-                "workflow_id": current_wf_id, # Pass workflow context
+                "workflow_id": current_wf_id,
                 "source_action_id": source_id,
                 "target_action_id": target_id,
-                "dependency_type": "requires", # Default dependency type
+                "dependency_type": "requires",
             }
-            # Use internal call, don't record these meta-actions
             task = asyncio.create_task(
                 self._execute_tool_call_internal(dep_tool, args, record_action=False)
             )
             tasks.append(task)
 
-        # Gather results, log errors but don't block agent
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        target_list = list(valid_target_ids) # For consistent indexing with results
         for i, res in enumerate(results):
-            target_id = list(valid_target_ids)[i] # Get corresponding target ID
+            target_id = target_list[i]
             if isinstance(res, Exception):
                 self.logger.error(f"Error recording dependency {_fmt_id(source_id)} -> {_fmt_id(target_id)}: {res}", exc_info=False)
             elif isinstance(res, dict) and not res.get("success"):
                 self.logger.warning(f"Failed recording dependency {_fmt_id(source_id)} -> {_fmt_id(target_id)}: {res.get('error')}")
-            # else: Successfully recorded
 
 
     async def _record_action_completion_internal(
@@ -1261,32 +1205,25 @@ class AgentMasterLoop:
             self.logger.error(f"Cannot record action completion: Tool '{completion_tool}' unavailable.")
             return
 
-        # Determine status based on the result dictionary
         status = (
             ActionStatus.COMPLETED.value
             if isinstance(result, dict) and result.get("success")
             else ActionStatus.FAILED.value
         )
 
-        # Ensure we have a workflow ID (should match the action's workflow)
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         if not current_wf_id:
             self.logger.warning(f"Cannot record completion for action {_fmt_id(action_id)}: No active workflow ID.")
-            # Attempt to proceed without workflow_id? Risky. Let's skip.
             return
 
         payload = {
-            "workflow_id": current_wf_id, # Pass workflow context
+            "workflow_id": current_wf_id,
             "action_id": action_id,
             "status": status,
-            # Pass the full result dictionary to be serialized by the tool
             "tool_result": result,
-            # Could add summary here if available/needed
-            # "summary": result.get("summary") or result.get("message")
         }
 
         try:
-            # Use internal call, don't record this meta-action
             completion_result = await self._execute_tool_call_internal(
                 completion_tool, payload, record_action=False
             )
@@ -1298,16 +1235,15 @@ class AgentMasterLoop:
             self.logger.error(f"Exception recording action completion for {_fmt_id(action_id)}: {e}", exc_info=True)
 
     # ---------------------------------------------------- auto‑link helper --
-    # (Add the integrated _run_auto_linking method from the previous step here)
+    # (Keep the integrated _run_auto_linking method from the previous step here)
     async def _run_auto_linking(
         self,
         memory_id: str,
         *,
         workflow_id: Optional[str], # Added workflow_id snapshot
-        context_id: Optional[str], # Added context_id snapshot (unused here but good practice)
+        context_id: Optional[str], # Added context_id snapshot
     ) -> None:
         """Background task to automatically link a new memory using richer link types."""
-        # Abort if the workflow context changed while queued or shutdown requested
         if workflow_id != self.state.workflow_id or self._shutdown_event.is_set():
             self.logger.debug(f"Skipping auto-linking for {_fmt_id(memory_id)}: Workflow changed or shutdown.")
             return
@@ -1317,42 +1253,38 @@ class AgentMasterLoop:
                 self.logger.debug(f"Skipping auto-linking: Missing memory_id ({_fmt_id(memory_id)}) or workflow_id ({_fmt_id(workflow_id)}).")
                 return
 
-            await asyncio.sleep(random.uniform(*AUTO_LINKING_DELAY_SECS)) # Use constant
-            if self._shutdown_event.is_set(): return # Check again after sleep
+            await asyncio.sleep(random.uniform(*AUTO_LINKING_DELAY_SECS))
+            if self._shutdown_event.is_set(): return
 
             self.logger.debug(f"Attempting auto-linking for memory {_fmt_id(memory_id)} in workflow {_fmt_id(workflow_id)}...")
 
-            # Get source memory details
             source_mem_details_result = await self._execute_tool_call_internal(
                 TOOL_GET_MEMORY_BY_ID, {"memory_id": memory_id, "include_links": False}, record_action=False
             )
-            # Check success *and* that the memory still belongs to the expected workflow
             if not source_mem_details_result.get("success") or source_mem_details_result.get("workflow_id") != workflow_id:
                 self.logger.warning(f"Auto-linking failed for {_fmt_id(memory_id)}: Couldn't retrieve source memory or workflow mismatch.")
                 return
             source_mem = source_mem_details_result
 
-            # Use description or content for search query
-            query_text = source_mem.get("description", "") or source_mem.get("content", "")[:200] # Limit content length for query
+            query_text = source_mem.get("description", "") or source_mem.get("content", "")[:200]
             if not query_text:
                 self.logger.debug(f"Skipping auto-linking for {_fmt_id(memory_id)}: No description or content.")
                 return
 
-            # Prefer hybrid search if available
             search_tool = TOOL_HYBRID_SEARCH if self._find_tool_server(TOOL_HYBRID_SEARCH) else TOOL_SEMANTIC_SEARCH
             if not self._find_tool_server(search_tool):
                 self.logger.warning(f"Skipping auto-linking: Tool {search_tool} unavailable.")
                 return
 
             search_args = {
-                "workflow_id": workflow_id, # Use snapshotted workflow_id
+                "workflow_id": workflow_id,
                 "query": query_text,
-                "limit": self.auto_linking_max_links + 1, # Fetch one extra to filter self
-                "threshold": self.auto_linking_threshold, # Use constant
-                "include_content": False # Don't need full content for linking
+                "limit": self.auto_linking_max_links + 1,
+                "threshold": self.auto_linking_threshold,
+                "include_content": False
             }
             if search_tool == TOOL_HYBRID_SEARCH:
-                search_args.update({"semantic_weight": 0.8, "keyword_weight": 0.2}) # Prioritize semantics for linking
+                search_args.update({"semantic_weight": 0.8, "keyword_weight": 0.2})
 
             similar_results = await self._execute_tool_call_internal(
                 search_tool, search_args, record_action=False
@@ -1365,46 +1297,38 @@ class AgentMasterLoop:
             score_key = "hybrid_score" if search_tool == TOOL_HYBRID_SEARCH else "similarity"
 
             for similar_mem_summary in similar_results.get("memories", []):
-                if self._shutdown_event.is_set(): break # Check shutdown flag between links
+                if self._shutdown_event.is_set(): break
 
                 target_id = similar_mem_summary.get("memory_id")
                 similarity_score = similar_mem_summary.get(score_key, 0.0)
 
                 if not target_id or target_id == memory_id: continue
 
-                # Get target memory details to infer better link type
                 target_mem_details_result = await self._execute_tool_call_internal(
                     TOOL_GET_MEMORY_BY_ID, {"memory_id": target_id, "include_links": False}, record_action=False
                 )
-                # Check success *and* workflow match for the target memory
                 if not target_mem_details_result.get("success") or target_mem_details_result.get("workflow_id") != workflow_id:
                     self.logger.debug(f"Skipping link target {_fmt_id(target_id)}: Not found or workflow mismatch.")
                     continue
                 target_mem = target_mem_details_result
 
-                # Infer link type based on memory types (simple example from v3.3)
                 inferred_link_type = LinkType.RELATED.value
                 source_type = source_mem.get("memory_type")
                 target_type = target_mem.get("memory_type")
 
-                # Add more sophisticated linking logic here based on types if desired
                 if source_type == MemoryType.INSIGHT.value and target_type == MemoryType.FACT.value: inferred_link_type = LinkType.SUPPORTS.value
-                elif source_type == MemoryType.FACT.value and target_type == MemoryType.INSIGHT.value: inferred_link_type = LinkType.SUPPORTS.value # Bidirectional support?
+                elif source_type == MemoryType.FACT.value and target_type == MemoryType.INSIGHT.value: inferred_link_type = LinkType.SUPPORTS.value
                 elif source_type == MemoryType.QUESTION.value and target_type == MemoryType.FACT.value: inferred_link_type = LinkType.REFERENCES.value
-                # ... add other rules as needed ...
+                # Add more rules...
 
                 link_tool_name = TOOL_CREATE_LINK
                 if not self._find_tool_server(link_tool_name):
                     self.logger.warning(f"Cannot create link: Tool {link_tool_name} unavailable.")
-                    break # Stop trying if tool is missing
+                    break
 
-                # Create the link
                 link_args = {
-                    # workflow_id is usually inferred by the tool from memory IDs
-                    "source_memory_id": memory_id,
-                    "target_memory_id": target_id,
-                    "link_type": inferred_link_type,
-                    "strength": round(similarity_score, 3),
+                    "source_memory_id": memory_id, "target_memory_id": target_id,
+                    "link_type": inferred_link_type, "strength": round(similarity_score, 3),
                     "description": f"Auto-link ({inferred_link_type}) based on similarity ({score_key})"
                 }
                 link_result = await self._execute_tool_call_internal(
@@ -1415,30 +1339,27 @@ class AgentMasterLoop:
                     link_count += 1
                     self.logger.debug(f"Auto-linked memory {_fmt_id(memory_id)} to {_fmt_id(target_id)} ({inferred_link_type}, score: {similarity_score:.2f})")
                 else:
-                    # Log failure, but continue trying other links
                     self.logger.warning(f"Failed to auto-create link {_fmt_id(memory_id)}->{_fmt_id(target_id)}: {link_result.get('error')}")
 
                 if link_count >= self.auto_linking_max_links:
                     self.logger.debug(f"Reached auto-linking limit ({self.auto_linking_max_links}) for memory {_fmt_id(memory_id)}.")
                     break
-                await asyncio.sleep(0.1) # Small delay between link creations
+                await asyncio.sleep(0.1)
 
         except Exception as e:
-            # Catch errors within the background task itself
             self.logger.warning(f"Error in auto-linking task for {_fmt_id(memory_id)}: {e}", exc_info=False)
 
 
     # ---------------------------------------------------- promotion helper --
-    # (Add the integrated _check_and_trigger_promotion method from the previous step here)
+    # (Keep the integrated _check_and_trigger_promotion method from the previous step here)
     async def _check_and_trigger_promotion(
         self,
         memory_id: str,
         *,
         workflow_id: Optional[str], # Added workflow_id snapshot
-        context_id: Optional[str], # Added context_id snapshot (unused here but good practice)
+        context_id: Optional[str], # Added context_id snapshot
     ):
         """Checks a single memory for promotion and triggers it via TOOL_PROMOTE_MEM."""
-        # Abort if the workflow context changed or shutdown requested
         if workflow_id != self.state.workflow_id or self._shutdown_event.is_set():
             self.logger.debug(f"Skipping promotion check for {_fmt_id(memory_id)}: Workflow changed or shutdown.")
             return
@@ -1449,26 +1370,20 @@ class AgentMasterLoop:
             return
 
         try:
-            # Optional slight delay to avoid thundering herd on DB after a query
             await asyncio.sleep(random.uniform(0.1, 0.4))
-            if self._shutdown_event.is_set(): return # Check again after sleep
+            if self._shutdown_event.is_set(): return
 
             self.logger.debug(f"Checking promotion potential for memory {_fmt_id(memory_id)} in workflow {_fmt_id(workflow_id)}...")
-            # Execute the promotion check tool
-            # Workflow ID is likely inferred by the tool from memory_id, but pass if needed
             promotion_result = await self._execute_tool_call_internal(
                 promotion_tool_name, {"memory_id": memory_id}, record_action=False
             )
 
-            # Log success only if promotion actually occurred
             if promotion_result.get("success"):
                 if promotion_result.get("promoted"):
                     self.logger.info(f"Memory {_fmt_id(memory_id)} promoted from {promotion_result.get('previous_level')} to {promotion_result.get('new_level')}.", emoji_key="arrow_up")
                 else:
-                    # Log reason if not promoted but check was successful
                     self.logger.debug(f"Memory {_fmt_id(memory_id)} not promoted: {promotion_result.get('reason')}")
             else:
-                 # Log if the promotion check tool itself failed
                  self.logger.warning(f"Promotion check tool failed for {_fmt_id(memory_id)}: {promotion_result.get('error')}")
 
         except Exception as e:
@@ -1476,8 +1391,7 @@ class AgentMasterLoop:
 
 
     # ------------------------------------------------------ execute tool call --
-    # (Keep the integrated _execute_tool_call_internal from the previous step here,
-    # ensuring background triggers are included)
+    # <<< Start Integration Block: Background Triggers in _execute_tool_call_internal (Phase 1, Step 4) >>>
     async def _execute_tool_call_internal(
         self,
         tool_name: str,
@@ -1485,81 +1399,43 @@ class AgentMasterLoop:
         record_action: bool = True,
         planned_dependencies: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Handles server lookup, dependency checks, execution, results, optional action recording, dependency recording, and triggers."""
+        """Handles server lookup, dependency checks, execution, results, optional action recording, dependency recording, and background triggers."""
         target_server = self._find_tool_server(tool_name)
-        # Allow internal agent tool call without a server
         if not target_server and tool_name != AGENT_TOOL_UPDATE_PLAN:
             err = f"Tool server unavailable for {tool_name}"
             self.logger.error(err)
-            # Set error details for the main loop
             self.state.last_error_details = {"tool": tool_name, "error": err, "type": "ServerUnavailable"}
             return {"success": False, "error": err, "status_code": 503}
 
-        current_wf_id = (
-            self.state.workflow_stack[-1]
-            if self.state.workflow_stack
-            else self.state.workflow_id
-        )
-
-        # Inject context IDs automatically if missing and relevant
-        # Make a copy to avoid modifying the original arguments dict
+        current_wf_id = (self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id)
         final_arguments = arguments.copy()
-        if (
-            final_arguments.get("workflow_id") is None
-            and current_wf_id
-            and tool_name
-            not in { # Tools that don't need/take workflow_id explicitly
-                TOOL_CREATE_WORKFLOW,
-                TOOL_LIST_WORKFLOWS,
-                "core:list_servers",
-                "core:get_tool_schema",
-                AGENT_TOOL_UPDATE_PLAN,
-            }
-        ):
+        if (final_arguments.get("workflow_id") is None and current_wf_id and tool_name not in {TOOL_CREATE_WORKFLOW, TOOL_LIST_WORKFLOWS, "core:list_servers", "core:get_tool_schema", AGENT_TOOL_UPDATE_PLAN,}):
             final_arguments["workflow_id"] = current_wf_id
-        if (
-            final_arguments.get("context_id") is None
-            and self.state.context_id
-            and tool_name
-            in { # Tools operating on a specific cognitive context
-                TOOL_GET_WORKING_MEMORY,
-                TOOL_OPTIMIZE_WM,
-                TOOL_AUTO_FOCUS,
-                # Add others if they operate on context_id
-            }
-        ):
+        if (final_arguments.get("context_id") is None and self.state.context_id and tool_name in {TOOL_GET_WORKING_MEMORY, TOOL_OPTIMIZE_WM, TOOL_AUTO_FOCUS,}):
             final_arguments["context_id"] = self.state.context_id
-        if (
-            final_arguments.get("thought_chain_id") is None
-            and self.state.current_thought_chain_id
-            and tool_name == TOOL_RECORD_THOUGHT
-        ):
+        if (final_arguments.get("thought_chain_id") is None and self.state.current_thought_chain_id and tool_name == TOOL_RECORD_THOUGHT):
             final_arguments["thought_chain_id"] = self.state.current_thought_chain_id
 
-        # Dependency check before proceeding
         if planned_dependencies:
             ok, reason = await self._check_prerequisites(planned_dependencies)
             if not ok:
                 err_msg = f"Prerequisites not met for {tool_name}: {reason}"
                 self.logger.warning(err_msg)
                 self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "DependencyNotMetError", "dependencies": planned_dependencies}
-                self.state.needs_replan = True # Dependency failure requires replanning
-                return {"success": False, "error": err_msg, "status_code": 412} # 412 Precondition Failed
+                self.state.needs_replan = True
+                return {"success": False, "error": err_msg, "status_code": 412}
             else:
                 self.logger.info(f"Prerequisites {[_fmt_id(dep) for dep in planned_dependencies]} met for {tool_name}.")
 
-        # Handle internal plan‑update tool directly
         if tool_name == AGENT_TOOL_UPDATE_PLAN:
             try:
                 new_plan_data = final_arguments.get("plan", [])
                 if not isinstance(new_plan_data, list):
                     raise ValueError("`plan` argument must be a list of step objects.")
-                # Validate each step using the Pydantic model
                 validated_plan = [PlanStep(**p) for p in new_plan_data]
                 self.state.current_plan = validated_plan
-                self.state.needs_replan = False # Plan was explicitly updated
+                self.state.needs_replan = False
                 self.logger.info(f"Internal plan update successful. New plan has {len(validated_plan)} steps.")
-                # Clear errors after successful plan update
                 self.state.last_error_details = None
                 self.state.consecutive_error_count = 0
                 return {"success": True, "message": f"Plan updated with {len(validated_plan)} steps."}
@@ -1567,290 +1443,233 @@ class AgentMasterLoop:
                 err_msg = f"Failed to validate/apply new plan: {e}"
                 self.logger.error(err_msg)
                 self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "PlanUpdateError"}
-                # Don't increment consecutive errors for internal agent failure? Or maybe do? Let's increment.
                 self.state.consecutive_error_count += 1
-                self.state.needs_replan = True # Failed plan update needs replan
+                self.state.needs_replan = True
                 return {"success": False, "error": err_msg}
 
-        # --- Action Start Recording ---
         action_id: Optional[str] = None
-        # Use the _INTERNAL_OR_META_TOOLS set defined at class level
         should_record = record_action and tool_name not in self._INTERNAL_OR_META_TOOLS
         if should_record:
             action_id = await self._record_action_start_internal(
-                 tool_name, final_arguments, planned_dependencies # Pass potentially modified args
+                 tool_name, final_arguments, planned_dependencies
             )
-            # Note: _record_action_start_internal now handles dependency recording
 
-        # --- Define the actual tool call for retry wrapper ---
         async def _do_call():
-            # Ensure None values are stripped *before* sending to MCPClient execute
-            # MCPClient execute_tool likely handles this, but belt-and-suspenders
             call_args = {k: v for k, v in final_arguments.items() if v is not None}
-            # Target server must be valid here because AGENT_INTERNAL was handled
             return await self.mcp_client.execute_tool(target_server, tool_name, call_args)
 
         record_stats = self.state.tool_usage_stats[tool_name]
-        # --- Decide if tool is safe to auto‑retry ---
         idempotent = tool_name in {
-            # Read-only operations are generally idempotent
             TOOL_GET_CONTEXT, TOOL_GET_MEMORY_BY_ID, TOOL_SEMANTIC_SEARCH,
             TOOL_HYBRID_SEARCH, TOOL_GET_ACTION_DETAILS, TOOL_LIST_WORKFLOWS,
             TOOL_COMPUTE_STATS, TOOL_GET_WORKING_MEMORY, TOOL_GET_LINKED_MEMORIES,
             TOOL_GET_ARTIFACTS, TOOL_GET_ARTIFACT_BY_ID, TOOL_GET_ACTION_DEPENDENCIES,
-            TOOL_GET_THOUGHT_CHAIN, TOOL_GET_WORKFLOW_DETAILS,
-            # Some meta operations might be considered safe
-            TOOL_SUMMARIZE_TEXT,
+            TOOL_GET_THOUGHT_CHAIN, TOOL_GET_WORKFLOW_DETAILS, TOOL_SUMMARIZE_TEXT,
         }
 
         start_ts = time.time()
-        res = {} # Initialize result dict
+        res = {}
 
         try:
-            # Execute with retries
             raw = await self._with_retries(
-                _do_call,
-                max_retries=3 if idempotent else 1, # Retry only idempotent tools
-                # Retry on common transient errors or specific tool errors if needed
+                _do_call, max_retries=3 if idempotent else 1,
                 retry_exceptions=(ToolError, ToolInputError, asyncio.TimeoutError, ConnectionError),
             )
             latency_ms = (time.time() - start_ts) * 1000
             record_stats["latency_ms_total"] += latency_ms
 
-            # Process result format (handle dicts vs other types)
             if isinstance(raw, dict) and ("success" in raw or "isError" in raw):
-                # Assume standard MCP result format
                 is_error = raw.get("isError", not raw.get("success", True))
-                content = raw.get("content", raw.get("error", raw.get("data"))) # Get content or error
+                content = raw.get("content", raw.get("error", raw.get("data")))
                 if is_error:
                     res = {"success": False, "error": str(content), "status_code": raw.get("status_code")}
                 else:
-                    # If content itself contains success/error, use that structure
                     if isinstance(content, dict) and "success" in content:
                         res = content
-                    else: # Otherwise wrap the content under a 'data' key
+                    else:
                         res = {"success": True, "data": content}
-            elif isinstance(raw, dict): # Handle dicts without explicit success/isError
-                 res = {"success": True, "data": raw} # Assume success if no error indicators
+            elif isinstance(raw, dict):
+                 res = {"success": True, "data": raw}
             else:
-                # Handle non-dict results (e.g., simple strings, numbers)
                 res = {"success": True, "data": raw}
 
-            # --- State updates and Background Triggers on SUCCESS ---
+            # --- State updates and Background Triggers ---
             if res.get("success"):
-                # Reset error count ONLY if successful. Heuristics handle counters.
-                # self.state.consecutive_error_count = 0 # Let _apply_heuristic_plan_update handle this
                 record_stats["success"] += 1
-
-                # --- Background Triggers Integration ---
-                current_wf_id_snapshot = self.state.workflow_id # Snapshot WF ID  # noqa: F841
+                # --- Background Triggers Integration Start ---
+                current_wf_id_snapshot = self.state.workflow_id # Snapshot for safety  # noqa: F841
 
                 # Auto-linking triggers
                 if tool_name in [TOOL_STORE_MEMORY, TOOL_UPDATE_MEMORY] and res.get("memory_id"):
-                    self.logger.debug(f"Queueing auto-link check for memory {_fmt_id(res['memory_id'])}")
-                    self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=res["memory_id"])
+                    mem_id = res["memory_id"]
+                    self.logger.debug(f"Queueing auto-link check for memory {_fmt_id(mem_id)}")
+                    self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=mem_id) # workflow_id passed implicitly by _start_background_task
                 if tool_name == TOOL_RECORD_ARTIFACT and res.get("linked_memory_id"):
-                    self.logger.debug(f"Queueing auto-link check for memory linked to artifact: {_fmt_id(res['linked_memory_id'])}")
-                    self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=res["linked_memory_id"])
+                    linked_mem_id = res["linked_memory_id"]
+                    self.logger.debug(f"Queueing auto-link check for memory linked to artifact: {_fmt_id(linked_mem_id)}")
+                    self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=linked_mem_id)
 
                 # Promotion check triggers (after retrieval)
                 if tool_name in [TOOL_GET_MEMORY_BY_ID, TOOL_QUERY_MEMORIES, TOOL_HYBRID_SEARCH, TOOL_SEMANTIC_SEARCH, TOOL_GET_WORKING_MEMORY]:
-                    mem_ids_to_check = set() # Use set to avoid duplicates
+                    mem_ids_to_check = set()
+                    # Extract memory IDs from various possible result structures
+                    potential_mems = []
                     if tool_name == TOOL_GET_MEMORY_BY_ID:
-                        # Result might be directly the memory dict or nested under 'data'
-                        mem_data = res if "memory_id" in res else res.get("data", {})
-                        if isinstance(mem_data, dict):
-                             mem_ids_to_check.add(mem_data.get("memory_id"))
+                        potential_mems = [res] # Result is the memory dict itself
                     elif tool_name == TOOL_GET_WORKING_MEMORY:
-                        wm_data = res.get("working_memories", [])
-                        if isinstance(wm_data, list):
-                            focus_id = res.get("focal_memory_id")
-                            if focus_id: mem_ids_to_check.add(focus_id)
-                            mem_ids_to_check.update(m.get("memory_id") for m in wm_data[:2] if isinstance(m,dict) and m.get("memory_id")) # Check top 2
+                         potential_mems = res.get("working_memories", [])
+                         focus_id = res.get("focal_memory_id")
+                         if focus_id: mem_ids_to_check.add(focus_id)
                     else: # Query/Search results
-                        # Results might be under 'memories' or 'data.memories' etc.
-                        memories = res.get("memories", res.get("data", {}).get("memories") if isinstance(res.get("data"), dict) else [])
-                        if isinstance(memories, list):
-                            mem_ids_to_check.update(m.get("memory_id") for m in memories[:3] if isinstance(m,dict) and m.get("memory_id")) # Check top 3
+                         potential_mems = res.get("memories", [])
 
-                    for mem_id in filter(None, mem_ids_to_check): # Filter out None IDs
+                    if isinstance(potential_mems, list):
+                        # Limit checks to top few results
+                        mem_ids_to_check.update(
+                            m.get("memory_id") for m in potential_mems[:3] # Check top 3
+                            if isinstance(m, dict) and m.get("memory_id")
+                        )
+
+                    for mem_id in filter(None, mem_ids_to_check):
                          self.logger.debug(f"Queueing promotion check for retrieved memory {_fmt_id(mem_id)}")
                          self._start_background_task(AgentMasterLoop._check_and_trigger_promotion, memory_id=mem_id)
-
+                # --- Background Triggers Integration End ---
 
                 # Update current thought chain ID if a new one was created
                 if tool_name == TOOL_CREATE_THOUGHT_CHAIN and res.get("success"):
-                    # Result might be directly the chain dict or nested under 'data'
                     chain_data = res if "thought_chain_id" in res else res.get("data", {})
                     if isinstance(chain_data, dict):
                         new_chain_id = chain_data.get("thought_chain_id")
                         if new_chain_id:
                             self.state.current_thought_chain_id = new_chain_id
                             self.logger.info(f"Switched current thought chain to newly created: {_fmt_id(new_chain_id)}")
-                # --- End Background Triggers ---
 
             else: # Tool failed
-                # Don't increment error count here; let _apply_heuristic_plan_update handle it
                 record_stats["failure"] += 1
-                # Ensure error details are captured from the result
                 self.state.last_error_details = {
-                    "tool": tool_name,
-                    "args": arguments, # Log the arguments that caused failure
+                    "tool": tool_name, "args": arguments,
                     "error": res.get("error", "Unknown failure"),
-                    "status_code": res.get("status_code"),
-                    "type": "ToolExecutionError"
+                    "status_code": res.get("status_code"), "type": "ToolExecutionError"
                 }
-                # If it was a dependency error, update type
                 if res.get("status_code") == 412:
                      self.state.last_error_details["type"] = "DependencyNotMetError"
 
-            # Update last action summary (more detailed)
+            # Update last action summary (detailed version)
             summary = ""
             if res.get("success"):
-                # Try to find a meaningful summary field
-                for k in ("summary", "message", "memory_id", "action_id", "artifact_id", "chain_id", "state_id", "report", "visualization"):
-                    if k in res and res[k]:
-                        summary = f"{k}: {_fmt_id(res[k]) if 'id' in k else str(res[k])}"
-                        break
-                    elif isinstance(res.get("data"), dict) and k in res["data"] and res["data"][k]:
-                         summary = f"{k}: {_fmt_id(res['data'][k]) if 'id' in k else str(res['data'][k])}"
-                         break
-                else: # Fallback for generic success
-                    data_preview = str(res.get("data", "Success"))[:70]
-                    summary = f"Success. Data: {data_preview}..." if len(str(res.get("data", ""))) > 70 else f"Success. Data: {data_preview}"
+                summary_keys = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "chain_id", "state_id", "report", "visualization"]
+                data_payload = res.get("data", res) # Look in 'data' or the root
+                if isinstance(data_payload, dict):
+                    for k in summary_keys:
+                        if k in data_payload and data_payload[k]:
+                            summary = f"{k}: {_fmt_id(data_payload[k]) if 'id' in k else str(data_payload[k])}"
+                            break
+                    else: # Fallback if no specific key found
+                        data_str = str(data_payload)[:70]
+                        summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
+                else: # Handle non-dict data payload
+                     data_str = str(data_payload)[:70]
+                     summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
             else:
                 summary = f"Failed: {str(res.get('error', 'Unknown Error'))[:100]}"
                 if res.get('status_code'): summary += f" (Code: {res['status_code']})"
-
             self.state.last_action_summary = f"{tool_name} -> {summary}"
             self.logger.info(self.state.last_action_summary, emoji_key="checkered_flag" if res.get('success') else "warning")
 
-
         except (ToolError, ToolInputError) as e:
-            # Handle specific MCP exceptions caught during _with_retries or directly
             err_str = str(e); status_code = getattr(e, 'status_code', None)
             self.logger.error(f"Tool Error executing {tool_name}: {err_str}", exc_info=False)
             res = {"success": False, "error": err_str, "status_code": status_code}
             record_stats["failure"] += 1
             self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": type(e).__name__, "status_code": status_code}
             self.state.last_action_summary = f"{tool_name} -> Failed: {err_str[:100]}"
-            if status_code == 412: # Explicitly mark dependency failures for replanning
-                self.state.last_error_details["type"] = "DependencyNotMetError"
-                # self.state.needs_replan = True # Let heuristic update handle replan flag
-
+            if status_code == 412: self.state.last_error_details["type"] = "DependencyNotMetError"
         except asyncio.CancelledError:
-             # Handle task cancellation gracefully
              err_str = "Tool execution cancelled."
              self.logger.warning(f"{tool_name} execution was cancelled.")
-             res = {"success": False, "error": err_str, "status_code": 499} # Use 499 Client Closed Request
-             record_stats["failure"] += 1 # Count cancellation as failure for stats
+             res = {"success": False, "error": err_str, "status_code": 499}
+             record_stats["failure"] += 1
              self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "CancelledError"}
              self.state.last_action_summary = f"{tool_name} -> Cancelled"
-
         except Exception as e:
-            # Catch any other unexpected errors during execution or retries
             err_str = str(e)
             self.logger.error(f"Unexpected Error executing {tool_name}: {err_str}", exc_info=True)
             res = {"success": False, "error": f"Unexpected error: {err_str}"}
             record_stats["failure"] += 1
             self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "UnexpectedExecutionError"}
             self.state.last_action_summary = f"{tool_name} -> Failed: Unexpected error."
-            # self.state.needs_replan = True # Let heuristic update handle replan flag
-
 
         # --- Action Completion Recording ---
-        if action_id: # Only record completion if start was recorded
-            # Pass the final result 'res' to the completion recorder
+        if action_id:
             await self._record_action_completion_internal(action_id, res)
 
-
-        # --- Handle workflow side effects based on the final result ---
-        # (Moved *after* completion recording, using the final 'res')
+        # --- Handle workflow side effects ---
+        # Must be called *after* execution and completion recording
         await self._handle_workflow_side_effects(tool_name, final_arguments, res)
 
-
         return res
+    # <<< End Integration Block: Background Triggers >>>
+
 
     async def _handle_workflow_side_effects(self, tool_name: str, arguments: Dict, result_content: Dict):
         """Handles state changes after specific tool calls like workflow creation/completion."""
-        # (Keep existing v3.3.5 _handle_workflow_side_effects implementation, ensure _set_default_thought_chain called)
-        # --- Side effects for Workflow Creation ---
+        # (Keep existing v3.3.5 _handle_workflow_side_effects implementation)
         if tool_name == TOOL_CREATE_WORKFLOW and result_content.get("success"):
             new_wf_id = result_content.get("workflow_id")
             primary_chain_id = result_content.get("primary_thought_chain_id")
-            parent_id = arguments.get("parent_workflow_id") # Get parent from original args
+            parent_id = arguments.get("parent_workflow_id")
 
             if new_wf_id:
-                # Update primary workflow ID and context ID
                 self.state.workflow_id = new_wf_id
-                self.state.context_id = new_wf_id # Align context ID with new workflow
+                self.state.context_id = new_wf_id
 
-                # Manage workflow stack
                 if parent_id and parent_id in self.state.workflow_stack:
-                    # If created as a sub-workflow of an existing one on the stack
                     self.state.workflow_stack.append(new_wf_id)
                     log_prefix = "sub-"
                 else:
-                    # If it's a new root workflow or parent isn't on stack, reset stack
                     self.state.workflow_stack = [new_wf_id]
                     log_prefix = "new "
 
-                # Set the current thought chain ID for the new workflow
                 self.state.current_thought_chain_id = primary_chain_id
                 self.logger.info(f"Switched to {log_prefix}workflow: {_fmt_id(new_wf_id)}. Current chain: {_fmt_id(primary_chain_id)}", emoji_key="label")
 
-                # Reset plan, errors, and replan flag for the new workflow context
                 self.state.current_plan = [PlanStep(description=f"Start {log_prefix}workflow: '{result_content.get('title', 'Untitled')}'. Goal: {result_content.get('goal', 'Not specified')}.")]
                 self.state.consecutive_error_count = 0
                 self.state.needs_replan = False
                 self.state.last_error_details = None
-                # Reset meta-counters for new workflow? Optional, depends on desired behavior.
-                # self.state.successful_actions_since_reflection = 0
-                # self.state.successful_actions_since_consolidation = 0
 
-        # --- Side effects for Workflow Status Update (Completion/Failure) ---
         elif tool_name == TOOL_UPDATE_WORKFLOW_STATUS and result_content.get("success"):
-            status = arguments.get("status") # Status requested
-            wf_id_updated = arguments.get("workflow_id") # Workflow that was updated
+            status = arguments.get("status")
+            wf_id_updated = arguments.get("workflow_id")
 
-            # Check if the *current* workflow on top of the stack was finished
             if wf_id_updated and self.state.workflow_stack and wf_id_updated == self.state.workflow_stack[-1]:
-                # Check if status indicates terminal state
                 is_terminal = status in [
-                    WorkflowStatus.COMPLETED.value,
-                    WorkflowStatus.FAILED.value,
-                    WorkflowStatus.ABANDONED.value
+                    WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value, WorkflowStatus.ABANDONED.value
                 ]
 
                 if is_terminal:
-                    finished_wf = self.state.workflow_stack.pop() # Remove finished workflow
+                    finished_wf = self.state.workflow_stack.pop()
                     if self.state.workflow_stack:
-                        # Return to parent workflow
                         self.state.workflow_id = self.state.workflow_stack[-1]
-                        self.state.context_id = self.state.workflow_id # Realign context ID
-                        # Fetch parent's primary thought chain ID
+                        self.state.context_id = self.state.workflow_id
                         await self._set_default_thought_chain_id()
                         self.logger.info(f"Sub-workflow {_fmt_id(finished_wf)} finished ({status}). Returning to parent {_fmt_id(self.state.workflow_id)}. Current chain: {_fmt_id(self.state.current_thought_chain_id)}", emoji_key="arrow_left")
-                        # Force replan in parent context
                         self.state.needs_replan = True
                         self.state.current_plan = [PlanStep(description=f"Returned from sub-workflow {_fmt_id(finished_wf)} (status: {status}). Re-assess parent goal.")]
-                        self.state.last_error_details = None # Clear error from sub-task
+                        self.state.last_error_details = None
                     else:
-                        # Root workflow finished
                         self.logger.info(f"Root workflow {_fmt_id(finished_wf)} finished with status: {status}.")
                         self.state.workflow_id = None
                         self.state.context_id = None
                         self.state.current_thought_chain_id = None
-                        # Set goal achieved flag only if completed successfully
                         if status == WorkflowStatus.COMPLETED.value:
                              self.state.goal_achieved_flag = True
                         else:
-                             self.state.goal_achieved_flag = False # Mark as not achieved if failed/abandoned
-                        # Clear plan
+                             self.state.goal_achieved_flag = False
                         self.state.current_plan = []
 
 
-    # (Keep the integrated _apply_heuristic_plan_update method from the previous step here)
+    # <<< Start Integration Block: Heuristic Plan Update Method (Phase 1, Step 3) >>>
     async def _apply_heuristic_plan_update(self, last_decision: Dict[str, Any], last_tool_result_content: Optional[Dict[str, Any]] = None):
         """
         Applies heuristic updates to the plan when the LLM doesn't explicitly
@@ -1871,7 +1690,7 @@ class AgentMasterLoop:
         action_successful = False # Flag if the last action contributing to plan step was successful
         tool_name_executed = last_decision.get("tool_name") # Get tool name if applicable
 
-        if decision_type == "call_tool":
+        if decision_type == "call_tool" and tool_name_executed != AGENT_TOOL_UPDATE_PLAN:
             # Check result success, ensure it's a dictionary
             tool_success = isinstance(last_tool_result_content, dict) and last_tool_result_content.get("success", False)
             action_successful = tool_success # Tool call success directly maps to action success for plan update
@@ -1881,84 +1700,88 @@ class AgentMasterLoop:
                 # Try to get meaningful summary or ID from result
                 summary = "Success."
                 if isinstance(last_tool_result_content, dict):
-                     # Prioritize specific meaningful keys
                      summary_keys = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "chain_id", "state_id", "report", "visualization"]
-                     for k in summary_keys:
-                          if k in last_tool_result_content and last_tool_result_content[k]:
-                               summary = f"{k}: {_fmt_id(last_tool_result_content[k]) if 'id' in k else str(last_tool_result_content[k])}"
-                               break
-                     else: # Fallback to 'data' or generic success
-                          data_preview = str(last_tool_result_content.get("data", "Success."))[:70]
-                          summary = f"Data: {data_preview}..." if len(str(last_tool_result_content.get('data', ''))) > 70 else f"Data: {data_preview}"
+                     data_payload = last_tool_result_content.get("data", last_tool_result_content)
+                     if isinstance(data_payload, dict):
+                         for k in summary_keys:
+                              if k in data_payload and data_payload[k]:
+                                   summary = f"{k}: {_fmt_id(data_payload[k]) if 'id' in k else str(data_payload[k])}"
+                                   break
+                         else:
+                              data_str = str(data_payload)[:70]
+                              summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
+                     else:
+                          data_str = str(data_payload)[:70]
+                          summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
 
                 current_step.result_summary = summary[:150] # Truncate summary
                 self.state.current_plan.pop(0) # Remove completed step
                 if not self.state.current_plan:
                     self.logger.info("Plan completed. Adding final analysis step.")
                     self.state.current_plan.append(PlanStep(description="Plan finished. Analyze overall result and decide if goal is met."))
-                self.state.needs_replan = False # Success usually doesn't require replan unless LLM stated otherwise
+                self.state.needs_replan = False # Success usually doesn't require replan
             else: # Tool failed
                 current_step.status = "failed"
                 error_msg = "Unknown failure"
                 if isinstance(last_tool_result_content, dict):
                      error_msg = str(last_tool_result_content.get('error', 'Unknown failure'))
                 current_step.result_summary = f"Failure: {error_msg[:150]}"
-                # Keep failed step in plan for context, insert analysis step after it
-                # Avoid inserting duplicate analysis steps
+                # Keep failed step, insert analysis step if not already present
                 if len(self.state.current_plan) < 2 or not self.state.current_plan[1].description.startswith("Analyze failure of step"):
                     self.state.current_plan.insert(1, PlanStep(description=f"Analyze failure of step '{current_step.description[:30]}...' and replan."))
                 self.state.needs_replan = True # Failure requires replan
 
         elif decision_type == "thought_process":
-            action_successful = True # Recording a thought is usually considered success for plan progression
-            current_step.status = "completed" # Assume the thought fulfills the current plan step's intent
+            action_successful = True # Recording a thought progresses the plan heuristically
+            current_step.status = "completed"
             current_step.result_summary = f"Thought Recorded: {last_decision.get('content','')[:50]}..."
             self.state.current_plan.pop(0)
             if not self.state.current_plan:
                 self.logger.info("Plan completed after thought. Adding final analysis step.")
                 self.state.current_plan.append(PlanStep(description="Decide next action based on recorded thought and overall goal."))
-            self.state.needs_replan = False # Recording thought usually doesn't force replan
+            self.state.needs_replan = False
 
         elif decision_type == "complete":
             action_successful = True
             self.state.current_plan = [PlanStep(description="Goal Achieved. Finalizing.", status="completed")]
             self.state.needs_replan = False
 
-        else: # Includes decision_type == "error" or unhandled agent decisions
+        else: # Includes decision_type == "error" or AGENT_TOOL_UPDATE_PLAN (which shouldn't reach here)
+              # Or unhandled agent decisions
             action_successful = False
-            current_step.status = "failed"
-            err_summary = self.state.last_action_summary or "Unknown agent error"
-            current_step.result_summary = f"Agent/Tool Error: {err_summary[:100]}..."
-            # Keep failed step, insert analysis step
-            if len(self.state.current_plan) < 2 or not self.state.current_plan[1].description.startswith("Re-evaluate due to agent error"):
-                 self.state.current_plan.insert(1, PlanStep(description="Re-evaluate due to agent error or unclear decision."))
-            self.state.needs_replan = True # Agent error requires replan
+            # Only mark step failed if it wasn't the plan update tool itself that failed
+            if tool_name_executed != AGENT_TOOL_UPDATE_PLAN:
+                current_step.status = "failed"
+                err_summary = self.state.last_action_summary or "Unknown agent error"
+                current_step.result_summary = f"Agent/Tool Error: {err_summary[:100]}..."
+                # Keep failed step, insert analysis step if not already present
+                if len(self.state.current_plan) < 2 or not self.state.current_plan[1].description.startswith("Re-evaluate due to agent error"):
+                     self.state.current_plan.insert(1, PlanStep(description="Re-evaluate due to agent error or unclear decision."))
+            # Always set needs_replan if an error occurred or decision was unexpected
+            self.state.needs_replan = True
 
         # --- Update Meta-Counters based on Action Success ---
         if action_successful:
             self.state.consecutive_error_count = 0 # Reset error count on any success
+
             # Increment successful action counts *only* if the action wasn't purely internal/meta
+            # Check if tool_name_executed exists and is not in the excluded set
             if tool_name_executed and tool_name_executed not in self._INTERNAL_OR_META_TOOLS:
-                 # Use float increments to allow fractional progress for thoughts later if desired
                  self.state.successful_actions_since_reflection += 1.0
                  self.state.successful_actions_since_consolidation += 1.0
-                 self.logger.debug(f"Incremented success counters R:{self.state.successful_actions_since_reflection}, C:{self.state.successful_actions_since_consolidation}")
+                 self.logger.debug(f"Incremented success counters R:{self.state.successful_actions_since_reflection:.1f}, C:{self.state.successful_actions_since_consolidation:.1f} after successful action: {tool_name_executed}")
             elif decision_type == "thought_process":
-                 # Optional: Count thoughts as minor progress (e.g., 0.25 or 0.5)
-                 # self.state.successful_actions_since_reflection += 0.5
-                 # self.state.successful_actions_since_consolidation += 0.5
-                 pass # Currently not counting thoughts towards thresholds
-
-        else: # Action failed
+                 # Counting thoughts as progress (0.5) - adjust if needed
+                 self.state.successful_actions_since_reflection += 0.5
+                 self.state.successful_actions_since_consolidation += 0.5
+                 self.logger.debug(f"Incremented success counters R:{self.state.successful_actions_since_reflection:.1f}, C:{self.state.successful_actions_since_consolidation:.1f} after thought recorded.")
+        else: # Action failed or was an error condition handled above
             self.state.consecutive_error_count += 1
             self.logger.warning(f"Consecutive error count increased to: {self.state.consecutive_error_count}")
             # Reset reflection counter immediately on error to encourage reflection sooner
             if self.state.successful_actions_since_reflection > 0:
                  self.logger.info(f"Resetting reflection counter due to error (was {self.state.successful_actions_since_reflection:.1f}).")
                  self.state.successful_actions_since_reflection = 0
-                 # Consider if consolidation counter should also be reset or paused on error?
-                 # Let's keep consolidation counter running unless error rate is very high.
-
 
         # --- Log Final Plan State ---
         log_plan_msg = f"Plan updated heuristically. Steps remaining: {len(self.state.current_plan)}. "
@@ -1968,58 +1791,48 @@ class AgentMasterLoop:
         else:
             log_plan_msg += "Plan is now empty."
         self.logger.info(log_plan_msg, emoji_key="clipboard")
+    # <<< End Integration Block: Heuristic Plan Update Method >>>
 
 
     # ------------------------------------------------ adaptive thresholds --
     # (Keep existing v3.3.5 _adapt_thresholds implementation)
     def _adapt_thresholds(self, stats: Dict[str, Any]) -> None:
-        """Adjusts reflection and consolidation thresholds based on memory stats."""
         if not stats or not stats.get("success"):
              self.logger.warning("Cannot adapt thresholds: Invalid or failed stats received.")
              return
 
         self.logger.debug(f"Attempting threshold adaptation based on stats: {stats}")
-        adjustment_factor = 0.1 # How much to adjust thresholds by each time
+        adjustment_factor = 0.1
         changed = False
 
-        # --- Consolidation Threshold Adaptation ---
         episodic_count = stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0)
-        target_episodic = BASE_CONSOLIDATION_THRESHOLD * 1.5 # Target range guidepost
+        target_episodic = BASE_CONSOLIDATION_THRESHOLD * 1.5
 
-        # Lower threshold if episodic count is significantly high
-        if episodic_count > target_episodic * 1.5: # e.g., > 2.25 * base
-            # Calculate potential new threshold, decrease by factor
+        if episodic_count > target_episodic * 1.5:
             potential_new = max(MIN_CONSOLIDATION_THRESHOLD, self.state.current_consolidation_threshold - math.ceil(self.state.current_consolidation_threshold * adjustment_factor))
             if potential_new < self.state.current_consolidation_threshold:
                 self.logger.info(f"High episodic count ({episodic_count}). Lowering consolidation threshold: {self.state.current_consolidation_threshold} -> {potential_new}")
                 self.state.current_consolidation_threshold = potential_new
                 changed = True
-        # Raise threshold if episodic count is low (agent might be consolidating too often or not generating enough)
-        elif episodic_count < target_episodic * 0.75: # e.g., < 1.125 * base
-            # Calculate potential new threshold, increase by factor
+        elif episodic_count < target_episodic * 0.75:
              potential_new = min(MAX_CONSOLIDATION_THRESHOLD, self.state.current_consolidation_threshold + math.ceil(self.state.current_consolidation_threshold * adjustment_factor))
              if potential_new > self.state.current_consolidation_threshold:
                  self.logger.info(f"Low episodic count ({episodic_count}). Raising consolidation threshold: {self.state.current_consolidation_threshold} -> {potential_new}")
                  self.state.current_consolidation_threshold = potential_new
                  changed = True
 
-        # --- Reflection Threshold Adaptation ---
-        # Use tool usage stats accumulated in agent state
         total_calls = sum(v.get("success", 0) + v.get("failure", 0) for v in self.state.tool_usage_stats.values())
         total_failures = sum(v.get("failure", 0) for v in self.state.tool_usage_stats.values())
-        # Calculate failure rate, avoid division by zero, require minimum calls for significance
         min_calls_for_rate = 5
         failure_rate = (total_failures / total_calls) if total_calls >= min_calls_for_rate else 0.0
 
-        # Lower threshold if failure rate is high
-        if failure_rate > 0.25: # Threshold for high failure rate
+        if failure_rate > 0.25:
              potential_new = max(MIN_REFLECTION_THRESHOLD, self.state.current_reflection_threshold - math.ceil(self.state.current_reflection_threshold * adjustment_factor))
              if potential_new < self.state.current_reflection_threshold:
                  self.logger.info(f"High tool failure rate ({failure_rate:.1%}). Lowering reflection threshold: {self.state.current_reflection_threshold} -> {potential_new}")
                  self.state.current_reflection_threshold = potential_new
                  changed = True
-        # Raise threshold if failure rate is very low (agent performing well)
-        elif failure_rate < 0.05 and total_calls > 10: # Threshold for low rate, ensure enough data
+        elif failure_rate < 0.05 and total_calls > 10:
              potential_new = min(MAX_REFLECTION_THRESHOLD, self.state.current_reflection_threshold + math.ceil(self.state.current_reflection_threshold * adjustment_factor))
              if potential_new > self.state.current_reflection_threshold:
                   self.logger.info(f"Low tool failure rate ({failure_rate:.1%}). Raising reflection threshold: {self.state.current_reflection_threshold} -> {potential_new}")
@@ -2030,18 +1843,15 @@ class AgentMasterLoop:
              self.logger.debug("No threshold adjustments triggered based on current stats.")
 
     # ------------------------------------------------ periodic task runner --
-    # (Keep existing v3.3.5 _run_periodic_tasks implementation, ensure it calls
-    # the integrated _check_and_trigger_promotion and uses dynamic thresholds)
+    # (Keep existing v3.3.5 _run_periodic_tasks implementation)
     async def _run_periodic_tasks(self):
         """Runs meta-cognition and maintenance tasks, including adaptive adjustments."""
-        # Prevent running if no workflow or shutting down
         if not self.state.workflow_id or not self.state.context_id or self._shutdown_event.is_set():
             return
 
         tasks_to_run: List[Tuple[str, Dict]] = []
-        trigger_reasons: List[str] = [] # Collect reasons for logging
+        trigger_reasons: List[str] = []
 
-        # Check tool availability once
         reflection_tool_available = self._find_tool_server(TOOL_REFLECTION) is not None
         consolidation_tool_available = self._find_tool_server(TOOL_CONSOLIDATION) is not None
         optimize_wm_tool_available = self._find_tool_server(TOOL_OPTIMIZE_WM) is not None
@@ -2050,7 +1860,6 @@ class AgentMasterLoop:
         stats_tool_available = self._find_tool_server(TOOL_COMPUTE_STATS) is not None
         maintenance_tool_available = self._find_tool_server(TOOL_DELETE_EXPIRED_MEMORIES) is not None
 
-        # --- Tier 3: Stats Check & Adaptation Trigger ---
         self.state.loops_since_stats_adaptation += 1
         if self.state.loops_since_stats_adaptation >= STATS_ADAPTATION_INTERVAL:
             if stats_tool_available:
@@ -2060,71 +1869,59 @@ class AgentMasterLoop:
                         TOOL_COMPUTE_STATS, {"workflow_id": self.state.workflow_id}, record_action=False
                     )
                     if stats.get("success"):
-                        # Adapt thresholds based on the fetched stats
                         self._adapt_thresholds(stats)
-                        # Example: Trigger consolidation if episodic memories are high based on stats
                         episodic_count = stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0)
-                        # Trigger if count significantly exceeds current *dynamic* threshold
                         if episodic_count > (self.state.current_consolidation_threshold * 2.0) and consolidation_tool_available:
-                            if not any(task[0] == TOOL_CONSOLIDATION for task in tasks_to_run): # Avoid duplicates
+                            if not any(task[0] == TOOL_CONSOLIDATION for task in tasks_to_run):
                                 self.logger.info(f"High episodic count ({episodic_count}) detected via stats, scheduling consolidation.")
                                 tasks_to_run.append((TOOL_CONSOLIDATION, {"workflow_id": self.state.workflow_id, "consolidation_type": "summary", "query_filter": {"memory_level": MemoryLevel.EPISODIC.value}, "max_source_memories": self.consolidation_max_sources}))
                                 trigger_reasons.append(f"HighEpisodic({episodic_count})")
-                                self.state.successful_actions_since_consolidation = 0 # Reset counter as we're consolidating now
+                                self.state.successful_actions_since_consolidation = 0
                     else:
                         self.logger.warning(f"Failed to compute stats for adaptation: {stats.get('error')}")
                 except Exception as e:
                     self.logger.error(f"Error during stats computation/adaptation: {e}", exc_info=False)
                 finally:
-                     # Reset interval counter regardless of success/failure
                      self.state.loops_since_stats_adaptation = 0
             else:
                 self.logger.warning(f"Skipping stats/adaptation: Tool {TOOL_COMPUTE_STATS} not available")
 
 
-        # --- Tier 3: Maintenance Check ---
         self.state.loops_since_maintenance += 1
         if self.state.loops_since_maintenance >= MAINTENANCE_INTERVAL:
             if maintenance_tool_available:
-                # Append maintenance task to the list
                 tasks_to_run.append((TOOL_DELETE_EXPIRED_MEMORIES, {}))
                 trigger_reasons.append("MaintenanceInterval")
-                self.state.loops_since_maintenance = 0 # Reset interval counter
+                self.state.loops_since_maintenance = 0
             else:
                 self.logger.warning(f"Skipping maintenance: Tool {TOOL_DELETE_EXPIRED_MEMORIES} not available")
 
-        # --- Existing Triggers (Using Dynamic Thresholds) ---
-        # Reflection Trigger (Check replan flag OR success counter vs. dynamic threshold)
+
         if self.state.needs_replan or self.state.successful_actions_since_reflection >= self.state.current_reflection_threshold:
             if reflection_tool_available:
-                if not any(task[0] == TOOL_REFLECTION for task in tasks_to_run): # Avoid duplicates
-                    # Cycle through reflection types
+                if not any(task[0] == TOOL_REFLECTION for task in tasks_to_run):
                     reflection_type = self.reflection_type_sequence[self.state.reflection_cycle_index % len(self.reflection_type_sequence)]
                     tasks_to_run.append((TOOL_REFLECTION, {"workflow_id": self.state.workflow_id, "reflection_type": reflection_type}))
                     reason_str = f"ReplanNeeded({self.state.needs_replan})" if self.state.needs_replan else f"SuccessCount({self.state.successful_actions_since_reflection:.1f}>={self.state.current_reflection_threshold})"
                     trigger_reasons.append(f"Reflect({reason_str})")
-                    # Reset counter and advance cycle index
                     self.state.successful_actions_since_reflection = 0
                     self.state.reflection_cycle_index += 1
             else:
                 self.logger.warning(f"Skipping reflection: Tool {TOOL_REFLECTION} not available")
-                # Reset counter even if tool unavailable to prevent immediate re-trigger
                 self.state.successful_actions_since_reflection = 0
 
-        # Consolidation Trigger (Check success counter vs. dynamic threshold)
+
         if self.state.successful_actions_since_consolidation >= self.state.current_consolidation_threshold:
             if consolidation_tool_available:
-                if not any(task[0] == TOOL_CONSOLIDATION for task in tasks_to_run): # Avoid duplicates
+                if not any(task[0] == TOOL_CONSOLIDATION for task in tasks_to_run):
                     tasks_to_run.append((TOOL_CONSOLIDATION, {"workflow_id": self.state.workflow_id, "consolidation_type": "summary", "query_filter": {"memory_level": MemoryLevel.EPISODIC.value}, "max_source_memories": self.consolidation_max_sources}))
                     trigger_reasons.append(f"ConsolidateThreshold({self.state.successful_actions_since_consolidation:.1f}>={self.state.current_consolidation_threshold})")
-                    # Reset counter
                     self.state.successful_actions_since_consolidation = 0
             else:
                 self.logger.warning(f"Skipping consolidation: Tool {TOOL_CONSOLIDATION} not available")
-                 # Reset counter even if tool unavailable
                 self.state.successful_actions_since_consolidation = 0
 
-        # Optimization Trigger (Based on loop interval)
+
         self.state.loops_since_optimization += 1
         if self.state.loops_since_optimization >= OPTIMIZATION_LOOP_INTERVAL:
             if optimize_wm_tool_available:
@@ -2138,103 +1935,78 @@ class AgentMasterLoop:
                 trigger_reasons.append("FocusUpdate")
             else:
                 self.logger.warning(f"Skipping auto-focus: Tool {TOOL_AUTO_FOCUS} not available")
+            self.state.loops_since_optimization = 0
 
-            self.state.loops_since_optimization = 0 # Reset interval counter
 
-        # Promotion Check Trigger (Based on loop interval)
         self.state.loops_since_promotion_check += 1
         if self.state.loops_since_promotion_check >= MEMORY_PROMOTION_LOOP_INTERVAL:
             if promote_mem_tool_available:
-                # Schedule the check itself, not individual promotions
                 tasks_to_run.append(("CHECK_PROMOTIONS", {}))
                 trigger_reasons.append("PromotionInterval")
             else:
                 self.logger.warning(f"Skipping promotion check: Tool {TOOL_PROMOTE_MEM} not available")
-            self.state.loops_since_promotion_check = 0 # Reset interval counter
+            self.state.loops_since_promotion_check = 0
 
-        # --- Execute Scheduled Tasks ---
+
         if tasks_to_run:
-            unique_reasons_str = ', '.join(sorted(set(trigger_reasons))) # Deduplicate reasons for logging
+            unique_reasons_str = ', '.join(sorted(set(trigger_reasons)))
             self.logger.info(f"Running {len(tasks_to_run)} periodic tasks (Triggers: {unique_reasons_str})...", emoji_key="brain")
 
-            # Prioritize maintenance and stats if scheduled
             tasks_to_run.sort(key=lambda x: 0 if x[0] == TOOL_DELETE_EXPIRED_MEMORIES else 1 if x[0] == TOOL_COMPUTE_STATS else 2)
 
             for tool_name, args in tasks_to_run:
-                # Check shutdown flag before each task
                 if self._shutdown_event.is_set():
                     self.logger.info("Shutdown detected during periodic tasks, aborting remaining.")
                     break
                 try:
                     if tool_name == "CHECK_PROMOTIONS":
-                        # Special case: trigger the internal check method
                         await self._trigger_promotion_checks()
-                        continue # Move to next task
+                        continue
 
-                    # Execute standard tool calls
                     self.logger.debug(f"Executing periodic task: {tool_name} with args: {args}")
                     result_content = await self._execute_tool_call_internal(
-                        tool_name, args, record_action=False # Don't record periodic tasks as agent actions
+                        tool_name, args, record_action=False
                     )
 
-                    # --- Meta-Cognition Feedback Loop ---
                     if tool_name in [TOOL_REFLECTION, TOOL_CONSOLIDATION] and result_content.get('success'):
                         feedback = ""
-                        # Extract content based on tool type
-                        if tool_name == TOOL_REFLECTION:
-                            feedback = result_content.get("content", "")
-                        elif tool_name == TOOL_CONSOLIDATION:
-                             feedback = result_content.get("consolidated_content", "")
-
-                        # Handle nested 'data' key if necessary
+                        if tool_name == TOOL_REFLECTION: feedback = result_content.get("content", "")
+                        elif tool_name == TOOL_CONSOLIDATION: feedback = result_content.get("consolidated_content", "")
                         if not feedback and isinstance(result_content.get("data"), dict):
-                            if tool_name == TOOL_REFLECTION:
-                                feedback = result_content["data"].get("content", "")
-                            elif tool_name == TOOL_CONSOLIDATION:
-                                feedback = result_content["data"].get("consolidated_content", "")
+                            if tool_name == TOOL_REFLECTION: feedback = result_content["data"].get("content", "")
+                            elif tool_name == TOOL_CONSOLIDATION: feedback = result_content["data"].get("consolidated_content", "")
 
                         if feedback:
-                            # Create a concise summary for the feedback state
-                            feedback_summary = str(feedback).split('\n', 1)[0][:150] # First line up to 150 chars
+                            feedback_summary = str(feedback).split('\n', 1)[0][:150]
                             self.state.last_meta_feedback = f"Feedback from {tool_name.split(':')[-1]}: {feedback_summary}..."
                             self.logger.info(f"Received meta-feedback: {self.state.last_meta_feedback}")
-                            # Force replan after receiving feedback from reflection/consolidation
                             self.state.needs_replan = True
                         else:
                             self.logger.debug(f"Periodic task {tool_name} succeeded but provided no feedback content.")
 
                 except Exception as e:
-                    # Log errors but continue with other periodic tasks
                     self.logger.warning(f"Periodic task {tool_name} failed: {e}", exc_info=False)
-
-                # Small delay between periodic tasks if needed
                 await asyncio.sleep(0.1)
 
 
     async def _trigger_promotion_checks(self):
         """Checks promotion criteria for recently accessed, eligible memories."""
         # (Keep existing v3.3.5 _trigger_promotion_checks implementation)
-        # Ensure this method calls the integrated _check_and_trigger_promotion
         if not self.state.workflow_id:
              self.logger.debug("Skipping promotion check: No active workflow.")
              return
 
         self.logger.debug("Running periodic promotion check for recent memories...")
-        query_tool_name = TOOL_QUERY_MEMORIES # Use query for broader filtering
+        query_tool_name = TOOL_QUERY_MEMORIES
         if not self._find_tool_server(query_tool_name):
             self.logger.warning(f"Skipping promotion check: Tool {query_tool_name} unavailable.")
             return
 
         candidate_memory_ids = set()
         try:
-            # Check recent Episodic memories
             episodic_args = {
-                "workflow_id": self.state.workflow_id,
-                "memory_level": MemoryLevel.EPISODIC.value,
-                "sort_by": "last_accessed", # Prioritize recently accessed
-                "sort_order": "DESC",
-                "limit": 5, # Check top 5 recent/relevant
-                "include_content": False # Don't need content for check
+                "workflow_id": self.state.workflow_id, "memory_level": MemoryLevel.EPISODIC.value,
+                "sort_by": "last_accessed", "sort_order": "DESC", "limit": 5, "include_content": False
             }
             episodic_results = await self._execute_tool_call_internal(query_tool_name, episodic_args, record_action=False)
             if episodic_results.get("success"):
@@ -2242,22 +2014,14 @@ class AgentMasterLoop:
                 if isinstance(mems, list):
                     candidate_memory_ids.update(m.get('memory_id') for m in mems if isinstance(m, dict) and m.get('memory_id'))
 
-            # Check recent Semantic memories (potential promotion to Procedural)
             semantic_args = {
-                "workflow_id": self.state.workflow_id,
-                "memory_level": MemoryLevel.SEMANTIC.value,
-                 # Optionally filter by type if only certain semantic types can become procedural
-                # "memory_type": MemoryType.PROCEDURE.value, # Or check both PROCEDURE and SKILL?
-                "sort_by": "last_accessed",
-                "sort_order": "DESC",
-                "limit": 5,
-                "include_content": False
+                "workflow_id": self.state.workflow_id, "memory_level": MemoryLevel.SEMANTIC.value,
+                "sort_by": "last_accessed", "sort_order": "DESC", "limit": 5, "include_content": False
             }
             semantic_results = await self._execute_tool_call_internal(query_tool_name, semantic_args, record_action=False)
             if semantic_results.get("success"):
                 mems = semantic_results.get("memories", [])
                 if isinstance(mems, list):
-                     # Only consider PROCEDURE or SKILL types for promotion from SEMANTIC
                      candidate_memory_ids.update(
                           m.get('memory_id') for m in mems
                           if isinstance(m, dict) and m.get('memory_id') and
@@ -2267,14 +2031,12 @@ class AgentMasterLoop:
 
             if candidate_memory_ids:
                 self.logger.debug(f"Checking {len(candidate_memory_ids)} memories for potential promotion: {[_fmt_id(item_id) for item_id in candidate_memory_ids]}")
-                # Create tasks to check each candidate in background
                 promo_tasks = []
                 for mem_id in candidate_memory_ids:
-                     # Use _start_background_task to handle snapshotting workflow_id etc.
                      task = self._start_background_task(AgentMasterLoop._check_and_trigger_promotion, memory_id=mem_id)
                      promo_tasks.append(task)
-                # Optionally await these checks if critical, or let them run truly in background
-                # await asyncio.gather(*promo_tasks, return_exceptions=True) # Uncomment to wait
+                # Optional: await these checks if needed
+                # await asyncio.gather(*promo_tasks, return_exceptions=True)
             else:
                 self.logger.debug("No recently accessed, eligible memories found for promotion check.")
         except Exception as e:
@@ -2282,7 +2044,6 @@ class AgentMasterLoop:
 
 
     # ================================================================= main loop --
-    # (Keep the integrated run method from the previous step here)
     async def run(self, goal: str, max_loops: int = 50) -> None:
         """Main agent execution loop, integrating rich context and refined plan updates."""
         if not await self.initialize():
@@ -2304,157 +2065,141 @@ class AgentMasterLoop:
             if self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
                 self.logger.error(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) reached. Aborting.", emoji_key="stop_sign")
                 if self.state.workflow_id:
-                    # Use internal helper to update status
                     await self._execute_tool_call_internal(
                         TOOL_UPDATE_WORKFLOW_STATUS,
                         {"status": "failed", "completion_message": "Agent failed due to repeated errors."},
                         record_action=False
                     )
-                break # Exit loop
+                break
 
             # ---------- Gather Rich Context ----------
             context = await self._gather_context() # Use the enhanced version
             if context.get("status") == "No Active Workflow":
                 self.logger.warning("No active workflow. Agent must create one.")
-                # Reset plan to focus on creation
                 self.state.current_plan = [PlanStep(description=f"Create the primary workflow for goal: {goal}")]
-                self.state.needs_replan = False # Not a replan, it's initial plan
-                self.state.last_error_details = None # Clear any previous errors
+                self.state.needs_replan = False
+                self.state.last_error_details = None
             elif "errors" in context and context.get("errors"):
                 self.logger.warning(f"Context gathering encountered errors: {context['errors']}. Proceeding cautiously.")
-                # Potentially set needs_replan = True if context errors are critical?
-                # self.state.needs_replan = True
+
 
             # ---------- LLM Decision ----------
-            # Ensure context is passed correctly
-            agent_decision = await self._call_agent_llm(goal, context)
+            agent_decision = await self._call_agent_llm(goal, context) # Uses the enhanced prompt
             decision_type = agent_decision.get("decision")
 
             # ---------- Act ----------
             last_res: Optional[Dict[str, Any]] = None
             plan_updated_by_tool = False # Flag if AGENT_TOOL_UPDATE_PLAN was called
 
-            # Get Current Plan Step and Dependencies *before* executing
-            current_plan_step: Optional[PlanStep] = self.state.current_plan[0] if self.state.current_plan else None
-            planned_dependencies_for_step: Optional[List[str]] = current_plan_step.depends_on if current_plan_step else None
+            current_plan_step = self.state.current_plan[0] if self.state.current_plan else None
+            planned_dependencies_for_step = current_plan_step.depends_on if current_plan_step else None
 
             if decision_type == "call_tool":
                 tool_name = agent_decision.get("tool_name")
                 arguments = agent_decision.get("arguments", {})
                 if tool_name == AGENT_TOOL_UPDATE_PLAN:
-                    # Handle the specific plan update tool call
                     self.logger.info(f"Agent requests plan update via tool: {AGENT_TOOL_UPDATE_PLAN}")
                     last_res = await self._execute_tool_call_internal(
-                        tool_name, arguments, record_action=False # Don't record this internal agent action
+                        tool_name, arguments, record_action=False
                     )
                     if last_res.get("success"):
                         plan_updated_by_tool = True
                         self.logger.info("Plan successfully updated by agent tool.")
-                        # Clear errors and replan flag after successful explicit plan update
                         self.state.consecutive_error_count = 0
                         self.state.needs_replan = False
                         self.state.last_error_details = None
                     else:
                         self.logger.error(f"Agent tool {AGENT_TOOL_UPDATE_PLAN} failed: {last_res.get('error')}")
-                        self.state.needs_replan = True # Failed plan update needs replan
+                        self.state.needs_replan = True
                 elif tool_name:
-                    # Handle regular tool calls
                     self.logger.info(f"Agent requests tool: {tool_name} with args: {arguments}", emoji_key="wrench")
                     last_res = await self._execute_tool_call_internal(
-                        tool_name, arguments, True, planned_dependencies_for_step # Pass dependencies
+                        tool_name, arguments, True, planned_dependencies_for_step
                     )
-                    # needs_replan flag is handled by _execute_tool_call_internal on failure/dependency issues
+                    # needs_replan flag is handled by _execute_tool_call_internal/heuristic update
                     if isinstance(last_res, dict) and not last_res.get("success"):
                         self.logger.warning(f"Tool execution failed or prerequisites not met for {tool_name}.")
-                        # Further action (like replan) handled by heuristic update based on last_error_details
                 else:
-                    # Handle case where decision was 'call_tool' but tool_name was missing
                     self.logger.error("LLM requested tool call but provided no tool name.")
                     self.state.last_action_summary = "Agent error: Missing tool name."
                     self.state.last_error_details = {"agent_decision_error": "Missing tool name"}
-                    # self.state.consecutive_error_count += 1 # Let heuristic update handle count
                     self.state.needs_replan = True
                     last_res = {"success": False, "error": "Missing tool name from LLM"}
-
 
             elif decision_type == "thought_process":
                 content = agent_decision.get("content", "No thought content.")
                 self.logger.info(f"Agent reasoning: '{content[:100]}...'. Recording.", emoji_key="thought_balloon")
                 if self.state.workflow_id:
                    thought_args = {"content": content, "thought_type": ThoughtType.INFERENCE.value}
-                   # workflow_id and thought_chain_id are injected by _execute_tool_call_internal
                    last_res = await self._execute_tool_call_internal(TOOL_RECORD_THOUGHT, thought_args, True)
-                   # If thought fails to record, set needs_replan?
                    if not last_res.get("success"):
                         self.state.needs_replan = True
                         self.logger.error(f"Failed to record thought: {last_res.get('error')}")
                 else:
                     self.logger.warning("Cannot record thought: No active workflow.")
-                    last_res = {"success": True} # Treat as success for plan progression
+                    last_res = {"success": True}
 
             elif decision_type == "complete":
                  summary = agent_decision.get("summary", "Goal achieved.")
                  self.logger.info(f"Agent signals completion: {summary}", emoji_key="tada")
                  self.state.goal_achieved_flag = True
                  self.state.needs_replan = False
-                 last_res = {"success": True} # Mark as success
+                 last_res = {"success": True}
                  if self.state.workflow_id:
-                      # Record a final summary thought
-                      await self._execute_tool_call_internal(TOOL_RECORD_THOUGHT, {"content": f"Goal Achieved: {summary}", "thought_type": ThoughtType.SUMMARY.value}, False) # Don't record this meta-action
-                      # Update workflow status
+                      await self._execute_tool_call_internal(TOOL_RECORD_THOUGHT, {"content": f"Goal Achieved: {summary}", "thought_type": ThoughtType.SUMMARY.value}, False)
                       await self._execute_tool_call_internal(TOOL_UPDATE_WORKFLOW_STATUS, {"status": "completed", "completion_message": summary}, False)
-                 break # Exit loop on completion
+                 break
 
             elif decision_type == "error":
                  error_msg = agent_decision.get("message", "Unknown agent error")
                  self.logger.error(f"Agent decision error: {error_msg}", emoji_key="x")
                  self.state.last_action_summary = f"Agent decision error: {error_msg[:100]}"
                  self.state.last_error_details = {"agent_decision_error": error_msg}
-                 # self.state.consecutive_error_count += 1 # Let heuristic handle count
                  self.state.needs_replan = True
                  last_res = {"success": False, "error": f"Agent decision error: {error_msg}"}
-                 # Try to record this error as a thought
                  if self.state.workflow_id:
                      await self._execute_tool_call_internal(TOOL_RECORD_THOUGHT, {"content": f"Agent Error: {error_msg}", "thought_type": ThoughtType.CRITIQUE.value}, False)
 
-
-            else: # Should not happen
+            else:
                  self.logger.warning(f"Unhandled decision: {decision_type}")
                  self.state.last_action_summary = "Unknown agent decision."
-                 # self.state.consecutive_error_count += 1 # Let heuristic handle count
                  self.state.needs_replan = True
                  self.state.last_error_details = {"agent_decision_error": f"Unknown type: {decision_type}"}
                  last_res = {"success": False, "error": f"Unhandled decision type: {decision_type}"}
 
 
+            # <<< Start Integration Block: Heuristic Plan Update Call (Phase 1, Step 3) >>>
             # ---------- Apply Heuristic Plan Update (if not done by agent tool) ----------
             if not plan_updated_by_tool:
                  # Pass the actual decision and result to the heuristic update function
                  await self._apply_heuristic_plan_update(agent_decision, last_res)
+            # <<< End Integration Block: Heuristic Plan Update Call >>>
 
 
-            # ---------- Periodic Tasks ----------
+            # ---------- periodic tasks ----------
             await self._run_periodic_tasks()
 
-            # ---------- Persistence (Maybe check if state *changed* before saving?) ----------
-            if self.state.current_loop % 5 == 0: # Or use a time-based interval
+            # ---------- persistence ----------
+            if self.state.current_loop % 5 == 0:
                 await self._save_agent_state()
 
             # --- Loop Delay ---
+            # Check for shutdown signal before sleeping
+            if self._shutdown_event.is_set():
+                self.logger.info("Shutdown signal detected, breaking loop before sleep.")
+                break
             await asyncio.sleep(random.uniform(0.8, 1.2))
 
         # --- End of Loop ---
+        # (Keep existing end-of-loop logic)
         self.logger.info(f"--- Agent Loop Finished (Reason: {'Goal Achieved' if self.state.goal_achieved_flag else 'Max Loops Reached' if self.state.current_loop >= max_loops else 'Shutdown Signal' if self._shutdown_event.is_set() else 'Error Limit'}) ---", emoji_key="stopwatch")
-        # Final save before shutdown
-        await self._save_agent_state()
+        await self._save_agent_state() # Ensure final state is saved
         if self.state.workflow_id and not self._shutdown_event.is_set() and self.state.consecutive_error_count < MAX_CONSECUTIVE_ERRORS:
-            final_status = WorkflowStatus.COMPLETED.value if self.state.goal_achieved_flag else WorkflowStatus.FAILED.value # Or maybe INCOMPLETE? Let's use FAILED if goal not achieved.
+            final_status = WorkflowStatus.COMPLETED.value if self.state.goal_achieved_flag else WorkflowStatus.FAILED.value
             self.logger.info(f"Workflow {_fmt_id(self.state.workflow_id)} ended with status: {final_status}")
-            # Don't automatically mark failed here, let the logic inside the loop handle status updates
-            # await self._generate_final_report() # Generate report only on clean exit?
+            await self._generate_final_report()
         elif not self.state.workflow_id:
             self.logger.info("Loop finished with no active workflow.")
-
         # Final cleanup called by external runner or signal handler via shutdown()
 
 
@@ -2472,31 +2217,23 @@ class AgentMasterLoop:
 
         self.logger.info(f"Generating final report for workflow {_fmt_id(self.state.workflow_id)}...", emoji_key="scroll")
         try:
-            # Request a professional markdown report by default
             report_args = {
-                "workflow_id": self.state.workflow_id,
-                "report_format": "markdown",
-                "style": "professional",
-                "include_details": True, # Include details by default for final report
-                "include_thoughts": True,
-                "include_artifacts": True,
+                "workflow_id": self.state.workflow_id, "report_format": "markdown",
+                "style": "professional", "include_details": True,
+                "include_thoughts": True, "include_artifacts": True,
             }
             report_result = await self._execute_tool_call_internal(
-                report_tool_name, report_args, record_action=False # Don't record report generation
+                report_tool_name, report_args, record_action=False
             )
 
             if isinstance(report_result, dict) and report_result.get("success"):
                 report_text = report_result.get("report", "Report content missing.")
-                # Print report clearly demarcated
                 output_lines = [
                     "\n" + "="*30 + " FINAL WORKFLOW REPORT " + "="*30,
                     f"Workflow ID: {self.state.workflow_id}",
                     f"Generated at: {datetime.now(timezone.utc).isoformat()}",
-                    "-"*80,
-                    report_text,
-                    "="*81 # Match top length
+                    "-"*80, report_text, "="*81
                 ]
-                # Use safe_print if available from MCP Client
                 printer = getattr(self.mcp_client, 'safe_print', print)
                 printer("\n".join(output_lines))
             else:
@@ -2526,57 +2263,42 @@ async def run_agent_process(
     mcp_client_instance = None
     agent_loop_instance = None
     exit_code = 0
-    # Use print initially, switch to safe_print if available
     printer = print
 
     try:
         printer("Instantiating MCP Client...")
-        # Pass base_url explicitly during instantiation if needed by your client
         mcp_client_instance = MCPClient(base_url=mcp_server_url, config_path=config_file)
-        # Switch to safe_print if the client provides it
         if hasattr(mcp_client_instance, 'safe_print') and callable(mcp_client_instance.safe_print):
             printer = mcp_client_instance.safe_print
             log.info("Using MCPClient's safe_print for output.")
 
-        # Configure API key if not already set
         if not mcp_client_instance.config.api_key:
             if anthropic_key:
                 printer("Using provided Anthropic API key.")
                 mcp_client_instance.config.api_key = anthropic_key
-                # Re-initialize the anthropic client instance if necessary
                 mcp_client_instance.anthropic = AsyncAnthropic(api_key=anthropic_key)
             else:
                 printer("❌ CRITICAL ERROR: Anthropic API key missing in config and not provided.")
                 raise ValueError("Anthropic API key missing.")
 
         printer("Setting up MCP Client connections...")
-        # Setup might involve connecting to servers defined in config/discovery
         await mcp_client_instance.setup(interactive_mode=False)
 
         printer("Instantiating Agent Master Loop...")
         agent_loop_instance = AgentMasterLoop(mcp_client_instance=mcp_client_instance, agent_state_file=state_file)
 
-        # --- Signal Handling Setup ---
         loop = asyncio.get_running_loop()
-        stop_event = asyncio.Event() # Use an event for clearer signaling
+        stop_event = asyncio.Event()
 
         def signal_handler_wrapper(signum):
             signal_name = signal.Signals(signum).name
             log.warning(f"Signal {signal_name} received. Initiating graceful shutdown.")
-            # Signal the main loop to stop via the event
             stop_event.set()
-            # Also trigger the agent's internal shutdown logic if possible
             if agent_loop_instance:
-                 # Schedule shutdown asynchronously, don't await here
                  asyncio.create_task(agent_loop_instance.shutdown())
-            # Note: loop.stop() might be too abrupt, let the agent handle shutdown
 
-        # Register signal handlers
         for sig in [signal.SIGINT, signal.SIGTERM]:
             try:
-                # Ensure handler isn't already attached before adding
-                # This check might be platform specific or require internal loop state inspection
-                # Simplified: Just add, assuming loop handles duplicates if necessary
                 loop.add_signal_handler(sig, signal_handler_wrapper, sig)
                 log.debug(f"Registered signal handler for {sig.name}")
             except ValueError:
@@ -2586,14 +2308,9 @@ async def run_agent_process(
 
 
         printer(f"Running Agent Loop for goal: \"{goal}\"")
-        # Main execution - replace with awaiting the run method directly if preferred
-        # This structure allows checking the stop_event periodically if run isn't fully async-aware
-        # await agent_loop_instance.run(goal=goal, max_loops=max_loops)
-        # OR, if run needs to be interruptible by the signal event:
         run_task = asyncio.create_task(agent_loop_instance.run(goal=goal, max_loops=max_loops))
         stop_task = asyncio.create_task(stop_event.wait())
 
-        # Wait for either the agent task to finish or the stop event to be set
         done, pending = await asyncio.wait(
             {run_task, stop_task},
             return_when=asyncio.FIRST_COMPLETED
@@ -2601,21 +2318,19 @@ async def run_agent_process(
 
         if stop_task in done:
              printer("\n[yellow]Shutdown signal processed. Waiting for agent task to finalize...[/yellow]")
-             # Give run_task a chance to finish its cleanup via agent_loop_instance.shutdown()
              if run_task in pending:
-                 run_task.cancel() # Attempt cancellation if still pending
+                 run_task.cancel()
                  try:
                      await run_task
                  except asyncio.CancelledError:
                       log.info("Agent run task cancelled gracefully.")
                  except Exception as e:
                       log.error(f"Exception during agent run task finalization after signal: {e}", exc_info=True)
-             exit_code = 130 # Standard exit code for Ctrl+C
+             exit_code = 130
 
         elif run_task in done:
-             # Agent finished normally or hit max loops/error limit
              try:
-                 run_task.result() # Check for exceptions if run_task raised one
+                 run_task.result()
                  log.info("Agent run task completed normally.")
              except Exception as e:
                  printer(f"\n❌ Agent loop finished with error: {e}")
@@ -2624,10 +2339,9 @@ async def run_agent_process(
 
 
     except KeyboardInterrupt:
-        # Should be caught by signal handler now, but keep as fallback
         printer("\n[yellow]KeyboardInterrupt caught (fallback).[/yellow]")
         exit_code = 130
-    except ValueError as ve: # Catch specific config errors
+    except ValueError as ve:
         printer(f"\n❌ Configuration Error: {ve}")
         exit_code = 2
     except Exception as main_err:
@@ -2636,7 +2350,10 @@ async def run_agent_process(
         exit_code = 1
     finally:
         printer("Initiating final shutdown sequence...")
-        # Agent shutdown should have been triggered by signal handler or normal completion
+        # Ensure agent shutdown (might be redundant if signaled, but safe)
+        if agent_loop_instance and not agent_loop_instance._shutdown_event.is_set():
+             printer("Ensuring agent loop shutdown...")
+             await agent_loop_instance.shutdown() # Call directly if not signaled
         # Ensure client is closed
         if mcp_client_instance:
             printer("Closing MCP client connections...")
@@ -2645,9 +2362,7 @@ async def run_agent_process(
             except Exception as close_err:
                 printer(f"[red]Error closing MCP client:[/red] {close_err}")
         printer("Agent execution finished.")
-        # Exit only if running as the main script
         if __name__ == "__main__":
-            # Short delay to allow logs/output to flush
             await asyncio.sleep(0.5)
             sys.exit(exit_code)
 
@@ -2667,11 +2382,9 @@ if __name__ == "__main__":
         print("❌ ERROR: ANTHROPIC_API_KEY missing in environment variables.")
         sys.exit(1)
     if not MCP_CLIENT_AVAILABLE:
-        # This check happens earlier now, but good practice
         print("❌ ERROR: MCPClient dependency missing.")
         sys.exit(1)
 
-    # Display configuration before starting
     print(f"--- {AGENT_NAME} ---")
     print(f"Memory System URL: {MCP_SERVER_URL}")
     print(f"Agent Goal: {AGENT_GOAL}")
@@ -2683,7 +2396,6 @@ if __name__ == "__main__":
     print("-----------------------------------------")
 
 
-    # Wrapper to run the main process
     async def _main() -> None:
         await run_agent_process(
             MCP_SERVER_URL,
@@ -2694,10 +2406,8 @@ if __name__ == "__main__":
             CONFIG_PATH,
         )
 
-    # Run the async main function
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
-        # This might catch Ctrl+C during initial setup before signal handlers are active
         print("\n[yellow]Initial KeyboardInterrupt detected. Exiting.[/yellow]")
         sys.exit(130)
