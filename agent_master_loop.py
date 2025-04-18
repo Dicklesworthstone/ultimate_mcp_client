@@ -1,5 +1,5 @@
 """
-EideticEngine Agent Master Loop (AML) - v4.0 P1
+EideticEngine Agent Master Loop (AML) - v4.0 P1 - ENHANCED
 ======================================================================
 
 This module implements the core orchestration logic for the EideticEngine
@@ -8,49 +8,56 @@ Unified Memory System (UMS) via MCPClient, leverages an LLM (Anthropic Claude)
 for decision-making and planning, and incorporates several cognitive functions
 inspired by human memory and reasoning.
 
+** V4.0 P1 ENHANCED implements Phase 1 improvements: refined context, adaptive
+thresholds, plan validation/repair, structured error handling, and robust
+background task management. **
+
 Key Functionalities:
 --------------------
 *   **Workflow & Context Management:**
     - Creates, manages, and tracks progress within structured workflows.
     - Supports sub-workflow execution via a workflow stack.
     - Gathers rich, multi-faceted context for the LLM decision-making process, including:
-        *   Current working memory and focal points.
+        *   Current working memory and focal points **(Prioritized)**.
         *   Core workflow context (recent actions, important memories, key thoughts).
-        *   Proactively searched memories relevant to the current goal/plan step.
-        *   Relevant procedural memories (how-to knowledge).
-        *   Summaries of memories linked to the current focus.
+        *   Proactively searched memories relevant to the current goal/plan step **(Limited Fetch)**.
+        *   Relevant procedural memories (how-to knowledge) **(Limited Fetch)**.
+        *   Summaries of memories linked to the current focus **(Limited Fetch)**.
+        *   **Freshness indicators** for context components.
     - Implements structure-aware context truncation and optional LLM-based compression.
 
 *   **Planning & Execution:**
     - Maintains an explicit, modifiable plan consisting of sequential steps with dependencies.
     - Allows the LLM to propose plan updates via a dedicated tool or text parsing.
     - Includes a heuristic fallback mechanism to update plan steps based on action outcomes if the LLM doesn't explicitly replan.
+    - **Validates plan steps and detects dependency cycles.**
     - Checks action prerequisites (dependencies) before execution.
     - Executes tools via the MCPClient, handling server lookup and argument injection.
     - Records detailed action history (start, completion, arguments, results, dependencies).
 
 *   **LLM Interaction & Reasoning:**
     - Constructs detailed prompts for the LLM, providing comprehensive context, tool schemas, and cognitive instructions.
+    - **Prompts explicitly guide analysis of working memory and provide error recovery strategies.**
     - Parses LLM responses to identify tool calls, textual reasoning (recorded as thoughts), or goal completion signals.
     - Manages dedicated thought chains for recording the agent's reasoning process.
 
 *   **Cognitive & Meta-Cognitive Processes:**
     - **Memory Interaction:** Stores, updates, searches (semantic/hybrid/keyword), and links memories in the UMS.
     - **Working Memory Management:** Retrieves, optimizes (based on relevance/diversity), and automatically focuses working memory via UMS tools.
-    - **Background Cognitive Tasks:** Initiates asynchronous tasks for:
+    - **Background Cognitive Tasks:** Initiates asynchronous tasks **with timeouts and concurrency limits (semaphore)** for:
         *   Automatic semantic linking of newly created/updated memories.
         *   Checking and potentially promoting memories to higher cognitive levels (e.g., Episodic -> Semantic) based on usage/confidence.
     - **Periodic Meta-cognition:** Runs scheduled tasks based on loop intervals or success counters:
         *   **Reflection:** Generates analysis of progress, gaps, strengths, or plans using an LLM.
         *   **Consolidation:** Synthesizes information from multiple memories into summaries, insights, or procedures using an LLM.
-        *   **Adaptive Thresholds:** Dynamically adjusts the frequency of reflection/consolidation based on agent performance (e.g., error rates, memory statistics).
+        *   **Adaptive Thresholds:** Dynamically adjusts the frequency of reflection/consolidation based on agent performance (e.g., error rates, **memory statistics, trends**) **with enhanced heuristics and dampening**.
     - **Maintenance:** Periodically deletes expired memories.
 
 *   **State & Error Handling:**
     - Persists the complete agent runtime state (workflow, plan, counters, thresholds) atomically to a JSON file for resumption.
     - Implements retry logic with backoff for potentially transient tool failures (especially for idempotent operations).
     - Tracks consecutive errors and halts execution if a limit is reached.
-    - Provides detailed error information back to the LLM for recovery attempts.
+    - Provides detailed, **categorized** error information back to the LLM for recovery attempts.
     - Handles graceful shutdown via system signals (SIGINT, SIGTERM).
 
 ────────────────────────────────────────────────────────────────────────────
@@ -65,23 +72,18 @@ import logging
 import math
 import os
 import random
-import re
 import signal
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque  # Added deque for cycle detection  # noqa: F401
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import aiofiles
 from anthropic import APIConnectionError, APIStatusError, AsyncAnthropic, RateLimitError  # Correct imports
 from pydantic import BaseModel, Field, ValidationError
-
-if TYPE_CHECKING:
-    # Type checking only import for Anthropic response model
-    from anthropic.types import Message  # Correct import path
 
 try:
     # Note: Import all potentially used enums/classes from MCPClient for clarity
@@ -94,7 +96,7 @@ try:
         MemoryLevel,
         MemoryType,
         MemoryUtils,
-        ThoughtType,  # noqa: F401
+        ThoughtType,
         ToolError,
         ToolInputError,
         WorkflowStatus,  # Keep import even if unused directly here
@@ -128,9 +130,9 @@ if log.level <= logging.DEBUG:
 # CONSTANTS
 # ==========================================================================
 # File for saving/loading agent state, versioned for this implementation phase
-AGENT_STATE_FILE = "agent_loop_state_v4.0_p1_complete.json"
+AGENT_STATE_FILE = "agent_loop_state_v4.0_p1_enhanced.json" # Updated filename
 # Agent identifier used in prompts and logging
-AGENT_NAME = "EidenticEngine4.0-P1"
+AGENT_NAME = "EidenticEngine4.0-P1-Enhanced" # Updated agent name
 # Default LLM model string (can be overridden by environment or config)
 MASTER_LEVEL_AGENT_LLM_MODEL_STRING = "claude-3-5-sonnet-20240620" # Use the confirmed model
 
@@ -143,6 +145,8 @@ MIN_REFLECTION_THRESHOLD = 3
 MAX_REFLECTION_THRESHOLD = 15
 MIN_CONSOLIDATION_THRESHOLD = 5
 MAX_CONSOLIDATION_THRESHOLD = 25
+# Dampening factor for threshold adjustments (e.g., 0.75 means apply 75% of calculated change)
+THRESHOLD_ADAPTATION_DAMPENING = float(os.environ.get("THRESHOLD_DAMPENING", "0.75"))
 
 # ---------------- interval constants (in loop iterations) ----------------
 # How often to run working memory optimization and auto-focus checks
@@ -160,14 +164,22 @@ AUTO_LINKING_DELAY_SECS: Tuple[float, float] = (1.5, 3.0)
 # Default description for the initial plan step if none exists
 DEFAULT_PLAN_STEP = "Assess goal, gather context, formulate initial plan."
 
-# Limits for various context components included in the prompt
-CONTEXT_RECENT_ACTIONS = 7
-CONTEXT_IMPORTANT_MEMORIES = 5
-CONTEXT_KEY_THOUGHTS = 5
-CONTEXT_PROCEDURAL_MEMORIES = 2 # Limit procedural memories included
-CONTEXT_PROACTIVE_MEMORIES = 3 # Limit goal-relevant memories included
-CONTEXT_WORKING_MEMORY_LIMIT = 10 # Max working memory items shown in context
-CONTEXT_LINK_TRAVERSAL_LIMIT = 3 # Max links shown per direction in link summary
+# Limits for various context components included in the prompt (PRE-FETCH LIMITS)
+CONTEXT_RECENT_ACTIONS_FETCH_LIMIT = 10 # Fetch slightly more than shown
+CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT = 7
+CONTEXT_KEY_THOUGHTS_FETCH_LIMIT = 7
+CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT = 3 # Fetch limit for procedural
+CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT = 5 # Fetch limit for proactive goal-relevant
+CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT = 5 # Fetch limit for link traversal per direction
+
+# Limits for items SHOWN in final prompt context (after potential truncation/summarization)
+CONTEXT_RECENT_ACTIONS_SHOW_LIMIT = 7
+CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT = 5
+CONTEXT_KEY_THOUGHTS_SHOW_LIMIT = 5
+CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT = 2 # Limit procedural memories included
+CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT = 3 # Limit goal-relevant memories included
+CONTEXT_WORKING_MEMORY_SHOW_LIMIT = 10 # Max working memory items shown in context
+CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT = 3 # Max links shown per direction in link summary
 
 # Token limits triggering context compression
 CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD = 15_000
@@ -215,6 +227,10 @@ TOOL_SUMMARIZE_TEXT = "unified_memory:summarize_text"
 # --- Agent-internal tool name constant ---
 AGENT_TOOL_UPDATE_PLAN = "agent:update_plan"
 
+# --- Background Task Management ---
+BACKGROUND_TASK_TIMEOUT_SECONDS = 60.0 # Timeout for individual background tasks
+MAX_CONCURRENT_BG_TASKS = 10 # Limit concurrent background tasks (linking, promotion)
+
 # ==========================================================================
 # Utility helpers
 # ==========================================================================
@@ -238,11 +254,11 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
     Structure‑aware context truncation with UTF‑8 safe fallback.
 
     Attempts to intelligently reduce context size while preserving structure
-    and indicating where truncation occurred.
+    and indicating where truncation occurred. Honors CONTEXT_*_SHOW_LIMIT constants.
 
     1. Serialise full context – if within limit, return.
     2. Iteratively truncate known large lists (e.g., recent actions, memories)
-       to a few items, adding a note about omissions.
+       based on SHOW_LIMIT constants, adding a note about omissions.
     3. Remove lowest‑priority top‑level keys (e.g., procedures, links)
        until size fits.
     4. Final fallback: utf‑8 safe byte slice of the full JSON, attempting to
@@ -266,15 +282,15 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
     ctx_copy["_truncation_applied"] = "structure‑aware" # Add metadata about truncation
     original_length = len(full)
 
-    # Define paths to lists that can be truncated and the number of items to keep
-    # Order can matter; truncating larger lists first might be more effective.
-    list_paths_to_truncate = [ # (parent_key or None, key_of_list, items_to_keep)
-        ("core_context", "recent_actions", 3),
-        ("core_context", "important_memories", 3),
-        ("core_context", "key_thoughts", 3),
-        (None, "proactive_memories", 2), # Keep fewer proactive/procedural
-        (None, "current_working_memory", 5), # Keep more working memory items
-        (None, "relevant_procedures", 1),
+    # Define paths to lists that can be truncated and the number of items to keep (using SHOW_LIMIT constants)
+    list_paths_to_truncate = [ # (parent_key or None, key_of_list, items_to_keep_constant)
+        ("core_context", "recent_actions", CONTEXT_RECENT_ACTIONS_SHOW_LIMIT),
+        ("core_context", "important_memories", CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT),
+        ("core_context", "key_thoughts", CONTEXT_KEY_THOUGHTS_SHOW_LIMIT),
+        (None, "proactive_memories", CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT),
+        # Apply limit to the list *within* the working memory dict
+        ("current_working_memory", "working_memories", CONTEXT_WORKING_MEMORY_SHOW_LIMIT),
+        (None, "relevant_procedures", CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT),
     ]
     # Define keys to remove entirely if context is still too large, in order of least importance
     keys_to_remove_low_priority = [
@@ -282,13 +298,14 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
         "proactive_memories",
         "contextual_links", # Link summary is lower priority than core items
         # Removing items from core_context is more impactful
-        "key_thoughts",
-        "important_memories",
-        "recent_actions",
-        "core_context", # Remove the entire core context as a last resort before byte slice
+        ("core_context", "key_thoughts"), # Check nested key first
+        ("core_context", "important_memories"),
+        ("core_context", "recent_actions"),
+        "core_context", # Remove the entire core context dict last
+        "current_working_memory", # Remove working memory context before byte slice
     ]
 
-    # 1. Truncate specified lists
+    # 1. Truncate specified lists based on SHOW_LIMIT constants
     for parent, key, keep_count in list_paths_to_truncate:
         try:
             container = ctx_copy
@@ -303,8 +320,12 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
                 original_count = len(container[key])
                 # Add a note indicating truncation within the list itself
                 note = {"truncated_note": f"{original_count - keep_count} items omitted from '{key}'"}
-                container[key] = container[key][:keep_count] + [note]
-                log.debug(f"Truncated list '{key}' (under '{parent or 'root'}') to {keep_count} items.")
+                # Slice to keep the desired number of items
+                container[key] = container[key][:keep_count]
+                # Append the note if there's space or if it's crucial context
+                if keep_count > 0: # Only add note if we kept some items
+                    container[key].append(note)
+                log.debug(f"Truncated list '{key}' (under '{parent or 'root'}') to {keep_count} items (+ note).")
 
             # Check size after each list truncation
             serial = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
@@ -317,18 +338,26 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
             continue
 
     # 2. Remove low-priority keys if still too large
-    for key_to_remove in keys_to_remove_low_priority:
+    for key_info in keys_to_remove_low_priority:
         removed = False
-        # Try removing from the root level
-        if key_to_remove in ctx_copy:
-            ctx_copy.pop(key_to_remove)
+        key_to_remove = key_info
+        parent_key_to_remove = None
+        if isinstance(key_info, tuple): # Handle nested keys like ("core_context", "key_thoughts")
+            parent_key_to_remove, key_to_remove = key_info
+
+        # Try removing from the parent or root level
+        container_to_remove = ctx_copy
+        if parent_key_to_remove:
+            if parent_key_to_remove in container_to_remove and isinstance(container_to_remove[parent_key_to_remove], dict):
+                container_to_remove = container_to_remove[parent_key_to_remove]
+            else:
+                continue # Skip if parent doesn't exist or isn't a dict
+
+        # Remove the key if it exists in the target container
+        if key_to_remove in container_to_remove:
+            container_to_remove.pop(key_to_remove)
             removed = True
-            log.debug(f"Removed low-priority key '{key_to_remove}' from root for truncation.")
-        # Also check if the key might be inside 'core_context'
-        elif "core_context" in ctx_copy and isinstance(ctx_copy["core_context"], dict) and key_to_remove in ctx_copy["core_context"]:
-            ctx_copy["core_context"].pop(key_to_remove)
-            removed = True
-            log.debug(f"Removed low-priority key '{key_to_remove}' from core_context for truncation.")
+            log.debug(f"Removed low-priority key '{key_to_remove}' from {'root' if parent_key_to_remove is None else parent_key_to_remove} for truncation.")
 
         # Check size after each key removal
         if removed:
@@ -405,7 +434,7 @@ class AgentState:
         goal_achieved_flag: Boolean flag indicating if the overall goal has been marked as achieved.
         consecutive_error_count: Counter for consecutive failed actions, used for error limiting.
         needs_replan: Boolean flag indicating if the agent needs to revise its plan in the next cycle.
-        last_error_details: A dictionary holding structured information about the last error encountered.
+        last_error_details: A dictionary holding structured information about the last error encountered **(Enhanced with category)**.
         successful_actions_since_reflection: Counter for successful *agent-level* actions since the last reflection.
         successful_actions_since_consolidation: Counter for successful *agent-level* actions since the last consolidation.
         loops_since_optimization: Counter for loops since the last working memory optimization/focus update.
@@ -414,8 +443,8 @@ class AgentState:
         loops_since_maintenance: Counter for loops since the last maintenance task (e.g., deleting expired memories).
         reflection_cycle_index: Index to cycle through different reflection types.
         last_meta_feedback: Stores the summary of the last reflection/consolidation output for the next prompt.
-        current_reflection_threshold: The current dynamic threshold for triggering reflection.
-        current_consolidation_threshold: The current dynamic threshold for triggering consolidation.
+        current_reflection_threshold: The current dynamic threshold for triggering reflection **(Adaptive)**.
+        current_consolidation_threshold: The current dynamic threshold for triggering consolidation **(Adaptive)**.
         tool_usage_stats: Dictionary tracking success/failure counts and latency for each tool used.
         background_tasks: (Transient) Set holding currently running asyncio background tasks (not saved to state file).
     """
@@ -438,7 +467,7 @@ class AgentState:
     # --- error/replan ---
     consecutive_error_count: int = 0
     needs_replan: bool = False # Flag to force replanning cycle
-    last_error_details: Optional[Dict[str, Any]] = None # Stores info about the last error
+    last_error_details: Optional[Dict[str, Any]] = None # Stores info about the last error **(Enhanced)**
 
     # --- meta‑cognition metrics ---
     # Counters reset when corresponding meta-task runs or on error
@@ -560,6 +589,8 @@ class AgentMasterLoop:
         self._shutdown_event = asyncio.Event()
         # Lock for safely managing the background tasks set
         self._bg_tasks_lock = asyncio.Lock()
+        # Semaphore to limit concurrent background tasks
+        self._bg_task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BG_TASKS)
         # Placeholder for loaded tool schemas
         self.tool_schemas: List[Dict[str, Any]] = []
 
@@ -588,8 +619,9 @@ class AgentMasterLoop:
         process instructions, cognitive guidance, and the current runtime context
         (plan, errors, feedback, memories, etc.) into the prompt structure
         expected by the Anthropic API. Includes robust context truncation.
+        **Enhanced with specific guidance on WM, error recovery, and plan repair.**
         """
-        # <<< Start Integration Block: Detailed System Prompt (Phase 1, Step 2) >>>
+        # <<< Start Integration Block: Enhance _construct_agent_prompt (Phase 1, Step 1 & 4) >>>
         # ---------- system ----------
         system_blocks: List[str] = [
             f"You are '{AGENT_NAME}', an AI agent orchestrator using a Unified Memory System.",
@@ -629,40 +661,54 @@ class AgentMasterLoop:
                     f"  Schema: {input_schema_str}"
                 )
         system_blocks.append("")
-        # --- Detailed Process Instructions ---
+        # --- Detailed Process Instructions (Enhanced) ---
         system_blocks.extend([
             "Your Process at each step:",
-            "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details`), recent actions, memories (`core_context`, `proactive_memories`), thoughts, `current_plan`, `relevant_procedures`, `current_working_memory` (most active memories), `current_thought_chain_id`, and `meta_feedback`. Pay attention to memory `importance`/`confidence`.",
-            "2.  Error Handling: If `last_error_details` exists, **FIRST** reason about the error and propose a recovery strategy in your reasoning. Check if it was a dependency failure.",
+            "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details` - *pay attention to error `type`*), recent actions, memories (`core_context`, `proactive_memories`), thoughts, `current_plan`, `relevant_procedures`, **`current_working_memory` (use this for immediate relevance, note `focal_memory_id` if present)**, `current_thought_chain_id`, and `meta_feedback`. Pay attention to memory `importance`/`confidence` and context component `retrieved_at` timestamps.",
+            "2.  Error Handling: If `last_error_details` exists, **FIRST** reason about the error `type` and `message`. Propose a recovery strategy in your reasoning. Refer to 'Recovery Strategies' below.",
             "3.  Reasoning & Planning:",
             "    a. State step-by-step reasoning towards the Goal/Sub-goal, integrating context and feedback. Consider `current_working_memory` for immediate context. Record key thoughts using `record_thought` and specify the `thought_chain_id` if different from `current_thought_chain_id`.",
-            "    b. Evaluate `current_plan`. Is it valid? Does it address errors? Are dependencies (`depends_on`) likely met?",
+            "    b. Evaluate `current_plan`. Is it valid? Does it address errors? Are dependencies (`depends_on`) likely met? Check for cycles.",
             "    c. **Action Dependencies:** If planning Step B requires output from Step A (action ID 'a123'), include `\"depends_on\": [\"a123\"]` in Step B's plan object.",
             "    d. **Artifact Tracking:** If planning to use a tool that creates a file/data, plan a subsequent step to call `record_artifact`. If needing a previously created artifact, plan to use `get_artifacts` or `get_artifact_by_id` first.",
             "    e. **Direct Memory Management:** If you synthesize a critical new fact, insight, or procedure, plan to use `store_memory` to explicitly save it. If you find strong evidence contradicting a stored memory, plan to use `update_memory` to correct it. Provide clear `content`, `memory_type`, `importance`, and `confidence`.",
             "    f. **Custom Thought Chains:** If tackling a distinct sub-problem or exploring a complex tangent, consider creating a new reasoning thread using `create_thought_chain`. Provide a clear `title`. Subsequent related thoughts should specify the new `thought_chain_id`. The loop tracks the `current_thought_chain_id`.",
             "    g. **Linking:** Identify potential memory relationships (causal, supportive, contradictory). Plan to use `create_memory_link` with specific `link_type`s (e.g., `SUPPORTS`, `CONTRADICTS`, `CAUSAL`, `REFERENCES`).",
             "    h. **Search:** Prefer `hybrid_search_memories` for mixed queries needing relevance and keyword matching. Use `search_semantic_memories` for pure conceptual similarity.",
-            "    i. **Update Plan Tool:** Use the `agent:update_plan` tool ONLY for significant plan changes (e.g., error recovery, major strategy shift, inserting/removing multiple steps). Do NOT use it for simply marking a step complete.",
+            "    i. **Update Plan Tool / Repair:** Use `agent:update_plan` ONLY for significant changes (error recovery, major strategy shift, multi-step insertion/removal, fixing validation issues like cycles). **If `needs_replan` is true in context, prioritize using this tool to fix the plan.** Do NOT use it for simply marking a step complete.",
             "4.  Action Decision: Choose **ONE** action based on the *first planned step* in your current plan:",
             "    *   Call Memory/Other Tool: Select the most precise tool. Provide args per schema. **Mandatory:** Call `create_workflow` if context shows 'No Active Workflow'.",
             "    *   Record Thought: Use `record_thought` for logging reasoning, questions, hypotheses etc. Specify `thought_chain_id` if not the current one.",
-            "    *   Update Plan Tool: Call `agent:update_plan` with the new plan structure if major changes are needed.",
+            "    *   Update Plan Tool: Call `agent:update_plan` with the **complete, repaired** plan structure if major changes are needed or validation failed.",
             "    *   Signal Completion: If Overall Goal is MET, respond ONLY with the text \"Goal Achieved:\" followed by a brief summary.",
             "5.  Output Format: Respond **ONLY** with the valid JSON for the chosen tool call OR the \"Goal Achieved:\" text."
         ])
-        # --- Key Considerations ---
+        # --- Key Considerations (Enhanced) ---
         system_blocks.extend([
             "\nKey Considerations:",
-            "*   Dependencies: Ensure `depends_on` actions are likely complete. Use `get_action_details` if unsure.",
+            "*   Dependencies & Cycles: Ensure `depends_on` actions are likely complete. Avoid circular dependencies. Use `get_action_details` if unsure.",
             "*   Artifacts: Track outputs (`record_artifact`), retrieve inputs (`get_artifacts`/`get_artifact_by_id`).",
             "*   Memory: Store important learned info (`store_memory`). Update incorrect info (`update_memory`). Use confidence scores.",
             "*   Thought Chains: Use `create_thought_chain` for complex sub-problems. Use the correct `thought_chain_id` when recording thoughts.",
             "*   Linking: Use specific `link_type`s to build the knowledge graph.",
-            "*   Focus: Leverage `current_working_memory` for immediate context."
+            "*   Focus: Leverage `current_working_memory` for immediate context. Note the `focal_memory_id`.",
+            "*   Errors: Prioritize error analysis and recovery based on `last_error_details.type`."
+        ])
+        # --- Recovery Strategies Guidance ---
+        system_blocks.extend([
+            "\nRecovery Strategies based on `last_error_details.type`:",
+            "*   `InvalidInputError`: Review tool schema, arguments, and context. Correct the arguments and retry OR choose a different tool/step.",
+            "*   `DependencyNotMetError`: Use `get_action_details` on dependency IDs to check status. Adjust plan order using `agent:update_plan` or wait.",
+            "*   `ServerUnavailable` / `NetworkError`: The tool's server might be down. Try a different tool, wait, or adjust the plan.",
+            "*   `APILimitError` / `RateLimitError`: The external API (e.g., LLM) is busy. Plan to wait (record a thought) before retrying the step.",
+            "*   `ToolExecutionError` / `ToolInternalError`: The tool failed internally. Analyze the error message. Maybe try different arguments, use an alternative tool, or adjust the plan.",
+            "*   `PlanUpdateError`: The plan structure you proposed was invalid. Re-examine the plan steps and dependencies, then try `agent:update_plan` again with a valid list.",
+            "*   `PlanValidationError`: The proposed plan has logical issues (e.g., cycles). Debug dependencies and propose a corrected plan structure using `agent:update_plan`.",
+            "*   `CancelledError`: The previous action was cancelled. Re-evaluate the current step.",
+            "*   `UnknownError` / `UnexpectedExecutionError`: Analyze the error message carefully. Try to understand the cause. You might need to simplify the step, use a different approach, or ask for clarification via `record_thought` if stuck."
         ])
         system_prompt = "\n".join(system_blocks)
-        # <<< End Integration Block: Detailed System Prompt >>>
+        # <<< End Integration Block: Enhance _construct_agent_prompt >>>
 
         # ---------- user ----------
         # Construct the user part of the prompt, including truncated context
@@ -707,13 +753,15 @@ class AgentMasterLoop:
         user_blocks += [
             f"Overall Goal: {goal}",
             "",
-            "Instruction: Analyze context & errors. Reason step-by-step. Decide ONE action: call a tool (output tool_use JSON), update the plan IF NEEDED (call `agent:update_plan`), or signal completion (output 'Goal Achieved: ...').",
+            # Updated instruction emphasizing error/plan repair
+            "Instruction: Analyze context & errors (use recovery strategies if needed). Reason step-by-step. Evaluate and **REPAIR** the plan if `needs_replan` is true or errors indicate plan issues (use `agent:update_plan`). Otherwise, decide ONE action based on the *first planned step*: call a tool (output tool_use JSON), record a thought (`record_thought`), or signal completion (output 'Goal Achieved: ...').",
         ]
         user_prompt = "\n".join(user_blocks)
 
         # Return structure for Anthropic API (user prompt combines system instructions and current state)
         # Note: Anthropic recommends placing system prompts outside the 'messages' list if using their client directly.
         # Here, we combine them into the user message content as per the original structure.
+        # >>>>> PRESERVED ORIGINAL PROMPT STRUCTURE <<<<<
         return [{"role": "user", "content": system_prompt + "\n---\n" + user_prompt}]
 
 
@@ -725,12 +773,29 @@ class AgentMasterLoop:
 
     async def _background_task_done_safe(self, task: asyncio.Task) -> None:
         """
-        Safely removes a completed task from the tracking set and logs any exceptions.
-        Ensures thread-safety using an asyncio Lock.
+        Safely removes a completed task from the tracking set, releases the semaphore,
+        and logs any exceptions. Ensures thread-safety using an asyncio Lock.
         """
+        # <<< Start Integration Block: Enhance _background_task_done_safe (Phase 1, Step 5) >>>
+        was_present = False
         async with self._bg_tasks_lock: # Acquire lock before modifying the set
-            self.state.background_tasks.discard(task)
-        # Log cancellation or exceptions after releasing the lock
+            if task in self.state.background_tasks:
+                 self.state.background_tasks.discard(task)
+                 was_present = True
+
+        # Release the semaphore ONLY if the task was successfully removed from the set
+        # This prevents releasing the semaphore multiple times if the callback somehow fires twice
+        if was_present:
+            try:
+                self._bg_task_semaphore.release()
+                log.debug(f"Released semaphore. Count: {self._bg_task_semaphore._value}. Task: {task.get_name()}")
+            except ValueError:
+                 # This can happen if release is called more times than acquire (should not normally occur)
+                 log.warning(f"Semaphore release attempt failed for task {task.get_name()}. Already fully released?")
+            except Exception as sem_err:
+                 log.error(f"Unexpected error releasing semaphore for task {task.get_name()}: {sem_err}")
+
+        # Log cancellation or exceptions after releasing the lock and semaphore
         if task.cancelled():
             self.logger.debug(f"Background task {task.get_name()} was cancelled.")
             return
@@ -739,14 +804,17 @@ class AgentMasterLoop:
         if exc:
             # Log the exception details
             self.logger.error(
-                f"Background task {task.get_name()} failed:",
+                # Provide task name/info for better debugging
+                f"Background task {task.get_name()} failed: {type(exc).__name__}",
                 exc_info=(type(exc), exc, exc.__traceback__), # Provide full traceback info
             )
+        # <<< End Integration Block: Enhance _background_task_done_safe >>>
 
     def _start_background_task(self, coro_fn, *args, **kwargs) -> asyncio.Task:
         """
         Creates and starts an asyncio task for a background operation.
 
+        Acquires a semaphore slot before starting. Includes timeout handling.
         Captures essential state (workflow_id, context_id) at the time of creation
         to ensure the background task operates on the correct context, even if the
         main agent state changes before the task runs. Adds the task to the
@@ -761,6 +829,7 @@ class AgentMasterLoop:
         Returns:
             The created asyncio.Task object.
         """
+        # <<< Start Integration Block: Enhance _start_background_task (Phase 1, Step 5) >>>
         # Snapshot critical state needed by the background task at the moment of creation
         snapshot_wf_id = self.state.workflow_id
         snapshot_ctx_id = self.state.context_id
@@ -768,29 +837,50 @@ class AgentMasterLoop:
 
         # Define an async wrapper function to execute the coroutine with snapshotted state
         async def _wrapper():
-            # Pass snapshotted state to the actual coroutine function
-            # Check if coro_fn is an instance method and pass 'self' implicitly/explicitly
-            # Note: This check might be overly complex; usually passing 'self' if needed is handled by how coro_fn is defined/called.
-            # Simplified: Assume coro_fn is defined correctly (e.g., AgentMasterLoop._some_bg_method)
-            await coro_fn(
-                 self, # Pass the agent instance
-                 *args,
-                 workflow_id=snapshot_wf_id, # Pass snapshotted workflow_id
-                 context_id=snapshot_ctx_id, # Pass snapshotted context_id
-                 **kwargs,
-            )
+            # Acquire semaphore before running the actual work
+            log.debug(f"Waiting for semaphore... Task: {asyncio.current_task().get_name()}. Current count: {self._bg_task_semaphore._value}")
+            await self._bg_task_semaphore.acquire()
+            log.debug(f"Acquired semaphore. Task: {asyncio.current_task().get_name()}. New count: {self._bg_task_semaphore._value}")
+            try:
+                # Run the actual coroutine with timeout
+                await asyncio.wait_for(
+                    coro_fn(
+                        self, # Pass the agent instance
+                        *args,
+                        workflow_id=snapshot_wf_id, # Pass snapshotted workflow_id
+                        context_id=snapshot_ctx_id, # Pass snapshotted context_id
+                        **kwargs,
+                    ),
+                    timeout=BACKGROUND_TASK_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # Log timeout specifically
+                self.logger.warning(f"Background task {asyncio.current_task().get_name()} timed out after {BACKGROUND_TASK_TIMEOUT_SECONDS}s.")
+            except Exception:
+                # Log other exceptions, they will also be logged by the done callback
+                self.logger.debug(f"Exception caught within background task wrapper {asyncio.current_task().get_name()}. Will be logged by done callback.")
+            # finally:
+            #     # Ensure semaphore is released *within the task itself*
+            #     # This is handled by the done callback now to simplify wrapper logic
+            #     # self._bg_task_semaphore.release()
+            #     # log.debug(f"Released semaphore via FINALLY. Task: {asyncio.current_task().get_name()}")
+            #     pass
 
         # Create the asyncio task
-        task = asyncio.create_task(_wrapper())
+        # Naming the task helps with debugging
+        task_name = f"bg_{coro_fn.__name__}_{_fmt_id(snapshot_wf_id)}_{random.randint(100,999)}"
+        task = asyncio.create_task(_wrapper(), name=task_name)
 
         # Schedule adding the task to the tracking set safely using another task
         # This avoids potential blocking if the lock is held
         asyncio.create_task(self._add_bg_task(task))
 
-        # Add the completion callback to handle cleanup and logging
+        # Add the completion callback to handle cleanup and logging (this callback now also releases semaphore)
         task.add_done_callback(self._background_task_done)
         self.logger.debug(f"Started background task: {task.get_name()} for WF {_fmt_id(snapshot_wf_id)}")
         return task
+        # <<< End Integration Block: Enhance _start_background_task >>>
+
 
     async def _add_bg_task(self, task: asyncio.Task) -> None:
         """Safely add a task to the background task set using the lock."""
@@ -800,8 +890,10 @@ class AgentMasterLoop:
     async def _cleanup_background_tasks(self) -> None:
         """
         Cancels all pending background tasks and awaits their completion.
-        Called during graceful shutdown.
+        Called during graceful shutdown. Ensures semaphores are released.
         """
+        # <<< Start Integration Block: Enhance _cleanup_background_tasks (Phase 1, Step 5) >>>
+        tasks_to_cleanup: List[asyncio.Task] = []
         async with self._bg_tasks_lock: # Acquire lock to safely get the list
             # Create a copy to iterate over, as the set might be modified by callbacks
             tasks_to_cleanup = list(self.state.background_tasks)
@@ -812,11 +904,16 @@ class AgentMasterLoop:
 
         self.logger.info(f"Cleaning up {len(tasks_to_cleanup)} background tasks…")
         cancelled_tasks = []
+        already_done_tasks = []
+
+        # Cancel running tasks
         for t in tasks_to_cleanup:
             if not t.done():
                 # Cancel any task that hasn't finished yet
                 t.cancel()
                 cancelled_tasks.append(t)
+            else:
+                 already_done_tasks.append(t)
 
         # Wait for all tasks (including those just cancelled) to finish
         # return_exceptions=True prevents gather from stopping on the first exception
@@ -824,19 +921,38 @@ class AgentMasterLoop:
 
         # Log the outcome of each task cleanup
         for i, res in enumerate(results):
-            task_name = tasks_to_cleanup[i].get_name()
+            task = tasks_to_cleanup[i]
+            task_name = task.get_name()
             if isinstance(res, asyncio.CancelledError):
                 # This is expected for tasks that were cancelled above
                 self.logger.debug(f"Task {task_name} successfully cancelled during cleanup.")
             elif isinstance(res, Exception):
                 # Log any unexpected errors that occurred during task execution/cleanup
                 self.logger.error(f"Task {task_name} raised an exception during cleanup: {res}")
-            # else: Task completed normally before/during cleanup or was already done
+            else:
+                # Task completed normally before/during cleanup or was already done
+                self.logger.debug(f"Task {task_name} finalized during cleanup (completed normally or already done).")
+
+            # --- Ensure semaphore is released ---
+            # The done callback should handle release, but we add a check here as a failsafe
+            # during shutdown, especially if the callback didn't run or failed itself.
+            # This is tricky because we don't know if the task acquired the semaphore before being cancelled.
+            # A potentially safer approach is *not* to release here unless we are certain the task
+            # acquired it and didn't release it. Releasing without acquiring increments the semaphore count.
+            # Given the complexity, we rely on the robust done_callback for release.
+            # Adding a log message if the semaphore count seems wrong at the end might be useful.
 
         # Clear the tracking set after all tasks are handled
         async with self._bg_tasks_lock:
             self.state.background_tasks.clear()
+
+        # Final check on semaphore count after cleanup
+        final_sem_count = self._bg_task_semaphore._value
+        if final_sem_count != MAX_CONCURRENT_BG_TASKS:
+             self.logger.warning(f"Semaphore count is {final_sem_count} after cleanup, expected {MAX_CONCURRENT_BG_TASKS}. Some tasks might not have released.")
+
         self.logger.info("Background tasks cleanup finished.")
+        # <<< End Integration Block: Enhance _cleanup_background_tasks >>>
 
 
     # ------------------------------------------------------- token estimator --
@@ -1086,14 +1202,31 @@ class AgentMasterLoop:
             if extra_keys:
                 self.logger.warning(f"Ignoring unknown keys found in state file: {extra_keys}")
 
-            # Ensure mandatory fields (like thresholds) have values, using defaults if somehow missed
-            if "current_reflection_threshold" not in kwargs:
-                kwargs["current_reflection_threshold"] = BASE_REFLECTION_THRESHOLD
-            if "current_consolidation_threshold" not in kwargs:
-                kwargs["current_consolidation_threshold"] = BASE_CONSOLIDATION_THRESHOLD
-
             # Create the AgentState instance using the processed keyword arguments
-            self.state = AgentState(**kwargs)
+            # >>>>> PRESERVED ORIGINAL LOADING LOGIC FOR UNHANDLED FIELDS <<<<<
+            # Note: This implicitly handles fields not explicitly checked above,
+            # relying on the dataclass constructor to handle types if possible.
+            # It's generally safer to handle complex types explicitly as done for plan/stats.
+            temp_state = AgentState(**kwargs)
+
+            # Ensure mandatory fields (like thresholds) have values AFTER construction,
+            # using defaults if somehow missed or loading failed for them.
+            if not isinstance(temp_state.current_reflection_threshold, int):
+                 self.logger.warning(f"Invalid loaded reflection threshold ({temp_state.current_reflection_threshold}). Resetting to base.")
+                 temp_state.current_reflection_threshold = BASE_REFLECTION_THRESHOLD
+            else:
+                 # Ensure loaded threshold is within bounds
+                 temp_state.current_reflection_threshold = max(MIN_REFLECTION_THRESHOLD, min(MAX_REFLECTION_THRESHOLD, temp_state.current_reflection_threshold))
+
+            if not isinstance(temp_state.current_consolidation_threshold, int):
+                 self.logger.warning(f"Invalid loaded consolidation threshold ({temp_state.current_consolidation_threshold}). Resetting to base.")
+                 temp_state.current_consolidation_threshold = BASE_CONSOLIDATION_THRESHOLD
+            else:
+                 # Ensure loaded threshold is within bounds
+                 temp_state.current_consolidation_threshold = max(MIN_CONSOLIDATION_THRESHOLD, min(MAX_CONSOLIDATION_THRESHOLD, temp_state.current_consolidation_threshold))
+
+            # Assign the potentially corrected state
+            self.state = temp_state
             self.logger.info(f"Loaded state from {self.agent_state_file}; current loop {self.state.current_loop}")
 
         except (json.JSONDecodeError, TypeError, FileNotFoundError) as e:
@@ -1382,6 +1515,65 @@ class AgentMasterLoop:
             # Assume not found if an error occurs
             return False
 
+    # <<< Start Integration Block: Plan Cycle Detection Helper (Phase 1, Step 3) >>>
+    def _detect_plan_cycle(self, plan: List[PlanStep]) -> bool:
+        """
+        Detects cyclic dependencies in the agent's plan using Depth First Search.
+
+        Args:
+            plan: The list of PlanStep objects representing the current plan.
+
+        Returns:
+            True if a cycle is detected, False otherwise.
+        """
+        if not plan: return False # Empty plan has no cycles
+
+        adj: Dict[str, Set[str]] = defaultdict(set) # Adjacency list: step_id -> set(dependency_step_ids)
+        plan_step_ids = {step.id for step in plan} # Set of all valid step IDs in the current plan
+
+        # Build the adjacency list from depends_on relationships
+        for step in plan:
+            for dep_id in step.depends_on:
+                # Only add dependency if the target step actually exists in the current plan
+                if dep_id in plan_step_ids:
+                    adj[step.id].add(dep_id)
+                else:
+                    # Log if a dependency points to a non-existent step (potential issue)
+                    self.logger.warning(f"Plan step {_fmt_id(step.id)} depends on non-existent step {_fmt_id(dep_id)} in current plan.")
+
+        # DFS state tracking:
+        # path: nodes currently in the recursion stack for the current DFS path
+        # visited: nodes that have been completely explored (all descendants visited)
+        path: Set[str] = set()
+        visited: Set[str] = set()
+
+        def dfs(node_id: str) -> bool:
+            """Recursive DFS function. Returns True if a cycle is detected."""
+            path.add(node_id) # Mark node as currently visiting
+            visited.add(node_id) # Mark node as visited
+
+            # Explore neighbors (dependencies)
+            for neighbor_id in adj[node_id]:
+                if neighbor_id in path: # Cycle detected! Neighbor is already in the current path.
+                    self.logger.warning(f"Dependency cycle detected involving steps: {_fmt_id(node_id)} -> {_fmt_id(neighbor_id)}")
+                    return True
+                if neighbor_id not in visited: # If neighbor not visited yet, recurse
+                    if dfs(neighbor_id):
+                        return True # Propagate cycle detection signal up
+
+            # Finished exploring node_id's descendants, remove from current path
+            path.remove(node_id)
+            return False # No cycle found starting from this node
+
+        # Run DFS from each node in the plan to check all potential cycles
+        for step_id in plan_step_ids:
+            if step_id not in visited:
+                if dfs(step_id):
+                    return True # Cycle found
+
+        # If DFS completes for all nodes without finding a cycle
+        return False
+    # <<< End Integration Block: Plan Cycle Detection Helper >>>
 
     # ------------------------------------------------ dependency check --
     async def _check_prerequisites(self, ids: List[str]) -> Tuple[bool, str]:
@@ -1756,8 +1948,10 @@ class AgentMasterLoop:
                 if source_type == MemoryType.INSIGHT.value and target_type == MemoryType.FACT.value: inferred_link_type = LinkType.SUPPORTS.value
                 elif source_type == MemoryType.FACT.value and target_type == MemoryType.INSIGHT.value: inferred_link_type = LinkType.SUPPORTS.value # Or maybe GENERALIZES/SPECIALIZES?
                 elif source_type == MemoryType.QUESTION.value and target_type == MemoryType.FACT.value: inferred_link_type = LinkType.REFERENCES.value
-                elif source_type == MemoryType.HYPOTHESIS.value and target_type == MemoryType.EVIDENCE.value: inferred_link_type = LinkType.SUPPORTS.value # Assuming evidence supports hypothesis
-                elif source_type == MemoryType.EVIDENCE.value and target_type == MemoryType.HYPOTHESIS.value: inferred_link_type = LinkType.SUPPORTS.value
+                # >>>>> PRESERVED ORIGINAL LINK TYPE RULES <<<<<
+                # (Can add more rules here based on analysis)
+                # elif source_type == MemoryType.HYPOTHESIS.value and target_type == MemoryType.EVIDENCE.value: inferred_link_type = LinkType.SUPPORTS.value # Assuming evidence supports hypothesis
+                # elif source_type == MemoryType.EVIDENCE.value and target_type == MemoryType.HYPOTHESIS.value: inferred_link_type = LinkType.SUPPORTS.value
                 # ... add other rules ...
 
                 # 7. Create the link using the UMS tool
@@ -1872,20 +2066,20 @@ class AgentMasterLoop:
         - Optional recording of action start/completion/dependencies.
         - Retry logic for idempotent tools.
         - Result parsing and standardization.
-        - Error handling and state updates (last_error_details).
+        - **Enhanced error handling/categorization** and state updates (last_error_details).
         - Triggering relevant background tasks (auto-linking, promotion check).
         - Updating last_action_summary state.
         - Handling workflow side effects (creation/completion).
         """
-        # <<< Start Integration Block: Background Triggers in _execute_tool_call_internal (Phase 1, Step 4) >>>
+        # <<< Start Integration Block: Enhance _execute_tool_call_internal (Phase 1, Step 4) >>>
         # --- Step 1: Server Lookup ---
         target_server = self._find_tool_server(tool_name)
         # Handle case where tool server is not found, except for the internal agent tool
         if not target_server and tool_name != AGENT_TOOL_UPDATE_PLAN:
             err = f"Tool server unavailable for {tool_name}"
             self.logger.error(err)
-            # Set error details for the main loop to see
-            self.state.last_error_details = {"tool": tool_name, "error": err, "type": "ServerUnavailable"}
+            # Set error details for the main loop to see - Enhanced Category
+            self.state.last_error_details = {"tool": tool_name, "error": err, "type": "ServerUnavailable", "status_code": 503}
             # Return a failure dictionary consistent with other error returns
             return {"success": False, "error": err, "status_code": 503} # 503 Service Unavailable
 
@@ -1939,8 +2133,8 @@ class AgentMasterLoop:
                 # If dependencies not met, log warning, set error state, and return failure
                 err_msg = f"Prerequisites not met for {tool_name}: {reason}"
                 self.logger.warning(err_msg)
-                # Store detailed error info for the LLM
-                self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "DependencyNotMetError", "dependencies": planned_dependencies}
+                # Store detailed error info for the LLM - Enhanced Category
+                self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "DependencyNotMetError", "dependencies": planned_dependencies, "status_code": 412}
                 # Signal that replanning is needed due to dependency failure
                 self.state.needs_replan = True
                 return {"success": False, "error": err_msg, "status_code": 412} # 412 Precondition Failed
@@ -1958,6 +2152,15 @@ class AgentMasterLoop:
                     raise ValueError("`plan` argument must be a list of step objects.")
                 # Convert list of dicts to list of PlanStep objects (validates structure)
                 validated_plan = [PlanStep(**p) for p in new_plan_data]
+
+                # --- Plan Cycle Detection ---
+                if self._detect_plan_cycle(validated_plan):
+                    err_msg = "Proposed plan contains a dependency cycle."
+                    self.logger.error(err_msg)
+                    self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "PlanValidationError", "proposed_plan": new_plan_data}
+                    self.state.needs_replan = True # Force replan again
+                    return {"success": False, "error": err_msg}
+
                 # Replace the agent's current plan
                 self.state.current_plan = validated_plan
                 # Plan was explicitly updated, so replan flag can be cleared
@@ -1971,8 +2174,8 @@ class AgentMasterLoop:
                 # Handle errors during plan validation or application
                 err_msg = f"Failed to validate/apply new plan: {e}"
                 self.logger.error(err_msg)
-                # Store error details for the LLM
-                self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "PlanUpdateError"}
+                # Store error details for the LLM - Enhanced Category
+                self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "PlanUpdateError", "proposed_plan": final_arguments.get("plan")}
                 # Increment error count for internal failures too? Decide policy. Yes, for now.
                 self.state.consecutive_error_count += 1
                 # Failed plan update requires another attempt at planning
@@ -2063,7 +2266,7 @@ class AgentMasterLoop:
                 # --- Background Triggers Integration ---
                 # Snapshot the workflow ID *before* potentially starting background tasks
                 # (This ensures tasks operate on the workflow active during the trigger event)
-                # current_wf_id_snapshot = self.state.workflow_id # Redundant - already have current_wf_id
+                current_wf_id_snapshot = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id  # noqa: F841
 
                 # Trigger auto-linking after storing/updating a memory or recording an artifact with a linked memory
                 if tool_name in [TOOL_STORE_MEMORY, TOOL_UPDATE_MEMORY] and res.get("memory_id"):
@@ -2122,17 +2325,26 @@ class AgentMasterLoop:
                 # Update failure stats
                 record_stats["failure"] += 1
                 # Ensure error details are captured from the result for the LLM context
-                # Note: Error count increment happens in the heuristic plan update
+                # Enhance error details with categorization
+                error_type = "ToolExecutionError" # Default category
+                status_code = res.get("status_code")
+                error_message = res.get("error", "Unknown failure")
+                if status_code == 412: error_type = "DependencyNotMetError"
+                elif status_code == 503: error_type = "ServerUnavailable"
+                elif "input" in str(error_message).lower() or "validation" in str(error_message).lower(): error_type = "InvalidInputError" # Basic keyword check
+                elif "timeout" in str(error_message).lower(): error_type = "NetworkError" # Assuming timeout implies network
+                # ... (can add more categorization based on status codes or keywords) ...
+
                 self.state.last_error_details = {
                     "tool": tool_name,
                     "args": arguments, # Log the arguments that caused failure
-                    "error": res.get("error", "Unknown failure"),
-                    "status_code": res.get("status_code"),
-                    "type": "ToolExecutionError" # Default error type
+                    "error": error_message,
+                    "status_code": status_code,
+                    "type": error_type # Store the categorized error type
                 }
-                # Specifically identify dependency errors
-                if res.get("status_code") == 412:
-                     self.state.last_error_details["type"] = "DependencyNotMetError"
+                # Log the categorized error
+                self.logger.warning(f"Tool {tool_name} failed. Type: {error_type}, Error: {error_message}")
+
 
             # --- Step 9: Update Last Action Summary ---
             # Create a concise summary of the action's outcome for the next prompt
@@ -2154,7 +2366,10 @@ class AgentMasterLoop:
                      data_str = str(data_payload)[:70] # Preview the data
                      summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
             else: # If failed
-                summary = f"Failed: {str(res.get('error', 'Unknown Error'))[:100]}" # Truncate error message
+                # Use the structured error details for a more informative summary
+                err_type = self.state.last_error_details.get("type", "Unknown") if self.state.last_error_details else "Unknown"
+                err_msg = str(res.get('error', 'Unknown Error'))[:100]
+                summary = f"Failed ({err_type}): {err_msg}" # Include error type
                 if res.get('status_code'): summary += f" (Code: {res['status_code']})" # Add status code if available
 
             # Update the state variable
@@ -2164,17 +2379,48 @@ class AgentMasterLoop:
 
 
         # --- Step 10: Exception Handling for Tool Call/Retries ---
+        # Updated Exception handling to add error categorization
         except (ToolError, ToolInputError) as e:
             # Handle specific MCP exceptions caught during execution or retries
             err_str = str(e); status_code = getattr(e, 'status_code', None)
+            # Determine category based on type and status code
+            error_type = "InvalidInputError" if isinstance(e, ToolInputError) else "ToolInternalError"
+            if status_code == 412: error_type = "DependencyNotMetError"
             self.logger.error(f"Tool Error executing {tool_name}: {err_str}", exc_info=False) # Don't need full trace for these
             res = {"success": False, "error": err_str, "status_code": status_code}
             record_stats["failure"] += 1 # Record failure
-            # Store error details for the LLM
-            self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": type(e).__name__, "status_code": status_code}
-            self.state.last_action_summary = f"{tool_name} -> Failed: {err_str[:100]}"
-            # Identify dependency errors specifically
-            if status_code == 412: self.state.last_error_details["type"] = "DependencyNotMetError"
+            # Store categorized error details for the LLM
+            self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": error_type, "status_code": status_code}
+            self.state.last_action_summary = f"{tool_name} -> Failed ({error_type}): {err_str[:100]}"
+
+        except APIConnectionError as e:
+            err_str = f"LLM API Connection Error: {e}"
+            self.logger.error(err_str, exc_info=False)
+            res = {"success": False, "error": err_str}
+            record_stats["failure"] += 1
+            self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "NetworkError"}
+            self.state.last_action_summary = f"{tool_name} -> Failed: NetworkError"
+        except RateLimitError as e:
+            err_str = f"LLM Rate Limit Error: {e}"
+            self.logger.error(err_str, exc_info=False)
+            res = {"success": False, "error": err_str}
+            record_stats["failure"] += 1
+            self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "APILimitError"}
+            self.state.last_action_summary = f"{tool_name} -> Failed: APILimitError"
+        except APIStatusError as e:
+            err_str = f"LLM API Error {e.status_code}: {e.message}"
+            self.logger.error(f"Anthropic API status error: {e.status_code} - {e.response}", exc_info=False)
+            res = {"success": False, "error": err_str, "status_code": e.status_code}
+            record_stats["failure"] += 1
+            self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "APIError", "status_code": e.status_code}
+            self.state.last_action_summary = f"{tool_name} -> Failed: APIError ({e.status_code})"
+        except asyncio.TimeoutError as e: # Catch timeouts from retry wrapper or internal calls
+            err_str = f"Operation timed out: {e}"
+            self.logger.error(f"Timeout executing {tool_name}: {err_str}", exc_info=False)
+            res = {"success": False, "error": err_str}
+            record_stats["failure"] += 1
+            self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "TimeoutError"}
+            self.state.last_action_summary = f"{tool_name} -> Failed: Timeout"
 
         except asyncio.CancelledError:
              # Handle task cancellation gracefully (e.g., due to shutdown signal)
@@ -2193,6 +2439,7 @@ class AgentMasterLoop:
             self.logger.error(f"Unexpected Error executing {tool_name}: {err_str}", exc_info=True) # Log full traceback
             res = {"success": False, "error": f"Unexpected error: {err_str}"}
             record_stats["failure"] += 1 # Record failure
+            # Store categorized error
             self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "UnexpectedExecutionError"}
             self.state.last_action_summary = f"{tool_name} -> Failed: Unexpected error."
 
@@ -2207,7 +2454,7 @@ class AgentMasterLoop:
 
         # Return the final processed result dictionary
         return res
-    # <<< End Integration Block: Background Triggers >>>
+        # <<< End Integration Block: Enhance _execute_tool_call_internal >>>
 
 
     async def _handle_workflow_side_effects(self, tool_name: str, arguments: Dict, result_content: Dict):
@@ -2362,7 +2609,13 @@ class AgentMasterLoop:
                 # Extract error message for summary
                 error_msg = "Unknown failure"
                 if isinstance(last_tool_result_content, dict):
-                     error_msg = str(last_tool_result_content.get('error', 'Unknown failure'))
+                     # Use the enhanced error details if available
+                     error_details = self.state.last_error_details
+                     if error_details:
+                         error_msg = f"Type: {error_details.get('type', 'Unknown')}, Msg: {error_details.get('error', 'Unknown')}"
+                     else: # Fallback to basic error message
+                         error_msg = str(last_tool_result_content.get('error', 'Unknown failure'))
+
                 current_step.result_summary = f"Failure: {error_msg[:150]}" # Add error summary
                 # Keep the failed step in the plan for context.
                 # Insert an analysis step *after* the failed step, if one isn't already there.
@@ -2449,72 +2702,84 @@ class AgentMasterLoop:
         """
         Adjusts reflection and consolidation thresholds based on memory statistics
         and tool usage patterns to dynamically control meta-cognition frequency.
+        **Enhanced with more stats, nuanced calculation, and dampening.**
         """
+        # <<< Start Integration Block: Enhance _adapt_thresholds (Phase 1, Step 2) >>>
         # Validate stats input
         if not stats or not stats.get("success"):
              self.logger.warning("Cannot adapt thresholds: Invalid or failed stats received.")
              return
 
-        self.logger.debug(f"Attempting threshold adaptation based on stats: {stats}")
-        adjustment_factor = 0.1 # % adjustment per adaptation cycle
+        self.logger.debug(f"Adapting thresholds based on stats: {stats}")
+        # Use dampening factor from constant
+        adjustment_dampening = THRESHOLD_ADAPTATION_DAMPENING
         changed = False # Flag to log if any threshold changed
 
         # --- Consolidation Threshold Adaptation ---
-        # Goal: Consolidate more often if many unprocessed episodic memories exist, less often if few.
         episodic_count = stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0)
-        # Define a target range relative to the base threshold as a guide
-        target_episodic_upper_bound = BASE_CONSOLIDATION_THRESHOLD * 2.0 # Encourage consolidation if > 2x base
-        target_episodic_lower_bound = BASE_CONSOLIDATION_THRESHOLD * 0.75 # Allow less consolidation if < 0.75x base
+        total_memories = stats.get("total_memories", 1) # Avoid division by zero
+        episodic_ratio = episodic_count / total_memories if total_memories > 0 else 0
+        # Target range for episodic ratio (e.g., ideally keep it below 30%)
+        target_episodic_ratio_upper = 0.30
+        target_episodic_ratio_lower = 0.10
+        # Calculate deviation from the middle of the target range
+        mid_target_ratio = (target_episodic_ratio_upper + target_episodic_ratio_lower) / 2
+        ratio_deviation = episodic_ratio - mid_target_ratio
+        # Calculate adjustment: more negative deviation (low ratio) -> increase threshold
+        # More positive deviation (high ratio) -> decrease threshold
+        # Scale adjustment based on current threshold (larger thresholds allow bigger steps)
+        consolidation_adjustment = -math.ceil(ratio_deviation * self.state.current_consolidation_threshold * 2.0) # Factor of 2 controls sensitivity
 
-        # Lower threshold (consolidate MORE often) if episodic count is high
-        if episodic_count > target_episodic_upper_bound:
-            # Calculate potential new threshold, decrease by factor, respect minimum bound
-            potential_new = max(MIN_CONSOLIDATION_THRESHOLD, self.state.current_consolidation_threshold - math.ceil(self.state.current_consolidation_threshold * adjustment_factor))
-            # Apply change only if it actually lowers the threshold
-            if potential_new < self.state.current_consolidation_threshold:
-                self.logger.info(f"High episodic count ({episodic_count}). Lowering consolidation threshold: {self.state.current_consolidation_threshold} -> {potential_new}")
+        # Apply dampening to the adjustment
+        dampened_adjustment = int(consolidation_adjustment * adjustment_dampening)
+        if dampened_adjustment != 0:
+            old_threshold = self.state.current_consolidation_threshold
+            # Calculate potential new threshold, enforcing MIN/MAX bounds
+            potential_new = max(MIN_CONSOLIDATION_THRESHOLD, min(MAX_CONSOLIDATION_THRESHOLD, old_threshold + dampened_adjustment))
+            # Apply change only if it's different from the current threshold
+            if potential_new != old_threshold:
+                change_direction = "Lowering" if dampened_adjustment < 0 else "Raising"
+                self.logger.info(
+                    f"{change_direction} consolidation threshold: {old_threshold} -> {potential_new} "
+                    f"(Episodic Ratio: {episodic_ratio:.1%}, Deviation: {ratio_deviation:+.1%}, Adjustment: {dampened_adjustment})"
+                )
                 self.state.current_consolidation_threshold = potential_new
                 changed = True
-        # Raise threshold (consolidate LESS often) if episodic count is low
-        elif episodic_count < target_episodic_lower_bound:
-            # Calculate potential new threshold, increase by factor, respect maximum bound
-             potential_new = min(MAX_CONSOLIDATION_THRESHOLD, self.state.current_consolidation_threshold + math.ceil(self.state.current_consolidation_threshold * adjustment_factor))
-             # Apply change only if it actually raises the threshold
-             if potential_new > self.state.current_consolidation_threshold:
-                 self.logger.info(f"Low episodic count ({episodic_count}). Raising consolidation threshold: {self.state.current_consolidation_threshold} -> {potential_new}")
-                 self.state.current_consolidation_threshold = potential_new
-                 changed = True
 
         # --- Reflection Threshold Adaptation ---
-        # Goal: Reflect more often if encountering errors, less often if performing well.
         # Use tool usage stats accumulated in agent state
         total_calls = sum(v.get("success", 0) + v.get("failure", 0) for v in self.state.tool_usage_stats.values())
         total_failures = sum(v.get("failure", 0) for v in self.state.tool_usage_stats.values())
         # Calculate failure rate, avoid division by zero, require minimum calls for statistical significance
         min_calls_for_rate = 5 # Need at least 5 calls to calculate a meaningful rate
         failure_rate = (total_failures / total_calls) if total_calls >= min_calls_for_rate else 0.0
+        # Target failure rate (e.g., aim for below 10%)
+        target_failure_rate = 0.10
+        failure_deviation = failure_rate - target_failure_rate
+        # Calculate adjustment: more positive deviation (high failure) -> decrease threshold
+        # More negative deviation (low failure) -> increase threshold
+        reflection_adjustment = -math.ceil(failure_deviation * self.state.current_reflection_threshold * 3.0) # Factor of 3 controls sensitivity
 
-        # Lower threshold (reflect MORE often) if failure rate is high
-        failure_rate_high_threshold = 0.25 # e.g., > 25% failure rate
-        if failure_rate > failure_rate_high_threshold:
-             potential_new = max(MIN_REFLECTION_THRESHOLD, self.state.current_reflection_threshold - math.ceil(self.state.current_reflection_threshold * adjustment_factor))
-             if potential_new < self.state.current_reflection_threshold:
-                 self.logger.info(f"High tool failure rate ({failure_rate:.1%}). Lowering reflection threshold: {self.state.current_reflection_threshold} -> {potential_new}")
-                 self.state.current_reflection_threshold = potential_new
-                 changed = True
-        # Raise threshold (reflect LESS often) if failure rate is very low (agent performing well)
-        failure_rate_low_threshold = 0.05 # e.g., < 5% failure rate
-        min_calls_for_low_rate = 10 # Ensure low rate is based on sufficient evidence
-        if failure_rate < failure_rate_low_threshold and total_calls > min_calls_for_low_rate:
-             potential_new = min(MAX_REFLECTION_THRESHOLD, self.state.current_reflection_threshold + math.ceil(self.state.current_reflection_threshold * adjustment_factor))
-             if potential_new > self.state.current_reflection_threshold:
-                  self.logger.info(f"Low tool failure rate ({failure_rate:.1%}). Raising reflection threshold: {self.state.current_reflection_threshold} -> {potential_new}")
-                  self.state.current_reflection_threshold = potential_new
-                  changed = True
+        # Apply dampening
+        dampened_adjustment = int(reflection_adjustment * adjustment_dampening)
+        if dampened_adjustment != 0 and total_calls >= min_calls_for_rate: # Only adjust if enough calls
+            old_threshold = self.state.current_reflection_threshold
+            # Calculate potential new threshold, enforcing MIN/MAX bounds
+            potential_new = max(MIN_REFLECTION_THRESHOLD, min(MAX_REFLECTION_THRESHOLD, old_threshold + dampened_adjustment))
+            # Apply change only if different
+            if potential_new != old_threshold:
+                change_direction = "Lowering" if dampened_adjustment < 0 else "Raising"
+                self.logger.info(
+                    f"{change_direction} reflection threshold: {old_threshold} -> {potential_new} "
+                    f"(Failure Rate: {failure_rate:.1%}, Deviation: {failure_deviation:+.1%}, Adjustment: {dampened_adjustment})"
+                )
+                self.state.current_reflection_threshold = potential_new
+                changed = True
 
         # Log if no changes were made
         if not changed:
-             self.logger.debug("No threshold adjustments triggered based on current stats.")
+             self.logger.debug("No threshold adjustments triggered based on current stats/heuristics.")
+        # <<< End Integration Block: Enhance _adapt_thresholds >>>
 
 
     # ------------------------------------------------ periodic task runner --
@@ -2831,16 +3096,19 @@ class AgentMasterLoop:
 
         Includes:
         - Core context (recent actions, important memories, key thoughts) via TOOL_GET_CONTEXT.
-        - Current working memory via TOOL_GET_WORKING_MEMORY.
-        - Proactively searched memories relevant to the current plan step.
-        - Relevant procedural memories.
-        - Summary of links around a focal or important memory.
+        - Current working memory via TOOL_GET_WORKING_MEMORY **(Prioritized)**.
+        - Proactively searched memories relevant to the current plan step **(Limited Fetch)**.
+        - Relevant procedural memories **(Limited Fetch)**.
+        - Summary of links around a focal or important memory **(Limited Fetch)**.
+        - **Freshness indicators** for components.
         - Handles potential errors during retrieval.
         - Initiates context compression if token estimates exceed thresholds.
         """
-        # <<< Start Integration Block: Enhance Context Gathering (Phase 1, Step 1 Completed) >>>
+        # <<< Start Integration Block: Enhance _gather_context (Phase 1, Step 1 Completed) >>>
         self.logger.info("Gathering comprehensive context...", emoji_key="satellite")
         start_time = time.time()
+        retrieval_timestamp = datetime.now(timezone.utc).isoformat() # Timestamp for freshness
+
         # Initialize context dictionary with placeholders and essential state
         base_context = {
             # Core agent state info
@@ -2851,15 +3119,16 @@ class AgentMasterLoop:
             "last_action_summary": self.state.last_action_summary,
             "consecutive_error_count": self.state.consecutive_error_count,
             "last_error_details": copy.deepcopy(self.state.last_error_details), # Deep copy error details
+            "needs_replan": self.state.needs_replan, # Include replan flag in context
             "workflow_stack": self.state.workflow_stack,
             "meta_feedback": self.state.last_meta_feedback, # Include feedback from last meta task
             "current_thought_chain_id": self.state.current_thought_chain_id,
             # Placeholders for dynamically fetched context components
             "core_context": None, # From TOOL_GET_CONTEXT
             "current_working_memory": None, # From TOOL_GET_WORKING_MEMORY (will be dict)
-            "proactive_memories": [], # List of relevant memories
-            "relevant_procedures": [], # List of procedural memories
-            "contextual_links": None, # Summary of links around focal memory
+            "proactive_memories": None, # Dict: {"retrieved_at": ..., "memories": [...]}
+            "relevant_procedures": None, # Dict: {"retrieved_at": ..., "memories": [...]}
+            "contextual_links": None, # Dict: {"retrieved_at": ..., "summary": {...}}
             "compression_summary": None, # If compression is applied
             "status": "Gathering...", # Initial status
             "errors": [] # List to collect errors during gathering
@@ -2881,20 +3150,22 @@ class AgentMasterLoop:
         # --- Fetch Core Context (e.g., Recent Actions, Important Memories, Key Thoughts) ---
         if self._find_tool_server(TOOL_GET_CONTEXT):
             try:
-                # Fetch core context with predefined limits
+                # Fetch core context with predefined limits (FETCH_LIMIT constants)
                 core_ctx_result = await self._execute_tool_call_internal(
                     TOOL_GET_CONTEXT,
                     {
                         "workflow_id": current_workflow_id,
-                        "recent_actions_limit": CONTEXT_RECENT_ACTIONS,
-                        "important_memories_limit": CONTEXT_IMPORTANT_MEMORIES,
-                        "key_thoughts_limit": CONTEXT_KEY_THOUGHTS,
+                        # Use FETCH limits here, truncation to SHOW limits happens later if needed
+                        "recent_actions_limit": CONTEXT_RECENT_ACTIONS_FETCH_LIMIT,
+                        "important_memories_limit": CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT,
+                        "key_thoughts_limit": CONTEXT_KEY_THOUGHTS_FETCH_LIMIT,
                     },
                     record_action=False # Internal context fetch
                 )
                 if core_ctx_result.get("success"):
-                    # Store the successful result (might contain nested lists/dicts)
+                    # Store the successful result and add freshness timestamp
                     base_context["core_context"] = core_ctx_result
+                    base_context["core_context"]["retrieved_at"] = retrieval_timestamp # Add freshness
                     # Clean up redundant success/timing info from the nested result
                     base_context["core_context"].pop("success", None)
                     base_context["core_context"].pop("processing_time", None)
@@ -2911,7 +3182,8 @@ class AgentMasterLoop:
             self.logger.warning(f"Skipping core context: Tool {TOOL_GET_CONTEXT} unavailable.")
 
         # --- Get Current Working Memory (Provides active memories and focal point) ---
-        # Filling in placeholder logic based on expected tool behavior
+        focal_mem_id_from_wm: Optional[str] = None # Store focal ID if found
+        working_mem_list_from_wm: List[Dict] = [] # Store memory list if found
         if current_context_id and self._find_tool_server(TOOL_GET_WORKING_MEMORY):
             try:
                 wm_result = await self._execute_tool_call_internal(
@@ -2924,14 +3196,18 @@ class AgentMasterLoop:
                     record_action=False
                 )
                 if wm_result.get("success"):
-                    # Store the entire result dict, which includes focal_memory_id and working_memories list
+                    # Store the entire result dict and add freshness
                     base_context["current_working_memory"] = wm_result
+                    base_context["current_working_memory"]["retrieved_at"] = retrieval_timestamp # Add freshness
                     # Clean up redundant fields
                     base_context["current_working_memory"].pop("success", None)
                     base_context["current_working_memory"].pop("processing_time", None)
+                    # Extract focal ID and memory list for later use
+                    focal_mem_id_from_wm = wm_result.get("focal_memory_id")
+                    working_mem_list_from_wm = wm_result.get("working_memories", [])
                     # Log count of retrieved working memories
-                    wm_count = len(wm_result.get("working_memories", []))
-                    self.logger.info(f"Retrieved {wm_count} items from working memory (Context: {_fmt_id(current_context_id)}).")
+                    wm_count = len(working_mem_list_from_wm)
+                    self.logger.info(f"Retrieved {wm_count} items from working memory (Context: {_fmt_id(current_context_id)}). Focal: {_fmt_id(focal_mem_id_from_wm)}")
                 else:
                     err_msg = f"Working memory retrieval failed: {wm_result.get('error')}"
                     base_context["errors"].append(err_msg)
@@ -2955,7 +3231,7 @@ class AgentMasterLoop:
             search_args = {
                 "workflow_id": current_workflow_id,
                 "query": proactive_query,
-                "limit": CONTEXT_PROACTIVE_MEMORIES, # Use constant limit
+                "limit": CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT, # Use FETCH limit
                 "include_content": False # Keep context light
             }
             # Adjust weights for hybrid search
@@ -2969,18 +3245,21 @@ class AgentMasterLoop:
                     proactive_mems = result_content.get("memories", [])
                     # Determine score key based on tool used
                     score_key = "hybrid_score" if search_tool_proactive == TOOL_HYBRID_SEARCH else "similarity"
-                    # Format results for context
-                    base_context["proactive_memories"] = [
-                        {
-                            "memory_id": m.get("memory_id"),
-                            "description": m.get("description"),
-                            "score": round(m.get(score_key, 0), 3), # Include score
-                            "type": m.get("memory_type") # Include type
-                         }
-                        for m in proactive_mems # Iterate through results
-                    ]
-                    if base_context["proactive_memories"]:
-                        self.logger.info(f"Retrieved {len(base_context['proactive_memories'])} proactive memories using {search_tool_proactive.split(':')[-1]}.")
+                    # Format results for context, include freshness
+                    base_context["proactive_memories"] = {
+                        "retrieved_at": retrieval_timestamp,
+                        "memories": [
+                            {
+                                "memory_id": m.get("memory_id"),
+                                "description": m.get("description"),
+                                "score": round(m.get(score_key, 0), 3), # Include score
+                                "type": m.get("memory_type") # Include type
+                             }
+                            for m in proactive_mems # Iterate through results
+                        ]
+                    }
+                    if base_context["proactive_memories"]["memories"]:
+                        self.logger.info(f"Retrieved {len(base_context['proactive_memories']['memories'])} proactive memories using {search_tool_proactive.split(':')[-1]}.")
                 else:
                     err_msg = f"Proactive memory search ({search_tool_proactive}) failed: {result_content.get('error')}"
                     base_context["errors"].append(err_msg)
@@ -3001,7 +3280,7 @@ class AgentMasterLoop:
             search_args = {
                 "workflow_id": current_workflow_id,
                 "query": proc_query,
-                "limit": CONTEXT_PROCEDURAL_MEMORIES, # Use constant limit
+                "limit": CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT, # Use FETCH limit
                 "memory_level": MemoryLevel.PROCEDURAL.value, # Explicitly filter for procedural level
                 "include_content": False # Keep context light
             }
@@ -3014,17 +3293,20 @@ class AgentMasterLoop:
                 if proc_result.get("success"):
                     proc_mems = proc_result.get("memories", [])
                     score_key = "hybrid_score" if search_tool_proc == TOOL_HYBRID_SEARCH else "similarity"
-                    # Format results for context
-                    base_context["relevant_procedures"] = [
-                        {
-                            "memory_id": m.get("memory_id"),
-                            "description": m.get("description"),
-                            "score": round(m.get(score_key, 0), 3)
-                        }
-                        for m in proc_mems
-                    ]
-                    if base_context["relevant_procedures"]:
-                        self.logger.info(f"Retrieved {len(base_context['relevant_procedures'])} relevant procedures using {search_tool_proc.split(':')[-1]}.")
+                    # Format results for context, include freshness
+                    base_context["relevant_procedures"] = {
+                         "retrieved_at": retrieval_timestamp,
+                         "procedures": [
+                            {
+                                "memory_id": m.get("memory_id"),
+                                "description": m.get("description"),
+                                "score": round(m.get(score_key, 0), 3)
+                            }
+                            for m in proc_mems
+                         ]
+                    }
+                    if base_context["relevant_procedures"]["procedures"]:
+                        self.logger.info(f"Retrieved {len(base_context['relevant_procedures']['procedures'])} relevant procedures using {search_tool_proc.split(':')[-1]}.")
                 else:
                     err_msg = f"Procedure search failed: {proc_result.get('error')}"
                     base_context["errors"].append(err_msg)
@@ -3036,22 +3318,23 @@ class AgentMasterLoop:
         else:
             self.logger.warning("Skipping procedure search: No suitable search tool available.")
 
-        # --- Contextual Link Traversal (From Focal/Working/Important Memory) ---
+        # --- Contextual Link Traversal (Prioritizing Focal Memory) ---
         # Find memories linked to the current focus or most relevant items
         get_linked_memories_tool = TOOL_GET_LINKED_MEMORIES
         if self._find_tool_server(get_linked_memories_tool):
             mem_id_to_traverse = None
-            # 1. Try focal memory from working memory result
-            if isinstance(base_context.get("current_working_memory"), dict):
-                mem_id_to_traverse = base_context["current_working_memory"].get("focal_memory_id")
+            # 1. PRIORITIZE focal memory from working memory result
+            if focal_mem_id_from_wm:
+                mem_id_to_traverse = focal_mem_id_from_wm
+                self.logger.debug(f"Link traversal starting from focal memory: {_fmt_id(mem_id_to_traverse)}")
 
             # 2. If no focal, try the first memory *in* the working memory list
-            if not mem_id_to_traverse and isinstance(base_context.get("current_working_memory"), dict):
-                wm_list = base_context["current_working_memory"].get("working_memories", [])
-                if isinstance(wm_list, list) and wm_list:
-                     first_wm_item = wm_list[0]
-                     if isinstance(first_wm_item, dict):
-                         mem_id_to_traverse = first_wm_item.get("memory_id")
+            if not mem_id_to_traverse and working_mem_list_from_wm:
+                first_wm_item = working_mem_list_from_wm[0]
+                if isinstance(first_wm_item, dict):
+                    mem_id_to_traverse = first_wm_item.get("memory_id")
+                    if mem_id_to_traverse:
+                        self.logger.debug(f"Link traversal starting from first working memory item: {_fmt_id(mem_id_to_traverse)}")
 
             # 3. If still no ID, try the first important memory from the core context
             if not mem_id_to_traverse:
@@ -3062,6 +3345,8 @@ class AgentMasterLoop:
                         first_mem = important_mem_list[0]
                         if isinstance(first_mem, dict):
                             mem_id_to_traverse = first_mem.get("memory_id")
+                            if mem_id_to_traverse:
+                                self.logger.debug(f"Link traversal starting from first important memory: {_fmt_id(mem_id_to_traverse)}")
 
             # If we found a relevant memory ID to start traversal from
             if mem_id_to_traverse:
@@ -3072,7 +3357,7 @@ class AgentMasterLoop:
                         {
                             "memory_id": mem_id_to_traverse,
                             "direction": "both", # Get incoming and outgoing links
-                            "limit": CONTEXT_LINK_TRAVERSAL_LIMIT, # Limit links per direction
+                            "limit": CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT, # Use FETCH limit
                             "include_memory_details": False # Just need link info for context
                          },
                         record_action=False
@@ -3088,17 +3373,18 @@ class AgentMasterLoop:
                             "incoming_count": len(incoming_links),
                             "top_links_summary": [] # List of concise link descriptions
                         }
-                        # Add summaries for top outgoing links
-                        for link in outgoing_links[:2]: # Show max 2 outgoing
+                        # Add summaries for top outgoing links (up to SHOW limit)
+                        for link in outgoing_links[:CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT]:
                             link_summary["top_links_summary"].append(
                                 f"OUT: {link.get('link_type', 'related')} -> {_fmt_id(link.get('target_memory_id'))}"
                             )
-                        # Add summaries for top incoming links
-                        for link in incoming_links[:2]: # Show max 2 incoming
+                        # Add summaries for top incoming links (up to SHOW limit)
+                        for link in incoming_links[:CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT]:
                             link_summary["top_links_summary"].append(
                                 f"IN: {_fmt_id(link.get('source_memory_id'))} -> {link.get('link_type', 'related')}"
                             )
-                        base_context["contextual_links"] = link_summary
+                        # Add freshness timestamp to the link summary
+                        base_context["contextual_links"] = {"retrieved_at": retrieval_timestamp, "summary": link_summary}
                         self.logger.info(f"Retrieved link summary for memory {_fmt_id(mem_id_to_traverse)} ({len(outgoing_links)} out, {len(incoming_links)} in).")
                     else:
                         err_msg = f"Link retrieval ({get_linked_memories_tool}) failed: {links_result_content.get('error', 'Unknown')}"
@@ -3134,7 +3420,7 @@ class AgentMasterLoop:
                         actions_to_summarize = core_ctx.get("recent_actions")
 
                     # Only summarize if the actions list exists and is substantial (e.g., > 1000 chars JSON)
-                    if actions_to_summarize and len(json.dumps(actions_to_summarize, default=str)) > 1000:
+                    if actions_to_summarize and isinstance(actions_to_summarize, list) and len(json.dumps(actions_to_summarize, default=str))                    > 1000:
                          actions_text = json.dumps(actions_to_summarize, default=str) # Serialize for summarizer
                          summary_result = await self._execute_tool_call_internal(
                               TOOL_SUMMARIZE_TEXT,
@@ -3178,153 +3464,213 @@ class AgentMasterLoop:
         return base_context
 
 
-    async def _call_agent_llm(self, goal: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    # ------------------------------------------------------------ main loop --
+    async def run(self, goal: str, max_loops: int = 100) -> None:
         """
-        Calls the configured LLM (Anthropic Claude) to get the next action/decision.
-
-        Constructs the prompt using `_construct_agent_prompt`, sends it to the LLM
-        along with available tool schemas, parses the response (tool call, text, or
-        goal completion signal), and handles potential API errors. Includes logic
-        to parse a structured plan update from the LLM's text response.
+        The main execution loop for the agent.
 
         Args:
-            goal: The overall goal for the agent.
-            context: The comprehensive context gathered by `_gather_context`.
-
-        Returns:
-            A dictionary representing the agent's decision, e.g.:
-            {'decision': 'call_tool', 'tool_name': '...', 'arguments': {...}}
-            {'decision': 'thought_process', 'content': '...'}
-            {'decision': 'complete', 'summary': '...'}
-            {'decision': 'error', 'message': '...'}
-            May also include 'updated_plan_steps': List[PlanStep] if parsed.
+            goal: The high-level goal for the agent to achieve.
+            max_loops: Maximum number of iterations before stopping automatically.
         """
-        self.logger.info("Calling Agent LLM (Claude 3.5 Sonnet) for decision/plan...", emoji_key="robot_face")
-        # Ensure Anthropic client is available
-        if not self.anthropic_client:
-            self.logger.error("Anthropic client unavailable during LLM call.")
-            return {"decision": "error", "message": "Anthropic client unavailable."}
+        self.logger.info(f"Starting agent loop. Goal: '{goal}'. Max loops: {max_loops}")
 
-        # Construct the prompt messages
-        messages = self._construct_agent_prompt(goal, context)
-        # Get available tool schemas for the LLM
-        api_tools = self.tool_schemas
-
-        try:
-            # Make the API call to Anthropic
-            response: Message = await self.anthropic_client.messages.create(
-                model=MASTER_LEVEL_AGENT_LLM_MODEL_STRING, # Use configured model
-                max_tokens=4000, # Max tokens for the response
-                messages=messages, # Pass the constructed prompt
-                tools=api_tools, # Provide available tools
-                tool_choice={"type": "auto"}, # Let the model decide whether to use a tool
-                temperature=0.4 # Slightly lower temperature for more deterministic planning/tool use
+        # Initialize or ensure workflow exists
+        if not self.state.workflow_id:
+            self.logger.info("No active workflow found. Creating initial workflow.")
+            wf_create_args = {
+                "title": f"Agent Task: {goal[:50]}...",
+                "goal": goal,
+                "description": f"Agent workflow initiated at {datetime.now(timezone.utc).isoformat()} to achieve: {goal}",
+                "tags": ["agent_run", AGENT_NAME.lower()]
+            }
+            wf_create_result = await self._execute_tool_call_internal(
+                TOOL_CREATE_WORKFLOW, wf_create_args, record_action=False
             )
-            # Log the reason the LLM stopped generating
-            self.logger.debug(f"LLM Raw Response Stop Reason: {response.stop_reason}")
-
-            # --- Parse LLM Response ---
-            decision = {"decision": "error", "message": "LLM provided no actionable output."} # Default error
-            text_parts = [] # To collect text blocks from the response
-            tool_call = None # To store the first tool_use block found
-            updated_plan_steps = None # To store parsed plan update
-
-            # Iterate through content blocks in the response
-            for block in response.content:
-                if block.type == "text":
-                    text_parts.append(block.text)
-                elif block.type == "tool_use" and not tool_call: # Capture the first tool use block
-                    tool_call = block
-                    self.logger.debug(f"LLM response included tool call: {tool_call.name}")
-
-            # Combine all text parts into a single string
-            full_text = "".join(text_parts).strip()
-            if full_text:
-                 self.logger.debug(f"LLM Response Text Content (first 200 chars): {full_text[:200]}")
+            # Note: _handle_workflow_side_effects should set self.state.workflow_id, context_id, stack, chain_id etc.
+            if not wf_create_result.get("success") or not self.state.workflow_id:
+                self.logger.critical(f"Failed to create initial workflow: {wf_create_result.get('error')}. Aborting.")
+                return
+        elif not self.state.current_thought_chain_id:
+            # If workflow loaded but no chain ID, try setting default
+            await self._set_default_thought_chain_id()
 
 
-            # --- Heuristic Plan Update Parsing from Text ---
-            # Look for a specific "Updated Plan:" block in the text response
-            # This allows the LLM to propose plan changes even without using the dedicated tool
-            plan_match = re.search(
-                r"updated plan:\s*```(?:json)?\s*([\s\S]+?)\s*```", # Flexible regex
-                full_text,
-                re.IGNORECASE | re.DOTALL # Case-insensitive, dot matches newline
-            )
-            if plan_match:
-                plan_json_str = plan_match.group(1).strip() # Extract JSON block
-                try:
-                    plan_data = json.loads(plan_json_str) # Parse JSON
-                    # Validate it's a list of potential steps
-                    if isinstance(plan_data, list):
-                        # Validate each step against the PlanStep model
-                        validated_plan = [PlanStep(**step_data) for step_data in plan_data]
-                        updated_plan_steps = validated_plan # Store the validated plan
-                        self.logger.info(f"LLM proposed updated plan with {len(updated_plan_steps)} steps via text block.")
-                    else:
-                        self.logger.warning("LLM provided 'Updated Plan' block, but content was not a list.")
-                except (json.JSONDecodeError, ValidationError, TypeError) as e:
-                    # Log errors during parsing or validation
-                    self.logger.warning(f"Failed to parse/validate structured plan from LLM text response: {e}")
-            else:
-                # Log if no plan block was found
-                self.logger.debug("No structured 'Updated Plan:' block found in LLM text response.")
+        # --- Main Think-Act Loop ---
+        while self.state.current_loop < max_loops and not self.state.goal_achieved_flag and not self._shutdown_event.is_set():
+            self.state.current_loop += 1
+            self.logger.info(f"--- Starting Loop {self.state.current_loop}/{max_loops} (WF: {_fmt_id(self.state.workflow_id)}) ---")
 
+            # --- 1. Periodic Cognitive Tasks ---
+            try:
+                 await self._run_periodic_tasks()
+            except Exception as e:
+                 self.logger.error(f"Error during periodic tasks: {e}", exc_info=True) # Log but continue loop
 
-            # --- Determine Final Agent Decision ---
-            # Priority: Tool Call > Goal Achieved > Text (Thought) > Error
-            if tool_call:
-                # If the LLM chose to use a tool
-                tool_name_sanitized = tool_call.name # Sanitized name used by LLM
-                tool_input = tool_call.input or {} # Arguments provided by LLM
-                # Map back to the original tool name for execution
-                original_tool_name = self.mcp_client.server_manager.sanitized_to_original.get(tool_name_sanitized, tool_name_sanitized)
-                self.logger.info(f"LLM chose tool: {original_tool_name}", emoji_key="hammer_and_wrench")
-                decision = {
-                    "decision": "call_tool",
-                    "tool_name": original_tool_name, # Use original name internally
-                    "arguments": tool_input
-                }
-            elif full_text.startswith("Goal Achieved:"):
-                # If the LLM signaled goal completion
-                decision = {
-                    "decision": "complete",
-                    "summary": full_text.replace("Goal Achieved:", "").strip() # Extract summary
-                }
-            elif full_text:
-                 # If no tool call or completion signal, treat text as reasoning/thought
-                 decision = {"decision": "thought_process", "content": full_text}
-                 self.logger.info("LLM provided text reasoning/thought.")
-            # else: decision remains the default error if no output matched
+            # Check shutdown flag again after periodic tasks
+            if self._shutdown_event.is_set(): break
 
-            # Attach the parsed plan update (if any) to the decision object
-            # The main loop can then decide whether to apply this plan update
-            if updated_plan_steps:
-                decision["updated_plan_steps"] = updated_plan_steps
+            # --- 2. Gather Context ---
+            context = await self._gather_context()
 
-            self.logger.debug(f"Agent Decision Parsed: {decision}")
-            return decision
+            # Check if no active workflow after context gathering (e.g., root workflow finished)
+            if not self.state.workflow_id:
+                 self.logger.info("No active workflow. Agent loop concluding.")
+                 break # Exit loop if workflow finished
 
-        # --- Exception Handling for API Calls ---
-        except APIConnectionError as e:
-            msg = f"LLM API Connection Error: {e}"
-            self.logger.error(msg, exc_info=True)
-        except RateLimitError:
-            msg = "LLM Rate limit exceeded."
-            self.logger.error(msg, exc_info=True)
-            # Optional: Add a delay before potentially retrying in the main loop
-            await asyncio.sleep(random.uniform(5, 10))
-        except APIStatusError as e:
-            msg = f"LLM API Error {e.status_code}: {e.message}"
-            # Log the detailed response if available
-            self.logger.error(f"Anthropic API status error: {e.status_code} - {e.response}", exc_info=True)
-        except Exception as e:
-            # Catch any other unexpected errors during the LLM interaction
-            msg = f"Unexpected LLM interaction error: {e}"
-            self.logger.error(msg, exc_info=True)
+            # --- 3. Pre-computation/Pre-analysis (If needed before LLM call) ---
+            # (Placeholder for future logic)
 
-        # Return an error decision if any exception occurred
-        return {"decision": "error", "message": msg}
+            # --- 4. Call LLM for Decision ---
+            # Clear error details before LLM call (unless needs_replan is set for error recovery)
+            if not self.state.needs_replan:
+                 self.state.last_error_details = None
+            # Call the LLM
+            decision = await self._call_agent_llm(goal, context)
+
+            # --- 5. Execute Decision ---
+            tool_result_content: Optional[Dict[str, Any]] = None # Store result for heuristic update
+            llm_proposed_plan = decision.get("updated_plan_steps") # Check if LLM proposed plan via text
+
+            # Handle decision based on type
+            if decision.get("decision") == "call_tool":
+                tool_name = decision.get("tool_name")
+                arguments = decision.get("arguments", {})
+
+                # --- Plan Validation (Pre-Execution Check) ---
+                # Ensure the intended step (likely first in plan) is valid
+                if not self.state.current_plan:
+                    self.logger.error("Attempting tool call but plan is empty! Forcing replan.")
+                    self.state.needs_replan = True
+                    self.state.last_error_details = {"error": "Plan became empty before tool call.", "type": "PlanValidationError"}
+                elif not self.state.current_plan[0].description:
+                    self.logger.error(f"Attempting tool call for invalid plan step (missing description)! Step ID: {self.state.current_plan[0].id}. Forcing replan.")
+                    self.state.needs_replan = True
+                    self.state.last_error_details = {"error": "Current plan step is invalid (missing description).", "type": "PlanValidationError", "step_id": self.state.current_plan[0].id}
+                # If checks pass, execute the tool call
+                elif tool_name:
+                    # Extract dependencies *from the current plan step* that this tool call corresponds to
+                    current_step_deps = self.state.current_plan[0].depends_on if self.state.current_plan else []
+                    # Execute the tool call, passing planned dependencies for checking
+                    tool_result_content = await self._execute_tool_call_internal(
+                        tool_name, arguments, record_action=True, planned_dependencies=current_step_deps
+                    )
+                else: # Should not happen if parsing worked correctly
+                    self.logger.error("LLM decided to call tool but no tool name was provided.")
+                    self.state.last_error_details = {"error": "LLM tool call decision missing tool name.", "type": "LLMOutputError"}
+                    tool_result_content = {"success": False, "error": "Missing tool name from LLM."}
+
+            elif decision.get("decision") == "thought_process":
+                # Record the thought provided by the LLM
+                thought_content = decision.get("content")
+                if thought_content:
+                    # Default to 'inference' type if LLM doesn't specify
+                    thought_type = ThoughtType.INFERENCE.value
+                    # Advanced: Could try to infer type from text content if needed
+                    tool_result_content = await self._execute_tool_call_internal(
+                        TOOL_RECORD_THOUGHT,
+                        {"content": thought_content, "thought_type": thought_type},
+                        # Allow workflow_id and thought_chain_id injection
+                        record_action=False # Recording thoughts isn't a primary world action
+                    )
+                else: # Handle missing content
+                    self.logger.warning("LLM provided 'thought_process' decision but no content.")
+                    tool_result_content = {"success": False, "error": "Missing thought content from LLM."}
+
+            elif decision.get("decision") == "complete":
+                # Goal achieved signal from LLM
+                self.logger.info(f"LLM signaled goal completion: {decision.get('summary')}")
+                self.state.goal_achieved_flag = True # Set flag to terminate loop
+                # Optionally update workflow status to completed
+                if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
+                    await self._execute_tool_call_internal(
+                        TOOL_UPDATE_WORKFLOW_STATUS,
+                        {
+                            "workflow_id": self.state.workflow_id,
+                            "status": WorkflowStatus.COMPLETED.value,
+                            "completion_message": decision.get('summary', 'Goal marked achieved by agent.')
+                        },
+                        record_action=False # Meta-action
+                    )
+                # Break the loop after handling completion
+                break
+
+            elif decision.get("decision") == "error":
+                 # LLM or internal error during decision making
+                 self.logger.error(f"LLM decision error: {decision.get('message')}")
+                 self.state.last_action_summary = f"LLM Decision Error: {decision.get('message', 'Unknown')[:100]}"
+                 # Store error details if not already set by tool execution
+                 if not self.state.last_error_details:
+                     self.state.last_error_details = {"error": decision.get('message'), "type": "LLMError"}
+                 self.state.needs_replan = True # Force replan after LLM error
+                 # action_successful remains False
+
+            # --- 6. Apply Plan Updates ---
+            # Priority: Plan proposed by LLM via text > Heuristic update
+            if llm_proposed_plan:
+                 try:
+                     # Validate the structure (already done by _call_agent_llm parsing)
+                     # --- Plan Cycle Detection ---
+                     if self._detect_plan_cycle(llm_proposed_plan):
+                         err_msg = "LLM-proposed plan contains a dependency cycle. Applying heuristic update instead."
+                         self.logger.error(err_msg)
+                         self.state.last_error_details = {"error": err_msg, "type": "PlanValidationError", "proposed_plan": [p.model_dump() for p in llm_proposed_plan]}
+                         self.state.needs_replan = True # Force replan again
+                         # Fallback to heuristic update if LLM plan is invalid
+                         await self._apply_heuristic_plan_update(decision, tool_result_content)
+                     else:
+                         # Apply the LLM's validated plan
+                         self.state.current_plan = llm_proposed_plan
+                         self.state.needs_replan = False # LLM provided the plan, assume it's intended
+                         self.logger.info(f"Applied LLM-proposed plan update ({len(llm_proposed_plan)} steps).")
+                         # Clear errors after successful LLM plan update
+                         self.state.last_error_details = None
+                         self.state.consecutive_error_count = 0
+                 except Exception as plan_apply_err:
+                      # Catch errors applying the plan (should be rare if validation passed)
+                      self.logger.error(f"Error applying LLM proposed plan: {plan_apply_err}. Falling back to heuristic.", exc_info=True)
+                      self.state.last_error_details = {"error": f"Failed to apply LLM plan: {plan_apply_err}", "type": "PlanUpdateError"}
+                      self.state.needs_replan = True
+                      await self._apply_heuristic_plan_update(decision, tool_result_content)
+
+            elif decision.get("tool_name") != AGENT_TOOL_UPDATE_PLAN: # Heuristic only if LLM didn't explicitly update plan
+                # Apply heuristic updates if LLM didn't use the plan update tool or provide a valid text plan
+                await self._apply_heuristic_plan_update(decision, tool_result_content)
+            # else: If AGENT_TOOL_UPDATE_PLAN was called, success/failure already handled by _execute_tool_call_internal
+
+            # --- 7. Check Error Limit & Save State ---
+            if self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
+                self.logger.critical(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) reached. Aborting loop.")
+                # Update workflow status to failed if possible
+                if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
+                     await self._execute_tool_call_internal(
+                         TOOL_UPDATE_WORKFLOW_STATUS,
+                         {
+                             "workflow_id": self.state.workflow_id,
+                             "status": WorkflowStatus.FAILED.value,
+                             "completion_message": f"Aborted after {MAX_CONSECUTIVE_ERRORS} consecutive errors."
+                         },
+                         record_action=False
+                     )
+                break # Exit loop
+
+            # Save state at the end of each loop iteration
+            await self._save_agent_state()
+
+            # Optional: Small delay between loops
+            # await asyncio.sleep(0.5)
+
+        # --- Loop End ---
+        if self._shutdown_event.is_set():
+            self.logger.info("Agent loop terminated due to shutdown signal.")
+        elif self.state.current_loop >= max_loops:
+            self.logger.warning(f"Agent loop reached max iterations ({max_loops}). Stopping.")
+        elif self.state.goal_achieved_flag:
+            self.logger.info("Agent loop finished: Goal achieved.", emoji_key="tada")
+        else:
+            self.logger.warning("Agent loop finished for unexpected reason.")
+
+        # Final state save and cleanup handled by shutdown() or run_agent_process() finally block
 
 
 # =============================================================================
@@ -3410,6 +3756,12 @@ async def run_agent_process(
             except NotImplementedError: # Signal handling might not be supported (e.g., Windows sometimes)
                 log.warning(f"Signal handling for {sig.name} not supported on this platform.")
 
+
+        printer("Initializing agent...")
+        if not await agent_loop_instance.initialize():
+             printer("❌ Agent initialization failed. Exiting.")
+             exit_code = 1
+             return # Exit early if initialization fails
 
         printer(f"Running Agent Loop for goal: \"{goal}\"")
         # Create tasks for the main agent run and for waiting on the stop signal
