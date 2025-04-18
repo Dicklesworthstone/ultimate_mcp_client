@@ -1,5 +1,5 @@
 """
-EideticEngine Agent Master Loop (AML) - v4.0 P1 - ENHANCED
+EideticEngine Agent Master Loop (AML) - v4.1 P1 - GOAL STACK + MOMENTUM
 ======================================================================
 
 This module implements the core orchestration logic for the EideticEngine
@@ -8,16 +8,19 @@ Unified Memory System (UMS) via MCPClient, leverages an LLM (Anthropic Claude)
 for decision-making and planning, and incorporates several cognitive functions
 inspired by human memory and reasoning.
 
-** V4.0 P1 ENHANCED implements Phase 1 improvements: refined context, adaptive
-thresholds, plan validation/repair, structured error handling, and robust
-background task management. **
+** V4.1 P1 implements Phase 1 improvements: refined context, adaptive
+thresholds, plan validation/repair, structured error handling, robust
+background task management, AND adds explicit Goal Stack management and
+a "Mental Momentum" bias. **
 
 Key Functionalities:
 --------------------
 *   **Workflow & Context Management:**
     - Creates, manages, and tracks progress within structured workflows.
     - Supports sub-workflow execution via a workflow stack.
+    - **Manages an explicit Goal Stack for hierarchical task decomposition.**
     - Gathers rich, multi-faceted context for the LLM decision-making process, including:
+        *   **Current Goal Stack information.**
         *   Current working memory and focal points **(Prioritized)**.
         *   Core workflow context (recent actions, important memories, key thoughts).
         *   Proactively searched memories relevant to the current goal/plan step **(Limited Fetch)**.
@@ -37,24 +40,25 @@ Key Functionalities:
 
 *   **LLM Interaction & Reasoning:**
     - Constructs detailed prompts for the LLM, providing comprehensive context, tool schemas, and cognitive instructions.
-    - **Prompts explicitly guide analysis of working memory and provide error recovery strategies.**
+    - **Prompts explicitly guide analysis of working memory, goal stack, and provide error recovery strategies.**
     - Parses LLM responses to identify tool calls, textual reasoning (recorded as thoughts), or goal completion signals.
     - Manages dedicated thought chains for recording the agent's reasoning process.
 
 *   **Cognitive & Meta-Cognitive Processes:**
     - **Memory Interaction:** Stores, updates, searches (semantic/hybrid/keyword), and links memories in the UMS.
     - **Working Memory Management:** Retrieves, optimizes (based on relevance/diversity), and automatically focuses working memory via UMS tools.
+    - **Goal Management:** Uses UMS tools to push new sub-goals onto the stack and mark goals as completed/failed.
     - **Background Cognitive Tasks:** Initiates asynchronous tasks **with timeouts and concurrency limits (semaphore)** for:
         *   Automatic semantic linking of newly created/updated memories.
         *   Checking and potentially promoting memories to higher cognitive levels (e.g., Episodic -> Semantic) based on usage/confidence.
     - **Periodic Meta-cognition:** Runs scheduled tasks based on loop intervals or success counters:
         *   **Reflection:** Generates analysis of progress, gaps, strengths, or plans using an LLM.
         *   **Consolidation:** Synthesizes information from multiple memories into summaries, insights, or procedures using an LLM.
-        *   **Adaptive Thresholds:** Dynamically adjusts the frequency of reflection/consolidation based on agent performance (e.g., error rates, **memory statistics, trends**) **with enhanced heuristics and dampening**.
+        *   **Adaptive Thresholds:** Dynamically adjusts the frequency of reflection/consolidation based on agent performance (e.g., error rates, **memory statistics, trends, goal progress stability**) **with enhanced heuristics and dampening**. **Includes "Mental Momentum" bias.**
     - **Maintenance:** Periodically deletes expired memories.
 
 *   **State & Error Handling:**
-    - Persists the complete agent runtime state (workflow, plan, counters, thresholds) atomically to a JSON file for resumption.
+    - Persists the complete agent runtime state (workflow, **goal stack**, plan, counters, thresholds) atomically to a JSON file for resumption.
     - Implements retry logic with backoff for potentially transient tool failures (especially for idempotent operations).
     - Tracks consecutive errors and halts execution if a limit is reached.
     - Provides detailed, **categorized** error information back to the LLM for recovery attempts.
@@ -75,7 +79,7 @@ import random
 import signal
 import sys
 import time
-from collections import defaultdict, deque  # Added deque for cycle detection  # noqa: F401
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,10 +91,9 @@ from pydantic import BaseModel, Field, ValidationError
 
 try:
     # Note: Import all potentially used enums/classes from MCPClient for clarity
-    from mcp_client import (  # type: ignore
+    from mcp_client import (
         ActionStatus,
         ActionType,
-        ArtifactType,  # noqa: F401
         LinkType,
         MCPClient,
         MemoryLevel,
@@ -99,7 +102,7 @@ try:
         ThoughtType,
         ToolError,
         ToolInputError,
-        WorkflowStatus,  # Keep import even if unused directly here
+        WorkflowStatus,
     )
 
     MCP_CLIENT_AVAILABLE = True
@@ -130,9 +133,9 @@ if log.level <= logging.DEBUG:
 # CONSTANTS
 # ==========================================================================
 # File for saving/loading agent state, versioned for this implementation phase
-AGENT_STATE_FILE = "agent_loop_state_v4.0_p1_enhanced.json" # Updated filename
+AGENT_STATE_FILE = "agent_loop_state_v4.1_p1_goalstack_momentum.json" # Updated filename
 # Agent identifier used in prompts and logging
-AGENT_NAME = "EidenticEngine4.0-P1-Enhanced" # Updated agent name
+AGENT_NAME = "EidenticEngine4.1-P1-GoalStackMomentum" # Updated agent name
 # Default LLM model string (can be overridden by environment or config)
 MASTER_LEVEL_AGENT_LLM_MODEL_STRING = "claude-3-5-sonnet-20240620" # Use the confirmed model
 
@@ -147,6 +150,8 @@ MIN_CONSOLIDATION_THRESHOLD = 5
 MAX_CONSOLIDATION_THRESHOLD = 25
 # Dampening factor for threshold adjustments (e.g., 0.75 means apply 75% of calculated change)
 THRESHOLD_ADAPTATION_DAMPENING = float(os.environ.get("THRESHOLD_DAMPENING", "0.75"))
+# Positive bias added to thresholds during "Mental Momentum" (low errors)
+MOMENTUM_THRESHOLD_BIAS_FACTOR = 1.2 # e.g., multiply base adjustment by this if momentum is high
 
 # ---------------- interval constants (in loop iterations) ----------------
 # How often to run working memory optimization and auto-focus checks
@@ -171,6 +176,7 @@ CONTEXT_KEY_THOUGHTS_FETCH_LIMIT = 7
 CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT = 3 # Fetch limit for procedural
 CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT = 5 # Fetch limit for proactive goal-relevant
 CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT = 5 # Fetch limit for link traversal per direction
+CONTEXT_GOAL_DETAILS_FETCH_LIMIT = 3 # How many parent goals to fetch details for in context
 
 # Limits for items SHOWN in final prompt context (after potential truncation/summarization)
 CONTEXT_RECENT_ACTIONS_SHOW_LIMIT = 7
@@ -180,6 +186,7 @@ CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT = 2 # Limit procedural memories included
 CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT = 3 # Limit goal-relevant memories included
 CONTEXT_WORKING_MEMORY_SHOW_LIMIT = 10 # Max working memory items shown in context
 CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT = 3 # Max links shown per direction in link summary
+CONTEXT_GOAL_STACK_SHOW_LIMIT = 5 # Max goals shown from the stack in context
 
 # Token limits triggering context compression
 CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD = 15_000
@@ -224,6 +231,10 @@ TOOL_GET_LINKED_MEMORIES = "unified_memory:get_linked_memories"
 TOOL_LIST_WORKFLOWS = "unified_memory:list_workflows"
 TOOL_GENERATE_REPORT = "unified_memory:generate_workflow_report"
 TOOL_SUMMARIZE_TEXT = "unified_memory:summarize_text"
+# --- New UMS Tool Constants for Goal Stack ---
+TOOL_PUSH_SUB_GOAL = "unified_memory:push_sub_goal" # Assumed UMS tool
+TOOL_MARK_GOAL_STATUS = "unified_memory:mark_goal_status" # Assumed UMS tool
+TOOL_GET_GOAL_DETAILS = "unified_memory:get_goal_details" # Assumed UMS tool
 # --- Agent-internal tool name constant ---
 AGENT_TOOL_UPDATE_PLAN = "agent:update_plan"
 
@@ -257,7 +268,7 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
     and indicating where truncation occurred. Honors CONTEXT_*_SHOW_LIMIT constants.
 
     1. Serialise full context – if within limit, return.
-    2. Iteratively truncate known large lists (e.g., recent actions, memories)
+    2. Iteratively truncate known large lists (e.g., recent actions, memories, goal stack)
        based on SHOW_LIMIT constants, adding a note about omissions.
     3. Remove lowest‑priority top‑level keys (e.g., procedures, links)
        until size fits.
@@ -291,6 +302,8 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
         # Apply limit to the list *within* the working memory dict
         ("current_working_memory", "working_memories", CONTEXT_WORKING_MEMORY_SHOW_LIMIT),
         (None, "relevant_procedures", CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT),
+        # --- Add goal stack truncation ---
+        ("current_goal_context", "goal_stack_summary", CONTEXT_GOAL_STACK_SHOW_LIMIT),
     ]
     # Define keys to remove entirely if context is still too large, in order of least importance
     keys_to_remove_low_priority = [
@@ -303,6 +316,7 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
         ("core_context", "recent_actions"),
         "core_context", # Remove the entire core context dict last
         "current_working_memory", # Remove working memory context before byte slice
+        "current_goal_context", # Remove goal context before byte slice (lower priority than plan?)
     ]
 
     # 1. Truncate specified lists based on SHOW_LIMIT constants
@@ -419,19 +433,20 @@ class AgentState:
     Represents the complete persisted runtime state of the Agent Master Loop.
 
     This dataclass holds all information necessary to resume the agent's operation,
-    including workflow context, planning state, error tracking, meta-cognition metrics,
-    and adaptive thresholds.
+    including workflow context, **goal hierarchy**, planning state, error tracking,
+    meta-cognition metrics, and adaptive thresholds.
 
     Attributes:
         workflow_id: The ID of the primary workflow the agent is currently focused on.
         context_id: The specific context ID for memory operations (often matches workflow_id).
         workflow_stack: A list maintaining the hierarchy of active workflows (e.g., for sub-workflows).
+        goal_stack: List of goal dictionaries tracking hierarchical goals. **(NEW)**
+        current_goal_id: ID of the goal at the top of the `goal_stack` (the agent's current focus). **(RENAMED/REPURPOSED)**
         current_plan: A list of `PlanStep` objects representing the agent's current plan.
-        current_sub_goal_id: ID of the current specific sub-goal being pursued (optional).
         current_thought_chain_id: ID of the active thought chain for recording reasoning.
         last_action_summary: A brief string summarizing the outcome of the last action taken.
         current_loop: The current iteration number of the main agent loop.
-        goal_achieved_flag: Boolean flag indicating if the overall goal has been marked as achieved.
+        goal_achieved_flag: Boolean flag indicating if the *overall root goal* has been marked as achieved.
         consecutive_error_count: Counter for consecutive failed actions, used for error limiting.
         needs_replan: Boolean flag indicating if the agent needs to revise its plan in the next cycle.
         last_error_details: A dictionary holding structured information about the last error encountered **(Enhanced with category)**.
@@ -443,8 +458,8 @@ class AgentState:
         loops_since_maintenance: Counter for loops since the last maintenance task (e.g., deleting expired memories).
         reflection_cycle_index: Index to cycle through different reflection types.
         last_meta_feedback: Stores the summary of the last reflection/consolidation output for the next prompt.
-        current_reflection_threshold: The current dynamic threshold for triggering reflection **(Adaptive)**.
-        current_consolidation_threshold: The current dynamic threshold for triggering consolidation **(Adaptive)**.
+        current_reflection_threshold: The current dynamic threshold for triggering reflection **(Adaptive + Momentum)**.
+        current_consolidation_threshold: The current dynamic threshold for triggering consolidation **(Adaptive + Momentum)**.
         tool_usage_stats: Dictionary tracking success/failure counts and latency for each tool used.
         background_tasks: (Transient) Set holding currently running asyncio background tasks (not saved to state file).
     """
@@ -454,15 +469,18 @@ class AgentState:
     context_id: Optional[str] = None
     workflow_stack: List[str] = field(default_factory=list)
 
+    # --- Goal Management --- (NEW/MODIFIED)
+    goal_stack: List[Dict[str, Any]] = field(default_factory=list) # Stores {goal_id, description, status, ...}
+    current_goal_id: Optional[str] = None # ID of the active goal (top of the stack)
+
     # --- planning & reasoning ---
     current_plan: List[PlanStep] = field(
         default_factory=lambda: [PlanStep(description=DEFAULT_PLAN_STEP)]
     )
-    current_sub_goal_id: Optional[str] = None # For future goal stack feature
     current_thought_chain_id: Optional[str] = None # Tracks the current reasoning thread
     last_action_summary: str = "Loop initialized."
     current_loop: int = 0
-    goal_achieved_flag: bool = False # Flag to signal loop termination
+    goal_achieved_flag: bool = False # Flag to signal loop termination (based on root goal)
 
     # --- error/replan ---
     consecutive_error_count: int = 0
@@ -481,7 +499,7 @@ class AgentState:
     reflection_cycle_index: int = 0 # Used to cycle through reflection types
     last_meta_feedback: Optional[str] = None # Feedback from last meta-task for next prompt
 
-    # adaptive thresholds (dynamic) - Initialized from constants, adapted based on stats
+    # adaptive thresholds (dynamic) - Initialized from constants, adapted based on stats and momentum
     current_reflection_threshold: int = BASE_REFLECTION_THRESHOLD
     current_consolidation_threshold: int = BASE_CONSOLIDATION_THRESHOLD
 
@@ -504,10 +522,10 @@ class AgentMasterLoop:
 
     This class orchestrates the primary think-act cycle of the AI agent.
     It manages state, interacts with the Unified Memory System via MCPClient,
-    calls the LLM for decision-making, handles plan execution, and runs
-    periodic meta-cognitive tasks (reflection, consolidation, optimization).
-    This version integrates rich context gathering and detailed prompting
-    as defined in Phase 1 of the v4.0 plan.
+    calls the LLM for decision-making, handles plan execution, manages goal hierarchies,
+    and runs periodic meta-cognitive tasks (reflection, consolidation, optimization).
+    This version integrates rich context gathering, goal stack management, mental momentum bias,
+    and detailed prompting as defined in Phase 1 of the v4.1 plan.
     """
 
     # Set of tool names considered internal or meta-cognitive,
@@ -530,9 +548,13 @@ class AgentMasterLoop:
         TOOL_GET_ACTION_DEPENDENCIES,
         TOOL_GET_THOUGHT_CHAIN,
         TOOL_GET_WORKFLOW_DETAILS, # Getting details is informational
+        TOOL_GET_GOAL_DETAILS, # Getting goal details is informational (NEW)
         # Managing relationships is meta
         TOOL_ADD_ACTION_DEPENDENCY,
         TOOL_CREATE_LINK,
+        # Goal stack management is meta
+        TOOL_PUSH_SUB_GOAL, # (NEW)
+        TOOL_MARK_GOAL_STATUS, # (NEW)
         # Admin/Utility tasks are not primary actions
         TOOL_LIST_WORKFLOWS,
         TOOL_COMPUTE_STATS,
@@ -617,24 +639,36 @@ class AgentMasterLoop:
 
         Integrates the overall goal, available tools with schemas, detailed
         process instructions, cognitive guidance, and the current runtime context
-        (plan, errors, feedback, memories, etc.) into the prompt structure
+        (plan, errors, feedback, **goal stack**, memories, etc.) into the prompt structure
         expected by the Anthropic API. Includes robust context truncation.
-        **Enhanced with specific guidance on WM, error recovery, and plan repair.**
+        **Enhanced with goal stack guidance, mental momentum bias, and error recovery strategies.**
         """
-        # <<< Start Integration Block: Enhance _construct_agent_prompt (Phase 1, Step 1 & 4) >>>
+        # <<< Start Integration Block: Enhance _construct_agent_prompt (Goal Stack + Momentum) >>>
         # ---------- system ----------
+        # Initialize the list for system prompt blocks
         system_blocks: List[str] = [
             f"You are '{AGENT_NAME}', an AI agent orchestrator using a Unified Memory System.",
             "",
-            f"Overall Goal: {goal}",
-            "",
-            # Tool Listing and Cognitive Guidance
-            "Available Unified Memory & Agent Tools (Use ONLY these):",
+            # --- GOAL CONTEXT (Logic moved outside list literal) ---
+            f"Overall Goal: {goal}", # This remains the root goal
         ]
+
+        # Extract current goal details from context and append the appropriate string
+        current_goal_info = context.get("current_goal_context", {}).get("current_goal")
+        if current_goal_info:
+            system_blocks.append(f"Current Goal: {current_goal_info.get('description', 'N/A')} (ID: {_fmt_id(current_goal_info.get('goal_id'))}, Status: {current_goal_info.get('status', 'N/A')})")
+        else:
+            system_blocks.append("Current Goal: None specified (Focus on Overall Goal or plan step)")
+
+        # Add the separator and the next section header
+        system_blocks.append("") # Separator
+        system_blocks.append("Available Unified Memory & Agent Tools (Use ONLY these):")
+
+        # --- Continue appending other system blocks as before ---
         if not self.tool_schemas:
             system_blocks.append("- CRITICAL WARNING: No tools loaded. Cannot function.")
         else:
-            # Define key tools to highlight in the prompt
+            # Define key tools to highlight in the prompt (adding Goal tools)
             essential_cognitive_tools = {
                 TOOL_ADD_ACTION_DEPENDENCY, TOOL_RECORD_ARTIFACT, TOOL_HYBRID_SEARCH,
                 TOOL_STORE_MEMORY, TOOL_UPDATE_MEMORY, TOOL_CREATE_LINK,
@@ -642,7 +676,9 @@ class AgentMasterLoop:
                 TOOL_REFLECTION, TOOL_CONSOLIDATION, TOOL_PROMOTE_MEM,
                 TOOL_OPTIMIZE_WM, TOOL_AUTO_FOCUS, TOOL_GET_WORKING_MEMORY,
                 TOOL_QUERY_MEMORIES, TOOL_SEMANTIC_SEARCH,
-                AGENT_TOOL_UPDATE_PLAN # Also highlight the agent's own tool
+                AGENT_TOOL_UPDATE_PLAN, # Also highlight the agent's own tool
+                # --- Goal Stack Tools ---
+                TOOL_PUSH_SUB_GOAL, TOOL_MARK_GOAL_STATUS, TOOL_GET_GOAL_DETAILS,
             }
             # Format each tool schema for the prompt
             for schema in self.tool_schemas:
@@ -661,31 +697,34 @@ class AgentMasterLoop:
                     f"  Schema: {input_schema_str}"
                 )
         system_blocks.append("")
-        # --- Detailed Process Instructions (Enhanced) ---
+        # --- Detailed Process Instructions (Enhanced for Goals & Momentum) ---
         system_blocks.extend([
             "Your Process at each step:",
-            "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details` - *pay attention to error `type`*), recent actions, memories (`core_context`, `proactive_memories`), thoughts, `current_plan`, `relevant_procedures`, **`current_working_memory` (use this for immediate relevance, note `focal_memory_id` if present)**, `current_thought_chain_id`, and `meta_feedback`. Pay attention to memory `importance`/`confidence` and context component `retrieved_at` timestamps.",
+            "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details` - *pay attention to error `type`*), **goal stack (`current_goal_context` -> `goal_stack_summary`) and the `current_goal`**, recent actions, memories (`core_context`, `proactive_memories`), thoughts, `current_plan`, `relevant_procedures`, **`current_working_memory` (use this for immediate relevance, note `focal_memory_id` if present)**, `current_thought_chain_id`, and `meta_feedback`. Pay attention to memory `importance`/`confidence` and context component `retrieved_at` timestamps.",
             "2.  Error Handling: If `last_error_details` exists, **FIRST** reason about the error `type` and `message`. Propose a recovery strategy in your reasoning. Refer to 'Recovery Strategies' below.",
             "3.  Reasoning & Planning:",
-            "    a. State step-by-step reasoning towards the Goal/Sub-goal, integrating context and feedback. Consider `current_working_memory` for immediate context. Record key thoughts using `record_thought` and specify the `thought_chain_id` if different from `current_thought_chain_id`.",
-            "    b. Evaluate `current_plan`. Is it valid? Does it address errors? Are dependencies (`depends_on`) likely met? Check for cycles.",
-            "    c. **Action Dependencies:** If planning Step B requires output from Step A (action ID 'a123'), include `\"depends_on\": [\"a123\"]` in Step B's plan object.",
-            "    d. **Artifact Tracking:** If planning to use a tool that creates a file/data, plan a subsequent step to call `record_artifact`. If needing a previously created artifact, plan to use `get_artifacts` or `get_artifact_by_id` first.",
-            "    e. **Direct Memory Management:** If you synthesize a critical new fact, insight, or procedure, plan to use `store_memory` to explicitly save it. If you find strong evidence contradicting a stored memory, plan to use `update_memory` to correct it. Provide clear `content`, `memory_type`, `importance`, and `confidence`.",
-            "    f. **Custom Thought Chains:** If tackling a distinct sub-problem or exploring a complex tangent, consider creating a new reasoning thread using `create_thought_chain`. Provide a clear `title`. Subsequent related thoughts should specify the new `thought_chain_id`. The loop tracks the `current_thought_chain_id`.",
-            "    g. **Linking:** Identify potential memory relationships (causal, supportive, contradictory). Plan to use `create_memory_link` with specific `link_type`s (e.g., `SUPPORTS`, `CONTRADICTS`, `CAUSAL`, `REFERENCES`).",
-            "    h. **Search:** Prefer `hybrid_search_memories` for mixed queries needing relevance and keyword matching. Use `search_semantic_memories` for pure conceptual similarity.",
-            "    i. **Update Plan Tool / Repair:** Use `agent:update_plan` ONLY for significant changes (error recovery, major strategy shift, multi-step insertion/removal, fixing validation issues like cycles). **If `needs_replan` is true in context, prioritize using this tool to fix the plan.** Do NOT use it for simply marking a step complete.",
+            "    a. State step-by-step reasoning towards the **Current Goal**, integrating context and feedback. Consider `current_working_memory` for immediate context. Record key thoughts using `record_thought` and specify the `thought_chain_id` if different from `current_thought_chain_id`.",
+            "    b. Evaluate `current_plan`. Is it aligned with the **Current Goal**? Is it valid? Does it address errors? Are dependencies (`depends_on`) likely met? Check for cycles.",
+            "    c. **Goal Management:** If the Current Goal is too complex, break it down by using `push_sub_goal` with a clear `description`. When a sub-goal is achieved or fails, use `mark_goal_status` with the `goal_id` and appropriate `status` ('completed' or 'failed').", # Goal instructions
+            "    d. **Action Dependencies:** If planning Step B requires output from Step A (action ID 'a123'), include `\"depends_on\": [\"a123\"]` in Step B's plan object.",
+            "    e. **Artifact Tracking:** If planning to use a tool that creates a file/data, plan a subsequent step to call `record_artifact`. If needing a previously created artifact, plan to use `get_artifacts` or `get_artifact_by_id` first.",
+            "    f. **Direct Memory Management:** If you synthesize a critical new fact, insight, or procedure, plan to use `store_memory` to explicitly save it. If you find strong evidence contradicting a stored memory, plan to use `update_memory` to correct it. Provide clear `content`, `memory_type`, `importance`, and `confidence`.",
+            "    g. **Custom Thought Chains:** If tackling a distinct sub-problem or exploring a complex tangent, consider creating a new reasoning thread using `create_thought_chain`. Provide a clear `title`. Subsequent related thoughts should specify the new `thought_chain_id`.",
+            "    h. **Linking:** Identify potential memory relationships (causal, supportive, contradictory). Plan to use `create_memory_link` with specific `link_type`s (e.g., `SUPPORTS`, `CONTRADICTS`, `CAUSAL`, `REFERENCES`).",
+            "    i. **Search:** Prefer `hybrid_search_memories` for mixed queries needing relevance and keyword matching. Use `search_semantic_memories` for pure conceptual similarity.",
+            "    j. **Update Plan Tool / Repair:** Use `agent:update_plan` ONLY for significant changes (error recovery, major strategy shift, multi-step insertion/removal, fixing validation issues like cycles). **If `needs_replan` is true in context, prioritize using this tool to fix the plan.** Do NOT use it for simply marking a step complete.",
             "4.  Action Decision: Choose **ONE** action based on the *first planned step* in your current plan:",
-            "    *   Call Memory/Other Tool: Select the most precise tool. Provide args per schema. **Mandatory:** Call `create_workflow` if context shows 'No Active Workflow'.",
+            "    *   Call Memory/Other Tool: Select the most precise tool (including goal tools like `push_sub_goal` or `mark_goal_status`). Provide args per schema. **Mandatory:** Call `create_workflow` if context shows 'No Active Workflow'.", # Added goal tools example
             "    *   Record Thought: Use `record_thought` for logging reasoning, questions, hypotheses etc. Specify `thought_chain_id` if not the current one.",
             "    *   Update Plan Tool: Call `agent:update_plan` with the **complete, repaired** plan structure if major changes are needed or validation failed.",
-            "    *   Signal Completion: If Overall Goal is MET, respond ONLY with the text \"Goal Achieved:\" followed by a brief summary.",
+            "    *   Signal Completion: If the **Current Goal** is MET (use `mark_goal_status`) OR the Overall Goal is MET (respond ONLY with the text \"Goal Achieved:\" followed by a brief summary).", # Clarified goal completion
             "5.  Output Format: Respond **ONLY** with the valid JSON for the chosen tool call OR the \"Goal Achieved:\" text."
         ])
-        # --- Key Considerations (Enhanced) ---
+        # --- Key Considerations (Enhanced for Goals & Momentum) ---
         system_blocks.extend([
             "\nKey Considerations:",
+            "*   Goal Focus: Always work towards the **Current Goal** (top of the stack). Use `push_sub_goal` and `mark_goal_status` to manage the hierarchy.",
+            "*   **Mental Momentum:** Prioritize completing the current plan steps if progress is steady. Justify significant deviations or replanning efforts.", # Momentum instruction
             "*   Dependencies & Cycles: Ensure `depends_on` actions are likely complete. Avoid circular dependencies. Use `get_action_details` if unsure.",
             "*   Artifacts: Track outputs (`record_artifact`), retrieve inputs (`get_artifacts`/`get_artifact_by_id`).",
             "*   Memory: Store important learned info (`store_memory`). Update incorrect info (`update_memory`). Use confidence scores.",
@@ -705,6 +744,7 @@ class AgentMasterLoop:
             "*   `PlanUpdateError`: The plan structure you proposed was invalid. Re-examine the plan steps and dependencies, then try `agent:update_plan` again with a valid list.",
             "*   `PlanValidationError`: The proposed plan has logical issues (e.g., cycles). Debug dependencies and propose a corrected plan structure using `agent:update_plan`.",
             "*   `CancelledError`: The previous action was cancelled. Re-evaluate the current step.",
+            "*   `GoalManagementError`: An error occurred managing the goal stack (e.g., trying to mark a non-existent goal). Review `current_goal_context` and the goal stack logic.", # Added Goal error
             "*   `UnknownError` / `UnexpectedExecutionError`: Analyze the error message carefully. Try to understand the cause. You might need to simplify the step, use a different approach, or ask for clarification via `record_thought` if stuck."
         ])
         system_prompt = "\n".join(system_blocks)
@@ -751,10 +791,11 @@ class AgentMasterLoop:
             ]
         # Reiterate the overall goal and the final instruction
         user_blocks += [
-            f"Overall Goal: {goal}",
+            # Reiterate current goal from context for emphasis
+            f"Current Goal Reminder: {context.get('current_goal_context', {}).get('current_goal', {}).get('description', 'Overall Goal')}",
             "",
-            # Updated instruction emphasizing error/plan repair
-            "Instruction: Analyze context & errors (use recovery strategies if needed). Reason step-by-step. Evaluate and **REPAIR** the plan if `needs_replan` is true or errors indicate plan issues (use `agent:update_plan`). Otherwise, decide ONE action based on the *first planned step*: call a tool (output tool_use JSON), record a thought (`record_thought`), or signal completion (output 'Goal Achieved: ...').",
+            # Updated instruction emphasizing error/plan repair AND goal management
+            "Instruction: Analyze context & errors (use recovery strategies if needed). Reason step-by-step towards the Current Goal. Evaluate and **REPAIR** the plan if `needs_replan` is true or errors indicate plan issues (use `agent:update_plan`). Manage goals using `push_sub_goal` or `mark_goal_status` if needed. Otherwise, decide ONE action based on the *first planned step*: call a tool (output tool_use JSON), record a thought (`record_thought`), or signal completion (use `mark_goal_status` for sub-goals or output 'Goal Achieved: ...' for overall goal).",
         ]
         user_prompt = "\n".join(user_blocks)
 
@@ -1063,7 +1104,7 @@ class AgentMasterLoop:
 
         Uses a temporary file and `os.replace` for atomicity. Includes fsync
         for robustness against crashes. Serializes the AgentState dataclass,
-        handling nested structures like the plan and tool stats. Excludes
+        handling nested structures like the plan, goal stack, and tool stats. Excludes
         transient fields like `background_tasks`.
         """
         # Create a dictionary from the dataclass state
@@ -1080,6 +1121,8 @@ class AgentMasterLoop:
         state_dict["current_plan"] = [
             step.model_dump(exclude_none=True) for step in self.state.current_plan
         ]
+        # --- ADDED: Ensure goal_stack (list of dicts) is saved correctly ---
+        state_dict["goal_stack"] = self.state.goal_stack # Already a list of dicts
 
         try:
             # Ensure the directory for the state file exists
@@ -1120,7 +1163,8 @@ class AgentMasterLoop:
         Handles file not found, JSON decoding errors, and potential mismatches
         between the saved state structure and the current `AgentState` dataclass
         (missing keys use defaults, extra keys are ignored with a warning).
-        Ensures critical fields like thresholds are initialized even if loading fails.
+        Ensures critical fields like thresholds and the **goal stack** are initialized
+        even if loading fails.
         """
         # Check if the state file exists
         if not self.agent_state_file.exists():
@@ -1177,6 +1221,18 @@ class AgentMasterLoop:
                                     dd[k]["failure"] = int(v_dict.get("failure", 0))
                                     dd[k]["latency_ms_total"] = float(v_dict.get("latency_ms_total", 0.0))
                         kwargs["tool_usage_stats"] = dd
+                    # --- ADDED: Handle loading goal_stack ---
+                    elif name == "goal_stack":
+                        if isinstance(value, list):
+                             # Basic validation: ensure items are dicts (more complex validation could be added)
+                             if all(isinstance(item, dict) for item in value):
+                                 kwargs[name] = value
+                             else:
+                                 self.logger.warning("Invalid goal_stack format in saved state. Resetting.")
+                                 kwargs[name] = [] # Reset to empty list
+                        else:
+                             self.logger.warning("goal_stack in saved state is not a list. Resetting.")
+                             kwargs[name] = []
                     # Add handling for other complex types here if necessary in the future
                     else:
                         # Directly assign the loaded value if no special handling is needed
@@ -1194,6 +1250,11 @@ class AgentMasterLoop:
                         kwargs[name] = BASE_REFLECTION_THRESHOLD
                     elif name == "current_consolidation_threshold":
                         kwargs[name] = BASE_CONSOLIDATION_THRESHOLD
+                    # Handle missing goal stack/ID explicitly
+                    elif name == "goal_stack":
+                         kwargs[name] = [] # Default to empty list
+                    elif name == "current_goal_id":
+                         kwargs[name] = None # Default to None
                     # Otherwise, the field will be missing if it had no default and wasn't saved
 
             # Warn about extra keys found in the file but not defined in the current AgentState
@@ -1209,6 +1270,7 @@ class AgentMasterLoop:
             # It's generally safer to handle complex types explicitly as done for plan/stats.
             temp_state = AgentState(**kwargs)
 
+            # --- Validation and Correction after loading ---
             # Ensure mandatory fields (like thresholds) have values AFTER construction,
             # using defaults if somehow missed or loading failed for them.
             if not isinstance(temp_state.current_reflection_threshold, int):
@@ -1224,6 +1286,16 @@ class AgentMasterLoop:
             else:
                  # Ensure loaded threshold is within bounds
                  temp_state.current_consolidation_threshold = max(MIN_CONSOLIDATION_THRESHOLD, min(MAX_CONSOLIDATION_THRESHOLD, temp_state.current_consolidation_threshold))
+
+            # Ensure goal stack consistency
+            if not isinstance(temp_state.goal_stack, list):
+                self.logger.warning("Loaded goal_stack is not a list. Resetting.")
+                temp_state.goal_stack = []
+            # Ensure current_goal_id points to a goal actually in the stack (or is None)
+            if temp_state.current_goal_id and not any(g.get('goal_id') == temp_state.current_goal_id for g in temp_state.goal_stack):
+                 self.logger.warning(f"Loaded current_goal_id {_fmt_id(temp_state.current_goal_id)} not found in loaded goal_stack. Resetting.")
+                 # Set current_goal_id to the top of the loaded stack, or None if stack is empty
+                 temp_state.current_goal_id = temp_state.goal_stack[-1].get('goal_id') if temp_state.goal_stack else None
 
             # Assign the potentially corrected state
             self.state = temp_state
@@ -1298,8 +1370,9 @@ class AgentMasterLoop:
         Initializes the Agent Master Loop.
 
         Loads prior agent state, fetches available tool schemas from MCPClient,
-        validates the presence of essential tools, checks the validity of any
-        loaded workflow state, and sets the initial thought chain ID.
+        validates the presence of essential tools (including goal tools),
+        checks the validity of any loaded workflow and goal state,
+        and sets the initial thought chain ID.
 
         Returns:
             True if initialization is successful, False otherwise.
@@ -1368,6 +1441,10 @@ class AgentMasterLoop:
                 TOOL_REFLECTION,    # Essential for meta-cognition loop
                 TOOL_CONSOLIDATION, # Essential for meta-cognition loop
                 TOOL_GET_WORKFLOW_DETAILS, # Needed for setting default chain ID on load
+                # --- ADDED: Check essential Goal Stack tools ---
+                TOOL_PUSH_SUB_GOAL,
+                TOOL_MARK_GOAL_STATUS,
+                # TOOL_GET_GOAL_DETAILS, # Maybe not essential to *start*, but needed for context
             ]
             # Check availability using the server lookup helper
             missing = [t for t in essential if not self._find_tool_server(t)]
@@ -1393,10 +1470,13 @@ class AgentMasterLoop:
                     tool_usage_stats=preserved_stats,
                     current_reflection_threshold=pres_ref_thresh,
                     current_consolidation_threshold=pres_con_thresh
-                    # All other fields reset to defaults
+                    # All other fields reset to defaults (including goal_stack, current_goal_id)
                 )
                 # Save the reset state immediately
                 await self._save_agent_state()
+
+            # --- ADDED: Validate loaded goal stack consistency ---
+            await self._validate_goal_stack_on_load()
 
             # Initialize the current thought chain ID if a workflow exists but the chain ID is missing
             # This ensures thoughts are recorded correctly after loading state
@@ -1514,6 +1594,70 @@ class AgentMasterLoop:
             self.logger.error(f"Error checking workflow {_fmt_id(workflow_id)} existence: {e}", exc_info=False)
             # Assume not found if an error occurs
             return False
+
+    # <<< Start Integration Block: Goal Stack Validation Helper >>>
+    async def _validate_goal_stack_on_load(self):
+        """
+        Validates the loaded goal stack against the UMS.
+
+        Checks if the goals in the stack still exist and belong to the correct
+        workflow context. Removes invalid goals from the stack.
+        This assumes a UMS tool `get_goal_details` exists.
+        """
+        if not self.state.goal_stack:
+            return # Nothing to validate if stack is empty
+
+        tool_name = TOOL_GET_GOAL_DETAILS # Assumed UMS tool
+        if not self._find_tool_server(tool_name):
+            self.logger.warning(f"Cannot validate goal stack: Tool {tool_name} unavailable. Loaded stack may be invalid.")
+            return
+
+        current_wf_id = self.state.workflow_id
+        if not current_wf_id:
+            self.logger.warning("Cannot validate goal stack: No active workflow ID.")
+            # Clear the stack if there's no workflow context
+            self.state.goal_stack = []
+            self.state.current_goal_id = None
+            return
+
+        valid_goals = []
+        needs_update = False
+        original_stack_ids = [g.get('goal_id') for g in self.state.goal_stack if g.get('goal_id')]
+
+        for goal_dict in self.state.goal_stack:
+            goal_id = goal_dict.get('goal_id')
+            if not goal_id:
+                self.logger.warning(f"Found goal with missing ID in loaded stack: {goal_dict}. Removing.")
+                needs_update = True
+                continue
+
+            try:
+                # Check goal existence and workflow association
+                goal_details = await self._execute_tool_call_internal(
+                    tool_name, {"goal_id": goal_id}, record_action=False
+                )
+                # Assuming the tool returns 'success' and 'workflow_id' if found
+                if goal_details.get("success") and goal_details.get("workflow_id") == current_wf_id:
+                    valid_goals.append(goal_dict) # Keep the goal if valid
+                else:
+                    self.logger.warning(f"Removing goal {_fmt_id(goal_id)} from stack: Not found or wrong workflow ({goal_details.get('workflow_id')}) in UMS.")
+                    needs_update = True
+            except Exception as e:
+                 self.logger.error(f"Error validating goal {_fmt_id(goal_id)}: {e}. Removing from stack.")
+                 needs_update = True
+
+        if needs_update:
+            self.logger.info(f"Goal stack updated after validation. Original IDs: {[_fmt_id(g) for g in original_stack_ids]}, Valid IDs: {[_fmt_id(g.get('goal_id')) for g in valid_goals]}")
+            self.state.goal_stack = valid_goals
+            # Update current_goal_id to the top of the validated stack
+            self.state.current_goal_id = self.state.goal_stack[-1].get('goal_id') if self.state.goal_stack else None
+            self.logger.info(f"Reset current_goal_id after stack validation: {_fmt_id(self.state.current_goal_id)}")
+
+        # If stack became empty after validation, ensure current_goal_id is None
+        elif not self.state.goal_stack:
+             self.state.current_goal_id = None
+
+    # <<< End Integration Block: Goal Stack Validation Helper >>>
 
     # <<< Start Integration Block: Plan Cycle Detection Helper (Phase 1, Step 3) >>>
     def _detect_plan_cycle(self, plan: List[PlanStep]) -> bool:
@@ -1759,7 +1903,7 @@ class AgentMasterLoop:
         for target_id in valid_target_ids:
             args = {
                 # workflow_id might be inferred by the tool, but pass for robustness
-                "workflow_id": current_wf_id,
+                # "workflow_id": current_wf_id, # Removed as UMS tool infers from action IDs
                 "source_action_id": source_id,
                 "target_action_id": target_id,
                 "dependency_type": "requires", # Assuming 'requires' is the default/most common type here
@@ -1818,7 +1962,7 @@ class AgentMasterLoop:
         # Prepare payload for the completion tool
         payload = {
             # Pass workflow_id for context, though tool might infer from action_id
-            "workflow_id": current_wf_id,
+            # "workflow_id": current_wf_id, # Removed as UMS tool infers from action ID
             "action_id": action_id,
             "status": status,
             # Pass the entire result dictionary to be stored/summarized by the UMS tool
@@ -2069,9 +2213,9 @@ class AgentMasterLoop:
         - **Enhanced error handling/categorization** and state updates (last_error_details).
         - Triggering relevant background tasks (auto-linking, promotion check).
         - Updating last_action_summary state.
-        - Handling workflow side effects (creation/completion).
+        - Handling workflow and **goal stack** side effects.
         """
-        # <<< Start Integration Block: Enhance _execute_tool_call_internal (Phase 1, Step 4) >>>
+        # <<< Start Integration Block: Enhance _execute_tool_call_internal (Goal Stack Side Effects) >>>
         # --- Step 1: Server Lookup ---
         target_server = self._find_tool_server(tool_name)
         # Handle case where tool server is not found, except for the internal agent tool
@@ -2087,6 +2231,7 @@ class AgentMasterLoop:
         # Get current workflow context IDs from state
         current_wf_id = (self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id)
         current_ctx_id = self.state.context_id
+        current_goal_id = self.state.current_goal_id # Get current goal ID
 
         # Make a copy to avoid modifying the original arguments dict passed in
         final_arguments = arguments.copy()
@@ -2101,6 +2246,9 @@ class AgentMasterLoop:
                 "core:list_servers", # Core MCP tool
                 "core:get_tool_schema", # Core MCP tool
                 AGENT_TOOL_UPDATE_PLAN, # Internal agent tool
+                TOOL_PUSH_SUB_GOAL, # Assumes UMS handles workflow association
+                TOOL_MARK_GOAL_STATUS, # Uses goal_id, workflow inferred
+                TOOL_GET_GOAL_DETAILS, # Uses goal_id
             }
         ):
             final_arguments["workflow_id"] = current_wf_id
@@ -2124,6 +2272,13 @@ class AgentMasterLoop:
             and tool_name == TOOL_RECORD_THOUGHT # Only for the record_thought tool
         ):
             final_arguments["thought_chain_id"] = self.state.current_thought_chain_id
+        # --- ADDED: Inject parent goal ID for push_sub_goal if not provided ---
+        if (
+             final_arguments.get("parent_goal_id") is None # Only if not already provided
+             and current_goal_id # Only if a goal is currently active
+             and tool_name == TOOL_PUSH_SUB_GOAL # Only for this tool
+        ):
+             final_arguments["parent_goal_id"] = current_goal_id
 
         # --- Step 3: Dependency Check ---
         # If dependencies were declared for this action, check them first
@@ -2213,6 +2368,7 @@ class AgentMasterLoop:
             TOOL_COMPUTE_STATS, TOOL_GET_WORKING_MEMORY, TOOL_GET_LINKED_MEMORIES,
             TOOL_GET_ARTIFACTS, TOOL_GET_ARTIFACT_BY_ID, TOOL_GET_ACTION_DEPENDENCIES,
             TOOL_GET_THOUGHT_CHAIN, TOOL_GET_WORKFLOW_DETAILS,
+            TOOL_GET_GOAL_DETAILS, # Getting goal details is idempotent (NEW)
             # Some meta operations might be considered retry-safe
             TOOL_SUMMARIZE_TEXT,
         }
@@ -2333,7 +2489,9 @@ class AgentMasterLoop:
                 elif status_code == 503: error_type = "ServerUnavailable"
                 elif "input" in str(error_message).lower() or "validation" in str(error_message).lower(): error_type = "InvalidInputError" # Basic keyword check
                 elif "timeout" in str(error_message).lower(): error_type = "NetworkError" # Assuming timeout implies network
-                # ... (can add more categorization based on status codes or keywords) ...
+                # --- ADDED: Categorize goal management errors ---
+                elif tool_name in [TOOL_PUSH_SUB_GOAL, TOOL_MARK_GOAL_STATUS] and ("not found" in str(error_message).lower() or "invalid" in str(error_message).lower()):
+                     error_type = "GoalManagementError"
 
                 self.state.last_error_details = {
                     "tool": tool_name,
@@ -2351,7 +2509,7 @@ class AgentMasterLoop:
             summary = ""
             if res.get("success"):
                 # Try to find a meaningful summary field in the result or its 'data' payload
-                summary_keys = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "chain_id", "state_id", "report", "visualization"]
+                summary_keys = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "chain_id", "state_id", "report", "visualization", "goal_id"] # Added goal_id
                 data_payload = res.get("data", res) # Check 'data' key or root level
                 if isinstance(data_payload, dict):
                     for k in summary_keys:
@@ -2448,54 +2606,155 @@ class AgentMasterLoop:
             # Pass the final result 'res' (success or failure dict) to the completion recorder
             await self._record_action_completion_internal(action_id, res)
 
-        # --- Step 12: Handle Workflow Side Effects ---
+        # --- Step 12: Handle Workflow & Goal Side Effects ---
         # Call this *after* execution and completion recording, using the final 'res'
-        await self._handle_workflow_side_effects(tool_name, final_arguments, res)
+        await self._handle_workflow_and_goal_side_effects(tool_name, final_arguments, res)
 
         # Return the final processed result dictionary
         return res
         # <<< End Integration Block: Enhance _execute_tool_call_internal >>>
 
 
-    async def _handle_workflow_side_effects(self, tool_name: str, arguments: Dict, result_content: Dict):
+    async def _handle_workflow_and_goal_side_effects(self, tool_name: str, arguments: Dict, result_content: Dict):
         """
         Handles agent state changes triggered by specific tool outcomes,
-        primarily workflow creation and termination.
+        including workflow creation/termination and goal stack updates.
         """
+        # <<< Start Integration Block: Goal Stack Side Effects >>>
         # --- Side effects for Workflow Creation ---
         if tool_name == TOOL_CREATE_WORKFLOW and result_content.get("success"):
-            # Extract details from the successful creation result
             new_wf_id = result_content.get("workflow_id")
             primary_chain_id = result_content.get("primary_thought_chain_id")
-            parent_id = arguments.get("parent_workflow_id") # Get parent from original args
+            parent_wf_id = arguments.get("parent_workflow_id") # Parent WF from original args
+            wf_title = result_content.get("title", "Untitled Workflow")
+            wf_goal_desc = result_content.get("goal", "Achieve objectives")
 
             if new_wf_id:
                 # Set the agent's primary workflow ID and context ID to the new one
                 self.state.workflow_id = new_wf_id
                 self.state.context_id = new_wf_id # Align context ID
 
-                # Manage the workflow stack for sub-workflows
-                if parent_id and parent_id in self.state.workflow_stack:
-                    # If created as a sub-workflow of an existing one on the stack, push it
+                # Manage the workflow stack
+                is_sub_workflow = parent_wf_id and parent_wf_id in self.state.workflow_stack
+                if is_sub_workflow:
                     self.state.workflow_stack.append(new_wf_id)
                     log_prefix = "sub-"
-                else:
-                    # If it's a new root workflow or parent isn't on stack, reset stack
+                else: # New root workflow or parent not on stack
                     self.state.workflow_stack = [new_wf_id]
                     log_prefix = "new "
 
-                # Set the current thought chain ID for the new workflow
+                # Set the current thought chain ID
                 self.state.current_thought_chain_id = primary_chain_id
-                self.logger.info(f"Switched to {log_prefix}workflow: {_fmt_id(new_wf_id)}. Current chain: {_fmt_id(primary_chain_id)}", emoji_key="label")
+
+                # --- Goal Stack Update for New Workflow ---
+                # If it's a new root workflow, reset the goal stack and create a root goal
+                if not is_sub_workflow:
+                    self.state.goal_stack = []
+                    self.state.current_goal_id = None
+                    # Try to create a root goal in the UMS for this new workflow
+                    if self._find_tool_server(TOOL_PUSH_SUB_GOAL):
+                        try:
+                            goal_res = await self._execute_tool_call_internal(
+                                TOOL_PUSH_SUB_GOAL,
+                                {
+                                    "workflow_id": new_wf_id,
+                                    "description": wf_goal_desc,
+                                    # Parent is None for the root goal
+                                },
+                                record_action=False
+                            )
+                            if goal_res.get("success") and goal_res.get("goal_id"):
+                                new_goal = {"goal_id": goal_res["goal_id"], "description": wf_goal_desc, "status": "active"}
+                                self.state.goal_stack.append(new_goal)
+                                self.state.current_goal_id = new_goal["goal_id"]
+                                self.logger.info(f"Created root goal {_fmt_id(self.state.current_goal_id)} for {log_prefix}workflow {_fmt_id(new_wf_id)}.")
+                            else:
+                                self.logger.warning(f"Failed to create root goal via UMS for new workflow {_fmt_id(new_wf_id)}: {goal_res.get('error')}")
+                        except Exception as goal_err:
+                             self.logger.error(f"Error creating root goal for new workflow {_fmt_id(new_wf_id)}: {goal_err}")
+                    else:
+                        self.logger.warning(f"Cannot create root goal for new workflow: Tool {TOOL_PUSH_SUB_GOAL} unavailable.")
+                # If it's a sub-workflow, the goal that triggered its creation should already be on the stack.
+                # We don't automatically create a new goal here; the LLM should explicitly push one if needed.
+
+                self.logger.info(f"Switched to {log_prefix}workflow: {_fmt_id(new_wf_id)}. Current chain: {_fmt_id(primary_chain_id)}. Current goal: {_fmt_id(self.state.current_goal_id)}", emoji_key="label")
 
                 # Reset plan, errors, and replan flag for the new workflow context
-                self.state.current_plan = [PlanStep(description=f"Start {log_prefix}workflow: '{result_content.get('title', 'Untitled')}'. Goal: {result_content.get('goal', 'Not specified')}.")]
+                self.state.current_plan = [PlanStep(description=f"Start {log_prefix}workflow: '{wf_title}'. Goal: {wf_goal_desc}.")]
                 self.state.consecutive_error_count = 0
                 self.state.needs_replan = False
                 self.state.last_error_details = None
-                # Optionally reset meta-counters for the new workflow
-                # self.state.successful_actions_since_reflection = 0
-                # self.state.successful_actions_since_consolidation = 0
+
+        # --- Side effects for Pushing a Sub-Goal ---
+        elif tool_name == TOOL_PUSH_SUB_GOAL and result_content.get("success"):
+            new_goal = result_content.get("goal") # Assuming tool returns the created goal object
+            if isinstance(new_goal, dict) and new_goal.get("goal_id"):
+                 # Add the new goal to the agent's state stack
+                 self.state.goal_stack.append(new_goal)
+                 # Set the new goal as the current goal
+                 self.state.current_goal_id = new_goal["goal_id"]
+                 self.logger.info(f"Pushed new sub-goal {_fmt_id(self.state.current_goal_id)} onto stack: '{new_goal.get('description', '')[:50]}...'. Stack depth: {len(self.state.goal_stack)}", emoji_key="arrow_down")
+                 # Force replan to address the new sub-goal
+                 self.state.needs_replan = True
+                 self.state.current_plan = [PlanStep(description=f"Start new sub-goal: '{new_goal.get('description', '')[:50]}...'")]
+                 self.state.last_error_details = None # Clear errors when pushing new goal
+            else:
+                 self.logger.warning(f"Tool {TOOL_PUSH_SUB_GOAL} succeeded but did not return valid goal data: {result_content}")
+
+        # --- Side effects for Marking Goal Status ---
+        elif tool_name == TOOL_MARK_GOAL_STATUS and result_content.get("success"):
+            goal_id_marked = arguments.get("goal_id")
+            new_status = arguments.get("status")
+
+            # Update the goal status within the agent's state stack
+            goal_found_in_stack = False
+            for goal in self.state.goal_stack:
+                if goal.get("goal_id") == goal_id_marked:
+                    goal["status"] = new_status
+                    goal_found_in_stack = True
+                    self.logger.info(f"Updated goal {_fmt_id(goal_id_marked)} status in state stack to: {new_status}.")
+                    break
+
+            if not goal_found_in_stack:
+                 self.logger.warning(f"Goal {_fmt_id(goal_id_marked)} (marked {new_status}) not found in current agent goal stack: {self.state.goal_stack}")
+
+            # If the goal marked was the *current* goal and it's now completed/failed
+            if goal_id_marked == self.state.current_goal_id and new_status in ["completed", "failed"]:
+                # Pop the completed/failed goal from the stack
+                if self.state.goal_stack and self.state.goal_stack[-1].get("goal_id") == goal_id_marked:
+                    finished_goal = self.state.goal_stack.pop()
+                    self.logger.info(f"Popped goal {_fmt_id(finished_goal.get('goal_id'))} (status: {new_status}) from stack.")
+                else:
+                     self.logger.warning(f"Attempted to pop goal {_fmt_id(goal_id_marked)}, but it wasn't at the top of the stack.")
+
+                # Set the new current goal to the one now at the top
+                self.state.current_goal_id = self.state.goal_stack[-1].get("goal_id") if self.state.goal_stack else None
+                self.logger.info(f"Returning focus to goal: {_fmt_id(self.state.current_goal_id) if self.state.current_goal_id else 'Overall Goal'}. Stack depth: {len(self.state.goal_stack)}", emoji_key="arrow_up")
+
+                # Check if the stack is now empty (meaning the root goal was completed/failed)
+                if not self.state.goal_stack:
+                     self.logger.info("Goal stack empty. Overall goal presumed finished.")
+                     # Set overall goal achieved flag *only if the last goal was completed*
+                     self.state.goal_achieved_flag = (new_status == "completed")
+                     # Optionally update workflow status if stack is empty
+                     if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
+                         wf_status = WorkflowStatus.COMPLETED.value if self.state.goal_achieved_flag else WorkflowStatus.FAILED.value
+                         await self._execute_tool_call_internal(
+                             TOOL_UPDATE_WORKFLOW_STATUS,
+                             {
+                                 "workflow_id": self.state.workflow_id,
+                                 "status": wf_status,
+                                 "completion_message": f"Overall goal marked {wf_status} after stack completion."
+                             },
+                             record_action=False
+                         )
+                     # Clear plan when overall goal is done
+                     self.state.current_plan = []
+                else:
+                    # Force replan to address the parent goal after returning from sub-goal
+                    self.state.needs_replan = True
+                    self.state.current_plan = [PlanStep(description=f"Returned from sub-goal {_fmt_id(goal_id_marked)} (status: {new_status}). Re-assess current goal: {_fmt_id(self.state.current_goal_id)}.")]
+                self.state.last_error_details = None # Clear error details when goal status changes
 
         # --- Side effects for Workflow Status Update (Completion/Failure/Abandonment) ---
         elif tool_name == TOOL_UPDATE_WORKFLOW_STATUS and result_content.get("success"):
@@ -2514,16 +2773,51 @@ class AgentMasterLoop:
                 if is_terminal:
                     # Remove the finished workflow from the stack
                     finished_wf = self.state.workflow_stack.pop()
-                    if self.state.workflow_stack:
+                    parent_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else None
+
+                    # --- Goal Stack Update for Completed Sub-Workflow ---
+                    # Find the goal on the *parent's* stack that likely corresponds to this finished sub-workflow.
+                    # This is heuristic - assumes the goal *currently active* when the sub-workflow finished is the relevant one.
+                    # A more robust system might store the initiating goal ID when the sub-workflow is created.
+                    corresponding_goal_id = self.state.current_goal_id # Goal active *before* popping WF stack
+                    if corresponding_goal_id and parent_wf_id: # Ensure we have a goal and a parent WF to mark it in
+                        # Infer goal status from workflow status
+                        goal_status_to_set = "completed" if status == WorkflowStatus.COMPLETED.value else "failed"
+                        self.logger.info(f"Attempting to mark goal {_fmt_id(corresponding_goal_id)} as {goal_status_to_set} due to sub-workflow {_fmt_id(finished_wf)} completion.")
+                        if self._find_tool_server(TOOL_MARK_GOAL_STATUS):
+                             mark_res = await self._execute_tool_call_internal(
+                                 TOOL_MARK_GOAL_STATUS,
+                                 {
+                                     "goal_id": corresponding_goal_id,
+                                     "status": goal_status_to_set,
+                                     "reason": f"Sub-workflow {_fmt_id(finished_wf)} finished with status: {status}"
+                                 },
+                                 record_action=False
+                             )
+                             # This call will trigger the goal stack popping logic above if successful
+                             if not mark_res.get("success"):
+                                 self.logger.warning(f"Failed to automatically mark goal {_fmt_id(corresponding_goal_id)} after sub-workflow completion: {mark_res.get('error')}")
+                        else:
+                             self.logger.warning(f"Cannot mark goal status after sub-workflow completion: Tool {TOOL_MARK_GOAL_STATUS} unavailable.")
+                    elif corresponding_goal_id and not parent_wf_id:
+                         self.logger.info(f"Root workflow {_fmt_id(finished_wf)} finished. Corresponding goal {_fmt_id(corresponding_goal_id)} likely represents overall completion.")
+                         # The MARK_GOAL_STATUS logic above should handle the root goal completion and set goal_achieved_flag
+                    else:
+                         self.logger.warning(f"Sub-workflow {_fmt_id(finished_wf)} finished, but couldn't identify corresponding goal to mark.")
+
+
+                    # --- Update Agent State Based on Workflow Stack ---
+                    if parent_wf_id:
                         # If there's a parent workflow remaining on the stack, return to it
-                        self.state.workflow_id = self.state.workflow_stack[-1]
+                        self.state.workflow_id = parent_wf_id
                         self.state.context_id = self.state.workflow_id # Realign context ID
-                        # Fetch the parent's primary thought chain ID
+                        # Set thought chain (should align with parent)
                         await self._set_default_thought_chain_id()
-                        self.logger.info(f"Sub-workflow {_fmt_id(finished_wf)} finished ({status}). Returning to parent {_fmt_id(self.state.workflow_id)}. Current chain: {_fmt_id(self.state.current_thought_chain_id)}", emoji_key="arrow_left")
-                        # Force replan in the parent context as the sub-task outcome needs consideration
+                        # Note: Current goal ID should have been updated by the MARK_GOAL_STATUS call above
+                        self.logger.info(f"Sub-workflow {_fmt_id(finished_wf)} finished ({status}). Returning to parent {_fmt_id(self.state.workflow_id)}. Current chain: {_fmt_id(self.state.current_thought_chain_id)}. Current Goal: {_fmt_id(self.state.current_goal_id)}", emoji_key="arrow_left")
+                        # Force replan in the parent context
                         self.state.needs_replan = True
-                        self.state.current_plan = [PlanStep(description=f"Returned from sub-workflow {_fmt_id(finished_wf)} (status: {status}). Re-assess parent goal.")]
+                        self.state.current_plan = [PlanStep(description=f"Returned from sub-workflow {_fmt_id(finished_wf)} (status: {status}). Re-assess current goal: {_fmt_id(self.state.current_goal_id)}.")]
                         self.state.last_error_details = None # Clear error details from the sub-task
                     else:
                         # If the stack is empty, the root workflow finished
@@ -2532,14 +2826,10 @@ class AgentMasterLoop:
                         self.state.workflow_id = None
                         self.state.context_id = None
                         self.state.current_thought_chain_id = None
-                        # Set goal achieved flag only if completed successfully
-                        if status == WorkflowStatus.COMPLETED.value:
-                             self.state.goal_achieved_flag = True
-                        else:
-                             # Mark as not achieved if failed or abandoned
-                             self.state.goal_achieved_flag = False
+                        # The goal_achieved_flag should have been set by the MARK_GOAL_STATUS logic when the stack became empty
                         # Clear the plan as the workflow is over
                         self.state.current_plan = []
+        # <<< End Integration Block: Goal Stack Side Effects >>>
 
 
     async def _apply_heuristic_plan_update(self, last_decision: Dict[str, Any], last_tool_result_content: Optional[Dict[str, Any]] = None):
@@ -2582,7 +2872,7 @@ class AgentMasterLoop:
                 summary = "Success."
                 if isinstance(last_tool_result_content, dict):
                      # Prioritize specific meaningful keys from the result
-                     summary_keys = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "chain_id", "state_id", "report", "visualization"]
+                     summary_keys = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "chain_id", "state_id", "report", "visualization", "goal_id"] # Added goal_id
                      data_payload = last_tool_result_content.get("data", last_tool_result_content) # Look in 'data' or root
                      if isinstance(data_payload, dict):
                          for k in summary_keys:
@@ -2700,11 +2990,11 @@ class AgentMasterLoop:
     # ------------------------------------------------ adaptive thresholds --
     def _adapt_thresholds(self, stats: Dict[str, Any]) -> None:
         """
-        Adjusts reflection and consolidation thresholds based on memory statistics
-        and tool usage patterns to dynamically control meta-cognition frequency.
-        **Enhanced with more stats, nuanced calculation, and dampening.**
+        Adjusts reflection and consolidation thresholds based on memory statistics,
+        tool usage patterns, and **progress stability** to dynamically control
+        meta-cognition frequency. Includes "Mental Momentum" bias.
         """
-        # <<< Start Integration Block: Enhance _adapt_thresholds (Phase 1, Step 2) >>>
+        # <<< Start Integration Block: Enhance _adapt_thresholds (Goal Stack + Momentum) >>>
         # Validate stats input
         if not stats or not stats.get("success"):
              self.logger.warning("Cannot adapt thresholds: Invalid or failed stats received.")
@@ -2760,7 +3050,14 @@ class AgentMasterLoop:
         # More negative deviation (low failure) -> increase threshold
         reflection_adjustment = -math.ceil(failure_deviation * self.state.current_reflection_threshold * 3.0) # Factor of 3 controls sensitivity
 
-        # Apply dampening
+        # --- Mental Momentum Bias ---
+        is_stable_progress = (failure_rate < target_failure_rate * 0.5) and (self.state.consecutive_error_count == 0)
+        if is_stable_progress and reflection_adjustment >= 0: # Only apply bias if adjustment is non-negative (i.e., increasing or zero)
+             momentum_bias = math.ceil(reflection_adjustment * (MOMENTUM_THRESHOLD_BIAS_FACTOR - 1.0)) # Calculate the *additional* bias
+             reflection_adjustment += momentum_bias # Add the positive bias
+             self.logger.debug(f"Applying Mental Momentum: Adding +{momentum_bias} bias to reflection threshold adjustment (Stable progress).")
+
+        # Apply dampening to the (potentially biased) adjustment
         dampened_adjustment = int(reflection_adjustment * adjustment_dampening)
         if dampened_adjustment != 0 and total_calls >= min_calls_for_rate: # Only adjust if enough calls
             old_threshold = self.state.current_reflection_threshold
@@ -2769,9 +3066,10 @@ class AgentMasterLoop:
             # Apply change only if different
             if potential_new != old_threshold:
                 change_direction = "Lowering" if dampened_adjustment < 0 else "Raising"
+                momentum_tag = " (+Momentum)" if is_stable_progress and momentum_bias > 0 else ""
                 self.logger.info(
                     f"{change_direction} reflection threshold: {old_threshold} -> {potential_new} "
-                    f"(Failure Rate: {failure_rate:.1%}, Deviation: {failure_deviation:+.1%}, Adjustment: {dampened_adjustment})"
+                    f"(Failure Rate: {failure_rate:.1%}, Deviation: {failure_deviation:+.1%}, Adjustment: {dampened_adjustment}{momentum_tag})"
                 )
                 self.state.current_reflection_threshold = potential_new
                 changed = True
@@ -3096,6 +3394,7 @@ class AgentMasterLoop:
 
         Includes:
         - Core context (recent actions, important memories, key thoughts) via TOOL_GET_CONTEXT.
+        - **Current goal stack context (NEW)**.
         - Current working memory via TOOL_GET_WORKING_MEMORY **(Prioritized)**.
         - Proactively searched memories relevant to the current plan step **(Limited Fetch)**.
         - Relevant procedural memories **(Limited Fetch)**.
@@ -3104,7 +3403,7 @@ class AgentMasterLoop:
         - Handles potential errors during retrieval.
         - Initiates context compression if token estimates exceed thresholds.
         """
-        # <<< Start Integration Block: Enhance _gather_context (Phase 1, Step 1 Completed) >>>
+        # <<< Start Integration Block: Enhance _gather_context (Goal Stack Context) >>>
         self.logger.info("Gathering comprehensive context...", emoji_key="satellite")
         start_time = time.time()
         retrieval_timestamp = datetime.now(timezone.utc).isoformat() # Timestamp for freshness
@@ -3124,6 +3423,7 @@ class AgentMasterLoop:
             "meta_feedback": self.state.last_meta_feedback, # Include feedback from last meta task
             "current_thought_chain_id": self.state.current_thought_chain_id,
             # Placeholders for dynamically fetched context components
+            "current_goal_context": None, # (NEW) Dict: {"retrieved_at": ..., "current_goal": {...}, "goal_stack_summary": [...]}
             "core_context": None, # From TOOL_GET_CONTEXT
             "current_working_memory": None, # From TOOL_GET_WORKING_MEMORY (will be dict)
             "proactive_memories": None, # Dict: {"retrieved_at": ..., "memories": [...]}
@@ -3146,6 +3446,48 @@ class AgentMasterLoop:
             base_context["message"] = "Agent must create or load a workflow."
             self.logger.warning(base_context["message"])
             return base_context
+
+        # --- Fetch Goal Stack Context (NEW) ---
+        goal_context_data = {"retrieved_at": retrieval_timestamp, "current_goal": None, "goal_stack_summary": []}
+        if self.state.goal_stack:
+             # Provide summary of the stack (limited depth)
+             goal_context_data["goal_stack_summary"] = self.state.goal_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:]
+             # Fetch details for the current goal (top of stack) if tool exists
+             current_goal_id = self.state.current_goal_id
+             if current_goal_id and self._find_tool_server(TOOL_GET_GOAL_DETAILS):
+                 try:
+                     goal_details_res = await self._execute_tool_call_internal(
+                         TOOL_GET_GOAL_DETAILS, {"goal_id": current_goal_id}, record_action=False
+                     )
+                     if goal_details_res.get("success") and isinstance(goal_details_res.get("goal"), dict):
+                         goal_context_data["current_goal"] = goal_details_res["goal"] # Store full details of current goal
+                     else:
+                          err_msg = f"Failed to get details for current goal {_fmt_id(current_goal_id)}: {goal_details_res.get('error')}"
+                          goal_context_data["current_goal"] = {"goal_id": current_goal_id, "error": err_msg} # Store error marker
+                          base_context["errors"].append(err_msg)
+                          self.logger.warning(err_msg)
+                 except Exception as e:
+                      err_msg = f"Exception getting goal details for {_fmt_id(current_goal_id)}: {e}"
+                      goal_context_data["current_goal"] = {"goal_id": current_goal_id, "error": err_msg}
+                      base_context["errors"].append(err_msg)
+                      self.logger.error(err_msg, exc_info=False)
+             elif current_goal_id: # If tool missing, use basic info from state
+                goal_context_data["current_goal"] = next # If tool missing, use basic info from state stack if available
+                current_goal_from_stack = next((g for g in self.state.goal_stack if g.get('goal_id') == current_goal_id), None)
+                if current_goal_from_stack:
+                    goal_context_data["current_goal"] = current_goal_from_stack # Use basic info from state
+                    self.logger.debug(f"Using basic goal info from state stack for current goal {_fmt_id(current_goal_id)} (Tool {TOOL_GET_GOAL_DETAILS} unavailable).")
+                else: # This case should be rare if state is consistent
+                    err_msg = f"Current goal ID {_fmt_id(current_goal_id)} exists, but details unavailable (Tool missing or goal not in stack)."
+                    goal_context_data["current_goal"] = {"goal_id": current_goal_id, "error": err_msg}
+                    base_context["errors"].append(err_msg)
+                    self.logger.warning(err_msg)
+        else: # No goals on the stack
+             goal_context_data["current_goal"] = None
+             goal_context_data["goal_stack_summary"] = []
+        # Assign the gathered goal context to the main context dictionary
+        base_context["current_goal_context"] = goal_context_data
+        self.logger.debug(f"Gathered goal context. Current Goal ID: {_fmt_id(self.state.current_goal_id)}")
 
         # --- Fetch Core Context (e.g., Recent Actions, Important Memories, Key Thoughts) ---
         if self._find_tool_server(TOOL_GET_CONTEXT):
@@ -3221,10 +3563,16 @@ class AgentMasterLoop:
 
 
         # --- Goal-Directed Proactive Memory Retrieval (Using Hybrid Search) ---
-        # Find memories relevant to the current plan step
-        active_plan_step_desc = self.state.current_plan[0].description if self.state.current_plan else "Achieve main goal"
-        # Formulate a query based on the current step
-        proactive_query = f"Information relevant to planning or executing: {active_plan_step_desc}"
+        # Find memories relevant to the current plan step OR current goal description
+        # Determine the primary query source: plan step or goal description
+        query_source_desc = "Achieve main goal" # Default if no plan/goal
+        if self.state.current_plan:
+            query_source_desc = self.state.current_plan[0].description
+        elif goal_context_data.get("current_goal"):
+            query_source_desc = goal_context_data["current_goal"].get("description", query_source_desc)
+
+        # Formulate a query based on the current step/goal
+        proactive_query = f"Information relevant to planning or executing: {query_source_desc}"
         # Prefer hybrid search, fallback to semantic
         search_tool_proactive = TOOL_HYBRID_SEARCH if self._find_tool_server(TOOL_HYBRID_SEARCH) else TOOL_SEMANTIC_SEARCH
         if self._find_tool_server(search_tool_proactive):
@@ -3272,11 +3620,11 @@ class AgentMasterLoop:
             self.logger.warning("Skipping proactive memory search: No suitable search tool available.")
 
         # --- Fetch Relevant Procedural Memories (Using Hybrid Search) ---
-        # Find procedural memories related to the current step
+        # Find procedural memories related to the current step/goal
         search_tool_proc = TOOL_HYBRID_SEARCH if self._find_tool_server(TOOL_HYBRID_SEARCH) else TOOL_SEMANTIC_SEARCH
         if self._find_tool_server(search_tool_proc):
-            # Formulate a query focused on finding procedures/how-to steps
-            proc_query = f"How to accomplish step-by-step: {active_plan_step_desc}"
+            # Formulate a query focused on finding procedures/how-to steps based on the same source description
+            proc_query = f"How to accomplish step-by-step: {query_source_desc}"
             search_args = {
                 "workflow_id": current_workflow_id,
                 "query": proc_query,
@@ -3420,7 +3768,7 @@ class AgentMasterLoop:
                         actions_to_summarize = core_ctx.get("recent_actions")
 
                     # Only summarize if the actions list exists and is substantial (e.g., > 1000 chars JSON)
-                    if actions_to_summarize and isinstance(actions_to_summarize, list) and len(json.dumps(actions_to_summarize, default=str))                    > 1000:
+                    if actions_to_summarize and isinstance(actions_to_summarize, list) and len(json.dumps(actions_to_summarize, default=str)) > 1000:
                          actions_text = json.dumps(actions_to_summarize, default=str) # Serialize for summarizer
                          summary_result = await self._execute_tool_call_internal(
                               TOOL_SUMMARIZE_TEXT,
@@ -3464,6 +3812,138 @@ class AgentMasterLoop:
         return base_context
 
 
+    # ----------------------------------------------------------- call‑llm --
+    async def _call_agent_llm(
+        self, goal: str, context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Calls the Anthropic LLM with the constructed prompt and context,
+        parsing the response to extract the agent's decision (tool call,
+        thought, or completion signal). Includes retry logic for API errors.
+
+        Returns:
+            A dictionary representing the agent's decision:
+            - {"decision": "call_tool", "tool_name": str, "arguments": dict}
+            - {"decision": "thought_process", "content": str}
+            - {"decision": "complete", "summary": str}
+            - {"decision": "error", "message": str}
+            - {"decision": "plan_update", "updated_plan_steps": List[PlanStep]} (Parsed from text)
+        """
+        # --- 1. Prepare Prompt ---
+        messages = self._construct_agent_prompt(goal, context)
+
+        # --- 2. Define Tools for Anthropic API ---
+        # Filter schemas slightly for Anthropic's specific format if needed,
+        # although MCPClient's format_tools_for_anthropic should handle this.
+        anthropic_tools = self.tool_schemas
+
+        # --- 3. Execute LLM Call (with Retries) ---
+        async def _do_llm_call():
+            # Ensure client is available
+            if not self.anthropic_client:
+                raise RuntimeError("Anthropic client unavailable for LLM call")
+
+            # Make the API call using the configured model
+            response = await self.anthropic_client.messages.create(
+                model=MASTER_LEVEL_AGENT_LLM_MODEL_STRING,
+                max_tokens=2048, # Allow sufficient tokens for response + tool use
+                system="", # System prompt is included in user message per original structure
+                messages=messages, # Pass the constructed messages list
+                tools=anthropic_tools, # Provide the tool schemas
+                tool_choice={"type": "auto"}, # Let model decide whether to use a tool
+                temperature=0.5, # Moderate temperature for balanced creativity/determinism
+            )
+            return response
+
+        try:
+            # Use retry wrapper for the API call
+            response = await self._with_retries(
+                _do_llm_call,
+                max_retries=3,
+                # Retry on specific Anthropic API errors and common network issues
+                retry_exceptions=(
+                    APIConnectionError, RateLimitError, APIStatusError,
+                    asyncio.TimeoutError, ConnectionError
+                ),
+            )
+            self.logger.debug(f"LLM Response Stop Reason: {response.stop_reason}")
+            # --- 4. Parse LLM Response ---
+            # Check if the response involves a tool call
+            if response.stop_reason == "tool_use" and response.content:
+                tool_calls = []
+                # Iterate through content blocks to find tool_use blocks
+                for block in response.content:
+                    if block.type == "tool_use":
+                        # Found a tool use block, extract name and input arguments
+                        tool_name_raw = block.name # This is the sanitized name
+                        tool_args = block.input or {}
+                        # Map sanitized name back to original MCP name
+                        original_name = self.mcp_client.server_manager.sanitized_to_original.get(tool_name_raw, tool_name_raw)
+                        tool_calls.append({"tool_name": original_name, "arguments": tool_args})
+                        self.logger.info(f"LLM decided to call tool: {original_name}", emoji_key="hammer")
+
+                # Currently designed to handle ONE tool call per response
+                if len(tool_calls) == 1:
+                    return {"decision": "call_tool", **tool_calls[0]}
+                elif len(tool_calls) > 1:
+                    # If multiple tool calls are requested, log a warning and handle only the first one
+                    self.logger.warning(f"LLM requested multiple tool calls ({len(tool_calls)}). Executing only the first: {tool_calls[0]['tool_name']}")
+                    return {"decision": "call_tool", **tool_calls[0]}
+                else: # Should not happen if stop_reason is tool_use, but handle defensively
+                     err_msg = "LLM stop reason was 'tool_use' but no tool calls found in content."
+                     self.logger.error(err_msg)
+                     return {"decision": "error", "message": err_msg}
+
+            # Check if the response is plain text (thought or goal completion)
+            elif response.content and response.content[0].type == "text":
+                response_text = response.content[0].text.strip()
+                # Check for explicit Goal Achieved signal
+                if response_text.upper().startswith("GOAL ACHIEVED:"):
+                    summary = response_text[len("GOAL ACHIEVED:"):].strip()
+                    self.logger.info(f"LLM signaled goal completion. Summary: {summary}", emoji_key="tada")
+                    return {"decision": "complete", "summary": summary}
+
+                # --- Check for Plan Update via Text ---
+                # Heuristic check: Does the text contain something like "Updated Plan:", "New Plan:", etc.
+                # followed by a list structure? This is less robust than the tool but provides a fallback.
+                plan_marker = "updated plan:" # Case-insensitive check
+                if plan_marker in response_text.lower():
+                     try:
+                          # Attempt to extract and parse the plan structure after the marker
+                          plan_part = response_text[response_text.lower().find(plan_marker) + len(plan_marker):].strip()
+                          # Simple JSON/list parsing attempt (might need more robust parsing)
+                          if plan_part.startswith("[") and plan_part.endswith("]"):
+                               plan_data = json.loads(plan_part)
+                               if isinstance(plan_data, list):
+                                    # Validate structure using Pydantic models
+                                    validated_plan = [PlanStep(**step_data) for step_data in plan_data]
+                                    self.logger.info(f"LLM proposed plan update via text ({len(validated_plan)} steps).")
+                                    # Return the validated plan steps for application
+                                    return {"decision": "plan_update", "updated_plan_steps": validated_plan}
+                     except (json.JSONDecodeError, ValidationError, TypeError) as e:
+                          # If parsing/validation fails, treat it as a regular thought
+                          self.logger.warning(f"LLM text suggested plan update, but parsing/validation failed: {e}. Treating as thought.")
+                          pass # Fall through to treat as thought
+
+                # Otherwise, treat the text response as a thought process
+                self.logger.info(f"LLM provided reasoning/thought: '{response_text[:100]}...'", emoji_key="speech_balloon")
+                return {"decision": "thought_process", "content": response_text}
+            else:
+                # Handle unexpected empty response or unknown content type
+                err_msg = f"LLM returned unexpected response content or stop reason: {response.stop_reason}, Content: {response.content}"
+                self.logger.error(err_msg)
+                return {"decision": "error", "message": err_msg}
+
+        except APIStatusError as e: # Handle API status errors specifically
+            err_msg = f"Anthropic API Error {e.status_code}: {e.message}"
+            self.logger.error(err_msg, exc_info=False)
+            return {"decision": "error", "message": err_msg}
+        except Exception as e: # Catch other exceptions during API call or parsing
+            err_msg = f"Error calling LLM or parsing response: {e}"
+            self.logger.error(err_msg, exc_info=True)
+            return {"decision": "error", "message": err_msg}
+
+
     # ------------------------------------------------------------ main loop --
     async def run(self, goal: str, max_loops: int = 100) -> None:
         """
@@ -3487,19 +3967,28 @@ class AgentMasterLoop:
             wf_create_result = await self._execute_tool_call_internal(
                 TOOL_CREATE_WORKFLOW, wf_create_args, record_action=False
             )
-            # Note: _handle_workflow_side_effects should set self.state.workflow_id, context_id, stack, chain_id etc.
+            # Note: _handle_workflow_and_goal_side_effects should set self.state.workflow_id, context_id, stack, chain_id etc.
             if not wf_create_result.get("success") or not self.state.workflow_id:
                 self.logger.critical(f"Failed to create initial workflow: {wf_create_result.get('error')}. Aborting.")
                 return
+            # Note: The root goal should now be created within _handle_workflow_and_goal_side_effects if successful
+            elif not self.state.current_goal_id:
+                 self.logger.critical("Workflow created, but root goal ID was not set. Aborting.")
+                 return
+
         elif not self.state.current_thought_chain_id:
             # If workflow loaded but no chain ID, try setting default
             await self._set_default_thought_chain_id()
+        # --- ADDED: Ensure current_goal_id is set if stack isn't empty ---
+        elif self.state.goal_stack and not self.state.current_goal_id:
+             self.state.current_goal_id = self.state.goal_stack[-1].get("goal_id")
+             self.logger.info(f"Set current_goal_id from top of loaded stack: {_fmt_id(self.state.current_goal_id)}")
 
 
         # --- Main Think-Act Loop ---
         while self.state.current_loop < max_loops and not self.state.goal_achieved_flag and not self._shutdown_event.is_set():
             self.state.current_loop += 1
-            self.logger.info(f"--- Starting Loop {self.state.current_loop}/{max_loops} (WF: {_fmt_id(self.state.workflow_id)}) ---")
+            self.logger.info(f"--- Starting Loop {self.state.current_loop}/{max_loops} (WF: {_fmt_id(self.state.workflow_id)}, Goal: {_fmt_id(self.state.current_goal_id)}) ---")
 
             # --- 1. Periodic Cognitive Tasks ---
             try:
@@ -3578,22 +4067,29 @@ class AgentMasterLoop:
                     tool_result_content = {"success": False, "error": "Missing thought content from LLM."}
 
             elif decision.get("decision") == "complete":
-                # Goal achieved signal from LLM
-                self.logger.info(f"LLM signaled goal completion: {decision.get('summary')}")
+                # Goal achieved signal from LLM (Handles *overall* goal completion)
+                self.logger.info(f"LLM signaled OVERALL goal completion: {decision.get('summary')}")
                 self.state.goal_achieved_flag = True # Set flag to terminate loop
-                # Optionally update workflow status to completed
+                # Update workflow status to completed if possible
                 if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
                     await self._execute_tool_call_internal(
                         TOOL_UPDATE_WORKFLOW_STATUS,
                         {
                             "workflow_id": self.state.workflow_id,
                             "status": WorkflowStatus.COMPLETED.value,
-                            "completion_message": decision.get('summary', 'Goal marked achieved by agent.')
+                            "completion_message": decision.get('summary', 'Overall goal marked achieved by agent.')
                         },
                         record_action=False # Meta-action
                     )
+                    # Note: _handle_workflow_and_goal_side_effects will clear WF state if root WF finished
                 # Break the loop after handling completion
                 break
+
+            elif decision.get("decision") == "plan_update": # Handle plan parsed from text
+                self.logger.info("LLM proposed plan update via text response.")
+                # The plan is already validated in _call_agent_llm
+                llm_proposed_plan = decision.get("updated_plan_steps") # Already validated PlanStep list
+                # We'll handle application of this plan in Step 6
 
             elif decision.get("decision") == "error":
                  # LLM or internal error during decision making
@@ -3609,7 +4105,6 @@ class AgentMasterLoop:
             # Priority: Plan proposed by LLM via text > Heuristic update
             if llm_proposed_plan:
                  try:
-                     # Validate the structure (already done by _call_agent_llm parsing)
                      # --- Plan Cycle Detection ---
                      if self._detect_plan_cycle(llm_proposed_plan):
                          err_msg = "LLM-proposed plan contains a dependency cycle. Applying heuristic update instead."
@@ -3668,7 +4163,14 @@ class AgentMasterLoop:
         elif self.state.goal_achieved_flag:
             self.logger.info("Agent loop finished: Goal achieved.", emoji_key="tada")
         else:
-            self.logger.warning("Agent loop finished for unexpected reason.")
+             # Log reason if loop finished but goal_achieved_flag is false (e.g., error limit, no active workflow)
+             if self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
+                 self.logger.warning("Agent loop finished due to reaching max consecutive errors.")
+             elif not self.state.workflow_id:
+                 self.logger.info("Agent loop finished because no workflow is active.")
+             else: # Generic case if workflow still active but loop ended
+                 self.logger.warning("Agent loop finished for unexpected reason (goal not achieved, loop limit not reached).")
+
 
         # Final state save and cleanup handled by shutdown() or run_agent_process() finally block
 
