@@ -2811,7 +2811,7 @@ class ServerManager:
         self._discovered_mdns = discovered_mdns
         log.info(f"Discovered {len(discovered_mdns)} local network servers via mDNS")
     
-    async def _process_discovery_results(self):
+    async def _process_discovery_results(self, interactive_mode: bool):
         """
         Process and display discovery results. Prompts user to add servers in interactive mode,
         otherwise automatically adds all newly discovered servers.
@@ -2867,7 +2867,7 @@ class ServerManager:
 
             # --- Determine Mode (Interactive vs Non-Interactive) ---
             # Check sys.argv for the interactive flag presence during initial call
-            is_interactive_mode = "--interactive" in sys.argv or "-i" in sys.argv
+            is_interactive_mode = interactive_mode
 
             servers_added_count = 0
             added_server_paths = {s.path for s in self.config.servers.values()} # Track paths to avoid duplicates
@@ -4921,10 +4921,14 @@ class MCPClient:
         if self.config.auto_discover:
             self.safe_print(f"{STATUS_EMOJI['search']} Discovering MCP servers...")
             try:
+                # Discover servers - this populates the cache
                 await self.server_manager.discover_servers()
+                # Now, process the results and add to config based on mode
+                await self.server_manager._process_discovery_results(interactive_mode=interactive_mode) # <-- ADD THIS CALL
             except Exception as discover_error:
                 log.error("Error during server discovery process", exc_info=True)
-                self.safe_print(f"[red]Error during server discovery: {discover_error}[/red]")
+                self.safe_print(f"[red]Error during server discovery: {discover_error}[/]")
+        # --- End Discovery and Processing ---
 
         # --- 7. Start Continuous Local Discovery (mDNS) ---
         if self.config.enable_local_discovery and self.server_manager.registry:
