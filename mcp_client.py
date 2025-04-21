@@ -3883,7 +3883,7 @@ class ServerManager:
             return session, initialize_result_obj, process_this_attempt, None
 
         except Exception as setup_or_load_err:
-            log.error(f"[{current_server_name}] Failed setup/handshake/loading in helper ({type(setup_or_load_err).__name__}): {setup_or_load_err}", exc_info=True)
+            log.warning(f"[{current_server_name}] Failed setup/handshake/loading in helper ({type(setup_or_load_err).__name__}): {setup_or_load_err}", exc_info=True)
             if session and hasattr(session, 'aclose'):
                 with suppress(Exception): await session.aclose()
             # Process termination is handled by the outer connect_to_server's error handling for process_this_attempt
@@ -4003,13 +4003,28 @@ class ServerManager:
             return session, initialize_result_obj
 
         except (httpx.RequestError, httpx.HTTPStatusError, McpError, asyncio.TimeoutError) as err:
-            log.warning(f"[{current_server_name}] Standard SSE connection/handshake failed ({type(err).__name__}): {err}")
+            log.info(f"[{current_server_name}] Standard SSE connection/handshake failed ({type(err).__name__}): {err}", exc_info=False)
             # IMPORTANT: Cleanup is handled by the main exit stack automatically on exception
             raise err
         except Exception as e:
-            log.error(f"[{current_server_name}] Unexpected error during standard SSE connection/handshake: {e}", exc_info=True)
+            is_common_failure = False
+            if isinstance(e, BaseExceptionGroup):
+                # Check if all sub-exceptions are common connection issues
+                common_errors = (httpx.ConnectError, asyncio.TimeoutError, ConnectionRefusedError)
+                # Check if there's at least one exception and all are common errors
+                if e.exceptions and all(isinstance(sub_exc, common_errors) for sub_exc in e.exceptions):
+                    is_common_failure = True
+                    # Log simple message for common group failure, NOT the full group traceback
+                    log.info(f"[{current_server_name}] Task group failed due to expected connection errors.", exc_info=False)
+            elif isinstance(e, (httpx.ConnectError, asyncio.TimeoutError)): # Handle direct common errors
+                 is_common_failure = True
+                 # This case might be redundant if the previous block catches these too, but safe to keep
+                 log.info(f"[{current_server_name}] Caught common connection error directly: {e}", exc_info=False)
+            if not is_common_failure:
+                # Log truly unexpected errors (including ExceptionGroups with non-common sub-exceptions) with traceback
+                log.warning(f"[{current_server_name}] Unexpected error during standard SSE connection/handshake: {e}", exc_info=True)
             # IMPORTANT: Cleanup is handled by the main exit stack automatically on exception
-            raise e # Re-raise
+            raise e # Re-raise the original exception
 
     async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
         """
@@ -4136,19 +4151,15 @@ class ServerManager:
 
                     # --- Outer Exception Handling for Connection Attempt ---
                     except (McpError, RuntimeError, ConnectionAbortedError, httpx.RequestError, subprocess.SubprocessError, OSError, FileNotFoundError, asyncio.TimeoutError, BaseException) as e:
-                        connection_error = e
-                        log.warning(f"Connection attempt failed for {current_server_name} (Attempt {retry_count + 1}, {type(e).__name__}): {e}")
-                        if isinstance(e, BaseExceptionGroup):
-                             for i, sub_exc in enumerate(e.exceptions): log.warning(f"  Sub-exception {i+1}: ({type(sub_exc).__name__}) {sub_exc}")
-                        # Cleanup resources specific to FAILED attempt (process, stderr task)
-                        if process_this_attempt and process_this_attempt.returncode is None:
-                            await self.terminate_process(current_server_name, process_this_attempt)
-                        if stderr_reader_task_this_attempt and not stderr_reader_task_this_attempt.done():
-                            stderr_reader_task_this_attempt.cancel()
-                            with suppress(asyncio.CancelledError): await stderr_reader_task_this_attempt
-                            if current_server_name in self._session_tasks and stderr_reader_task_this_attempt in self._session_tasks[current_server_name]:
-                                self._session_tasks[current_server_name].remove(stderr_reader_task_this_attempt)
-                        # NOTE: SSE cleanup is managed by self.exit_stack when the exception propagates
+                        is_common_connect_error = False
+                        common_errors_tuple = (httpx.ConnectError, asyncio.TimeoutError, ConnectionRefusedError, ConnectionAbortedError)
+                        if isinstance(e, common_errors_tuple):
+                            is_common_connect_error = True
+                        elif isinstance(e, BaseExceptionGroup):
+                            # Check if all sub-exceptions are common connection issues
+                            if e.exceptions and all(isinstance(sub_exc, common_errors_tuple) for sub_exc in e.exceptions):
+                                is_common_connect_error = True
+                        log.info(f"Connection attempt failed for {current_server_name} (Attempt {retry_count + 1}, {type(e).__name__}): {e}", exc_info=not is_common_connect_error) # Now uses the refined check
 
                     # --- Shared Error Handling & Retry Logic ---
                     retry_count += 1
@@ -4165,20 +4176,12 @@ class ServerManager:
 
                     if retry_count <= max_retries:
                         delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.1, 10.0)
-                        error_msg_display = str(connection_error or "Unknown error")[:150] + "..."
-                        log.warning(f"Error details for {current_server_name} (attempt {retry_count-1} failed): {str(connection_error or 'Unknown')}")
-                        self._safe_printer(f"[yellow]Error connecting {current_server_name}: {error_msg_display}[/]")
                         log.info(f"Retrying connection to {current_server_name} in {delay:.2f}s...")
-                        self._safe_printer(f"[cyan]Retrying in {delay:.2f}s...[/]")
-                        if span_context_manager:
-                            with suppress(Exception): span_context_manager.__exit__(*sys.exc_info())
-                            span_context_manager = None; span = None
-                        await asyncio.sleep(delay)
                         # Continue main while loop
                     else: # Max retries exceeded
                         final_error_msg = str(connection_error or "Unknown connection error")
-                        log.error(f"Failed to connect to {current_server_name} after {max_retries+1} attempts. Final error: {final_error_msg}")
-                        self._safe_printer(f"[red]Failed to connect to {current_server_name} after {max_retries+1} attempts.[/]")
+                        log.warning(f"Failed to connect to {current_server_name} after {max_retries+1} attempts. Final error: {final_error_msg}")
+                        self._safe_printer(f"[yellow]Server '{current_server_name}' unavailable after {max_retries+1} attempts.[/]")
                         if current_server_config.type == ServerType.STDIO and current_server_name in self.processes:
                             proc_to_clean = self.processes.pop(current_server_name, None)
                             if proc_to_clean and proc_to_clean.returncode is None:
