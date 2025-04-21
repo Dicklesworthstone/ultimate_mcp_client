@@ -3496,7 +3496,139 @@ class ServerManager:
         except Exception as e:
             log.error(f"Failed to connect to newly added server '{name}': {e}")
             return False, f"Server '{name}' added but failed to connect: {e}"
-            
+
+    async def test_server_connection(self, server_config: ServerConfig) -> bool:
+        """
+        Attempts a connection and handshake to a server without adding it
+        to active sessions or loading tools. Cleans up resources afterwards.
+
+        Returns True if the initialize handshake succeeds, False otherwise.
+        """
+        current_server_name = server_config.name
+        retry_count = 0
+        max_retries = server_config.retry_policy.get("max_attempts", 1) # Fewer retries for testing
+        backoff_factor = server_config.retry_policy.get("backoff_factor", 0.2)
+        last_error = None
+        test_exit_stack = AsyncExitStack() # Use a local exit stack for test resources
+
+        while retry_count <= max_retries:
+            session: Optional[ClientSession] = None
+            process_this_attempt: Optional[asyncio.subprocess.Process] = None
+            log_file_handle: Optional[aiofiles.thread.AsyncTextIOWrapper] = None
+
+            try:
+                log.debug(f"[Test:{current_server_name}] Connection attempt {retry_count+1}/{max_retries+1}")
+                # Use simplified connection logic similar to _connect_xxx helpers
+                if server_config.type == ServerType.STDIO:
+                    # Simplified STDIO start and handshake
+                    executable = server_config.path
+                    current_args = server_config.args
+                    BUFFER_LIMIT = 2**22 # 4 MiB
+                    log_file_path = (CONFIG_DIR / f"{current_server_name}_cleanup_test_stderr.log").resolve()
+                    log_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    # Open log file using the context manager
+                    log_file_handle = await test_exit_stack.enter_async_context(
+                        aiofiles.open(log_file_path, "ab")
+                    )
+                    stderr_fileno = log_file_handle.fileno()
+
+                    process_this_attempt = await asyncio.create_subprocess_exec(
+                        executable, *current_args,
+                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                        stderr=stderr_fileno, limit=BUFFER_LIMIT, env=os.environ.copy()
+                    )
+                    # Ensure process cleanup using exit stack
+                    await test_exit_stack.enter_async_context(self._manage_process_lifetime(process_this_attempt, current_server_name))
+
+                    await asyncio.sleep(0.5) # Allow startup
+                    if process_this_attempt.returncode is not None:
+                        raise RuntimeError(f"Test process failed immediately (code {process_this_attempt.returncode})")
+
+                    # Use RobustStdioSession for handshake test
+                    session = RobustStdioSession(process_this_attempt, f"test-{current_server_name}")
+                    await test_exit_stack.enter_async_context(session) # Manage session close
+
+                    init_timeout = server_config.timeout + 5.0 # Generous timeout for test
+                    # Perform only the initialize handshake
+                    await asyncio.wait_for(
+                        session.initialize(response_timeout=server_config.timeout),
+                        timeout=init_timeout
+                    )
+                    await session.send_initialized_notification() # Need this for some servers
+                    log.debug(f"[Test:{current_server_name}] STDIO Handshake successful.")
+                    return True # Success
+
+                elif server_config.type == ServerType.SSE:
+                    # Simplified SSE connection and handshake using standard client
+                    connect_url = server_config.path
+                    parsed_connect_url = urlparse(connect_url)
+                    if not parsed_connect_url.scheme: connect_url = f"http://{connect_url}"
+                    connect_timeout = server_config.timeout if server_config.timeout > 0 else 5.0 # Shorter timeout for test
+                    handshake_timeout = (server_config.timeout * 2) + 10.0 if server_config.timeout > 0 else 20.0
+
+                    sse_client_context = sse_client(url=connect_url, timeout=connect_timeout)
+                    read_stream, write_stream = await test_exit_stack.enter_async_context(sse_client_context)
+                    session_read_timeout_seconds = handshake_timeout + 5.0
+                    session = ClientSession(
+                        read_stream=read_stream, write_stream=write_stream,
+                        read_timeout_seconds=timedelta(seconds=session_read_timeout_seconds)
+                    )
+                    await test_exit_stack.enter_async_context(session) # Manage session close
+                    await asyncio.wait_for(session.initialize(), timeout=handshake_timeout)
+                    log.debug(f"[Test:{current_server_name}] SSE Handshake successful.")
+                    return True # Success
+                else:
+                    raise RuntimeError(f"Unknown server type: {server_config.type}")
+
+            except (McpError, RuntimeError, ConnectionAbortedError, httpx.RequestError, subprocess.SubprocessError, OSError, FileNotFoundError, asyncio.TimeoutError, BaseExceptionGroup) as e:
+                last_error = e
+                # Determine if it's a common, expected connection failure
+                common_errors_tuple = (httpx.ConnectError, asyncio.TimeoutError, ConnectionRefusedError, ConnectionAbortedError, subprocess.SubprocessError, FileNotFoundError, OSError)
+                is_common_failure = False
+                if isinstance(e, common_errors_tuple):
+                    is_common_failure = True
+                elif isinstance(e, BaseExceptionGroup):
+                    # Check if all sub-exceptions are common connection issues
+                    if e.exceptions and all(isinstance(sub_exc, common_errors_tuple) for sub_exc in e.exceptions):
+                        is_common_failure = True
+
+                # Log less verbosely for common failures, include traceback only at DEBUG level
+                log_message = f"[Test:{current_server_name}] Attempt {retry_count+1} failed: {type(e).__name__} - {e}"
+                if is_common_failure:
+                    log.debug(log_message, exc_info=True) # Debug level includes traceback for common errors
+                else:
+                    # Log unexpected errors at WARNING level with traceback for visibility
+                    log.warning(log_message, exc_info=True)
+                retry_count += 1
+                if retry_count <= max_retries:
+                    delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.05, 5.0)
+                    await asyncio.sleep(delay)
+                else:
+                    log.warning(f"[Test:{current_server_name}] Final connection test failed after {max_retries+1} attempts. Last error type: {type(last_error).__name__}") # Log only type for final warning
+                    return False # Failed after retries
+            except Exception as e:
+                 # Catch truly unexpected errors during the test itself
+                 last_error = e
+                 log.error(f"[Test:{current_server_name}] Unexpected error during connection test: {e}", exc_info=True) # Keep traceback for unexpected
+                 return False # Unexpected failure
+            finally:
+                # Ensure resources managed by the local exit stack are cleaned up for this attempt
+                await test_exit_stack.aclose()
+                # Reset stack for next potential retry
+                test_exit_stack = AsyncExitStack()
+
+        # Should only be reached if all retries fail
+        return False
+    
+    @asynccontextmanager
+    async def _manage_process_lifetime(self, process: asyncio.subprocess.Process, server_name: str):
+        """Async context manager to ensure a process is terminated."""
+        try:
+            yield process
+        finally:
+            await self.terminate_process(f"test-{server_name}", process)
+
     async def terminate_process(self, server_name: str, process: Optional[asyncio.subprocess.Process]):
         """Helper to terminate a process gracefully with fallback to kill."""
         if process is None or process.returncode is not None:
@@ -5252,6 +5384,62 @@ class MCPClient:
         if hasattr(self, 'server_manager'):
             await self.server_manager.close() # ServerManager.close() will handle its own clients
 
+    async def cleanup_non_working_servers(self):
+        """Tests connections to all configured servers and removes unreachable ones."""
+        self.safe_print(f"\n{STATUS_EMOJI['search']} Testing server connections for cleanup...")
+        servers_to_check = list(self.config.servers.items()) # Get a snapshot
+        removed_servers = []
+        checked_count = 0
+        total_to_check = len(servers_to_check)
+
+        # Use Progress for visual feedback
+        with Progress(
+            SpinnerColumn("dots"),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=get_safe_console()
+        ) as progress:
+            cleanup_task = progress.add_task("Checking servers...", total=total_to_check)
+
+            for name, server_config in servers_to_check:
+                # Check if server still exists (might have been removed by rename in setup)
+                if name not in self.config.servers:
+                    log.debug(f"Server '{name}' no longer in config, skipping cleanup check.")
+                    progress.update(cleanup_task, advance=1, description=f"Skipping {name}...")
+                    continue
+
+                log.info(f"Cleanup: Testing connection to server '{name}'...")
+                progress.update(cleanup_task, description=f"Testing {name}...")
+
+                # Use the dedicated test method
+                is_connectable = await self.server_manager.test_server_connection(server_config)
+                checked_count += 1
+
+                if not is_connectable:
+                    log.warning(f"Cleanup: Server '{name}' ({server_config.path}) failed connection test. Removing from config.")
+                    self.safe_print(f"  [yellow]✗ Unreachable:[/] {name} ({server_config.path}) - Removing")
+                    # Remove from the actual config dictionary
+                    if name in self.config.servers: # Double-check before deleting
+                        del self.config.servers[name]
+                        removed_servers.append(name)
+                    else:
+                        log.warning(f"Attempted to remove '{name}' during cleanup, but it was already gone.")
+                else:
+                    log.info(f"Cleanup: Server '{name}' is reachable.")
+                    self.safe_print(f"  [green]✓ Reachable:[/] {name}")
+
+                progress.update(cleanup_task, advance=1)
+
+            progress.update(cleanup_task, description=f"Cleanup check finished ({checked_count}/{total_to_check})")
+
+        # Save config if changes were made
+        if removed_servers:
+            self.safe_print(f"\n{STATUS_EMOJI['config']} Saving configuration after removing {len(removed_servers)} unreachable server(s)...")
+            await self.config.save_async()
+            self.safe_print(f"[green]Configuration saved. Removed: {', '.join(removed_servers)}[/]")
+        else:
+            self.safe_print(f"\n{STATUS_EMOJI['success']} No unreachable servers found to remove.")
 
     async def process_streaming_query(self, query: str, model: Optional[str] = None,
                                     max_tokens: Optional[int] = None) -> AsyncIterator[str]:
@@ -8798,6 +8986,7 @@ def run(
     webui_host: Annotated[str, typer.Option("--host", help="Host for Web UI")] = "127.0.0.1",
     webui_port: Annotated[int, typer.Option("--port", help="Port for Web UI")] = 8017,
     serve_ui_file: Annotated[bool, typer.Option("--serve-ui", help="Serve the default mcp_client_ui.html file")] = True,
+    cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers from config")] = False, # <-- ADDED FLAG
 ):
     """Run the MCP client in various modes (CLI, Interactive, Dashboard, or Web UI)."""
     # Configure logging based on verbosity
@@ -8809,7 +8998,7 @@ def run(
 
     # Run the main async function
     # Pass new webui flags
-    asyncio.run(main_async(query, model, server, dashboard, interactive, verbose, webui, webui_host, webui_port, serve_ui_file))
+    asyncio.run(main_async(query, model, server, dashboard, interactive, verbose, webui, webui_host, webui_port, serve_ui_file, cleanup_servers))
 
 @app.command()
 def servers(
@@ -8831,7 +9020,7 @@ def config(
     # Run the config management function
     asyncio.run(config_async(show, edit, reset))
 
-async def main_async(query, model, server, dashboard, interactive, verbose_logging, webui_flag, webui_host, webui_port, serve_ui_file):
+async def main_async(query, model, server, dashboard, interactive, verbose_logging, webui_flag, webui_host, webui_port, serve_ui_file, cleanup_servers):
     """Main async entry point - Handles CLI, Interactive, Dashboard, and Web UI modes."""
     client = None # Initialize client to None
     safe_console = get_safe_console()
@@ -8842,6 +9031,11 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
         log.info("Initializing MCPClient...")
         client = MCPClient() # Instantiation inside the try block
         await client.setup(interactive_mode=interactive or webui_flag) # Pass interactive if either mode uses it
+
+        if cleanup_servers:
+            log.info("Cleanup flag detected. Testing and removing unreachable servers...")
+            await client.cleanup_non_working_servers()
+            log.info("Server cleanup process complete.")
 
         # --- Mode Selection ---
         if webui_flag:

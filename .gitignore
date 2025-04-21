@@ -170,3 +170,4 @@ claude_desktop_config.json
 *.pyc
 __pycache__/
 .env
+claude_desktop_config.jsonOLD
