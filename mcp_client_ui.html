@@ -8855,157 +8855,137 @@
                     return unescapedContent;
                 },
 
-                // ===== TOOL RESULT RENDERER (Component Method) =====
+                // ===== TOOL RESULT RENDERER (Component Method) - FINAL ATTEMPT =====
                 renderUserProvidedToolResult(block, message) {
                     // 0. Hide if toggled off
                     if (!this.uiSettings.showToolDataMessages) return '<!-- tool message hidden -->';
 
                     // Initialize renderers
                     const renderer = this.visualRenderer.init(this);
-                    const inspector = this.contentInspector;
+                    const inspector = this.contentInspector; // Keep inspector for complex types
 
                     try {
-                        // 1. Extract and parse the actual payload
-                        const payload = this._extractAndUnescapePayload(block?.content);
+                        // 1. Get raw content first for the copy button later
+                        const rawBlockContent = block?.content;
+
+                        // 2. Extract, unescape ONLY JSON escapes, leave literal \n if it's not JSON
+                        const payload = this._extractAndUnescapePayload(rawBlockContent);
 
                         if (payload === null || typeof payload === 'undefined') {
                             return '<div class="tool-message opacity-70 italic">[Empty Tool Result]</div>';
                         }
 
-                        // 2. Analyze the extracted payload
-                        const analysisResult = inspector.inspectContent(payload);
                         let contentHTML = '';
+                        let isStringPayload = typeof payload === 'string';
 
-                        // 3. Render based on the analyzed payload type
-                        switch (analysisResult.detectedType) {
-                            case 'multi_provider':
-                                if (payload && typeof payload === 'object' && payload.results) {
-                                    contentHTML += renderer.renderMultiProviderResults(
-                                        payload.results,
-                                        payload.aggregate_stats
-                                    );
-                                } else {
-                                    contentHTML = renderer.renderCodeBlock(payload, 'json', 'Multi-Provider Results');
-                                }
-                                break;
+                        // 3. Determine Rendering Strategy
+                        // STRATEGY: If it's a string, try markdown FIRST. Otherwise, use inspector.
+                        if (isStringPayload) {
+                            // *** Explicitly handle literal \n for strings intended as markdown ***
+                            // Replace \\n with \n *only* for the markdown parser input
+                            const markdownInputString = payload.replace(/\\n/g, '\n');
 
-                            case 'model_comparison':
-                                // Handles the multi-completion case
-                                if (payload && typeof payload === 'object' && payload.results) {
-                                    const modelsList = Object.entries(payload.results || {}).map(([name, data]) => {
-                                        if (!data || typeof data !== 'object') return { provider: 'unknown', model: name };
-                                        const nameParts = String(name).split('/');
-                                        return {
-                                            provider: data.provider || (nameParts.length > 1 ? nameParts[0] : name),
-                                            model: data.model || (nameParts.length > 1 ? nameParts[1] : name),
-                                            ...data
-                                        };
-                                    });
-                                    contentHTML += renderer.renderComparisonTable(modelsList, 'Model Comparison Results');
-                                    modelsList.forEach((model, index) => {
-                                        contentHTML += renderer.renderModelResult(model, index + 1);
-                                    });
-                                    if (payload.aggregate_stats && typeof payload.aggregate_stats === 'object') {
-                                        contentHTML += renderer.renderStatsDashboard(payload.aggregate_stats, 'Aggregate Performance');
+                            // Render using the visualRenderer's markdown function
+                            // which now returns raw HTML without wrappers
+                            const markdownOutputHTML = renderer.renderMarkdown(markdownInputString);
+
+                            // Wrap the raw HTML output with appropriate prose classes
+                            contentHTML = `<div class="tool-markdown prose prose-sm max-w-none prose-invert">${markdownOutputHTML}</div>`;
+
+                        } else {
+                            // Payload is OBJECT or ARRAY, use the inspector and switch statement
+                            const analysisResult = inspector.inspectContent(payload);
+
+                            switch (analysisResult.detectedType) {
+                                case 'multi_provider':
+                                    contentHTML = (payload && typeof payload === 'object' && payload.results)
+                                        ? renderer.renderMultiProviderResults(payload.results, payload.aggregate_stats)
+                                        : renderer.renderCodeBlock(payload, 'json', 'Multi-Provider Results');
+                                    break;
+                                case 'model_comparison':
+                                    if (payload && typeof payload === 'object' && payload.results) {
+                                        const modelsList = Object.entries(payload.results || {}).map(([name, data]) => {
+                                            if (!data || typeof data !== 'object') return { provider: 'unknown', model: name };
+                                            const nameParts = String(name).split('/');
+                                            return {
+                                                provider: data.provider || (nameParts.length > 1 ? nameParts[0] : name),
+                                                model: data.model || (nameParts.length > 1 ? nameParts[1] : name),
+                                                ...data
+                                            };
+                                        });
+                                        contentHTML += renderer.renderComparisonTable(modelsList, 'Model Comparison Results');
+                                        modelsList.forEach((model, index) => {
+                                            contentHTML += renderer.renderModelResult(model, index + 1); // Ensure renderModelResult handles its internal strings
+                                        });
+                                        if (payload.aggregate_stats && typeof payload.aggregate_stats === 'object') {
+                                            contentHTML += renderer.renderStatsDashboard(payload.aggregate_stats, 'Aggregate Performance');
+                                        }
+                                    } else {
+                                        contentHTML = renderer.renderCodeBlock(payload, 'json', 'Comparison Data');
                                     }
-                                } else {
-                                    contentHTML = renderer.renderCodeBlock(payload, 'json', 'Comparison Data');
-                                }
-                                break;
-
-                            case 'single_model':
-                            case 'models':
-                                const modelsToRender = analysisResult.models?.length > 0
-                                    ? analysisResult.models
-                                    : (typeof payload === 'object' && ((payload.text && payload.model) || (payload.content && payload.model))
-                                        ? [payload] : []);
-
-                                modelsToRender.forEach((modelData, index) => {
-                                    if (modelData) {
-                                        contentHTML += renderer.renderModelResult(modelData, modelsToRender.length > 1 ? index + 1 : null);
-                                    }
-                                });
-                                // Add stats if found separately
-                                if (analysisResult.stats) {
-                                    contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
-                                }
-                                break;
-                            case 'providers_status':
-                                if (payload && typeof payload === 'object' && payload.providers) {
-                                    contentHTML += renderer.renderProvidersStatus(payload.providers);
-                                } else {
-                                    contentHTML = renderer.renderCodeBlock(payload, 'json', 'Provider Status Data');
-                                }
-                                break;
-
-                            case 'models_list':
-                                if (payload && typeof payload === 'object' && payload.models) {
-                                    contentHTML += renderer.renderModelsList(payload.models);
-                                } else {
-                                    contentHTML = renderer.renderCodeBlock(payload, 'json', 'Models List Data');
-                                }
-                                break;
-
-                            case 'markdown':
-                                // Render extracted markdown content
-                                if (analysisResult.markdown?.length > 0 && typeof analysisResult.markdown[0].content === 'string') {
-                                    contentHTML += renderer.renderMarkdown(analysisResult.markdown[0].content);
+                                    break;
+                                case 'single_model':
+                                case 'models':
+                                    const modelsToRender = analysisResult.models?.length > 0
+                                        ? analysisResult.models
+                                        : (typeof payload === 'object' && ((payload.text && payload.model) || (payload.content && payload.model))
+                                            ? [payload] : []);
+                                    modelsToRender.forEach((modelData, index) => {
+                                        if (modelData) {
+                                            contentHTML += renderer.renderModelResult(modelData, modelsToRender.length > 1 ? index + 1 : null); // Ensure renderModelResult handles its internal strings
+                                        }
+                                    });
                                     if (analysisResult.stats) {
                                         contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
                                     }
-                                } else if (typeof payload === 'string') { // Fallback if analysis missed it
-                                    contentHTML += renderer.renderMarkdown(payload);
-                                }
-                                break;
-
-                            case 'simple_message':
-                                if (typeof payload === 'object' && payload.message) {
-                                    contentHTML += renderer.renderSimpleMessage(payload);
-                                } else if (typeof payload === 'string') { // Fallback
-                                    contentHTML += renderer.renderSimpleMessage({ message: payload });
-                                }
-                                break;
-
-                            case 'json':
-                                // Generic JSON object
-                                if (analysisResult.json?.length > 0) {
-                                    contentHTML += renderer.renderCodeBlock(analysisResult.json[0].content, 'json', 'JSON Data');
-                                    if (analysisResult.stats) {
-                                        contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
-                                    }
-                                } else if (typeof payload === 'object') { // Fallback
-                                    contentHTML += renderer.renderCodeBlock(payload, 'json', 'JSON Data');
-                                }
-                                break;
-
-                            case 'text':
-                            default:
-                                // If we couldn't determine the type but it's an object with text and model properties,
-                                // try to render it as a model result
-                                if (typeof payload === 'object' && payload !== null &&
-                                    ((payload.text && payload.model) || (payload.content && payload.model))) {
-                                    contentHTML += renderer.renderModelResult(payload);
-                                } else if (typeof payload === 'string') {
-                                    contentHTML += `<pre class="tool-plain-text">${renderer._DOMPurify.sanitize(payload)}</pre>`;
-                                } else {
+                                    break;
+                                case 'providers_status':
+                                    contentHTML = (payload && typeof payload === 'object' && payload.providers)
+                                        ? renderer.renderProvidersStatus(payload.providers)
+                                        : renderer.renderCodeBlock(payload, 'json', 'Provider Status Data');
+                                    break;
+                                case 'models_list':
+                                    contentHTML = (payload && typeof payload === 'object' && payload.models)
+                                        ? renderer.renderModelsList(payload.models)
+                                        : renderer.renderCodeBlock(payload, 'json', 'Models List Data');
+                                    break;
+                                case 'simple_message':
+                                    // Handles object {message: "..."}
+                                    contentHTML = (typeof payload === 'object' && payload.message)
+                                        ? renderer.renderSimpleMessage(payload)
+                                        : renderer.renderCodeBlock(payload, 'json', 'Message Data'); // Fallback object
+                                    break;
+                                case 'json': // Inspector identified a generic JSON object
+                                    contentHTML = (analysisResult.json?.length > 0)
+                                        ? renderer.renderCodeBlock(analysisResult.json[0].content, 'json', 'JSON Data')
+                                        : renderer.renderCodeBlock(payload, 'json', 'JSON Data'); // Fallback
+                                    if (analysisResult.stats) contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
+                                    break;
+                                // Removed 'markdown' and 'text' cases here as they are handled by the initial string check above
+                                default: // Unknown object/array type
+                                    console.warn(`renderUserProvidedToolResult: Unknown/unhandled object type: ${analysisResult.detectedType}. Rendering as JSON.`);
                                     contentHTML += renderer.renderCodeBlock(payload, 'json', 'Raw Data');
-                                }
-                                break;
-                        }
+                                    break;
+                            }
+                        } // End of else block (payload is not string)
 
-                        // 4. Wrap in container
+
+                        // 4. Wrap in container - Use consistent dark theme container
                         return `
             <div class="tool-result-container">
                 <div class="tool-result-header">
-                    <div class="tool-result-title">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="tool-result-icon" viewBox="0 0 24 24" stroke="currentColor" fill="none">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/>
-                        </svg>
+                     <div class="tool-result-title">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="tool-result-icon" viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 17a2.4 2.4 0 0 1 0-4.8V7a2.4 2.4 0 0 1 4.8 0v5.2a2.4 2.4 0 0 1 0 4.8z"/><path d="M16.5 17a2.4 2.4 0 0 1 0-4.8V7a2.4 2.4 0 0 1 4.8 0v5.2a2.4 2.4 0 0 1 0 4.8zM5 12h14"/></svg>
                         <span>Tool Data (User Provided)</span>
+                         ${message?.tool_name ? `<span class="text-xs opacity-70 ml-2">(${DOMPurify.sanitize(message.tool_name)})</span>` : ''}
                     </div>
-                    <div class="tool-result-actions">${renderer.createCopyButton(block?.content || '', 'Copy Raw')}</div>
+                    <!-- Use the ORIGINAL rawBlockContent for the copy button -->
+                    <div class="tool-result-actions">${renderer.createCopyButton(rawBlockContent || '', 'Copy Raw')}</div>
                 </div>
-                <div class="tool-result-content">${contentHTML}</div>
+                 <!-- Force dark theme context for consistency -->
+                <div class="tool-result-content p-4 bg-gray-800 text-gray-200">
+                     ${contentHTML}
+                 </div>
             </div>`;
 
                     } catch (error) {
@@ -9015,32 +8995,75 @@
                     <p>Failed to render tool result: ${error.message}</p>
                 </div>`;
                     }
-
-                    // Find and fix the problematic provider cards
-                    document.querySelectorAll('.provider-result-card').forEach(card => {
-                        // Get the card body which needs fixing
-                        const cardBody = card.querySelector('.card-body');
-                        if (!cardBody) return;
-
-                        // Check if this is one of the cards with a white/transparent background
-                        const bgColor = window.getComputedStyle(cardBody).backgroundColor;
-                        if (bgColor === 'rgba(0, 0, 0, 0)' || bgColor === 'rgb(255, 255, 255)') {
-                            // First set a proper background to ensure text contrast works correctly
-                            cardBody.style.backgroundColor = '#1f2937';
-
-                            // Now apply your existing contrast fixing functions
-                            fixContrastRecursively(cardBody);
-
-                            // Add specific fix for pre tags which may need special handling
-                            const preTags = cardBody.querySelectorAll('pre');
-                            preTags.forEach(pre => {
-                                // Force contrast check on pre elements
-                                checkAndFixElementContrast(pre);
-                            });
-                        }
-                    });
-
                 }, // End renderUserProvidedToolResult
+
+
+                // --- Ensure visualRenderer.renderMarkdown is updated ---
+                // In visualRenderer object:
+                renderMarkdown(markdownInput) {
+                    // NOTE: Assumes \\n was already replaced with \n by the CALLER if needed.
+                    const inputType = typeof markdownInput;
+                    const mdSample = String(markdownInput || '').substring(0, 70).replace(/\n/g, '\\n'); // Log with visible newlines
+                    console.log(`[visualRenderer.renderMarkdown] Input Type: ${inputType}, Sample: "${mdSample}"`);
+
+                    if (!this._marked || !this._DOMPurify) {
+                        console.error("[visualRenderer.renderMarkdown] Missing marked or DOMPurify!");
+                        return `<div>${this._DOMPurify.sanitize(String(markdownInput || ''))}</div>`; // Basic div fallback
+                    }
+                    if (markdownInput === null || typeof markdownInput === 'undefined') {
+                        console.warn("[visualRenderer.renderMarkdown] Input is null/undefined.");
+                        return '';
+                    }
+                    try {
+                        const html = this._marked.parse(String(markdownInput)); // Ensure string input
+
+                        if (typeof html !== 'string') {
+                            console.error("[visualRenderer.renderMarkdown] marked.parse returned non-string:", html);
+                            return `<div>${this._DOMPurify.sanitize(String(markdownInput))}</div>`; // Sanitize original string
+                        }
+
+                        const sanitizedHtml = this._DOMPurify.sanitize(html, { USE_PROFILES: { html: true } }); // Allow safe HTML from markdown
+                        console.log(`[visualRenderer.renderMarkdown] Output Sample:`, sanitizedHtml.substring(0, 100));
+                        return sanitizedHtml; // Return raw sanitized HTML
+                    } catch (e) {
+                        console.error("[visualRenderer.renderMarkdown] FAILED:", e);
+                        return `<div>${this._DOMPurify.sanitize(String(markdownInput))}</div>`; // Sanitize original string on error
+                    }
+                },
+
+                // --- Ensure visualRenderer.renderModelResult is updated ---
+                // In visualRenderer object:
+                renderModelResult(model, indexOrName = null) {
+                    if (!model || typeof model !== 'object') return '<div class="text-error">Invalid model data</div>';
+
+                    const { provider = 'unknown', model: modelName = 'unknown', text, content, message, /* ... other fields */ } = model;
+                    const modelContent = text || content || message || ''; // Get the raw content
+
+                    let finalContentToRender = modelContent; // Content to be potentially displayed
+
+                    // *** Unescape \\n -> \n only if it's a string ***
+                    if (typeof modelContent === 'string') {
+                        finalContentToRender = String(modelContent).replace(/\\n/g, '\n');
+                    }
+
+                    // Determine if the (potentially unescaped) content should be markdown
+                    const isContentMarkdown = this._isMarkdown(finalContentToRender);
+
+                    // Render the potentially unescaped content
+                    const renderedModelContent = isContentMarkdown
+                        ? `<div class="tool-markdown prose prose-sm max-w-none prose-invert">${this.renderMarkdown(finalContentToRender)}</div>` // Wrap markdown HTML
+                        : `<pre class="tool-model-text whitespace-pre-wrap">${this._DOMPurify.sanitize(String(finalContentToRender))}</pre>`; // Sanitize non-markdown
+
+                    // ... rest of the function assembling badges, metrics, card HTML ...
+                    const badgeProvider = this.createBadge(this._DOMPurify.sanitize(provider), 'info');
+                    // ... etc ...
+                    return `
+<div class="tool-model-card ..." data-provider="${this._DOMPurify.sanitize(provider.toLowerCase())}">
+    <div class="tool-model-header ..."> ... </div>
+    <div class="tool-model-content p-4 bg-base-200"> ${renderedModelContent} </div>
+    <div class="tool-model-metrics ..."> ... </div>
+</div>`;
+                }, // End renderModelResult
 
                 renderMessageContent(message) {
                     try {
