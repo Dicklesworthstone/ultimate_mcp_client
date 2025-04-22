@@ -596,9 +596,7 @@ def adapt_path_for_platform(command: str, args: List[str]) -> Tuple[str, List[st
         Handles drive letters C-Z, case-insensitive.
         Replaces backslashes (represented as '\\' in Python strings) with forward slashes.
         """
-        # --- Added Debug Logging ---
         log.debug(f"convert_windows_path_to_linux: Checking path string: {repr(path_str)}")
-        # --- End Added Debug Logging ---
 
         # Check for DRIVE:\ or DRIVE:/ pattern (case-insensitive)
         # Note: It checks the actual string value, which might be 'C:\\Users\\...'
@@ -613,20 +611,14 @@ def adapt_path_for_platform(command: str, args: List[str]) -> Tuple[str, List[st
                 #     rest_of_path = rest_of_path[1:]
                 linux_path = f"/mnt/{drive_letter}/{rest_of_path}"
                 # Use logger configured elsewhere in your script
-                # --- Changed log level to DEBUG for successful conversion ---
                 log.debug(f"Converted Windows path '{path_str}' to Linux path '{linux_path}'")
-                # --- End Changed log level ---
                 return linux_path
             except Exception as e:
-                # --- Added Error Logging ---
                 log.error(f"Error during path conversion for '{path_str}': {e}", exc_info=True)
                 # Return original path on conversion error
                 return path_str
-                # --- End Added Error Logging ---
         # If it doesn't look like a Windows path, return it unchanged
-        # --- Added Debug Logging ---
         log.debug(f"convert_windows_path_to_linux: Path '{path_str}' did not match Windows pattern or wasn't converted.")
-        # --- End Added Debug Logging ---
         return path_str
 
     # Apply conversion to the command string itself only if it looks like a path
@@ -838,6 +830,12 @@ STATUS_EMOJI = {
     "failure": Emoji("collision"),
     "warning": Emoji("warning"),
     "model": Emoji("robot"),      
+}
+
+COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
+    # Claude models
+    "claude-3-7-sonnet-latest": {"input": 3.0, "output": 15.0}, 
+    # Add other models here as needed
 }
 
 # Constants
@@ -1704,8 +1702,8 @@ class Config:
         self.enable_port_scanning: bool = True # Enable by default? Or False? Let's start with True.
         self.port_scan_range_start: int = 8000
         self.port_scan_range_end: int = 9000 # Scan 1001 ports
-        self.port_scan_concurrency: int = 100 # Max simultaneous probes
-        self.port_scan_timeout: float = 2.5 # Timeout per port probe (seconds)
+        self.port_scan_concurrency: int = 50 # Max simultaneous probes
+        self.port_scan_timeout: float = 4.5 # Timeout per port probe (seconds)
         self.port_scan_targets: List[str] = ["127.0.0.1"] # Scan localhost by default
 
         # Use synchronous load for initialization since __init__ can't be async
@@ -3039,7 +3037,7 @@ class ServerManager:
         Logs failures only if USE_VERBOSE_SESSION_LOGGING is True.
         """
         # --- Step 1: Quick TCP Pre-check ---
-        tcp_check_timeout = 0.1
+        tcp_check_timeout = 0.2 # Slightly increased TCP timeout
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip_address, port),
@@ -3048,6 +3046,9 @@ class ServerManager:
             writer.close()
             await writer.wait_closed()
             if USE_VERBOSE_SESSION_LOGGING: log.debug(f"TCP Port open: {ip_address}:{port}. Proceeding.")
+            # *** ADD SMALL DELAY ***
+            await asyncio.sleep(0.05) # Add a 50ms delay after TCP connect success
+            # *** END ADDED DELAY ***
         except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
             return None
         except Exception as e:
@@ -3061,8 +3062,9 @@ class ServerManager:
 
         # --- Attempt 2a: GET /sse (Streaming Check) ---
         try:
-            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probing via streaming GET {sse_url}...")
+            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probing via streaming GET {sse_url} (timeout={probe_timeout}s)...")
             # Use client.stream for finer control
+            # The probe_timeout is passed to the client call below
             async with client.stream("GET", sse_url, timeout=probe_timeout) as response:
                 # Check headers immediately after response starts
                 if response.status_code == 200 and response.headers.get("content-type", "").lower().startswith("text/event-stream"):
@@ -3078,9 +3080,9 @@ class ServerManager:
                     if USE_VERBOSE_SESSION_LOGGING:
                         log.debug(f"Probe failed for streaming GET {sse_url} - Status: {response.status_code}, Content-Type: {response.headers.get('content-type')}")
             # The 'async with' ensures the response (and connection) is closed here
-            
+
         # Catch specific timeouts/errors related to establishing the connection or reading *headers*
-        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as http_err:
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, asyncio.TimeoutError) as http_err: # Added asyncio.TimeoutError here too
             if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probe error for streaming GET {sse_url}: {type(http_err).__name__}")
         except Exception as e: log.warning(f"Unexpected error probing streaming GET {sse_url}: {e}")
 
@@ -3093,7 +3095,8 @@ class ServerManager:
                 "id": str(uuid.uuid4())
             }
             try:
-                if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probing via POST {base_url}...")
+                if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probing via POST {base_url} (timeout={probe_timeout}s)...")
+                # Pass the probe_timeout here as well
                 response = await client.post(base_url, json=initialize_payload, timeout=probe_timeout)
                 if response.status_code == 200:
                     try:
@@ -3117,7 +3120,7 @@ class ServerManager:
                          if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Error parsing response from POST {base_url}: {parse_err}")
                 else:
                     if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probe failed for POST {base_url} - Status: {response.status_code}")
-            except (httpx.TimeoutException, httpx.RequestError) as http_err:
+            except (httpx.TimeoutException, httpx.RequestError, asyncio.TimeoutError) as http_err: # Added asyncio.TimeoutError
                 if USE_VERBOSE_SESSION_LOGGING: log.debug(f"Probe error for POST {base_url}: {type(http_err).__name__}")
             except Exception as e: log.warning(f"Unexpected error probing POST {base_url}: {e}")
 
@@ -3828,9 +3831,7 @@ class ServerManager:
 
     async def _connect_stdio_server(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[Dict[str, Any]], Optional[asyncio.subprocess.Process], None]:
         """
-        Handles STDIO connection, handshake, and capability loading.
-        Uses async file opening for stderr redirection to a file descriptor.
-        Includes explicit initialized notification and uses default capability timeouts.
+        Handles STDIO connection and handshake ONLY. Capability loading moved.
         """
         session: Optional[ClientSession] = None
         initialize_result_obj: Optional[Dict[str, Any]] = None
@@ -3930,7 +3931,7 @@ class ServerManager:
             session = RobustStdioSession(process_to_use, current_server_name)
             # REMOVED: Linking stderr task
 
-            # === Handshake AND Capability Loading ===
+            # === Handshake ONLY ===
             log.info(f"[{current_server_name}] Attempting MCP handshake: initialize...")
             init_timeout = server_config.timeout + 5.0
             initialize_result_obj = await asyncio.wait_for(
@@ -3944,78 +3945,15 @@ class ServerManager:
             await session.send_initialized_notification()
             log.info(f"[{current_server_name}] Explicit initialized notification sent.")
 
-            # --- Extract capabilities ---
-            server_capabilities = None
-            if isinstance(initialize_result_obj, dict):
-                server_capabilities = initialize_result_obj.get("capabilities")
+            # --- REMOVED CAPABILITY LOADING ---
 
-            # === LOAD CAPABILITIES IMMEDIATELY (Using Default 10s Timeout) ===
-            log.info(f"[{current_server_name}] Loading capabilities immediately...")
-            outer_capability_timeout = server_config.timeout + 15.0 # Overall wait limit
-
-            # --- List/Load Tools ---
-            has_tools_capability = isinstance(server_capabilities, dict) and "tools" in server_capabilities
-            if has_tools_capability:
-                log.info(f"[{current_server_name}] Loading tools (using default 10s request timeout)...")
-                try:
-                    list_tools_result: ListToolsResult = await asyncio.wait_for(
-                        session.list_tools(), # Uses default 10s timeout internally
-                        timeout=outer_capability_timeout
-                    )
-                    if list_tools_result and hasattr(list_tools_result, 'tools'):
-                        self._process_list_result(current_server_name, list_tools_result.tools, self.tools, MCPTool, "tool")
-                    else: log.warning(f"[{current_server_name}] Invalid ListToolsResult.")
-                except asyncio.TimeoutError:
-                    log.error(f"[{current_server_name}] Outer timeout ({outer_capability_timeout}s) waiting for list_tools response.")
-                except RuntimeError as e:
-                    log.error(f"[{current_server_name}] RuntimeError loading tools: {e}")
-                except Exception as e: log.error(f"[{current_server_name}] Error loading tools: {e}", exc_info=True)
-            else:
-                log.info(f"[{current_server_name}] Server does not advertise 'tools' capability.")
-
-            # --- List/Load Resources ---
-            has_resources_capability = isinstance(server_capabilities, dict) and "resources" in server_capabilities
-            if has_resources_capability and hasattr(session, 'list_resources'):
-                log.info(f"[{current_server_name}] Loading resources (using default 10s request timeout)...")
-                try:
-                    list_resources_result: ListResourcesResult = await asyncio.wait_for(
-                        session.list_resources(), # Uses default 10s timeout internally
-                        timeout=outer_capability_timeout
-                    )
-                    if list_resources_result and hasattr(list_resources_result, 'resources'):
-                        self._process_list_result(current_server_name, list_resources_result.resources, self.resources, MCPResource, "resource")
-                    else: log.warning(f"[{current_server_name}] Invalid ListResourcesResult.")
-                except asyncio.TimeoutError: log.error(f"[{current_server_name}] Outer timeout loading resources.")
-                except RuntimeError as e: log.error(f"[{current_server_name}] RuntimeError loading resources: {e}")
-                except Exception as e: log.error(f"[{current_server_name}] Error loading resources: {e}", exc_info=True)
-            else:
-                log.info(f"[{current_server_name}] Server does not advertise 'resources' capability.")
-
-            # --- List/Load Prompts ---
-            has_prompts_capability = isinstance(server_capabilities, dict) and "prompts" in server_capabilities
-            if has_prompts_capability and hasattr(session, 'list_prompts'):
-                log.info(f"[{current_server_name}] Loading prompts (using default 10s request timeout)...")
-                try:
-                    list_prompts_result: ListPromptsResult = await asyncio.wait_for(
-                        session.list_prompts(), # Uses default 10s timeout internally
-                        timeout=outer_capability_timeout
-                    )
-                    if list_prompts_result and hasattr(list_prompts_result, 'prompts'):
-                        self._process_list_result(current_server_name, list_prompts_result.prompts, self.prompts, MCPPrompt, "prompt")
-                    else: log.warning(f"[{current_server_name}] Invalid ListPromptsResult.")
-                except asyncio.TimeoutError: log.error(f"[{current_server_name}] Outer timeout loading prompts.")
-                except RuntimeError as e: log.error(f"[{current_server_name}] RuntimeError loading prompts: {e}")
-                except Exception as e: log.error(f"[{current_server_name}] Error loading prompts: {e}", exc_info=True)
-            else:
-                log.info(f"[{current_server_name}] Server does not advertise 'prompts' capability.")
-
-            log.info(f"[{current_server_name}] MCP handshake and capability loading complete inside helper.")
+            log.info(f"[{current_server_name}] MCP handshake complete inside helper (capability loading deferred).")
             # Return session, result, the process created, and None for the removed task
             # The file handle log_file_handle will be closed by the finally block
             return session, initialize_result_obj, process_this_attempt, None
 
         except Exception as setup_or_load_err:
-            log.warning(f"[{current_server_name}] Failed setup/handshake/loading in helper ({type(setup_or_load_err).__name__}): {setup_or_load_err}", exc_info=True)
+            log.warning(f"[{current_server_name}] Failed setup/handshake in helper ({type(setup_or_load_err).__name__}): {setup_or_load_err}", exc_info=True)
             if session and hasattr(session, 'aclose'):
                 with suppress(Exception): await session.aclose()
             # Process termination is handled by the outer connect_to_server's error handling for process_this_attempt
@@ -4029,317 +3967,368 @@ class ServerManager:
                 except Exception as close_err:
                     log.error(f"Error closing stderr log file handle for {current_server_name}: {close_err}")
 
-    async def _connect_sse_server(self, server_config: ServerConfig, current_server_name: str, retry_count: int) -> Tuple[Optional[ClientSession], Optional[InitializeResult]]:
+    async def _load_server_capabilities(self, server_name: str, session: ClientSession, server_capabilities: Optional[Dict[str, Any]]):
         """
-        Handles the specific logic for connecting, performing the MCP handshake,
-        AND LOADING CAPABILITIES for an SSE server using the standard mcp library client.
-        (This is intended for compliant servers).
+        Loads tools, resources, and prompts from a connected server session AFTER potential rename.
+        Uses the *final* server_name for registration. Uses anyio for structured concurrency.
+        Correctly handles both dict (STDIO) and ServerCapabilities object (SSE) types.
         """
-        session: Optional[ClientSession] = None
-        initialize_result_obj: Optional[InitializeResult] = None
-        sse_client_context = None # Keep track of the context manager instance
+        log.info(f"[{server_name}] Loading capabilities using anyio...")
+        capability_timeout = 30.0 # Timeout for individual capability list calls
 
-        connect_url = server_config.path
-        parsed_connect_url = urlparse(connect_url)
-        if not parsed_connect_url.scheme:
-            connect_url = f"http://{connect_url}"
-            log.debug(f"[{current_server_name}] Prepended http scheme for standard SSE connection: {connect_url}")
+        # Determine if capabilities are advertised
+        has_tools = False
+        has_resources = False
+        has_prompts = False
 
-        # Define timeouts based on config, providing reasonable defaults
-        connect_timeout = server_config.timeout if server_config.timeout > 0 else 10.0
-        read_timeout = (server_config.timeout * 2) if server_config.timeout > 0 else 20.0
-        # Handshake timeout includes initial GET + POST + result wait via SSE stream
-        handshake_timeout = (server_config.timeout * 3) + 15.0 if server_config.timeout > 0 else 45.0
-        capability_load_timeout = (server_config.timeout * 2) + 20.0 if server_config.timeout > 0 else 40.0
-        outer_wait_timeout = capability_load_timeout + 10.0
+        if isinstance(server_capabilities, dict): # Handles STDIO dict result
+            log.debug(f"[{server_name}] Determining capabilities from STDIO dict result.")
+            has_tools = server_capabilities.get("tools") is not None
+            has_resources = server_capabilities.get("resources") is not None
+            has_prompts = server_capabilities.get("prompts") is not None
+        # Check if it's the Pydantic model from InitializeResult
+        # Use hasattr for robust checking, even if type hint isn't perfect
+        elif hasattr(server_capabilities, 'tools') and hasattr(server_capabilities, 'resources') and hasattr(server_capabilities, 'prompts'):
+            log.debug(f"[{server_name}] Determining capabilities from InitializeResult.Capabilities object.")
+            # Access attributes directly, check for None explicitly as they are Optional
+            # Important: The capability object itself might exist, but its fields (tools, resources, prompts)
+            # might be None if the server doesn't support them.
+            has_tools = getattr(server_capabilities, 'tools', None) is not None
+            has_resources = getattr(server_capabilities, 'resources', None) is not None
+            has_prompts = getattr(server_capabilities, 'prompts', None) is not None
+        else:
+             log.warning(f"[{server_name}] Could not determine capabilities from initialize result type: {type(server_capabilities)}. Assuming none supported.")
+             # Default to False if type is unknown or None
 
-        log.debug(f"[{current_server_name}] Standard SSE Timeouts: Connect={connect_timeout}s, Read={read_timeout}s, Handshake={handshake_timeout}s, Caps={capability_load_timeout}s")
+        log.debug(f"[{server_name}] Determined capabilities: tools={has_tools}, resources={has_resources}, prompts={has_prompts}")
 
+        # --- Define async functions for loading each capability type ---
+        async def load_tools_task():
+            if has_tools and hasattr(session, 'list_tools'):
+                log.info(f"[{server_name}] Loading tools...")
+                try:
+                    list_tools_result = await asyncio.wait_for(session.list_tools(), timeout=capability_timeout)
+                    if list_tools_result and hasattr(list_tools_result, 'tools'):
+                        self._process_list_result(server_name, list_tools_result.tools, self.tools, MCPTool, "tool")
+                    else: log.warning(f"[{server_name}] Invalid ListToolsResult.")
+                except asyncio.TimeoutError: log.error(f"[{server_name}] Timeout loading tools.")
+                except RuntimeError as e: log.error(f"[{server_name}] RuntimeError loading tools: {e}")
+                except Exception as e: log.error(f"[{server_name}] Error loading tools: {e}", exc_info=True); raise # Re-raise other errors to cancel group
+            else: log.info(f"[{server_name}] Skipping tools (not advertised or list_tools unavailable).")
+
+        async def load_resources_task():
+            if has_resources and hasattr(session, 'list_resources'):
+                log.info(f"[{server_name}] Loading resources...")
+                try:
+                    list_resources_result = await asyncio.wait_for(session.list_resources(), timeout=capability_timeout)
+                    if list_resources_result and hasattr(list_resources_result, 'resources'):
+                        self._process_list_result(server_name, list_resources_result.resources, self.resources, MCPResource, "resource")
+                    else: log.warning(f"[{server_name}] Invalid ListResourcesResult.")
+                except asyncio.TimeoutError: log.error(f"[{server_name}] Timeout loading resources.")
+                except RuntimeError as e: log.error(f"[{server_name}] RuntimeError loading resources: {e}")
+                except Exception as e: log.error(f"[{server_name}] Error loading resources: {e}", exc_info=True); raise # Re-raise other errors
+            else: log.info(f"[{server_name}] Skipping resources (not advertised or list_resources unavailable).")
+
+        async def load_prompts_task():
+            if has_prompts and hasattr(session, 'list_prompts'):
+                log.info(f"[{server_name}] Loading prompts...")
+                try:
+                    list_prompts_result = await asyncio.wait_for(session.list_prompts(), timeout=capability_timeout)
+                    if list_prompts_result and hasattr(list_prompts_result, 'prompts'):
+                         self._process_list_result(server_name, list_prompts_result.prompts, self.prompts, MCPPrompt, "prompt")
+                    else: log.warning(f"[{server_name}] Invalid ListPromptsResult.")
+                except asyncio.TimeoutError: log.error(f"[{server_name}] Timeout loading prompts.")
+                except RuntimeError as e: log.error(f"[{server_name}] RuntimeError loading prompts: {e}")
+                except Exception as e: log.error(f"[{server_name}] Error loading prompts: {e}", exc_info=True); raise # Re-raise other errors
+            else: log.info(f"[{server_name}] Skipping prompts (not advertised or list_prompts unavailable).")
+        # --- End definition of loading tasks ---
+
+        # --- Use anyio.create_task_group for structured concurrency ---
         try:
-            # --- Step 1: Setup Persistent Streams using the standard sse_client ---
-            log.info(f"[{current_server_name}] Attempting standard SSE connection via sse_client to {connect_url} (Attempt {retry_count+1})...")
-
-            sse_client_context = sse_client(
-                url=connect_url,
-                headers=None,
-                timeout=connect_timeout, # Base timeout for connect/initial ops
-                sse_read_timeout=timedelta(minutes=15).total_seconds()
-            )
-            read_stream, write_stream = await self.exit_stack.enter_async_context(sse_client_context)
-            log.debug(f"[{current_server_name}] Standard SSE streams obtained via sse_client.")
-
-            # --- Step 2: Instantiate the standard ClientSession ---
-            log.info(f"[{current_server_name}] Initializing standard ClientSession...")
-            session_read_timeout_seconds = max(90.0, capability_load_timeout * 2)
-            session = ClientSession(
-                read_stream=read_stream,
-                write_stream=write_stream,
-                read_timeout_seconds=timedelta(seconds=session_read_timeout_seconds)
-            )
-            await self.exit_stack.enter_async_context(session)
-            log.debug(f"[{current_server_name}] Standard ClientSession instantiated and context entered.")
-
-            # --- Step 3: Perform Handshake using ClientSession ---
-            log.info(f"[{current_server_name}] Performing standard MCP handshake via ClientSession.initialize()...")
-            initialize_result_obj = await asyncio.wait_for(
-                session.initialize(),
-                timeout=handshake_timeout
-            )
-            log.info(f"[{current_server_name}] Standard Initialize successful (SSE). Server reported: {initialize_result_obj.serverInfo}")
-
-            # --- Step 4: LOAD CAPABILITIES ---
-            log.info(f"[{current_server_name}] Loading capabilities after standard handshake (SSE)...")
-            server_capabilities = initialize_result_obj.capabilities if initialize_result_obj else None
-            log.debug(f"[{current_server_name}] Received Server Capabilities (Standard SSE): {server_capabilities}")
-            capability_results = {}
-
-            async def load_tools():
-                 if server_capabilities and server_capabilities.tools is not None:
-                     log.info(f"[{current_server_name}] Listing tools (Standard SSE)...")
-                     try: result = await session.list_tools(); capability_results['tools'] = result.tools if result else []
-                     except Exception as e: capability_results['tools_error'] = e
-                 else: log.info(f"[{current_server_name}] Skipping tools (not advertised, Standard SSE)")
-
-            async def load_resources():
-                 if server_capabilities and server_capabilities.resources is not None:
-                     log.info(f"[{current_server_name}] Listing resources (Standard SSE)...")
-                     try: result = await session.list_resources(); capability_results['resources'] = result.resources if result else []
-                     except Exception as e: capability_results['resources_error'] = e
-                 else: log.info(f"[{current_server_name}] Skipping resources (not advertised, Standard SSE)")
-
-            async def load_prompts():
-                 if server_capabilities and server_capabilities.prompts is not None:
-                     log.info(f"[{current_server_name}] Listing prompts (Standard SSE)...")
-                     try: result = await session.list_prompts(); capability_results['prompts'] = result.prompts if result else []
-                     except Exception as e: capability_results['prompts_error'] = e
-                 else: log.info(f"[{current_server_name}] Skipping prompts (not advertised, Standard SSE)")
-
-            try: # Load concurrently
-                 async with asyncio.timeout(outer_wait_timeout):
-                      async with anyio.create_task_group() as cap_tg:
-                           cap_tg.start_soon(load_tools)
-                           cap_tg.start_soon(load_resources)
-                           cap_tg.start_soon(load_prompts)
-            except TimeoutError: log.error(f"[{current_server_name}] Overall timeout ({outer_wait_timeout}s) loading capabilities (Standard SSE).")
-
-            # Process results
-            if 'tools' in capability_results: self._process_list_result(current_server_name, capability_results['tools'], self.tools, MCPTool, "tool")
-            elif 'tools_error' in capability_results: log.error(f"[{current_server_name}] Error loading tools (Standard SSE): {capability_results['tools_error']}")
-            if 'resources' in capability_results: self._process_list_result(current_server_name, capability_results['resources'], self.resources, MCPResource, "resource")
-            elif 'resources_error' in capability_results: log.error(f"[{current_server_name}] Error loading resources (Standard SSE): {capability_results['resources_error']}")
-            if 'prompts' in capability_results: self._process_list_result(current_server_name, capability_results['prompts'], self.prompts, McpPromptType, "prompt")
-            elif 'prompts_error' in capability_results: log.error(f"[{current_server_name}] Error loading prompts (Standard SSE): {capability_results['prompts_error']}")
-
-
-            log.info(f"[{current_server_name}] Standard SSE handshake and capability loading complete.")
-            return session, initialize_result_obj
-
-        except (httpx.RequestError, httpx.HTTPStatusError, McpError, asyncio.TimeoutError) as err:
-            log.info(f"[{current_server_name}] Standard SSE connection/handshake failed ({type(err).__name__}): {err}", exc_info=False)
-            # IMPORTANT: Cleanup is handled by the main exit stack automatically on exception
-            raise err
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(load_tools_task)
+                tg.start_soon(load_resources_task)
+                tg.start_soon(load_prompts_task)
         except Exception as e:
-            is_common_failure = False
-            if isinstance(e, BaseExceptionGroup):
-                # Check if all sub-exceptions are common connection issues
-                common_errors = (httpx.ConnectError, asyncio.TimeoutError, ConnectionRefusedError)
-                # Check if there's at least one exception and all are common errors
-                if e.exceptions and all(isinstance(sub_exc, common_errors) for sub_exc in e.exceptions):
-                    is_common_failure = True
-                    # Log simple message for common group failure, NOT the full group traceback
-                    log.info(f"[{current_server_name}] Task group failed due to expected connection errors.", exc_info=False)
-            elif isinstance(e, (httpx.ConnectError, asyncio.TimeoutError)): # Handle direct common errors
-                 is_common_failure = True
-                 # This case might be redundant if the previous block catches these too, but safe to keep
-                 log.info(f"[{current_server_name}] Caught common connection error directly: {e}", exc_info=False)
-            if not is_common_failure:
-                # Log truly unexpected errors (including ExceptionGroups with non-common sub-exceptions) with traceback
-                log.warning(f"[{current_server_name}] Unexpected error during standard SSE connection/handshake: {e}", exc_info=True)
-            # IMPORTANT: Cleanup is handled by the main exit stack automatically on exception
-            raise e # Re-raise the original exception
+            # Log errors that caused the task group to cancel or other issues
+            log.error(f"[{server_name}] Error during concurrent capability loading task group: {e}", exc_info=True)
+        # --- End anyio usage ---
+
+        log.info(f"[{server_name}] Capability loading attempt finished.")
 
     async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
         """
         Connect to a single MCP server (STDIO or SSE) with retry logic.
-        Handles server renaming based on InitializeResult.
+        Handles server renaming based on InitializeResult BEFORE loading capabilities.
+        Creates persistent SSE session *after* successful handshake.
         """
-        current_server_name = server_config.name
+        initial_server_name = server_config.name
         current_server_config = dataclasses.replace(server_config)
+        current_server_name = initial_server_name
+
         retry_count = 0
         config_updated_by_rename = False
         max_retries = current_server_config.retry_policy.get("max_attempts", 3)
         backoff_factor = current_server_config.retry_policy.get("backoff_factor", 0.5)
 
-        with safe_stdout(): # Ensure all prints go to stderr if stdio active
+        with safe_stdout():
             while retry_count <= max_retries:
                 start_time = time.time()
                 session: Optional[ClientSession] = None
                 initialize_result_obj: Optional[Union[InitializeResult, Dict[str, Any]]] = None
                 process_this_attempt: Optional[asyncio.subprocess.Process] = None
-                stderr_reader_task_this_attempt: Optional[asyncio.Task] = None
+                # sse_client_context is managed within the attempt_exit_stack for SSE
                 connection_error: Optional[BaseException] = None
                 rename_occurred_this_attempt = False
                 span = None
                 span_context_manager = None
+                attempt_exit_stack = AsyncExitStack() # Stack for THIS attempt's resources
 
                 try: # Trace span setup
                     if tracer:
                         try:
                             span_context_manager = tracer.start_as_current_span(
                                 f"connect_server.{current_server_name}",
-                                attributes={ "server.name": current_server_name, "server.type": current_server_config.type.value, "retry": retry_count }
+                                attributes={ "server.name": initial_server_name, "server.type": current_server_config.type.value, "retry": retry_count }
                             )
                             if span_context_manager: span = span_context_manager.__enter__()
                         except Exception as e: log.warning(f"Failed to start trace span: {e}"); span = None; span_context_manager = None
 
                     # --- Main Connection Attempt ---
                     try:
-                        self._safe_printer(f"[cyan]Attempting connection & full setup for {current_server_name} (Attempt {retry_count+1}/{max_retries+1})...[/]")
+                        self._safe_printer(f"[cyan]Connecting to {initial_server_name} (as '{current_server_name}', Attempt {retry_count+1}/{max_retries+1})...[/]")
 
-                        # --- Call Connection Helpers ---
+                        # --- Connection & Handshake ---
                         if current_server_config.type == ServerType.STDIO:
-                            session, initialize_result_obj, process_this_attempt, stderr_reader_task_this_attempt = await self._connect_stdio_server(
+                            # STDIO connection uses its helper which returns the persistent session
+                            session, initialize_result_obj, process_this_attempt, _ = await self._connect_stdio_server(
                                 current_server_config, current_server_name, retry_count
                             )
+                            # Manage temporary process lifetime context for this attempt
+                            if process_this_attempt:
+                                 await attempt_exit_stack.enter_async_context(self._manage_process_lifetime(process_this_attempt, f"attempt-{current_server_name}-{retry_count}"))
+                            # Add the persistent session to the attempt stack
+                            if session:
+                                await attempt_exit_stack.enter_async_context(session)
+
                         elif current_server_config.type == ServerType.SSE:
-                            session, initialize_result_obj = await self._connect_sse_server(
-                                current_server_config, current_server_name, retry_count
+                            # *** SSE Connection/Session/Handshake integrated here ***
+                            connect_url = current_server_config.path
+                            parsed_connect_url = urlparse(connect_url)
+                            if not parsed_connect_url.scheme: connect_url = f"http://{connect_url}"
+
+                            connect_timeout = current_server_config.timeout if current_server_config.timeout > 0 else 10.0
+                            # Use a very long read timeout for the persistent session's underlying streams
+                            persistent_read_timeout_secs = timedelta(minutes=30).total_seconds()
+                            handshake_timeout = (current_server_config.timeout * 3) + 15.0 if current_server_config.timeout > 0 else 45.0
+
+                            log.info(f"[{current_server_name}] Creating persistent SSE context and session for {connect_url}...")
+
+                            # Create and enter the sse_client context within the attempt stack
+                            # This context manages the underlying streams and background tasks
+                            sse_ctx = sse_client(
+                                url=connect_url,
+                                headers=None,
+                                timeout=connect_timeout, # Timeout for initial connection
+                                sse_read_timeout=persistent_read_timeout_secs # Long timeout for background reader
                             )
+                            read_stream, write_stream = await attempt_exit_stack.enter_async_context(sse_ctx)
+                            log.debug(f"[{current_server_name}] Persistent SSE streams obtained via sse_client context.")
+
+                            # Create and enter the persistent ClientSession within the attempt stack
+                            # Use a slightly longer timeout for the session's read operations than the underlying stream
+                            session_read_timeout_secs = persistent_read_timeout_secs + 10.0
+                            session = ClientSession(
+                                read_stream=read_stream,
+                                write_stream=write_stream,
+                                read_timeout_seconds=timedelta(seconds=session_read_timeout_secs)
+                            )
+                            await attempt_exit_stack.enter_async_context(session)
+                            log.info(f"[{current_server_name}] Persistent SSE ClientSession created and context entered.")
+
+                            # Perform handshake using the persistent session
+                            log.info(f"[{current_server_name}] Performing standard MCP handshake via persistent ClientSession.initialize()...")
+                            initialize_result_obj = await asyncio.wait_for(
+                                session.initialize(), # This sends the request and waits for response via the session's reader
+                                timeout=handshake_timeout
+                            )
+                            log.info(f"[{current_server_name}] Standard Initialize successful (SSE). Server reported: {initialize_result_obj.serverInfo}")
                             process_this_attempt = None # No process for SSE
-                            stderr_reader_task_this_attempt = None
+
                         else:
                             raise RuntimeError(f"Unknown server type: {current_server_config.type}")
 
                         if not session:
-                             raise RuntimeError(f"Connection helper returned None session for {current_server_name}")
+                             # This path should ideally not be hit if helpers raise exceptions on failure
+                             raise RuntimeError(f"Session object is None after connection attempt for {current_server_name}")
 
-                        # --- Rename Logic ---
+                        # --- Rename Logic (Uses initialize_result_obj) ---
                         original_name_before_rename = current_server_name
-                        if initialize_result_obj:
-                            actual_server_name = None
-                            if isinstance(initialize_result_obj, dict): # STDIO (or potentially custom SSE result)
-                                actual_server_name = initialize_result_obj.get("serverInfo", {}).get("name")
-                            elif isinstance(initialize_result_obj, InitializeResult): # Standard/Custom SSE result
-                                if hasattr(initialize_result_obj, 'serverInfo') and initialize_result_obj.serverInfo:
-                                    actual_server_name = initialize_result_obj.serverInfo.name
+                        actual_server_name_from_init = None
+                        server_capabilities_from_init = None # Use this to store the capabilities dict/object
 
-                            if actual_server_name and actual_server_name != current_server_name:
-                                if actual_server_name in self.config.servers and actual_server_name != current_server_name:
-                                    log.warning(f"Server '{current_server_name}' reported name '{actual_server_name}', but it already exists. Keeping '{current_server_name}'.")
+                        if initialize_result_obj:
+                            if isinstance(initialize_result_obj, dict): # STDIO result
+                                server_info = initialize_result_obj.get("serverInfo", {})
+                                actual_server_name_from_init = server_info.get("name")
+                                server_capabilities_from_init = initialize_result_obj.get("capabilities")
+                            elif isinstance(initialize_result_obj, InitializeResult): # Standard SSE result
+                                if initialize_result_obj.serverInfo:
+                                    actual_server_name_from_init = initialize_result_obj.serverInfo.name
+                                server_capabilities_from_init = initialize_result_obj.capabilities
+
+                            # --- Perform Rename IF name differs and is valid ---
+                            if actual_server_name_from_init and actual_server_name_from_init != current_server_name:
+                                if actual_server_name_from_init in self.config.servers and actual_server_name_from_init != initial_server_name:
+                                     log.warning(f"Server '{initial_server_name}' reported name '{actual_server_name_from_init}', but it conflicts. Keeping '{current_server_name}'.")
                                 else:
-                                    log.info(f"Server '{current_server_name}' identified as '{actual_server_name}'. Renaming config & loaded items.")
-                                    self._safe_printer(f"[yellow]Server '{current_server_name}' identified as '{actual_server_name}', updating config.[/]")
+                                    log.info(f"Server '{initial_server_name}' identified as '{actual_server_name_from_init}'. Renaming config.")
+                                    self._safe_printer(f"[yellow]Server '{initial_server_name}' identified as '{actual_server_name_from_init}', updating config.[/]")
                                     try:
-                                        if current_server_name in self.config.servers:
-                                            original_config_entry = self.config.servers.pop(current_server_name)
-                                            original_config_entry.name = actual_server_name
-                                            self.config.servers[actual_server_name] = original_config_entry
-                                            if current_server_config.type == ServerType.STDIO and session and hasattr(session, '_server_name'): session._server_name = actual_server_name
+                                        if initial_server_name in self.config.servers:
+                                            original_config_entry = self.config.servers.pop(initial_server_name)
+                                            original_config_entry.name = actual_server_name_from_init
+                                            self.config.servers[actual_server_name_from_init] = original_config_entry
+
                                             if current_server_config.type == ServerType.STDIO:
-                                                if current_server_name in self.processes: self.processes[actual_server_name] = self.processes.pop(current_server_name)
-                                                if current_server_name in self._session_tasks: self._session_tasks[actual_server_name] = self._session_tasks.pop(current_server_name)
-                                            for item_dict in [self.tools, self.resources, self.prompts]:
-                                                keys_to_update = {} ; items_to_update = []
-                                                for key, item in item_dict.items():
-                                                    if item.server_name == original_name_before_rename:
-                                                        items_to_update.append(item)
-                                                        if key.startswith(original_name_before_rename + ":"):
-                                                            new_key = key.replace(original_name_before_rename + ":", actual_server_name + ":", 1)
-                                                            keys_to_update[key] = new_key
-                                                for item in items_to_update: item.server_name = actual_server_name
-                                                for old_key, new_key in keys_to_update.items():
-                                                    if old_key in item_dict: item_dict[new_key] = item_dict.pop(old_key)
-                                            current_server_name = actual_server_name
-                                            current_server_config.name = actual_server_name
+                                                if original_name_before_rename in self.processes:
+                                                    if process_this_attempt and self.processes[original_name_before_rename] == process_this_attempt:
+                                                         self.processes[actual_server_name_from_init] = self.processes.pop(original_name_before_rename)
+                                                    else:
+                                                         log.warning(f"Process mismatch during rename for {original_name_before_rename}.")
+                                                         if original_name_before_rename in self.processes: del self.processes[original_name_before_rename]
+                                                         if process_this_attempt: self.processes[actual_server_name_from_init] = process_this_attempt
+                                                if original_name_before_rename in self._session_tasks:
+                                                     self._session_tasks[actual_server_name_from_init] = self._session_tasks.pop(original_name_before_rename)
+                                                if session and hasattr(session, '_server_name'):
+                                                    session._server_name = actual_server_name_from_init
+
+                                            current_server_name = actual_server_name_from_init
+                                            current_server_config.name = actual_server_name_from_init
                                             config_updated_by_rename = True
                                             rename_occurred_this_attempt = True
-                                        else: log.warning(f"Attempted rename for '{current_server_name}' (to '{actual_server_name}'), but it was no longer in config.")
+                                            if span: span.set_attribute("server.name", current_server_name)
+                                            log.info(f"Successfully renamed server config entry from '{initial_server_name}' to '{current_server_name}'.")
+                                        else:
+                                             log.warning(f"Attempted rename for '{initial_server_name}', but it was no longer in config.")
+                                             actual_server_name_from_init = current_server_name
+
                                     except Exception as rename_err:
-                                        log.error(f"Failed to rename server '{current_server_name}' to '{actual_server_name}': {rename_err}", exc_info=True)
-                                        if current_server_name not in self.config.servers and 'original_config_entry' in locals(): self.config.servers[current_server_name] = original_config_entry
+                                        log.error(f"Failed to rename server config '{initial_server_name}' to '{actual_server_name_from_init}': {rename_err}", exc_info=True)
+                                        current_server_name = original_name_before_rename
+                                        current_server_config.name = original_name_before_rename
+                                        config_updated_by_rename = False
+                                        rename_occurred_this_attempt = False
+                                        raise RuntimeError(f"Failed during server rename: {rename_err}") from rename_err
+                        # --- END RENAME LOGIC ---
+
+                        # --- Capability Loading (AFTER potential rename) ---
+                        await self._load_server_capabilities(current_server_name, session, server_capabilities_from_init)
 
                         # --- Success Path ---
                         connection_time = (time.time() - start_time) * 1000
                         server_config_in_dict = self.config.servers.get(current_server_name)
                         if server_config_in_dict:
+                            # ... (update metrics) ...
                             server_config_in_dict.metrics.request_count += 1
                             server_config_in_dict.metrics.update_response_time(connection_time / 1000.0)
                             server_config_in_dict.metrics.update_status()
                         if latency_histogram:
                             with suppress(Exception): latency_histogram.record(connection_time, {"server.name": current_server_name})
                         if span:
+                            # ... (update span) ...
                             span.set_status(trace.StatusCode.OK)
                             if rename_occurred_this_attempt: span.set_attribute("server.name", current_server_name)
+
                         tools_loaded_count = len([t for t in self.tools.values() if t.server_name == current_server_name])
-                        log.info(f"Connected to {current_server_name} ({tools_loaded_count} tools loaded) in {connection_time:.2f}ms")
+                        log.info(f"Connected & loaded capabilities for {current_server_name} ({tools_loaded_count} tools) in {connection_time:.2f}ms")
                         self._safe_printer(f"[green]Connected & loaded: {current_server_name} ({tools_loaded_count} tools)[/]")
+
+                        # *** Add session to MAIN active_sessions and transfer resources from attempt_stack ***
                         self.active_sessions[current_server_name] = session
+                        # Move session, process context (STDIO), sse_client context (SSE) to main stack
+                        # Use sync pop_all(), no await needed
+                        await self.exit_stack.enter_async_context(attempt_exit_stack.pop_all())
+
+                        # Store final process object under final server name (only if STDIO)
+                        if process_this_attempt and current_server_config.type == ServerType.STDIO:
+                            self.processes[current_server_name] = process_this_attempt
+
+                        # Save config IF rename occurred
                         if config_updated_by_rename:
                             log.info(f"Saving configuration after server rename to {current_server_name}...")
                             await self.config.save_async()
                             config_updated_by_rename = False
+
                         if span_context_manager: span_context_manager.__exit__(None, None, None)
                         return session # Return success
 
                     # --- Outer Exception Handling for Connection Attempt ---
                     except (McpError, RuntimeError, ConnectionAbortedError, httpx.RequestError, subprocess.SubprocessError, OSError, FileNotFoundError, asyncio.TimeoutError, BaseException) as e:
+                        connection_error = e
+                        # ... (Keep existing error logging logic) ...
                         is_common_connect_error = False
                         common_errors_tuple = (httpx.ConnectError, asyncio.TimeoutError, ConnectionRefusedError, ConnectionAbortedError)
                         if isinstance(e, common_errors_tuple):
                             is_common_connect_error = True
                         elif isinstance(e, BaseExceptionGroup):
-                            # Check if all sub-exceptions are common connection issues
                             if e.exceptions and all(isinstance(sub_exc, common_errors_tuple) for sub_exc in e.exceptions):
                                 is_common_connect_error = True
-                        log.info(f"Connection attempt failed for {current_server_name} (Attempt {retry_count + 1}, {type(e).__name__}): {e}", exc_info=not is_common_connect_error) # Now uses the refined check
+                        log.info(f"Connection attempt failed for {initial_server_name} (as '{current_server_name}', Attempt {retry_count + 1}, {type(e).__name__}): {e}", exc_info=not is_common_connect_error)
+                        # Cleanup is handled by attempt_exit_stack's __aexit__
 
                     # --- Shared Error Handling & Retry Logic ---
+                    # ... (Keep existing retry logic: increment count, update metrics, update span, sleep) ...
                     retry_count += 1
                     config_for_metrics = self.config.servers.get(current_server_name)
                     if config_for_metrics:
-                        config_for_metrics.metrics.error_count += 1
-                        config_for_metrics.metrics.update_status()
-                    else: log.error(f"Could not find server config for '{current_server_name}' during error metric update.")
+                        config_for_metrics.metrics.error_count += 1; config_for_metrics.metrics.update_status()
+                    else:
+                         log.error(f"Could not find server config for '{current_server_name}' during error metric update.")
 
                     error_msg_for_span = str(connection_error)[:200] + "..." if connection_error and len(str(connection_error)) > 200 else str(connection_error or "Unknown connection error")
                     if span:
                         span.set_status(trace.StatusCode.ERROR, error_msg_for_span)
-                        if rename_occurred_this_attempt: span.set_attribute("server.name", current_server_name)
+                        span.set_attribute("server.name", current_server_name)
 
                     if retry_count <= max_retries:
-                        delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.1, 10.0)
-                        log.info(f"Retrying connection to {current_server_name} in {delay:.2f}s...")
+                         delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.1, 10.0)
+                         error_msg_display = str(connection_error or "Unknown error")[:150] + "..."
+                         log.warning(f"Error details for {initial_server_name} (as '{current_server_name}', attempt {retry_count-1} failed): {str(connection_error or 'Unknown')}")
+                         self._safe_printer(f"[yellow]Error connecting {initial_server_name} (as '{current_server_name}'): {error_msg_display}[/]")
+                         log.info(f"Retrying connection to {initial_server_name} (as '{current_server_name}') in {delay:.2f}s...")
+                         self._safe_printer(f"[cyan]Retrying connection to {initial_server_name} (as '{current_server_name}') in {delay:.2f}s...[/]")
+                         if span_context_manager:
+                             with suppress(Exception): span_context_manager.__exit__(*sys.exc_info())
+                             span_context_manager = None; span = None
+                         await asyncio.sleep(delay)
                         # Continue main while loop
                     else: # Max retries exceeded
                         final_error_msg = str(connection_error or "Unknown connection error")
-                        log.warning(f"Failed to connect to {current_server_name} after {max_retries+1} attempts. Final error: {final_error_msg}")
-                        self._safe_printer(f"[yellow]Server '{current_server_name}' unavailable after {max_retries+1} attempts.[/]")
-                        if current_server_config.type == ServerType.STDIO and current_server_name in self.processes:
-                            proc_to_clean = self.processes.pop(current_server_name, None)
-                            if proc_to_clean and proc_to_clean.returncode is None:
-                                log.info(f"Terminating process for {current_server_name} after max retries.")
-                                await self.terminate_process(current_server_name, proc_to_clean)
+                        log.error(f"Failed to connect to {initial_server_name} (as '{current_server_name}') after {max_retries+1} attempts. Final error: {final_error_msg}")
+                        self._safe_printer(f"[red]Failed to connect to {initial_server_name} (as '{current_server_name}') after {max_retries+1} attempts.[/]")
+
                         if span: span.set_status(trace.StatusCode.ERROR, f"Max retries exceeded. Final: {final_error_msg[:150]}...")
-                        if span_context_manager: 
-                            with suppress(Exception): 
-                                span_context_manager.__exit__(*sys.exc_info())
+                        if span_context_manager:
+                            with suppress(Exception): span_context_manager.__exit__(*sys.exc_info())
                         if config_updated_by_rename:
-                            log.info(f"Saving configuration after failed connection attempts for renamed server {current_server_name}...")
-                            await self.config.save_async()
+                             log.info(f"Saving configuration after failed connection attempts for renamed server {current_server_name}...")
+                             await self.config.save_async()
+                        # Let the attempt_exit_stack clean up resources from the failed attempt
+                        # await attempt_exit_stack.aclose() # No need to explicitly call, 'finally' below handles it
                         return None # Connection failed
 
-                # --- Finally block for trace span ---
+                # --- Finally block for trace span AND attempt cleanup ---
                 finally:
+                    # Ensure attempt-specific resources are closed if the attempt loop continues/exits
+                    await attempt_exit_stack.aclose() # This closes session, sse_ctx, process_ctx if they were added
                     if span_context_manager:
                          with suppress(Exception): span_context_manager.__exit__(*sys.exc_info())
 
             # --- Loop Exit (Should only happen if max retries exceeded) ---
-            log.error(f"Connection loop for {current_server_name} exited after max retries.")
-            if config_updated_by_rename:
-                log.info(f"Saving configuration after loop exit for renamed server {current_server_name}...")
-                await self.config.save_async()
+            log.error(f"Connection loop for {initial_server_name} (as '{current_server_name}') exited after max retries.")
             return None
-        
+
     async def connect_to_servers(self):
         """Connect to all enabled MCP servers"""
         if not self.config.servers:
@@ -4634,6 +4623,9 @@ class MCPClient:
 
         # For tracking the current query task (for dealing with aborting of long running queries)
         self.current_query_task: Optional[asyncio.Task] = None
+        self.session_input_tokens: int = 0
+        self.session_output_tokens: int = 0
+        self.session_total_cost: float = 0.0        
 
         # Extract actual emoji characters, escaping any potential regex special chars
         self._emoji_chars = [re.escape(str(emoji)) for emoji in STATUS_EMOJI.values()]
@@ -5446,7 +5438,7 @@ class MCPClient:
         """Process a query using Claude and available tools with streaming.
         Correctly handles OpenTelemetry spans, tool result formatting, streamed tool inputs,
         and graceful cancellation.
-        **Does not cache error results.**
+        *** Includes detailed tool status yields for UI feedback. ***
         """
         # Wrap the entire function in safe_stdout
         with safe_stdout():
@@ -5533,6 +5525,9 @@ class MCPClient:
         # --- OpenTelemetry Span Handling ---
         span = None
         span_context_manager = None
+        call_cost = 0.0 # Initialize cost for this specific API call
+        current_call_input_tokens = 0 # Track tokens for *this specific* API call within the loop
+        current_call_output_tokens = 0
         if tracer:
             try:
                 span_context_manager = tracer.start_as_current_span(
@@ -5555,6 +5550,11 @@ class MCPClient:
 
             # --- Main Streaming Loop ---
             while True: # Loop handles potential multi-turn tool use
+                # Reset tokens for this iteration of the loop
+                current_call_input_tokens = 0
+                current_call_output_tokens = 0
+                call_cost = 0.0 # Reset cost for this specific turn
+
                 # --- Check for cancellation before API call ---
                 if asyncio.current_task().cancelled():
                     log.debug("Streaming query cancelled before API call.")
@@ -5601,395 +5601,467 @@ class MCPClient:
 
                 # Make the API call
                 try:
-                    # Add a generous timeout for the entire stream processing
-                    async with asyncio.timeout(300): # 5 minutes timeout for the whole stream
-                        async with self.anthropic.messages.stream(
-                            model=model,
-                            max_tokens=max_tokens,
-                            messages=messages,
-                            tools=available_tools if available_tools else None,
-                            temperature=self.config.temperature,
-                        ) as stream:
-                            async for event in stream:
-                                # --- Check for cancellation inside stream loop ---
-                                if asyncio.current_task().cancelled():
-                                    log.debug("Streaming query cancelled during stream processing.")
-                                    yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
-                                    raise asyncio.CancelledError("Query cancelled during stream processing")
+                    final_message = None # Initialize final_message outside the block
+                    async with self.anthropic.messages.stream(
+                        model=model,
+                        max_tokens=max_tokens,
+                        messages=messages,
+                        tools=available_tools if available_tools else None,
+                        temperature=self.config.temperature,
+                    ) as stream: # The 'stream' object here is an AsyncMessageStream
+                        async for event in stream:
+                            # --- Check for cancellation inside stream loop ---
+                            if asyncio.current_task().cancelled():
+                                log.debug("Streaming query cancelled during stream processing.")
+                                yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
+                                raise asyncio.CancelledError("Query cancelled during stream processing")
 
-                                event_type = event.type
+                            event_type = event.type
 
-                                # Debug logging for received event (unchanged)
-                                if use_debug_logging:
-                                    log.debug(f"--- Stream Event Received --- Type: {event_type}")
-                                    # Add detailed logging for specific event types if needed...
+                            # Debug logging for received event (unchanged)
+                            if use_debug_logging:
+                                log.debug(f"--- Stream Event Received --- Type: {event_type}")
+                                # Add detailed logging for specific event types if needed...
 
-                                # --- Process stream events with state tracking & input accumulation ---
-                                if event_type == "message_start":
-                                    current_assistant_content = [] # Reset content for this assistant message
+                            # --- Process stream events with state tracking & input accumulation ---
+                            if event_type == "message_start":
+                                current_assistant_content = [] # Reset content for this assistant message
 
-                                elif event_type == "content_block_start":
-                                    block_type = event.content_block.type
-                                    if block_type == "text":
-                                        current_text_block = {"type": "text", "text": ""}
-                                    elif block_type == "tool_use":
-                                        current_tool_use_block = {
-                                            "type": "tool_use",
-                                            "id": event.content_block.id,
-                                            "name": event.content_block.name,
-                                            "input": {} # Initialize input
-                                        }
-                                        current_tool_input_json_accumulator = "" # Reset accumulator
+                            elif event_type == "content_block_start":
+                                block_type = event.content_block.type
+                                if block_type == "text":
+                                    current_text_block = {"type": "text", "text": ""}
+                                elif block_type == "tool_use":
+                                    current_tool_use_block = {
+                                        "type": "tool_use",
+                                        "id": event.content_block.id,
+                                        "name": event.content_block.name,
+                                        "input": {} # Initialize input
+                                    }
+                                    current_tool_input_json_accumulator = "" # Reset accumulator
+                                    # *** ADDED: Yield for Tool Preparation ***
+                                    original_tool_name = self.server_manager.sanitized_to_original.get(event.content_block.name, event.content_block.name)
+                                    yield f"@@STATUS@@\n{STATUS_EMOJI['tool']} Preparing tool: {original_tool_name} (ID: {event.content_block.id[:8]})...\n"
+                                    # *** END ADDED ***
 
-                                elif event_type == "content_block_delta":
-                                    delta = event.delta
-                                    if hasattr(delta, 'type'): # Check if delta has a type
-                                        if delta.type == "text_delta":
-                                            if current_text_block is not None: # Ensure we are tracking a text block
-                                                text_chunk = delta.text
-                                                current_text_block["text"] += text_chunk
-                                                yield text_chunk # Yield for live display
-                                        elif delta.type == "input_json_delta":
-                                            if current_tool_use_block is not None: # Ensure we are tracking a tool block
-                                                current_tool_input_json_accumulator += delta.partial_json
+                            elif event_type == "content_block_delta":
+                                delta = event.delta
+                                if hasattr(delta, 'type'): # Check if delta has a type
+                                    if delta.type == "text_delta":
+                                        if current_text_block is not None: # Ensure we are tracking a text block
+                                            text_chunk = delta.text
+                                            current_text_block["text"] += text_chunk
+                                            yield text_chunk # Yield for live display
+                                    elif delta.type == "input_json_delta":
+                                        if current_tool_use_block is not None: # Ensure we are tracking a tool block
+                                            current_tool_input_json_accumulator += delta.partial_json
 
-                                elif event_type == "content_block_stop":
-                                    # Finalize the completed block
-                                    if current_text_block is not None:
-                                        # Finalize and store the text block
-                                        current_assistant_content.append(current_text_block)
-                                        final_response_text += current_text_block["text"]
-                                        current_text_block = None # Reset state
-                                    elif current_tool_use_block is not None:
-                                        # Finalize and store the tool use block
-                                        parsed_input = {} # Default to empty dict
-                                        if current_tool_input_json_accumulator:
-                                            try:
-                                                log.debug(f"Attempting to parse JSON for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}). Accumulated JSON string:")
-                                                log.debug(f"RAW_ACCUMULATED_JSON>>>\n{current_tool_input_json_accumulator}\n<<<END_RAW_ACCUMULATED_JSON")
-                                                parsed_input = json.loads(current_tool_input_json_accumulator)
-                                                log.debug(f"Successfully parsed input: {parsed_input}")
-                                            except json.JSONDecodeError as e:
-                                                log.error(f"JSON PARSE FAILED for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}): {e}")
-                                                log.error(f"Failed JSON content was:\n{current_tool_input_json_accumulator}")
-                                                parsed_input = {"_tool_input_parse_error": f"Failed to parse JSON: {e}", "_raw_json": current_tool_input_json_accumulator}
-                                        else:
-                                            log.debug(f"Tool {current_tool_use_block['name']} received empty input stream (expected for no-arg tools). Final input: {{}}")
-                                            parsed_input = {}
+                            elif event_type == "content_block_stop":
+                                # Finalize the completed block
+                                if current_text_block is not None:
+                                    # Finalize and store the text block
+                                    current_assistant_content.append(current_text_block)
+                                    final_response_text += current_text_block["text"]
+                                    current_text_block = None # Reset state
+                                elif current_tool_use_block is not None:
+                                    # Finalize and store the tool use block
+                                    parsed_input = {} # Default to empty dict
+                                    if current_tool_input_json_accumulator:
+                                        try:
+                                            log.debug(f"Attempting to parse JSON for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}). Accumulated JSON string:")
+                                            log.debug(f"RAW_ACCUMULATED_JSON>>>\n{current_tool_input_json_accumulator}\n<<<END_RAW_ACCUMULATED_JSON")
+                                            parsed_input = json.loads(current_tool_input_json_accumulator)
+                                            log.debug(f"Successfully parsed input: {parsed_input}")
+                                        except json.JSONDecodeError as e:
+                                            log.error(f"JSON PARSE FAILED for tool {current_tool_use_block['name']} (ID: {current_tool_use_block['id']}): {e}")
+                                            log.error(f"Failed JSON content was:\n{current_tool_input_json_accumulator}")
+                                            parsed_input = {"_tool_input_parse_error": f"Failed to parse JSON: {e}", "_raw_json": current_tool_input_json_accumulator}
+                                    else:
+                                        log.debug(f"Tool {current_tool_use_block['name']} received empty input stream (expected for no-arg tools). Final input: {{}}")
+                                        parsed_input = {}
 
-                                        current_tool_use_block["input"] = parsed_input
+                                    current_tool_use_block["input"] = parsed_input
 
-                                        current_assistant_content.append(current_tool_use_block)
-                                        tool_calls_this_turn.append(current_tool_use_block)
+                                    current_assistant_content.append(current_tool_use_block)
+                                    tool_calls_this_turn.append(current_tool_use_block)
 
-                                        original_tool_name = self.server_manager.sanitized_to_original.get(current_tool_use_block['name'], current_tool_use_block['name'])
-                                        yield f"@@STATUS@@\n{STATUS_EMOJI['tool']} Preparing tool: {original_tool_name}...\n"
+                                    # *** REMOVED: Yield moved to content_block_start ***
+                                    # original_tool_name = self.server_manager.sanitized_to_original.get(current_tool_use_block['name'], current_tool_use_block['name'])
+                                    # yield f"@@STATUS@@\n{STATUS_EMOJI['tool']} Preparing tool: {original_tool_name}...\n"
+                                    # *** END REMOVED ***
 
-                                        current_tool_use_block = None
-                                        current_tool_input_json_accumulator = ""
+                                    current_tool_use_block = None
+                                    current_tool_input_json_accumulator = ""
 
-                                elif event_type == "message_delta":
-                                    if hasattr(event.delta, 'stop_reason') and event.delta.stop_reason:
-                                        stop_reason = event.delta.stop_reason
+                            elif event_type == "message_delta":
+                                if hasattr(event.delta, 'stop_reason') and event.delta.stop_reason:
+                                    stop_reason = event.delta.stop_reason
+                                # Accumulate usage delta if present (though final_message is more reliable)
+                                if hasattr(event, 'usage') and event.usage:
+                                    current_call_output_tokens += event.usage.output_tokens
 
-                                elif event_type == "message_stop":
-                                    if hasattr(event, 'message') and hasattr(event.message, 'stop_reason'):
-                                        stop_reason = event.message.stop_reason
-                                    # Finalize any trailing text block
-                                    if current_text_block is not None:
-                                        current_assistant_content.append(current_text_block)
-                                        final_response_text += current_text_block["text"]
-                                        current_text_block = None
-                                    # No need to break here, loop condition handles it
-                except TimeoutError:
-                    log.error("Timeout waiting for or processing message stream from Anthropic API.")
-                    yield "@@STATUS@@\n[Error: Timed out waiting for Claude's response]"
-                except asyncio.CancelledError:
-                    log.debug("Anthropic API stream iteration cancelled.")
-                    # Re-raise to be caught by the outer handler in this function
-                    raise
-                except Exception as stream_err:
-                    # Handle other stream errors
-                    log.error(f"Error processing Anthropic message stream: {stream_err}", exc_info=True)
-                    yield f"@@STATUS@@\n[Error processing response: {stream_err}]"
-                    # Decide if this should break the outer loop or just report
-                    stop_reason = "error_in_stream" # Mark an error state
+                            elif event_type == "message_stop":
+                                # Get stop reason from the event if available
+                                if hasattr(event, 'message') and hasattr(event.message, 'stop_reason'):
+                                     stop_reason = event.message.stop_reason
+                                # Finalize any trailing text block
+                                if current_text_block is not None:
+                                    current_assistant_content.append(current_text_block)
+                                    final_response_text += current_text_block["text"]
+                                    current_text_block = None
 
-                # --- Post-Stream Processing ---
-                # Add the assistant message (potentially containing text and/or completed tool_use blocks) to the history
-                if current_assistant_content:
-                    messages.append({"role": "assistant", "content": current_assistant_content})
+                        # --- AFTER the `async for event in stream:` loop finishes ---
+                        # Explicitly get the final message object from the stream
+                        final_message = await stream.get_final_message() # <-- Correct placement
 
-                # --- Check for cancellation before tool execution ---
-                if asyncio.current_task().cancelled():
-                    log.debug("Streaming query cancelled before tool execution loop.")
-                    yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
-                    raise asyncio.CancelledError("Query cancelled before tool execution")
+                    # --- Now process final_message for usage ---
+                    if final_message and hasattr(final_message, 'usage') and final_message.usage:
+                        current_call_input_tokens = final_message.usage.input_tokens # Get final input tokens
+                        current_call_output_tokens = final_message.usage.output_tokens # Get final output tokens
+                        self.session_input_tokens += current_call_input_tokens
+                        self.session_output_tokens += current_call_output_tokens
 
-                # Check if the reason for stopping was tool use
-                if stop_reason == "tool_use":
-                    tool_results_for_api: List[MessageParam] = []
-                    total_tools_in_turn = len(tool_calls_this_turn) # Get total count for this turn
-
-                    # Execute the completed tool calls collected during this stream iteration
-                    for i, tool_call_block in enumerate(tool_calls_this_turn): # Add index 'i'
-                        # --- Check for cancellation inside tool loop ---
-                        if asyncio.current_task().cancelled():
-                            log.debug("Streaming query cancelled during tool processing loop.")
-                            yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
-                            raise asyncio.CancelledError("Query cancelled during tool processing")
-
-                        tool_name_sanitized = tool_call_block["name"]
-                        tool_args = tool_call_block["input"] # Already parsed or contains error marker
-                        tool_use_id = tool_call_block["id"]
-                        tool_start_time = time.time() # Start timer for this specific tool call
-
-                        log.debug(f"Processing completed tool call {i+1}/{total_tools_in_turn}. Name: {tool_name_sanitized}, ID: {tool_use_id}, Args: {repr(tool_args)}")
-
-                        original_tool_name = self.server_manager.sanitized_to_original.get(tool_name_sanitized, tool_name_sanitized)
-                        tool_short_name = original_tool_name.split(':')[-1] # Get short name
-
-                        # Initialize vars for this tool call
-                        api_content_for_claude: str = "Error: Tool execution failed unexpectedly."
-                        log_content_for_history: Any = api_content_for_claude # Can store richer data for logging
-                        is_error = True
-                        cache_used = False
-
-                        # Handle potential JSON parsing error from stream processing
-                        if isinstance(tool_args, dict) and "_tool_input_parse_error" in tool_args:
-                             error_text = f"Client failed to parse JSON input from API for tool '{original_tool_name}'. Raw: {tool_args.get('_raw_json', 'N/A')}"
-                             api_content_for_claude = f"Error: {error_text}"
-                             log_content_for_history = {"error": error_text, "raw_json": tool_args.get('_raw_json')}
-                             is_error = True
-                             yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Input Error for [bold]{tool_short_name}[/]: {error_text}"
-                             log.error(error_text)
+                        # Ensure 'model' variable is accessible here (it should be from the function arguments)
+                        model_cost = COST_PER_MILLION_TOKENS.get(model)
+                        if model_cost:
+                            call_cost = (current_call_input_tokens * model_cost.get("input", 0) / 1_000_000) + \
+                                        (current_call_output_tokens * model_cost.get("output", 0) / 1_000_000)
+                            self.session_total_cost += call_cost
                         else:
-                            # Proceed if input was valid
-                            tool = self.server_manager.tools.get(original_tool_name)
+                            log.warning(f"Cost data not found for model: {model}. Session cost may be inaccurate.")
 
-                            if not tool:
-                                error_text = f"Tool '{original_tool_name}' (req: '{tool_name_sanitized}') not found by client."
+                        # Ensure 'span' variable is accessible here
+                        if span:
+                            span.set_attribute("api.input_tokens", current_call_input_tokens)
+                            span.set_attribute("api.output_tokens", current_call_output_tokens)
+                            span.set_attribute("api.estimated_cost", call_cost if model_cost else 0)
+                        log.info(f"API Call Tokens - Input: {current_call_input_tokens}, Output: {current_call_output_tokens}. Cost: ${call_cost:.4f}")
+                        yield f"@@STATUS@@\n{STATUS_EMOJI['model']} API Call Tokens: In={current_call_input_tokens}, Out={current_call_output_tokens} (Cost: ${call_cost:.4f})"
+
+                    else: # Handle case where final_message or usage is missing
+                        log.warning("Could not retrieve final usage data from the stream.")
+                        if span: span.set_attribute("api.usage_retrieval_error", True)
+
+
+                    # --- Post-Stream Processing (Before Handling Exceptions) ---
+                    # Add the assistant message (potentially containing text and/or completed tool_use blocks) to the message list
+                    if current_assistant_content:
+                        messages.append({"role": "assistant", "content": current_assistant_content})
+
+                    # --- Check for cancellation before tool execution ---
+                    if asyncio.current_task().cancelled():
+                        log.debug("Streaming query cancelled before tool execution loop.")
+                        yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
+                        raise asyncio.CancelledError("Query cancelled before tool execution")
+
+                    # Check if the reason for stopping was tool use
+                    if stop_reason == "tool_use":
+                        tool_results_for_api: List[MessageParam] = []
+                        total_tools_in_turn = len(tool_calls_this_turn) # Get total count for this turn
+
+                        # Execute the completed tool calls collected during this stream iteration
+                        for i, tool_call_block in enumerate(tool_calls_this_turn): # Add index 'i'
+                            # --- Check for cancellation inside tool loop ---
+                            if asyncio.current_task().cancelled():
+                                log.debug("Streaming query cancelled during tool processing loop.")
+                                yield "@@STATUS@@\n[yellow]Request Aborted by User.[/]"
+                                raise asyncio.CancelledError("Query cancelled during tool processing")
+
+                            tool_name_sanitized = tool_call_block["name"]
+                            tool_args = tool_call_block["input"] # Already parsed or contains error marker
+                            tool_use_id = tool_call_block["id"]
+                            tool_start_time = time.time() # Start timer for this specific tool call
+
+                            log.debug(f"Processing completed tool call {i+1}/{total_tools_in_turn}. Name: {tool_name_sanitized}, ID: {tool_use_id}, Args: {repr(tool_args)}")
+
+                            original_tool_name = self.server_manager.sanitized_to_original.get(tool_name_sanitized, tool_name_sanitized)
+                            tool_short_name = original_tool_name.split(':')[-1] # Get short name
+
+                            # Initialize vars for this tool call
+                            api_content_for_claude: str = "Error: Tool execution failed unexpectedly."
+                            log_content_for_history: Any = api_content_for_claude # Can store richer data for log
+                            is_error = True
+                            cache_used = False
+
+                            # Handle potential JSON parsing error from stream processing
+                            if isinstance(tool_args, dict) and "_tool_input_parse_error" in tool_args:
+                                error_text = f"Client failed to parse JSON input from API for tool '{original_tool_name}'. Raw: {tool_args.get('_raw_json', 'N/A')}"
                                 api_content_for_claude = f"Error: {error_text}"
-                                log_content_for_history = {"error": error_text}
+                                log_content_for_history = {"error": error_text, "raw_json": tool_args.get('_raw_json')}
                                 is_error = True
-                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: {error_text}"
-                                log.warning(f"Tool mapping/not found. Sanitized: '{tool_name_sanitized}', Original: '{original_tool_name}'")
+                                # *** RESTORED YIELD FOR INPUT PARSE ERROR ***
+                                yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Input Error for [bold]{tool_short_name}[/]: Client failed to parse JSON input."
+                                log.error(error_text)
+                                # *** END RESTORED YIELD ***
                             else:
-                                servers_used.add(tool.server_name)
-                                tools_used.append(original_tool_name)
-                                session = self.server_manager.active_sessions.get(tool.server_name)
+                                # Proceed if input was valid
+                                tool = self.server_manager.tools.get(original_tool_name)
 
-                                if not session:
-                                    error_text = f"Server '{tool.server_name}' for tool '{original_tool_name}' is not connected."
+                                if not tool:
+                                    error_text = f"Tool '{original_tool_name}' (req: '{tool_name_sanitized}') not found by client."
                                     api_content_for_claude = f"Error: {error_text}"
                                     log_content_for_history = {"error": error_text}
                                     is_error = True
-                                    yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: {error_text}"
+                                    # *** RESTORED YIELD FOR TOOL NOT FOUND ***
+                                    yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Tool Error: Tool '{original_tool_name}' not found by client."
+                                    log.warning(f"Tool mapping/not found. Sanitized: '{tool_name_sanitized}', Original: '{original_tool_name}'")
+                                    # *** END RESTORED YIELD ***
                                 else:
-                                    # Check cache
-                                    cached_result = None
-                                    if self.tool_cache:
-                                        try:
-                                            cached_result = self.tool_cache.get(original_tool_name, tool_args)
-                                        except TypeError as cache_key_error:
-                                             log.warning(f"Cannot check cache for {original_tool_name}: args unhashable ({type(tool_args)}). Error: {cache_key_error}")
-                                             cached_result = None
+                                    servers_used.add(tool.server_name)
+                                    tools_used.append(original_tool_name)
+                                    session = self.server_manager.active_sessions.get(tool.server_name)
 
-                                        if cached_result is not None:
-                                            # Cached result could be an error string we stored previously
-                                            is_cached_error = isinstance(cached_result, str) and cached_result.startswith("Error:")
-                                            if is_cached_error:
-                                                log.info(f"Cached result for {original_tool_name} is error, ignoring cache.")
-                                                cached_result = None # Treat as cache miss
-                                            else:
-                                                api_content_for_claude = str(cached_result)
-                                                log_content_for_history = cached_result # Keep original type for log
-                                                is_error = False # Cached non-error is success
-                                                cache_used = True
-                                                cache_hits_during_query += 1
-                                                # Add token estimate to cache message
-                                                cached_tokens = self._estimate_string_tokens(api_content_for_claude)
-                                                # Use markdown bold
-                                                yield (f"@@STATUS@@\n{STATUS_EMOJI['cached']} Using cached result for [bold]{tool_short_name}[/] "
-                                                       f"({cached_tokens} tokens)")
-                                                log.info(f"Using cached result for {original_tool_name}")
+                                    if not session:
+                                        error_text = f"Server '{tool.server_name}' for tool '{original_tool_name}' is not connected."
+                                        api_content_for_claude = f"Error: {error_text}"
+                                        log_content_for_history = {"error": error_text}
+                                        is_error = True
+                                        # *** RESTORED YIELD FOR SERVER NOT CONNECTED ***
+                                        yield f"@@STATUS@@\n{STATUS_EMOJI['failure']} Server Error: Server '{tool.server_name}' for tool '{original_tool_name}' not connected."
+                                        log.error(error_text)
+                                        # *** END RESTORED YIELD ***
+                                    else:
+                                        # Check cache
+                                        cached_result = None
+                                        if self.tool_cache:
+                                            try:
+                                                cached_result = self.tool_cache.get(original_tool_name, tool_args)
+                                            except TypeError as cache_key_error:
+                                                 log.warning(f"Cannot check cache for {original_tool_name}: args unhashable ({type(tool_args)}). Error: {cache_key_error}")
+                                                 cached_result = None
 
-                                    # Execute if not cached
-                                    if not cache_used:
-                                        # Update status - Remove redundant server name
-                                        # Use markdown bold
-                                        yield (f"@@STATUS@@\n{STATUS_EMOJI['server']} Executing [bold]{tool_short_name}[/] via {tool.server_name}...")
-                                        try:
-                                            # Check for cancellation just before execution
-                                            if asyncio.current_task().cancelled():
-                                                log.debug(f"Streaming query cancelled just before executing tool {original_tool_name}.")
-                                                raise asyncio.CancelledError(f"Query cancelled before executing tool {original_tool_name}")
-
-                                            with safe_stdout():
-                                                # This await will either return a CallToolResult or raise an exception
-                                                tool_call_outcome: CallToolResult = await self.execute_tool(
-                                                    tool.server_name, original_tool_name, tool_args
-                                                )
-
-                                            tool_latency = time.time() - tool_start_time # Calculate latency
-
-                                            # Directly check isError, as tool_call_outcome cannot be None here
-                                            if tool_call_outcome.isError:
-                                                error_text = "Tool execution failed."
-                                                # Attempt to extract more specific error from content
-                                                extracted_error = "Unknown server error"
-                                                if tool_call_outcome.content:
-                                                    if isinstance(tool_call_outcome.content, str):
-                                                        extracted_error = tool_call_outcome.content
-                                                    elif isinstance(tool_call_outcome.content, dict) and 'error' in tool_call_outcome.content:
-                                                        extracted_error = str(tool_call_outcome.content['error'])
-                                                    elif isinstance(tool_call_outcome.content, list) and tool_call_outcome.content:
-                                                        # Try to get text from the first block if it's a common structure
-                                                        first_block = tool_call_outcome.content[0]
-                                                        if isinstance(first_block, dict) and first_block.get('type') == 'text':
-                                                            extracted_error = first_block.get('text', 'Unknown error structure')
-                                                        else:
-                                                            extracted_error = str(tool_call_outcome.content) # Fallback
-                                                    else:
-                                                         extracted_error = str(tool_call_outcome.content) # Fallback
-
-                                                error_text = f"Tool execution failed: {extracted_error}"
-                                                api_content_for_claude = f"Error: {error_text}"
-                                                log_content_for_history = {"error": error_text, "raw_content": tool_call_outcome.content}
-                                                is_error = True
-                                                # Use markdown bold
-                                                yield (f"@@STATUS@@\n{STATUS_EMOJI['failure']} Error executing [bold]{tool_short_name}[/] ({tool_latency:.1f}s): "
-                                                       f"{error_text[:100]}...")
-
-                                            else: # Success case
-                                                # Process success content into a string for API
-                                                if tool_call_outcome.content is None:
-                                                    api_content_for_claude = "Tool executed successfully with no content returned."
-                                                elif isinstance(tool_call_outcome.content, str):
-                                                    api_content_for_claude = tool_call_outcome.content
-                                                elif isinstance(tool_call_outcome.content, (dict, list)):
-                                                    try:
-                                                        # Attempt to serialize complex objects nicely
-                                                        api_content_for_claude = json.dumps(tool_call_outcome.content, indent=2)
-                                                    except TypeError:
-                                                        # Fallback for non-serializable objects
-                                                        api_content_for_claude = str(tool_call_outcome.content)
+                                            if cached_result is not None:
+                                                # Cached result could be an error string we stored previously
+                                                is_cached_error = isinstance(cached_result, str) and cached_result.startswith("Error:")
+                                                if is_cached_error:
+                                                    log.info(f"Cached result for {original_tool_name} is error, ignoring cache.")
+                                                    cached_result = None # Treat as cache miss
                                                 else:
-                                                    # Fallback for other types
-                                                    api_content_for_claude = str(tool_call_outcome.content)
+                                                    api_content_for_claude = str(cached_result)
+                                                    log_content_for_history = cached_result # Keep original type for log
+                                                    is_error = False # Cached non-error is success
+                                                    cache_used = True
+                                                    cache_hits_during_query += 1
+                                                    # Add token estimate to cache message
+                                                    cached_tokens = self._estimate_string_tokens(api_content_for_claude)
+                                                    # Use markdown bold
+                                                    # *** RESTORED YIELD FOR CACHE HIT ***
+                                                    yield (f"@@STATUS@@\n{STATUS_EMOJI['cached']} Using cached result for [bold]{tool_short_name}[/] "
+                                                           f"({cached_tokens} tokens)")
+                                                    log.info(f"Using cached result for {original_tool_name}")
+                                                    # *** END RESTORED YIELD ***
 
-                                                log_content_for_history = tool_call_outcome.content # Log original success content
-                                                is_error = False
-                                                # Add token estimate and latency to success status
-                                                result_tokens = self._estimate_string_tokens(api_content_for_claude)
-                                                yield (f"@@STATUS@@\n{STATUS_EMOJI['success']} Result from [bold]{tool_short_name}[/] "
-                                                       f"({result_tokens:,} tokens, {tool_latency:.1f}s)")
+                                        # Execute if not cached
+                                        if not cache_used:
+                                            # *** RESTORED YIELD FOR TOOL EXECUTION START ***
+                                            yield (f"@@STATUS@@\n{STATUS_EMOJI['server']} Executing [bold]{tool_short_name}[/] via {tool.server_name}...")
+                                            log.info(f"Executing tool '{original_tool_name}' via server '{tool.server_name}'...")
+                                            # *** END RESTORED YIELD ***
+                                            try:
+                                                # Check for cancellation just before execution
+                                                if asyncio.current_task().cancelled():
+                                                    log.debug(f"Streaming query cancelled just before executing tool {original_tool_name}.")
+                                                    raise asyncio.CancelledError(f"Query cancelled before executing tool {original_tool_name}")
 
-                                            # Cache result if successful and cache enabled (but not error results)
-                                            if self.tool_cache and not is_error:
-                                                try:
-                                                    # We cache the string representation sent to Claude
-                                                    self.tool_cache.set(original_tool_name, tool_args, api_content_for_claude)
-                                                except TypeError as cache_set_error:
-                                                     log.warning(f"Failed to cache result for {original_tool_name}: {cache_set_error}")
-                                            elif is_error:
-                                                log.info(f"Skipping cache for error result of {original_tool_name}.")
+                                                with safe_stdout():
+                                                    # This await will either return a CallToolResult or raise an exception
+                                                    tool_call_outcome: CallToolResult = await self.execute_tool(
+                                                        tool.server_name, original_tool_name, tool_args
+                                                    )
 
-                                        except asyncio.CancelledError:
-                                            log.debug(f"Tool execution for {original_tool_name} cancelled.")
-                                            # Need to set state for the API response
-                                            error_text = "Tool execution aborted by user."
-                                            api_content_for_claude = f"Error: {error_text}"
-                                            log_content_for_history = {"error": error_text}
-                                            is_error = True
-                                            yield f"@@STATUS@@\n[yellow]Tool [bold]{tool_short_name}[/] execution aborted.[/]"
-                                            # Re-raise CancelledError to stop the entire query process
-                                            raise
+                                                tool_latency = time.time() - tool_start_time # Calculate latency
 
-                                        except Exception as exec_err:
-                                            tool_latency = time.time() - tool_start_time
-                                            log.error(f"Client error during tool execution {original_tool_name}: {exec_err}", exc_info=True)
-                                            error_text = f"Client error: {str(exec_err)}"
-                                            api_content_for_claude = f"Error: {error_text}"
-                                            log_content_for_history = {"error": error_text}
-                                            is_error = True
-                                            # Use markdown bold
-                                            yield (f"@@STATUS@@\n{STATUS_EMOJI['failure']} Client Error during [bold]{tool_short_name}[/] ({tool_latency:.2f}s): "
-                                                   f"{str(exec_err)}")
+                                                # Directly check isError, as tool_call_outcome cannot be None here
+                                                if tool_call_outcome.isError:
+                                                    error_text = "Tool execution failed."
+                                                    # Attempt to extract more specific error from content
+                                                    extracted_error = "Unknown server error"
+                                                    if tool_call_outcome.content:
+                                                        if isinstance(tool_call_outcome.content, str):
+                                                            extracted_error = tool_call_outcome.content
+                                                        elif isinstance(tool_call_outcome.content, dict) and 'error' in tool_call_outcome.content:
+                                                            extracted_error = str(tool_call_outcome.content['error'])
+                                                        elif isinstance(tool_call_outcome.content, list) and tool_call_outcome.content:
+                                                            # Try to get text from the first block if it's a common structure
+                                                            first_block = tool_call_outcome.content[0]
+                                                            if isinstance(first_block, dict) and first_block.get('type') == 'text':
+                                                                extracted_error = first_block.get('text', 'Unknown error structure')
+                                                            else:
+                                                                extracted_error = str(tool_call_outcome.content) # Fallback
+                                                        else:
+                                                             extracted_error = str(tool_call_outcome.content) # Fallback
+
+                                                    error_text = f"Tool execution failed: {extracted_error}"
+                                                    api_content_for_claude = f"Error: {error_text}"
+                                                    log_content_for_history = {"error": error_text, "raw_content": tool_call_outcome.content}
+                                                    is_error = True
+                                                    # *** RESTORED YIELD FOR SERVER-SIDE TOOL ERROR ***
+                                                    yield (f"@@STATUS@@\n{STATUS_EMOJI['failure']} Error executing [bold]{tool_short_name}[/] ({tool_latency:.1f}s): "
+                                                           f"{extracted_error[:100]}...")
+                                                    log.warning(f"Tool '{original_tool_name}' failed on server '{tool.server_name}' ({tool_latency:.1f}s): {extracted_error}")
+                                                    # *** END RESTORED YIELD ***
+
+                                                else: # Success case
+                                                    # Process success content into a string for API
+                                                    if tool_call_outcome.content is None:
+                                                        api_content_for_claude = "Tool executed successfully with no content returned."
+                                                    elif isinstance(tool_call_outcome.content, str):
+                                                        api_content_for_claude = tool_call_outcome.content
+                                                    elif isinstance(tool_call_outcome.content, (dict, list)):
+                                                        try:
+                                                            # Attempt to serialize complex objects nicely
+                                                            api_content_for_claude = json.dumps(tool_call_outcome.content, indent=2)
+                                                        except TypeError:
+                                                            # Fallback for non-serializable objects
+                                                            api_content_for_claude = str(tool_call_outcome.content)
+                                                    else:
+                                                        # Fallback for other types
+                                                        api_content_for_claude = str(tool_call_outcome.content)
+
+                                                    log_content_for_history = tool_call_outcome.content # Log original success content
+                                                    is_error = False
+                                                    # Add token estimate and latency to success status
+                                                    result_tokens = self._estimate_string_tokens(api_content_for_claude)
+                                                    # *** RESTORED YIELD FOR TOOL SUCCESS ***
+                                                    yield (f"@@STATUS@@\n{STATUS_EMOJI['success']} Result from [bold]{tool_short_name}[/] "
+                                                           f"({result_tokens:,} tokens, {tool_latency:.1f}s)")
+                                                    log.info(f"Tool '{original_tool_name}' executed successfully ({result_tokens:,} tokens, {tool_latency:.1f}s)")
+                                                    # *** END RESTORED YIELD ***
+
+                                                # Cache result if successful and cache enabled (but not error results)
+                                                if self.tool_cache and not is_error:
+                                                    try:
+                                                        # We cache the string representation sent to Claude
+                                                        self.tool_cache.set(original_tool_name, tool_args, api_content_for_claude)
+                                                    except TypeError as cache_set_error:
+                                                         log.warning(f"Failed to cache result for {original_tool_name}: {cache_set_error}")
+                                                elif is_error:
+                                                    log.info(f"Skipping cache for error result of {original_tool_name}.")
+
+                                            except asyncio.CancelledError:
+                                                log.debug(f"Tool execution for {original_tool_name} cancelled.")
+                                                # Need to set state for the API response
+                                                error_text = "Tool execution aborted by user."
+                                                api_content_for_claude = f"Error: {error_text}"
+                                                log_content_for_history = {"error": error_text}
+                                                is_error = True
+                                                # *** RESTORED YIELD FOR TOOL CANCELLATION ***
+                                                yield f"@@STATUS@@\n[yellow]Tool [bold]{tool_short_name}[/] execution aborted.[/]"
+                                                # *** END RESTORED YIELD ***
+                                                # Re-raise CancelledError to stop the entire query process
+                                                raise
+
+                                            except Exception as exec_err:
+                                                tool_latency = time.time() - tool_start_time
+                                                log.error(f"Client error during tool execution {original_tool_name}: {exec_err}", exc_info=True)
+                                                error_text = f"Client error: {str(exec_err)}"
+                                                api_content_for_claude = f"Error: {error_text}"
+                                                log_content_for_history = {"error": error_text}
+                                                is_error = True
+                                                # *** RESTORED YIELD FOR CLIENT-SIDE TOOL ERROR ***
+                                                yield (f"@@STATUS@@\n{STATUS_EMOJI['failure']} Client Error during [bold]{tool_short_name}[/] ({tool_latency:.2f}s): "
+                                                       f"{str(exec_err)}")
+                                                # *** END RESTORED YIELD ***
 
 
-                        # Append result (or error) for the *next* API call
-                        tool_results_for_api.append({
-                            "role": "user",
-                            "content": [ { "type": "tool_result", "tool_use_id": tool_use_id, "content": api_content_for_claude } ]
-                        })
-                        # Store structured info for final history logging
-                        tool_results_for_history.append({
-                            "tool_name": original_tool_name, "tool_use_id": tool_use_id,
-                            "content": log_content_for_history, "is_error": is_error, "cache_used": cache_used
-                        })
-                        # Yield brief pause after processing each tool result
-                        await asyncio.sleep(0.05)
+                            # Append result (or error) for the *next* API call
+                            tool_results_for_api.append({
+                                "role": "user",
+                                "content": [ { "type": "tool_result", "tool_use_id": tool_use_id, "content": api_content_for_claude } ]
+                            })
+                            # Store structured info for final history logging
+                            tool_results_for_history.append({
+                                "tool_name": original_tool_name, "tool_use_id": tool_use_id,
+                                "content": log_content_for_history, "is_error": is_error, "cache_used": cache_used
+                            })
+                            # Yield brief pause after processing each tool result
+                            await asyncio.sleep(0.05)
 
-                    # Add tool results to messages and continue the outer loop
-                    messages.extend(tool_results_for_api)
-                    # Yield control briefly after processing tools
-                    await asyncio.sleep(0.01)
-                    continue # Go back to start of while loop
+                        # Add tool results to messages and continue the outer loop
+                        messages.extend(tool_results_for_api)
+                        # Yield control briefly after processing tools
+                        await asyncio.sleep(0.01)
+                        continue # Go back to start of while loop
 
-                else: # Stop reason was not 'tool_use' (e.g., 'end_turn', 'max_tokens', 'error_in_stream')
-                    break # Exit the while True loop
+                    else: # Stop reason was not 'tool_use' (e.g., 'end_turn', 'max_tokens', 'error_in_stream')
+                        break # Exit the while True loop
+
+                # --- EXCEPTION HANDLING FOR THE STREAM PROCESSING BLOCK ---
+                except TimeoutError:
+                    log.error("Timeout waiting for or processing message stream from Anthropic API.")
+                    yield "@@STATUS@@\n[Error: Timed out waiting for Claude's response]"
+                    stop_reason = "timeout" # Indicate timeout
+                    break # Exit the main loop on timeout
+                except asyncio.CancelledError:
+                    log.debug("Anthropic API stream iteration cancelled.")
+                    raise # Re-raise to be caught by the outer handler in this function
+                except Exception as stream_err:
+                    log.error(f"Error processing Anthropic message stream: {stream_err}", exc_info=True)
+                    yield f"@@STATUS@@\n[Error processing response: {stream_err}]"
+                    stop_reason = "error_in_stream" # Mark an error state
+                    break # Exit the main loop on stream error
 
             # --- End of Streaming / Tool Call Loop ---
 
             # --- Update Conversation Graph and History ONLY if not cancelled ---
-            # This block is skipped if CancelledError was raised
+            # This block is skipped if CancelledError was raised higher up
             self.conversation_graph.current_node.messages = messages
             self.conversation_graph.current_node.model = model # Store model used
+            await self.conversation_graph.save(str(self.conversation_graph_file)) # Save the conversation graph
 
-            # Calculate metrics
+            # Calculate metrics (using data potentially gathered before exceptions)
             end_time = time.time()
             latency_ms = (end_time - start_time) * 1000
-            tokens_used = await self.count_tokens(messages)
+            # Use accumulated tokens for history, not just the last call's tokens
+            tokens_used = self.session_input_tokens + self.session_output_tokens
 
-            # Add to history
+            # Add to history (ensure this doesn't run if CancelledError occurred)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Ensure history class/method exists
             if hasattr(self, 'history') and hasattr(self.history, 'add_async'):
                 await self.history.add_async(ChatHistory(
                     query=query, response=final_response_text, model=model, timestamp=timestamp,
                     server_names=list(servers_used), tools_used=tools_used,
                     conversation_id=self.conversation_graph.current_node.id, latency_ms=latency_ms,
                     tokens_used=tokens_used, streamed=True, cached=(cache_hits_during_query > 0)
-                    # Include tool_results_for_history if the ChatHistory schema supports it
                 ))
             else:
                 log.warning("History object or add_async method not found, cannot save history.")
 
-
-            # Finalize Span
+            # Finalize Span (ensure this runs even if exceptions occurred before cancellation)
             if span:
-                span.set_status(trace.StatusCode.OK)
+                # Set status based on whether an error occurred *before* potential cancellation
+                if stop_reason == "error_in_stream" or stop_reason == "timeout":
+                    span.set_status(trace.StatusCode.ERROR, description=f"Query ended due to {stop_reason}")
+                else:
+                    span.set_status(trace.StatusCode.OK)
+
                 span.add_event("query_complete", {
                     "latency_ms": latency_ms, "tools_used_count": len(tools_used),
                     "servers_used_count": len(servers_used), "cache_hits": cache_hits_during_query,
-                    "response_length": len(final_response_text), "approximated_tokens": tokens_used,
+                    "response_length": len(final_response_text),
+                    "total_input_tokens": self.session_input_tokens, # Use accumulated session tokens
+                    "total_output_tokens": self.session_output_tokens, # Use accumulated session tokens
+                    "estimated_total_cost": self.session_total_cost, # Use accumulated session cost
                     "final_stop_reason": stop_reason
                 })
-            log.info(f"Streaming query completed successfully. Stop reason: {stop_reason}")
+            log.info(f"Streaming query processing finished. Stop reason: {stop_reason}")
 
         except asyncio.CancelledError as ce:
-            # --- Handle cancellation cleanly ---
+            # --- Handle cancellation cleanly (outermost handler) ---
             log.debug(f"process_streaming_query caught CancelledError: {ce}")
             # Finalize Span with cancelled status
             if span:
                 span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
+                # Record accumulated usage even if cancelled
+                span.set_attribute("api.input_tokens", self.session_input_tokens)
+                span.set_attribute("api.output_tokens", self.session_output_tokens)
+                span.set_attribute("api.estimated_cost", self.session_total_cost)
             # Do NOT update history or graph.
             # Re-raise so the caller (e.g., interactive_loop) knows it was cancelled.
             raise
 
         except Exception as e:
-            # --- Handle other unexpected errors ---
+            # --- Handle other unexpected errors (outermost handler) ---
             error_msg = f"Error processing query: {str(e)}"
             log.error(error_msg, exc_info=True)
             if span:
@@ -5998,6 +6070,10 @@ class MCPClient:
                 # Ensure record_exception exists before calling
                 if hasattr(span, 'record_exception'):
                      span.record_exception(e)
+                # Record accumulated usage even on error
+                span.set_attribute("api.input_tokens", self.session_input_tokens)
+                span.set_attribute("api.output_tokens", self.session_output_tokens)
+                span.set_attribute("api.estimated_cost", self.session_total_cost)
             # Yield error status message
             yield f"@@STATUS@@\n[bold red]Error: {error_msg}[/]"
             # Do not raise here, allow function to finish "normally" but signal error via status
@@ -6013,7 +6089,6 @@ class MCPClient:
                         span_context_manager.__exit__(exc_type, exc_value, tb)
                 except Exception as exit_err:
                     log.warning(f"Error exiting span context manager: {exit_err}")
-
 
     async def process_query(self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None) -> str:
         """
@@ -6248,14 +6323,7 @@ class MCPClient:
                                         tool_call_outcome: Optional[CallToolResult] = await self.execute_tool(
                                             tool.server_name, original_tool_name, tool_args
                                         )
-
-                                        if tool_call_outcome is None:
-                                            error_text = f"Tool '{original_tool_name}' execution prevented or failed unexpectedly (no result)."
-                                            api_content_for_claude = f"Error: {error_text}"
-                                            log_content_for_history = api_content_for_claude
-                                            is_error = True
-                                            status.update(f"{STATUS_EMOJI['failure']} Tool Execution Error: {error_text}")
-                                        elif tool_call_outcome.isError:
+                                        if tool_call_outcome.isError:
                                             error_text = "Tool execution failed with an unspecified error."
                                             if tool_call_outcome.content and isinstance(tool_call_outcome.content, list):
                                                 first_text = next((b.text for b in tool_call_outcome.content if hasattr(b, 'type') and b.type == 'text' and hasattr(b, 'text')), None)
@@ -6325,11 +6393,33 @@ class MCPClient:
 
             status.stop() # Stop the status indicator
 
+            if response and hasattr(response, 'usage') and response.usage:
+                input_tokens = response.usage.input_tokens
+                output_tokens = response.usage.output_tokens
+                self.session_input_tokens += input_tokens
+                self.session_output_tokens += output_tokens
+
+                model_cost = COST_PER_MILLION_TOKENS.get(model)
+                if model_cost:
+                    call_cost = (input_tokens * model_cost.get("input", 0) / 1_000_000) + \
+                                (output_tokens * model_cost.get("output", 0) / 1_000_000)
+                    self.session_total_cost += call_cost
+                else:
+                    log.warning(f"Cost data not found for model: {model}. Session cost may be inaccurate.")
+
+                # Update span if desired
+                if span:
+                    span.set_attribute("api.input_tokens", input_tokens)
+                    span.set_attribute("api.output_tokens", output_tokens)
+                    span.set_attribute("api.estimated_cost", call_cost if model_cost else 0)
+
             # --- Update Conversation Graph ---
             # Add the initial user message (already added at the start)
             # The loop above added all assistant messages and user tool_result messages
             self.conversation_graph.current_node.model = model # Store model used
-
+            self.conversation_graph.current_node.messages = messages  # Update the messages in the graph
+            await self.conversation_graph.save(str(self.conversation_graph_file))  # Save to disk
+            
             # Join the final text parts collected
             final_result_text = "".join(final_response_text_parts)
 
@@ -6339,6 +6429,7 @@ class MCPClient:
             tokens_used = 0
             if response and response.usage:
                  tokens_used = response.usage.input_tokens + response.usage.output_tokens
+
 
             # Add to history
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -6475,21 +6566,19 @@ class MCPClient:
                     abort_message = Text("Press Ctrl+C once to abort...", style="dim yellow")
                     first_response_received = False
                     initial_status = Status("Claude is thinking...", spinner="dots", console=interactive_console)
-
-                    # Initialize Live display with an initial Panel holding the status spinner
-                    initial_panel = Panel(initial_status, title="Claude", border_style="dim green")
-
-                    REFRESH_RATE = 4.0
+                    final_panel = None # Initialize final panel to None
+                    REFRESH_RATE = 60.0
+                    # Initialize Live display directly with the initial status Panel
                     live_display = Live(
-                        initial_panel, # Start Live with the initial panel
+                        Panel(initial_status, title="Claude", border_style="dim green"), # Start with initial panel
                         console=interactive_console,
                         refresh_per_second=REFRESH_RATE,
-                        transient=False, # Keep final output
-                        vertical_overflow="visible" # Allow panel to grow vertically
+                        transient=True, 
+                        vertical_overflow="visible" 
                     )
-                    live_display.start()
-
                     try:
+                        live_display.start() # Start Live display
+
                         log.debug("Creating query task...")
                         query_task = asyncio.create_task(
                             self._iterate_streaming_query(user_input, status_lines),
@@ -6525,7 +6614,7 @@ class MCPClient:
                             # Create the single Panel containing the combined content
                             panel_to_update = Panel(renderable_content, title="Claude", border_style=panel_border_style)
 
-                            # Update the Live display with the single Panel
+                            # Update the Live display with the main response panel ONLY
                             live_display.update(panel_to_update, refresh=False)
 
                             # Wait briefly or until task is done/cancelled
@@ -6539,10 +6628,10 @@ class MCPClient:
                                 log.debug("Query task cancelled while display loop was waiting.")
                                 break # Exit this display loop
 
-                        # Await task completion to handle exceptions
+                        # Await task completion to handle exceptions AFTER the loop
                         await self.current_query_task
 
-                        # Final update after successful completion
+                        # --- Prepare final panel after successful completion ---
                         if not first_response_received:
                             final_panel = Panel("[dim]No response received.[/dim]", title="Claude", border_style="yellow")
                         else:
@@ -6552,23 +6641,17 @@ class MCPClient:
                             renderable_group = Group(md, status_group)
                             final_panel = Panel(renderable_group, title="Claude", border_style="green")
 
-                        if live_display.is_started:
-                            live_display.update(final_panel, refresh=True) # Final refresh
-
                     except asyncio.CancelledError:
                         # Handle cancellation (SIGINT or API trigger)
                         log.debug("Query task processing caught CancelledError in interactive_loop.")
                         claude_text_content = getattr(self, "_current_query_text", "") # Get partial text
                         status_lines.append(Text("[bold yellow]Request Aborted.[/]", style="yellow"))
 
-                        # Update display one last time with abort message
+                        # --- Prepare final panel for aborted state ---
                         md = Markdown(claude_text_content)
                         status_group = Group(*list(status_lines))
                         renderable_group = Group(md, status_group)
-                        panel = Panel(renderable_group, title="Claude - Aborted", border_style="yellow")
-
-                        if live_display.is_started:
-                            live_display.update(panel, refresh=True)
+                        final_panel = Panel(renderable_group, title="Claude - Aborted", border_style="yellow")
 
                     except Exception as stream_err:
                          # Handle other errors during query processing
@@ -6576,25 +6659,34 @@ class MCPClient:
                          claude_text_content = getattr(self, "_current_query_text", "") # Get partial text
                          status_lines.append(Text.from_markup(f"[bold red]Error: {stream_err}[/]"))
 
-                         # Update the display one last time with the error
+                         # --- Prepare final panel for error state ---
                          md = Markdown(claude_text_content)
                          status_group = Group(*list(status_lines))
                          renderable_group = Group(md, status_group)
-                         panel = Panel(renderable_group, title="Claude - ERROR", border_style="red")
-
-                         if live_display.is_started:
-                             live_display.update(panel, refresh=True)
+                         final_panel = Panel(renderable_group, title="Claude - ERROR", border_style="red")
 
                     finally:
-                         # Cleanup after query attempt
+                         # --- Cleanup *after* query attempt ---
                          log.debug(f"Query task finalization. Task ref: {self.current_query_task.get_name() if self.current_query_task else 'None'}")
                          self.current_query_task = None # Clear task reference
                          if hasattr(self, "_current_query_text"):
                              delattr(self, "_current_query_text") # Clean up temp text storage
                          if live_display and live_display.is_started:
-                              live_display.stop() # Stop the live display
+                              live_display.stop() # Stop the live display cleanly
                          live_display = None # Clear reference
 
+                         if final_panel:
+                             interactive_console.print(final_panel)
+
+                         final_footer_text = Text.assemble(
+                             "Tokens: ",
+                             ("Input: ", "dim cyan"), (f"{self.session_input_tokens:,}", "cyan"), " | ",
+                             ("Output: ", "dim magenta"), (f"{self.session_output_tokens:,}", "magenta"), " | ",
+                             ("Total: ", "dim white"), (f"{self.session_input_tokens + self.session_output_tokens:,}", "white"),
+                             " | ",
+                             ("Cost: ", "dim yellow"), (f"${self.session_total_cost:.4f}", "yellow")
+                         )
+                         interactive_console.print(final_footer_text)
             # --- Outer Exception Handling ---
             except KeyboardInterrupt:
                 if live_display and live_display.is_started:
@@ -7385,7 +7477,7 @@ class MCPClient:
         if not args:
             self.safe_print(f"Current model: [cyan]{self.current_model}[/]")
             self.safe_print("Usage: /model MODEL_NAME")
-            self.safe_print("Example models: claude-3-7-sonnet-20250219, claude-3-5-sonnet-latest")
+            self.safe_print("Example models: claude-3-7-sonnet-latest")
             return
             
         self.current_model = args
@@ -8982,9 +9074,9 @@ def run(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose logging")] = False,
     interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Run in interactive mode")] = False,
     # --- Added Web UI Flag ---
-    webui: Annotated[bool, typer.Option("--webui", help="Run the experimental Web UI instead of CLI")] = False,
-    webui_host: Annotated[str, typer.Option("--host", help="Host for Web UI")] = "127.0.0.1",
-    webui_port: Annotated[int, typer.Option("--port", help="Port for Web UI")] = 8017,
+    webui: Annotated[bool, typer.Option("--webui", "-w", help="Run the experimental Web UI instead of CLI")] = False,
+    webui_host: Annotated[str, typer.Option("--host", "-h", help="Host for Web UI")] = "127.0.0.1",
+    webui_port: Annotated[int, typer.Option("--port", "-p", help="Port for Web UI")] = 8017,
     serve_ui_file: Annotated[bool, typer.Option("--serve-ui", help="Serve the default mcp_client_ui.html file")] = True,
     cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers from config")] = False, # <-- ADDED FLAG
 ):
@@ -9338,6 +9430,15 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
                 return {"message": "Current conversation node cleared, switched to root"}
 
+            @app.get("/api/usage")
+            async def get_token_usage(mcp_client: MCPClient = Depends(get_mcp_client)):
+                return {
+                    "input_tokens": mcp_client.session_input_tokens,
+                    "output_tokens": mcp_client.session_output_tokens,
+                    "total_tokens": mcp_client.session_input_tokens + mcp_client.session_output_tokens,
+                    "total_cost": mcp_client.session_total_cost
+                }
+
             @app.post("/api/conversation/optimize")
             async def optimize_conversation_api(req: OptimizeRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
                 summarization_model = req.model or mcp_client.config.summarization_model
@@ -9634,6 +9735,13 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                         else:
                                              await websocket.send_json(WebSocketMessage(type="text_chunk", payload=chunk).model_dump())
                                     await websocket.send_json(WebSocketMessage(type="query_complete").model_dump())
+                                    # Send token usage data after query completes
+                                    await websocket.send_json(WebSocketMessage(type="token_usage", payload={
+                                        "input_tokens": mcp_client.session_input_tokens,
+                                        "output_tokens": mcp_client.session_output_tokens,
+                                        "total_tokens": mcp_client.session_input_tokens + mcp_client.session_output_tokens,
+                                        "total_cost": mcp_client.session_total_cost
+                                    }).model_dump())                                    
                                 except asyncio.CancelledError:
                                      log.debug("Query cancelled during WebSocket processing.")
                                      cancel_msg = "[yellow]Request Aborted by User.[/]"

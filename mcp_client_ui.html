@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚡ Ultimate MCP Client UI</title>
+    <title>Ultimate MCP Client UI</title>
 
     <!-- Favicon (Example using FontAwesome) -->
     <link rel="icon"
@@ -1162,6 +1162,713 @@
             background-color: hsl(var(--b2)/0.6);
         }
 
+        /* Ensure proper contrast in all themes */
+        [data-theme] .not-prose .bg-gray-800,
+        [data-theme] .not-prose .bg-gray-900 {
+            background-color: #1f2937 !important;
+            color: #f3f4f6 !important;
+        }
+
+        [data-theme] .not-prose .bg-indigo-700 {
+            background-color: #4338ca !important;
+            color: #ffffff !important;
+        }
+
+        [data-theme] .not-prose .text-gray-100,
+        [data-theme] .not-prose .text-gray-200,
+        [data-theme] .not-prose .text-gray-300 {
+            color: #f3f4f6 !important;
+        }
+
+        /* Enhanced prose styling for markdown */
+        .prose-invert {
+            --tw-prose-body: rgb(229 231 235);
+            /* text-gray-200 */
+            --tw-prose-headings: rgb(255 255 255);
+            /* text-white */
+            --tw-prose-lead: rgb(209 213 219);
+            /* text-gray-300 */
+            --tw-prose-links: rgb(147 197 253);
+            /* text-blue-300 */
+            --tw-prose-bold: rgb(255 255 255);
+            /* text-white */
+            --tw-prose-counters: rgb(209 213 219);
+            /* text-gray-300 */
+            --tw-prose-bullets: rgb(156 163 175);
+            /* text-gray-400 */
+            --tw-prose-hr: rgb(75 85 99);
+            /* text-gray-600 */
+            --tw-prose-quotes: rgb(243 244 246);
+            /* text-gray-100 */
+            --tw-prose-quote-borders: rgb(75 85 99);
+            /* text-gray-600 */
+            --tw-prose-captions: rgb(156 163 175);
+            /* text-gray-400 */
+            --tw-prose-code: rgb(255 255 255);
+            /* text-white */
+            --tw-prose-pre-code: rgb(229 231 235);
+            /* text-gray-200 */
+            --tw-prose-pre-bg: rgb(31 41 55);
+            /* bg-gray-800 */
+            --tw-prose-th-borders: rgb(75 85 99);
+            /* text-gray-600 */
+            --tw-prose-td-borders: rgb(55 65 81);
+            /* text-gray-700 */
+        }
+
+        /* Improved markdown elements */
+        .not-prose .prose-invert h1,
+        .not-prose .prose-invert h2,
+        .not-prose .prose-invert h3,
+        .not-prose .prose-invert h4 {
+            color: rgb(255 255 255);
+            margin-top: 1rem;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+
+        .not-prose .prose-invert h1 {
+            font-size: 1.5rem;
+            line-height: 2rem;
+        }
+
+        .not-prose .prose-invert h2 {
+            font-size: 1.25rem;
+            line-height: 1.75rem;
+        }
+
+        .not-prose .prose-invert h3 {
+            font-size: 1.125rem;
+            line-height: 1.5rem;
+        }
+
+        .not-prose .prose-invert a {
+            color: rgb(147 197 253);
+            /* text-blue-300 */
+            text-decoration: underline;
+        }
+
+        .not-prose .prose-invert strong {
+            color: rgb(255 255 255);
+            font-weight: 600;
+        }
+
+        .not-prose .prose-invert ol,
+        .not-prose .prose-invert ul {
+            margin-top: 0.5rem;
+            margin-bottom: 0.5rem;
+            padding-left: 1.25rem;
+        }
+
+        .not-prose .prose-invert li {
+            margin-top: 0.25rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .not-prose .prose-invert pre {
+            background-color: rgb(31 41 55);
+            /* bg-gray-800 */
+            color: rgb(229 231 235);
+            /* text-gray-200 */
+            overflow-x: auto;
+            font-size: 0.875rem;
+            line-height: 1.5;
+            margin: 0.5rem 0;
+            padding: 0.75rem;
+            border-radius: 0.375rem;
+        }
+
+        .not-prose .prose-invert code {
+            color: rgb(255 255 255);
+            background-color: rgba(255, 255, 255, 0.1);
+            padding: 0.125rem 0.25rem;
+            border-radius: 0.25rem;
+            font-size: 0.875em;
+        }
+
+        .not-prose .prose-invert pre code {
+            background-color: transparent;
+            padding: 0;
+            font-size: inherit;
+            border-radius: 0;
+        }
+
+        /* Table styling for tool data */
+        .not-prose .prose-invert table {
+            width: 100%;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+            border-collapse: collapse;
+        }
+
+        .not-prose .prose-invert th {
+            background-color: rgba(55, 65, 81, 0.5);
+            font-weight: 600;
+            text-align: left;
+            padding: 0.5rem;
+            font-size: 0.875rem;
+        }
+
+        .not-prose .prose-invert td {
+            padding: 0.5rem;
+            border: 1px solid rgb(55, 65, 81);
+            font-size: 0.875rem;
+        }
+
+        .not-prose .prose-invert tr:nth-child(even) {
+            background-color: rgba(55, 65, 81, 0.2);
+        }
+
+        /* ===== TOOL RESULT CONTAINER ===== */
+        .tool-result-container {
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+            border-radius: 0.5rem;
+            overflow: hidden;
+            border: 1px solid rgba(165, 180, 252, 0.3);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
+            background-color: #111827;
+            color-scheme: dark;
+        }
+
+        .tool-result-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem;
+            background-image: linear-gradient(to right, #4338ca, #4f46e5);
+            color: white;
+        }
+
+        .tool-result-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 500;
+        }
+
+        .tool-result-icon {
+            width: 1.25rem;
+            height: 1.25rem;
+            stroke: currentColor;
+        }
+
+        .tool-result-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .tool-result-content {
+            padding: 1rem;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+            background-color: #111827;
+            color: #f3f4f6;
+        }
+
+        /* ===== MARKDOWN STYLING ===== */
+        .tool-markdown {
+            color: #f3f4f6;
+            margin-left: 0;
+            margin-right: 0;
+        }
+
+        .tool-markdown h1,
+        .tool-markdown h2,
+        .tool-markdown h3,
+        .tool-markdown h4 {
+            color: white;
+            font-weight: 600;
+            margin-top: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .tool-markdown h1 {
+            font-size: 1.25rem;
+            border-bottom: 1px solid #374151;
+            padding-bottom: 0.25rem;
+        }
+
+        .tool-markdown h2 {
+            font-size: 1.125rem;
+        }
+
+        .tool-markdown h3 {
+            font-size: 1rem;
+        }
+
+        .tool-markdown p {
+            margin-top: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .tool-markdown a {
+            color: #60a5fa;
+        }
+
+        .tool-markdown a:hover {
+            text-decoration: underline;
+        }
+
+        .tool-markdown ul,
+        .tool-markdown ol {
+            margin-top: 0.5rem;
+            margin-bottom: 0.5rem;
+            padding-left: 1.25rem;
+        }
+
+        .tool-markdown li {
+            margin-top: 0.25rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .tool-markdown blockquote {
+            padding-left: 1rem;
+            border-left: 4px solid #4b5563;
+            color: #d1d5db;
+            font-style: italic;
+            margin-top: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .tool-markdown code {
+            background-color: #1f2937;
+            padding-left: 0.25rem;
+            padding-right: 0.25rem;
+            padding-top: 0.125rem;
+            padding-bottom: 0.125rem;
+            border-radius: 0.25rem;
+            color: #93c5fd;
+        }
+
+        .tool-markdown pre {
+            background-color: #1f2937;
+            padding: 0.75rem;
+            border-radius: 0.375rem;
+            overflow-x: auto;
+            margin-top: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .tool-markdown pre code {
+            background-color: transparent;
+            padding: 0;
+            color: #f3f4f6;
+        }
+
+        .tool-markdown table {
+            width: 100%;
+            margin-top: 0.75rem;
+            margin-bottom: 0.75rem;
+            border-collapse: collapse;
+        }
+
+        .tool-markdown th {
+            background-color: #1f2937;
+            text-align: left;
+            padding: 0.5rem;
+            border: 1px solid #374151;
+        }
+
+        .tool-markdown td {
+            padding: 0.5rem;
+            border: 1px solid #374151;
+        }
+
+        .tool-markdown tr:nth-child(even) {
+            background-color: rgba(31, 41, 55, 0.5);
+        }
+
+        /* ===== CODE BLOCKS ===== */
+        .tool-code-container {
+            overflow: hidden;
+            border-radius: 0.375rem;
+            border: 1px solid #374151;
+        }
+
+        .tool-code-title {
+            background-color: #1f2937;
+            color: #d1d5db;
+            font-size: 0.875rem;
+            font-weight: 500;
+            padding-left: 0.75rem;
+            padding-right: 0.75rem;
+            padding-top: 0.375rem;
+            padding-bottom: 0.375rem;
+            border-bottom: 1px solid #374151;
+        }
+
+        .tool-code-block-wrapper {
+            position: relative;
+        }
+
+        .tool-code-block {
+            font-size: 0.875rem;
+            overflow-x: auto;
+            background-color: #1f2937;
+            padding: 0.75rem;
+            max-height: 24rem;
+            margin: 0;
+        }
+
+        .tool-plain-text {
+            font-size: 0.875rem;
+            padding: 0.75rem;
+            background-color: #1f2937;
+            border-radius: 0.375rem;
+            white-space: pre-wrap;
+            max-height: 20rem;
+            overflow: auto;
+        }
+
+        /* ===== MODEL CARDS ===== */
+        .tool-model-card {
+            margin-bottom: 1rem;
+            border-radius: 0.375rem;
+            overflow: hidden;
+            border: 1px solid #374151;
+            background-color: rgba(31, 41, 55, 0.5);
+        }
+
+        .tool-model-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.5rem;
+            border-bottom: 1px solid #374151;
+        }
+
+        .tool-model-info {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .tool-model-provider {
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .tool-model-name {
+            font-size: 0.75rem;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            color: #d1d5db;
+        }
+
+        .tool-model-index {
+            font-size: 0.75rem;
+            color: #9ca3af;
+        }
+
+        .tool-model-content {
+            padding: 0.75rem;
+            background-color: rgba(31, 41, 55, 0.3);
+        }
+
+        .tool-model-text {
+            white-space: pre-wrap;
+            font-size: 0.875rem;
+            color: #e5e7eb;
+        }
+
+        .tool-model-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.25rem;
+            padding: 0.5rem;
+            background-color: rgba(31, 41, 55, 0.7);
+            border-top: 1px solid #374151;
+        }
+
+        /* ===== METRICS ===== */
+        .tool-metric {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 0.5rem;
+            border-radius: 0.25rem;
+            background-color: rgba(55, 65, 81, 0.3);
+        }
+
+        .tool-metric-icon {
+            color: #d1d5db;
+            opacity: 0.8;
+            font-size: 0.875rem;
+        }
+
+        .tool-metric-value {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-weight: 500;
+            font-size: 0.875rem;
+        }
+
+        .tool-metric-label {
+            font-size: 0.75rem;
+            color: #9ca3af;
+        }
+
+        /* ===== STATS DASHBOARD ===== */
+        .tool-stats-dashboard {
+            border: 1px solid #374151;
+            border-radius: 0.375rem;
+            overflow: hidden;
+            background-color: rgba(31, 41, 55, 0.3);
+        }
+
+        .tool-stats-header {
+            background-image: linear-gradient(to right, rgba(30, 64, 175, 0.7), rgba(79, 70, 229, 0.7));
+            padding: 0.5rem;
+        }
+
+        .tool-stats-title {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: white;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .tool-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 0.5rem;
+            padding: 0.75rem;
+        }
+
+        @media (min-width: 640px) {
+            .tool-stats-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+        }
+
+        @media (min-width: 768px) {
+            .tool-stats-grid {
+                grid-template-columns: repeat(4, 1fr);
+            }
+        }
+
+        .tool-stat-card {
+            background-color: rgba(55, 65, 81, 0.3);
+            border-radius: 0.25rem;
+            padding: 0.5rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .tool-stat-icon {
+            color: #d1d5db;
+            opacity: 0.7;
+        }
+
+        .tool-stat-value {
+            font-weight: 500;
+            font-size: 0.875rem;
+        }
+
+        .tool-stat-label {
+            font-size: 0.75rem;
+            color: #9ca3af;
+        }
+
+        /* ===== MODEL COMPARISON ===== */
+        .tool-comparison {
+            border: 1px solid #374151;
+            border-radius: 0.375rem;
+            overflow: hidden;
+            background-color: rgba(31, 41, 55, 0.3);
+        }
+
+        .tool-comparison-header {
+            background-image: linear-gradient(to right, rgba(6, 95, 70, 0.7), rgba(13, 148, 136, 0.7));
+            padding: 0.5rem;
+        }
+
+        .tool-comparison-title {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: white;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .tool-comparison-table-wrapper {
+            padding: 0.5rem;
+            overflow-x: auto;
+        }
+
+        .tool-comparison-table {
+            width: 100%;
+            font-size: 0.875rem;
+            border-collapse: collapse;
+        }
+
+        .tool-comparison-table th {
+            text-align: left;
+            padding: 0.5rem;
+            background-color: rgba(55, 65, 81, 0.4);
+            border-bottom: 1px solid #4b5563;
+        }
+
+        .tool-comparison-table td {
+            padding: 0.5rem;
+            border-bottom: 1px solid rgba(55, 65, 81, 0.5);
+        }
+
+        .tool-comparison-table tr:hover {
+            background-color: rgba(55, 65, 81, 0.2);
+        }
+
+        /* ===== BADGES ===== */
+        .tool-badge {
+            display: inline-flex;
+            align-items: center;
+            padding-left: 0.5rem;
+            padding-right: 0.5rem;
+            padding-top: 0.125rem;
+            padding-bottom: 0.125rem;
+            border-radius: 0.25rem;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .tool-badge-success {
+            background-color: rgba(6, 78, 59, 0.6);
+            color: #a7f3d0;
+            border: 1px solid rgba(5, 150, 105, 0.3);
+        }
+
+        .tool-badge-error {
+            background-color: rgba(127, 29, 29, 0.6);
+            color: #fecaca;
+            border: 1px solid rgba(185, 28, 28, 0.3);
+        }
+
+        .tool-badge-warning {
+            background-color: rgba(120, 53, 15, 0.6);
+            color: #fde68a;
+            border: 1px solid rgba(146, 64, 14, 0.3);
+        }
+
+        .tool-badge-info {
+            background-color: rgba(30, 58, 138, 0.6);
+            color: #bfdbfe;
+            border: 1px solid rgba(37, 99, 235, 0.3);
+        }
+
+        .tool-badge-default {
+            background-color: rgba(55, 65, 81, 0.6);
+            color: #e5e7eb;
+            border: 1px solid rgba(75, 85, 99, 0.3);
+        }
+
+        /* ===== MESSAGES ===== */
+        .tool-message {
+            padding: 0.75rem;
+            background-color: #1f2937;
+            border-radius: 0.375rem;
+            color: #e5e7eb;
+        }
+
+        .tool-content-title {
+            font-size: 1.125rem;
+            font-weight: 500;
+            color: white;
+            margin-bottom: 0.5rem;
+        }
+
+        .tool-section-title {
+            font-size: 1rem;
+            font-weight: 500;
+            color: white;
+            margin-top: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        /* ===== COPY BUTTON ===== */
+        .copy-code-btn {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            background-color: rgba(55, 65, 81, 0.8);
+            color: #d1d5db;
+            padding-left: 0.5rem;
+            padding-right: 0.5rem;
+            padding-top: 0.25rem;
+            padding-bottom: 0.25rem;
+            border-radius: 0.25rem;
+            font-size: 0.75rem;
+            transition-property: opacity;
+            transition-duration: 200ms;
+            opacity: 0;
+            border: 1px solid rgba(75, 85, 99, 0.5);
+        }
+
+        .copy-code-btn:hover {
+            color: white;
+            background-color: #374151;
+        }
+
+        .copy-code-btn:focus {
+            opacity: 1;
+            outline: none;
+        }
+
+        /* Group hover for parent elements */
+        div:hover>.copy-code-btn,
+        pre:hover>.copy-code-btn,
+        .tool-code-block-wrapper:hover .copy-code-btn {
+            opacity: 1;
+        }
+
+        /* ===== PROVIDER-SPECIFIC STYLING ===== */
+        /* OpenAI */
+        .tool-model-card[data-provider="openai"] .tool-model-header,
+        .tool-model-card[data-provider="gpt"] .tool-model-header {
+            background-image: linear-gradient(to right, rgba(6, 78, 59, 0.8), rgba(13, 148, 136, 0.8));
+        }
+
+        /* Anthropic */
+        .tool-model-card[data-provider="anthropic"] .tool-model-header,
+        .tool-model-card[data-provider="claude"] .tool-model-header {
+            background-image: linear-gradient(to right, rgba(126, 34, 206, 0.8), rgba(217, 70, 239, 0.8));
+        }
+
+        /* Google */
+        .tool-model-card[data-provider="google"] .tool-model-header,
+        .tool-model-card[data-provider="gemini"] .tool-model-header {
+            background-image: linear-gradient(to right, rgba(30, 64, 175, 0.8), rgba(8, 145, 178, 0.8));
+        }
+
+        /* DeepSeek */
+        .tool-model-card[data-provider="deepseek"] .tool-model-header {
+            background-image: linear-gradient(to right, rgba(146, 64, 14, 0.8), rgba(234, 88, 12, 0.8));
+        }
+
+        /* Mistral */
+        .tool-model-card[data-provider="mistral"] .tool-model-header {
+            background-image: linear-gradient(to right, rgba(79, 70, 229, 0.8), rgba(139, 92, 246, 0.8));
+        }
+
+        /* Theme compatibility */
+        [data-theme] .tool-result-container,
+        [data-theme] .tool-markdown,
+        [data-theme] .tool-code-block,
+        [data-theme] .tool-model-card,
+        [data-theme] .tool-stats-dashboard,
+        [data-theme] .tool-comparison {
+            color-scheme: dark !important;
+            color: #f3f4f6 !important;
+        }
+
+        [data-theme] .tool-result-content {
+            background-color: #111827 !important;
+        }
+
         [x-cloak] {
             display: none;
         }
@@ -2001,6 +2708,24 @@
                                 class="fas fa-undo mr-1"></i>
                             Reset Settings</button>
                     </div> <!-- End original settings content -->
+
+                    <div class="divider text-xs">Usage Statistics</div>
+
+                    <div class="flex items-center justify-between">
+                        <div class="text-xs">
+                            <div>Input Tokens: <span x-text="tokenUsage.input_tokens?.toLocaleString() || 0"
+                                    class="font-mono"></span></div>
+                            <div>Output Tokens: <span x-text="tokenUsage.output_tokens?.toLocaleString() || 0"
+                                    class="font-mono"></span></div>
+                            <div>Cost: <span x-text="`$${(tokenUsage.total_cost || 0).toFixed(4)}`"
+                                    class="font-mono"></span></div>
+                        </div>
+                        <button
+                            @click="tokenUsage = {input_tokens: 0, output_tokens: 0, total_tokens: 0, total_cost: 0}; localStorage.setItem('mcp_token_usage', JSON.stringify(tokenUsage));"
+                            class="btn btn-sm btn-outline btn-warning">
+                            <i class="fas fa-eraser mr-1"></i> Reset Counter
+                        </button>
+                    </div>
 
                     <!-- START: Moved Cache Management Section HERE -->
                     <div class="mt-6 border-t border-base-300/50 pt-4">
@@ -3612,7 +4337,12 @@
                 // Add favoriteToolIds and recentToolIds for localStorage loading
                 favoriteToolIds: [],
                 recentToolIds: [],
-
+                tokenUsage: {
+                    input: 0,
+                    output: 0,
+                    total: 0,
+                    cost: 0
+                },
                 // System Stats
                 showSystemStats: false,
                 systemStats: { memory: 0, uptime: '0m' },
@@ -3909,6 +4639,9 @@
                             this.isSidebarOpen = false; // Auto-hide sidebar on larger screens
                         }
                     });
+                },
+                numberWithCommas(x) {
+                    return x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
                 },
 
                 toggleSidebar(force) {
@@ -5571,7 +6304,11 @@
                             this.currentAssistantMessageId = null;
                             this.addMessageToConversation('system', `Error processing last request: ${message.payload}`);
                             break;
-
+                        case 'token_usage':
+                            this.tokenUsage = message.payload;
+                            // Optional: Store in localStorage to persist across page reloads
+                            localStorage.setItem('mcp_token_usage', JSON.stringify(this.tokenUsage));
+                            break;
                         case 'command_response':
                             const responseData = message.payload;
                             const notificationType = responseData.success ? 'success' : 'error';
@@ -7391,89 +8128,898 @@
                     // Fallback - convert to JSON and render as structured data
                     return this.renderJson(content);
                 },
-
-                // Renders the specific structure when user provides a tool result back to the model
                 renderUserProvidedToolResult(block, message) {
-                    if (!this.uiSettings.showToolDataMessages) {
-                        return '<!-- User tool result hidden by setting -->';
+    if (!this.uiSettings.showToolDataMessages) return '<!-- tool message hidden -->';
+
+    // Create proper references to external dependencies
+    const hljs = window.hljs || this.hljs;
+    const DOMPurify = window.DOMPurify || this.DOMPurify;
+    const marked = window.marked || this.marked;
+    
+    // Preserve reference to parent context
+    const self = this;
+
+    // ===== CONTENT ANALYSIS & EXTRACTION ENGINE =====
+    const contentInspector = {
+        // Core Analysis Functions
+        inspectContent(content) {
+            // Initialize an empty result structure
+            const result = {
+                markdown: [],
+                json: [],
+                models: [],
+                stats: null,
+                rawText: [],
+                detectedType: 'unknown'
+            };
+
+            try {
+                // Deep recursive analysis
+                this._analyzeDeep(content, result);
+
+                // Determine the most appropriate content type
+                result.detectedType = this._determineContentType(result);
+            } catch (err) {
+                console.error("Content inspection error:", err);
+            }
+
+            return result;
+        },
+
+        // Recursive analysis engine
+        _analyzeDeep(content, result, path = '') {
+            // Base case: null or undefined
+            if (content === null || content === undefined) return;
+
+            // Handle strings - extract JSON or markdown
+            if (typeof content === 'string') {
+                // Clean TextContent wrappers (aggressive approach)
+                const cleanedContent = this._cleanTextContentWrappers(content);
+
+                // Check for embedded JSON patterns in the string
+                const extractedJson = this._extractJsonFromString(cleanedContent);
+                if (extractedJson) {
+                    // We found JSON within the string, analyze it recursively
+                    this._analyzeDeep(extractedJson, result, path + '.extracted');
+                    return;
+                }
+
+                // Check if it's markdown
+                if (this._isMarkdown(cleanedContent)) {
+                    result.markdown.push({
+                        content: cleanedContent,
+                        path: path
+                    });
+                    return;
+                }
+
+                // Store as raw text
+                result.rawText.push({
+                    content: cleanedContent,
+                    path: path
+                });
+                return;
+            }
+
+            // Handle arrays
+            if (Array.isArray(content)) {
+                // Check if this is a results array of model outputs
+                if (this._isModelResultsArray(content)) {
+                    content.forEach((model, index) => {
+                        if (model && typeof model === 'object') {
+                            result.models.push({
+                                ...model,
+                                _index: index,
+                                _path: `${path}[${index}]`
+                            });
+                        }
+                    });
+                    return;
+                }
+
+                // Process each array element recursively
+                content.forEach((item, index) => {
+                    this._analyzeDeep(item, result, `${path}[${index}]`);
+                });
+                return;
+            }
+
+            // Handle objects
+            if (typeof content === 'object') {
+                // Check if this is a model result object
+                if (this._isModelResultObject(content)) {
+                    result.models.push({
+                        ...content,
+                        _path: path
+                    });
+                    return;
+                }
+
+                // Check if this is a stats object
+                if (this._isStatsObject(content)) {
+                    // Merge stats data if we already have some
+                    if (result.stats) {
+                        result.stats = { ...result.stats, ...content };
+                    } else {
+                        result.stats = content;
                     }
+                }
 
-                    const toolUseId = block.tool_use_id || 'Unknown Tool Call';
-                    let contentData = block.content;
-                    let displayContent = '[Could not display content]';
-                    let language = 'plaintext';
-                    let isRawText = false;
+                // Store full object as JSON for reference
+                result.json.push({
+                    content: content,
+                    path: path
+                });
 
-                    // Style this distinctly but REMOVE THE BACKGROUND COLOR
-                    const containerClasses = "tool-data-bubble not-prose my-2 p-3 border border-primary/20 rounded-lg text-base-content";
-                    const headerIconClass = "fas fa-reply fa-fw text-primary";
-                    const headerText = 'Tool Data Provided';
+                // Look for specific keys that might contain valuable content
+                if (content && typeof content === 'object') {
+                    for (const key in content) {
+                        // Skip internal tracking properties
+                        if (key.startsWith('_')) continue;
 
-                    // Process the content string
-                    try {
-                        if (typeof contentData === 'string') {
-                            if (this.isProbablyJsonString(contentData)) {
-                                try {
-                                    const parsedData = JSON.parse(contentData);
-                                    displayContent = JSON.stringify(parsedData, null, 2);
-                                    language = 'json';
-                                } catch (e) {
-                                    console.warn("User tool result looked like JSON but failed to parse:", e, contentData);
-                                    displayContent = contentData;
-                                    isRawText = true;
+                        // Special handling for common key names
+                        if (key === 'text' || key === 'content' || key === 'message') {
+                            if (typeof content[key] === 'string') {
+                                if (this._isMarkdown(content[key])) {
+                                    result.markdown.push({
+                                        content: content[key],
+                                        path: `${path}.${key}`
+                                    });
+                                    continue;
                                 }
-                            } else {
-                                // Just a plain string
-                                displayContent = contentData;
-                                isRawText = true;
-                            }
-                        } else {
-                            // If it wasn't a string to begin with
-                            try {
-                                displayContent = JSON.stringify(contentData, null, 2);
-                                language = 'json';
-                            } catch (stringifyError) {
-                                console.error("Failed to stringify non-string user tool result:", stringifyError);
-                                displayContent = String(contentData);
-                                isRawText = true;
                             }
                         }
-                    } catch (e) {
-                        console.error("Error processing user tool result display:", e);
-                        displayContent = String(block.content || '[Error displaying content]');
-                        isRawText = true;
-                    }
 
-                    // Avoid highlighting if content is excessively long
-                    let highlightedContent = '';
-                    if (displayContent.length < 100000) {
-                        try {
-                            highlightedContent = hljs.highlight(displayContent, { language: language, ignoreIllegals: true }).value;
-                        } catch (highlightError) {
-                            console.error("Highlighting failed:", highlightError);
-                            highlightedContent = DOMPurify.sanitize(displayContent);
+                        // Results typically contain model outputs
+                        if (key === 'results' && typeof content[key] === 'object') {
+                            for (const modelName in content[key]) {
+                                const modelData = content[key][modelName];
+                                if (typeof modelData === 'object') {
+                                    result.models.push({
+                                        ...modelData,
+                                        provider: modelName.split('/')[0],
+                                        model: modelName.split('/')[1] || modelName,
+                                        _path: `${path}.${key}.${modelName}`
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Recursively analyze all other properties
+                        this._analyzeDeep(content[key], result, `${path}.${key}`);
+                    }
+                }
+                return;
+            }
+        },
+
+        // Extract embedded JSON from strings
+        _extractJsonFromString(str) {
+            if (typeof str !== 'string') return null;
+
+            // Pattern matching for JSON objects
+            const jsonRegexPatterns = [
+                // Complex match for JSON objects with proper braces balancing
+                /\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}/g,
+                // Similar for arrays
+                /\[(?:[^\[\]]|(?:\[(?:[^\[\]]|(?:\[[^\[\]]*\]))*\]))*\]/g
+            ];
+
+            for (const pattern of jsonRegexPatterns) {
+                const matches = str.match(pattern);
+                if (!matches) continue;
+
+                // Try each match to see if it's valid JSON
+                for (const match of matches) {
+                    try {
+                        // Skip if it's just a tiny fragment
+                        if (match.length < 10) continue;
+
+                        const parsed = JSON.parse(match);
+                        return parsed;
+                    } catch (e) {
+                        // Not valid JSON, continue to next match
+                    }
+                }
+            }
+
+            // Special case for TextContent objects
+            const textContentMatch = str.match(/TextContent\((?:.*text=['"])(.*?)(['"].*)\)/s);
+            if (textContentMatch && textContentMatch[1]) {
+                try {
+                    // Clean up escaped characters
+                    const cleaned = textContentMatch[1]
+                        .replace(/\\"/g, '"')
+                        .replace(/\\'/g, "'")
+                        .replace(/\\n/g, '\n')
+                        .replace(/\\\\/g, '\\');
+
+                    // Try to parse as JSON
+                    try {
+                        return JSON.parse(cleaned);
+                    } catch {
+                        // If not JSON, return the cleaned string
+                        return cleaned;
+                    }
+                } catch (e) {
+                    // Failed to process, continue
+                }
+            }
+
+            return null;
+        },
+
+        // Clean TextContent wrappers
+        _cleanTextContentWrappers(str) {
+            if (typeof str !== 'string') return str;
+
+            // Match TextContent patterns and extract the actual text content
+            const pattern = /TextContent\(\s*(?:type\s*=\s*(?:"|')text(?:"|'),\s*)?text\s*=\s*(?:"|')((?:\\.|[^"\\])*?)(?:"|')(?:,\s*annotations\s*=\s*(?:None|\[\]))?/;
+            const match = str.match(pattern);
+
+            if (match && match[1]) {
+                // Unescape Python-style string escapes
+                return match[1]
+                    .replace(/\\"/g, '"')
+                    .replace(/\\'/g, "'")
+                    .replace(/\\n/g, '\n')
+                    .replace(/\\\\/g, '\\')
+                    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+                        String.fromCharCode(parseInt(hex, 16)));
+            }
+
+            return str;
+        },
+
+        // Check if string contains markdown
+        _isMarkdown(str) {
+            if (typeof str !== 'string') return false;
+
+            // Extended markdown detection patterns
+            const markdownPatterns = [
+                /^#{1,6}\s+.+$/m,                     // Headers
+                /^[-*+]\s+.+$/m,                      // Unordered lists
+                /^>\s+.+$/m,                          // Blockquotes
+                /^```[\s\S]*?```$/m,                  // Code blocks
+                /^(?:\d+\.)\s+.+$/m,                  // Ordered lists
+                /\*\*.*?\*\*/,                        // Bold
+                /_.*?_/,                              // Italic
+                /`.*?`/,                              // Inline code
+                /\[.*?\]\(.*?\)/,                     // Links
+                /!\[.*?\]\(.*?\)/,                    // Images
+                /\|[^|]+\|[^|]+\|/,                   // Tables
+                /^---+$/m,                            // Horizontal rule
+                /^===+$/m                             // Alternate heading style
+            ];
+
+            // Check if at least one markdown pattern is found and the string has substantial length
+            return str.length > 20 && markdownPatterns.some(pattern => pattern.test(str));
+        },
+
+        // Check if object is a model result
+        _isModelResultObject(obj) {
+            if (!obj || typeof obj !== 'object') return false;
+
+            // Check for typical model result properties
+            const modelProperties = [
+                'model', 'provider', 'text', 'tokens',
+                'cost', 'processing_time', 'success'
+            ];
+
+            // Must have at least one of text and several model properties
+            return ('text' in obj || 'content' in obj) &&
+                modelProperties.filter(prop => prop in obj).length >= 2;
+        },
+
+        // Check if an array contains model results
+        _isModelResultsArray(arr) {
+            if (!Array.isArray(arr) || arr.length === 0) return false;
+
+            // Check if array elements look like model results
+            return arr.some(item => this._isModelResultObject(item));
+        },
+
+        // Check if object contains statistics
+        _isStatsObject(obj) {
+            if (!obj || typeof obj !== 'object') return false;
+
+            // Check for typical statistics properties
+            const statsProps = [
+                'tokens', 'cost', 'processing_time',
+                'total_requests', 'successful_requests', 'failed_requests',
+                'total_cost', 'average_processing_time'
+            ];
+
+            // Must have at least two stats properties
+            return statsProps.filter(prop => prop in obj).length >= 2;
+        },
+
+        // Determine the primary content type based on the analysis
+        _determineContentType(result) {
+            // Prioritize content types
+            if (result.models && result.models.length > 0) {
+                return 'models';
+            } else if (result.markdown && result.markdown.length > 0) {
+                return 'markdown';
+            } else if (result.json && result.json.length > 0) {
+                return 'json';
+            } else {
+                return 'text';
+            }
+        }
+    };
+
+    // ===== VISUAL RENDERING ENGINE =====
+    const visualRenderer = {
+        // Highlight code with proper language detection
+        highlight(code, forcedLanguage = null) {
+            if (!code) return '';
+
+            // Convert to string if object
+            const codeStr = typeof code === 'object'
+                ? JSON.stringify(code, null, 2)
+                : String(code);
+
+            // Detect language if not forced
+            let language = forcedLanguage;
+            if (!language) {
+                if (codeStr.trim().startsWith('{') || codeStr.trim().startsWith('[')) {
+                    language = 'json';
+                } else if (/^(function|const|let|var|import|class)\s/.test(codeStr)) {
+                    language = 'javascript';
+                } else if (/^(def|class|import|from|print)\s/.test(codeStr)) {
+                    language = 'python';
+                } else {
+                    language = 'plaintext';
+                }
+            }
+
+            // Apply syntax highlighting using parent component's hljs
+            try {
+                return hljs.highlight(codeStr, {
+                    language,
+                    ignoreIllegals: true
+                }).value;
+            } catch (e) {
+                console.error("Highlighting error:", e);
+                // Fallback to sanitized text
+                return DOMPurify.sanitize(codeStr);
+            }
+        },
+
+        // Create copy button for code blocks - using self reference to parent component
+        createCopyButton(content, label = 'Copy') {
+            try {
+                // Encode content safely for the attribute
+                const encodedContent = btoa(encodeURIComponent(
+                    typeof content === 'object'
+                        ? JSON.stringify(content)
+                        : String(content)
+                ));
+
+                return `
+                <button class="copy-code-btn" x-data="{ copied: false }" 
+                    @click.stop="copyToClipboard('${encodedContent}'); copied = true; setTimeout(() => copied = false, 1500)">
+                    <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i>
+                    <span x-text="copied ? 'Copied!' : '${label}'"></span>
+                </button>`;
+            } catch (e) {
+                console.error("Error creating copy button:", e);
+                return '';
+            }
+        },
+
+        // Render markdown content - using parent component's marked
+        renderMarkdown(markdown) {
+            if (!markdown) return '';
+
+            try {
+                const html = marked.parse(markdown);
+                return `
+                <div class="tool-markdown prose prose-invert prose-sm max-w-none">
+                    ${DOMPurify.sanitize(html)}
+                </div>`;
+            } catch (e) {
+                console.error("Markdown parsing error:", e);
+                return `<pre class="tool-code-block">${DOMPurify.sanitize(markdown)}</pre>`;
+            }
+        },
+
+        // Render syntax-highlighted code
+        renderCodeBlock(code, language = null, title = null) {
+            const highlighted = this.highlight(code, language);
+            const copyButton = this.createCopyButton(code);
+
+            return `
+            <div class="tool-code-container">
+                ${title ? `<div class="tool-code-title">${title}</div>` : ''}
+                <div class="tool-code-block-wrapper">
+                    <pre class="tool-code-block"><code class="hljs language-${language || 'plaintext'}">${highlighted}</code></pre>
+                    ${copyButton}
+                </div>
+            </div>`;
+        },
+
+        // Format values with appropriate units
+        formatValue(value, type) {
+            if (value === undefined || value === null) return 'N/A';
+
+            switch (type) {
+                case 'cost':
+                    const cost = typeof value === 'string' ? parseFloat(value) : value;
+                    if (isNaN(cost)) return 'N/A';
+                    if (cost < 0.0001) return `${(cost * 1000000).toFixed(2)}µ$`;
+                    if (cost < 0.01) return `${(cost * 1000).toFixed(2)}m$`;
+                    return `$${cost.toFixed(6)}`;
+
+                case 'time':
+                    const time = typeof value === 'string' ? parseFloat(value) : value;
+                    if (isNaN(time)) return 'N/A';
+                    if (time < 0.1) return `${(time * 1000).toFixed(0)}ms`;
+                    if (time < 60) return `${time.toFixed(2)}s`;
+                    const mins = Math.floor(time / 60);
+                    const secs = Math.round(time % 60);
+                    return `${mins}m ${secs}s`;
+
+                case 'number':
+                    return parseInt(value).toLocaleString();
+
+                default:
+                    return String(value);
+            }
+        },
+
+        // Create a badge with appropriate styling
+        createBadge(text, type = 'default') {
+            const classMap = {
+                'success': 'tool-badge-success',
+                'error': 'tool-badge-error',
+                'warning': 'tool-badge-warning',
+                'info': 'tool-badge-info',
+                'default': 'tool-badge-default'
+            };
+
+            const className = classMap[type] || classMap['default'];
+            return `<span class="tool-badge ${className}">${DOMPurify.sanitize(text)}</span>`;
+        },
+
+        // Render a model result card
+        renderModelResult(model, indexOrName = null) {
+            // Extract model data
+            const {
+                provider = 'unknown',
+                model: modelName = 'unknown',
+                text, content, message,
+                tokens, cost, processing_time,
+                success = true,
+                error = null
+            } = model || {};
+
+            // Get content from various possible properties
+            const modelContent = text || content || message || '';
+
+            // Generate a nice card for the model result
+            return `
+            <div class="tool-model-card" data-provider="${provider.toLowerCase()}">
+                <div class="tool-model-header">
+                    <div class="tool-model-info">
+                        <div class="tool-model-provider">
+                            ${this.createBadge(provider, 'info')}
+                        </div>
+                        <div class="tool-model-name">${modelName}</div>
+                        ${indexOrName !== null ? `<div class="tool-model-index">#${indexOrName}</div>` : ''}
+                    </div>
+                    <div class="tool-model-status">
+                        ${success
+                                    ? this.createBadge('Success', 'success')
+                                    : this.createBadge(error || 'Error', 'error')}
+                    </div>
+                </div>
+                
+                <div class="tool-model-content">
+                    ${this._isMarkdown(modelContent)
+                                    ? this.renderMarkdown(modelContent)
+                                    : `<pre class="tool-model-text">${DOMPurify.sanitize(modelContent)}</pre>`}
+                </div>
+                
+                <div class="tool-model-metrics">
+                    ${tokens ? `
+                    <div class="tool-metric">
+                        <div class="tool-metric-icon"><i class="fas fa-hashtag"></i></div>
+                        <div class="tool-metric-value">${typeof tokens === 'object'
+                                        ? this.formatValue(tokens.total || 0, 'number')
+                                        : this.formatValue(tokens, 'number')
+                                    }</div>
+                        <div class="tool-metric-label">Tokens</div>
+                    </div>` : ''}
+                    
+                    ${cost !== undefined ? `
+                    <div class="tool-metric">
+                        <div class="tool-metric-icon"><i class="fas fa-dollar-sign"></i></div>
+                        <div class="tool-metric-value">${this.formatValue(cost, 'cost')}</div>
+                        <div class="tool-metric-label">Cost</div>
+                    </div>` : ''}
+                    
+                    ${processing_time !== undefined ? `
+                    <div class="tool-metric">
+                        <div class="tool-metric-icon"><i class="fas fa-clock"></i></div>
+                        <div class="tool-metric-value">${this.formatValue(processing_time, 'time')}</div>
+                        <div class="tool-metric-label">Time</div>
+                    </div>` : ''}
+                </div>
+            </div>`;
+        },
+
+        // Render a statistics dashboard
+        renderStatsDashboard(stats, title = 'Performance Metrics') {
+            if (!stats || typeof stats !== 'object') return '';
+
+            // Prepare cost metrics
+            const costMetrics = [];
+            if (stats.cost !== undefined) {
+                costMetrics.push({
+                    icon: 'fa-dollar-sign',
+                    value: this.formatValue(stats.cost, 'cost'),
+                    label: 'Cost'
+                });
+            }
+            if (stats.total_cost !== undefined) {
+                costMetrics.push({
+                    icon: 'fa-dollar-sign',
+                    value: this.formatValue(stats.total_cost, 'cost'),
+                    label: 'Total Cost'
+                });
+            }
+
+            // Prepare time metrics
+            const timeMetrics = [];
+            if (stats.processing_time !== undefined) {
+                timeMetrics.push({
+                    icon: 'fa-clock',
+                    value: this.formatValue(stats.processing_time, 'time'),
+                    label: 'Processing Time'
+                });
+            }
+            if (stats.average_processing_time !== undefined) {
+                timeMetrics.push({
+                    icon: 'fa-clock',
+                    value: this.formatValue(stats.average_processing_time, 'time'),
+                    label: 'Avg Time'
+                });
+            }
+            if (stats.total_processing_time !== undefined) {
+                timeMetrics.push({
+                    icon: 'fa-stopwatch',
+                    value: this.formatValue(stats.total_processing_time, 'time'),
+                    label: 'Total Time'
+                });
+            }
+
+            // Prepare request metrics
+            const requestMetrics = [];
+            if (stats.total_requests !== undefined) {
+                requestMetrics.push({
+                    icon: 'fa-exchange-alt',
+                    value: this.formatValue(stats.total_requests, 'number'),
+                    label: 'Total Requests'
+                });
+            }
+            if (stats.successful_requests !== undefined) {
+                requestMetrics.push({
+                    icon: 'fa-check',
+                    value: this.formatValue(stats.successful_requests, 'number'),
+                    label: 'Successful'
+                });
+            }
+            if (stats.failed_requests !== undefined) {
+                requestMetrics.push({
+                    icon: 'fa-times',
+                    value: this.formatValue(stats.failed_requests, 'number'),
+                    label: 'Failed'
+                });
+            }
+
+            // Prepare token metrics
+            const tokenMetrics = [];
+            if (stats.tokens) {
+                if (typeof stats.tokens === 'object') {
+                    if (stats.tokens.total !== undefined) {
+                        tokenMetrics.push({
+                            icon: 'fa-hashtag',
+                            value: this.formatValue(stats.tokens.total, 'number'),
+                            label: 'Total Tokens'
+                        });
+                    }
+                    if (stats.tokens.input !== undefined) {
+                        tokenMetrics.push({
+                            icon: 'fa-sign-in-alt',
+                            value: this.formatValue(stats.tokens.input, 'number'),
+                            label: 'Input Tokens'
+                        });
+                    }
+                    if (stats.tokens.output !== undefined) {
+                        tokenMetrics.push({
+                            icon: 'fa-sign-out-alt',
+                            value: this.formatValue(stats.tokens.output, 'number'),
+                            label: 'Output Tokens'
+                        });
+                    }
+                } else {
+                    tokenMetrics.push({
+                        icon: 'fa-hashtag',
+                        value: this.formatValue(stats.tokens, 'number'),
+                        label: 'Tokens'
+                    });
+                }
+            }
+
+            // Combine all metrics
+            const allMetrics = [
+                ...costMetrics,
+                ...timeMetrics,
+                ...requestMetrics,
+                ...tokenMetrics
+            ];
+
+            // Generate the dashboard HTML
+            return `
+            <div class="tool-stats-dashboard">
+                <div class="tool-stats-header">
+                    <h3 class="tool-stats-title">
+                        <i class="fas fa-chart-line"></i> ${title}
+                    </h3>
+                </div>
+                <div class="tool-stats-grid">
+                    ${allMetrics.map(metric => `
+                    <div class="tool-stat-card">
+                        <div class="tool-stat-icon">
+                            <i class="fas ${metric.icon}"></i>
+                        </div>
+                        <div class="tool-stat-value">${metric.value}</div>
+                        <div class="tool-stat-label">${metric.label}</div>
+                    </div>
+                    `).join('')}
+                </div>
+            </div>`;
+        },
+
+        // Render comparison table
+        renderComparisonTable(models, title = 'Model Comparison') {
+            if (!models || models.length === 0) return '';
+
+            // Create table header
+            let tableHTML = `
+            <div class="tool-comparison">
+                <div class="tool-comparison-header">
+                    <h3 class="tool-comparison-title">
+                        <i class="fas fa-balance-scale"></i> ${title}
+                    </h3>
+                </div>
+                <div class="tool-comparison-table-wrapper">
+                    <table class="tool-comparison-table">
+                        <thead>
+                            <tr>
+                                <th>Provider</th>
+                                <th>Model</th>
+                                <th>Cost</th>
+                                <th>Time</th>
+                                <th>Tokens</th>
+                            </tr>
+                        </thead>
+                        <tbody>`;
+
+            // Add rows for each model
+            models.forEach(model => {
+                tableHTML += `
+                <tr>
+                    <td>${model.provider || 'Unknown'}</td>
+                    <td>${model.model || 'Unknown'}</td>
+                    <td>${model.cost !== undefined ? this.formatValue(model.cost, 'cost') : 'N/A'}</td>
+                    <td>${model.processing_time !== undefined ? this.formatValue(model.processing_time, 'time') : 'N/A'}</td>
+                    <td>${model.tokens ? (
+                                        typeof model.tokens === 'object'
+                                            ? this.formatValue(model.tokens.total || 0, 'number')
+                                            : this.formatValue(model.tokens, 'number')
+                                    ) : 'N/A'}</td>
+                </tr>`;
+            });
+
+            // Close the table
+            tableHTML += `
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+
+            return tableHTML;
+        },
+
+        // Utility to check if content is markdown
+        _isMarkdown(str) {
+            if (typeof str !== 'string') return false;
+
+            // Extended markdown detection patterns
+            const markdownPatterns = [
+                /^#{1,6}\s+.+$/m,                     // Headers
+                /^[-*+]\s+.+$/m,                      // Unordered lists
+                /^>\s+.+$/m,                          // Blockquotes
+                /^```[\s\S]*?```$/m,                  // Code blocks
+                /^(?:\d+\.)\s+.+$/m,                  // Ordered lists
+                /\*\*.*?\*\*/,                        // Bold
+                /_.*?_/,                              // Italic
+                /`.*?`/,                              // Inline code
+                /\[.*?\]\(.*?\)/,                     // Links
+                /!\[.*?\]\(.*?\)/,                    // Images
+                /\|[^|]+\|[^|]+\|/,                   // Tables
+                /^---+$/m,                            // Horizontal rule
+                /^===+$/m                             // Alternate heading style
+            ];
+
+            // Check if at least one markdown pattern is found and the string has substantial length
+            return str.length > 20 && markdownPatterns.some(pattern => pattern.test(str));
+        }
+    };
+
+    // ===== MAIN RENDERING FUNCTION =====
+    try {
+        // Analyze the content deeply
+        const analysisResult = contentInspector.inspectContent(block.content);
+
+        // Prepare the content sections
+        let contentHTML = '';
+
+        // Render based on the detected content type
+        switch (analysisResult.detectedType) {
+            case 'models': {
+                // Render model results
+                if (analysisResult.models && analysisResult.models.length > 1) {
+                    // Multiple models - create a comparison
+                    contentHTML += visualRenderer.renderComparisonTable(
+                        analysisResult.models,
+                        'Model Comparison'
+                    );
+
+                    // Render each model card separately
+                    analysisResult.models.forEach((model, index) => {
+                        contentHTML += visualRenderer.renderModelResult(model, index + 1);
+                    });
+                } else if (analysisResult.models && analysisResult.models.length === 1) {
+                    // Single model - render the card
+                    contentHTML += visualRenderer.renderModelResult(analysisResult.models[0]);
+                }
+
+                // Add stats dashboard if available
+                if (analysisResult.stats) {
+                    contentHTML += visualRenderer.renderStatsDashboard(
+                        analysisResult.stats,
+                        'Performance Metrics'
+                    );
+                }
+                break;
+            }
+
+            case 'markdown': {
+                // Render the first markdown content
+                if (analysisResult.markdown && analysisResult.markdown.length > 0) {
+                    contentHTML += visualRenderer.renderMarkdown(
+                        analysisResult.markdown[0].content
+                    );
+
+                    // Add stats dashboard if available
+                    if (analysisResult.stats) {
+                        contentHTML += visualRenderer.renderStatsDashboard(
+                            analysisResult.stats,
+                            'Performance Metrics'
+                        );
+                    }
+                }
+                break;
+            }
+
+            case 'json': {
+                // Check if the JSON is a structured report
+                if (analysisResult.json && analysisResult.json.length > 0) {
+                    const json = analysisResult.json[0].content;
+
+                    // Handle special cases for structured data
+                    if (json && json.message && typeof json.message === 'string') {
+                        // Simple message
+                        contentHTML += `<div class="tool-message">${DOMPurify.sanitize(json.message)}</div>`;
+                    } else if (json && (json.title || json.heading)) {
+                        // Structured report with title
+                        contentHTML += `<h2 class="tool-content-title">${DOMPurify.sanitize(json.title || json.heading)}</h2>`;
+
+                        if (json.content || json.text) {
+                            const content = json.content || json.text;
+                            contentHTML += visualRenderer._isMarkdown(content)
+                                ? visualRenderer.renderMarkdown(content)
+                                : `<div class="tool-message">${DOMPurify.sanitize(content)}</div>`;
+                        }
+
+                        // Handle sections
+                        if (json.sections && Array.isArray(json.sections)) {
+                            json.sections.forEach(section => {
+                                if (typeof section === 'string') {
+                                    contentHTML += visualRenderer.renderMarkdown(section);
+                                } else if (section && typeof section === 'object') {
+                                    if (section.title || section.heading) {
+                                        contentHTML += `<h3 class="tool-section-title">${DOMPurify.sanitize(section.title || section.heading)}</h3>`;
+                                    }
+
+                                    if (section.content || section.text) {
+                                        const content = section.content || section.text;
+                                        contentHTML += visualRenderer._isMarkdown(content)
+                                            ? visualRenderer.renderMarkdown(content)
+                                            : `<div class="tool-message">${DOMPurify.sanitize(content)}</div>`;
+                                    }
+                                }
+                            });
                         }
                     } else {
-                        highlightedContent = DOMPurify.sanitize(displayContent);
+                        // Default JSON rendering
+                        contentHTML += visualRenderer.renderCodeBlock(
+                            json,
+                            'json',
+                            'JSON Data'
+                        );
                     }
 
-                    // Build the HTML
-                    let html = `<div class="${containerClasses}">`;
-                    html += `<div class="flex flex-wrap items-baseline gap-x-2 gap-y-1 font-medium text-sm mb-1.5">
-         <span class="flex items-center gap-1.5"><i class="${headerIconClass}"></i>${headerText}</span>
-         <span class="text-xs opacity-80">(for <code class="text-xs font-mono bg-base-100/50 px-1 py-0.5 rounded">...${DOMPurify.sanitize(toolUseId.slice(-6))}</code>)</span>
-     </div>`;
+                    // Add stats dashboard if available
+                    if (analysisResult.stats) {
+                        contentHTML += visualRenderer.renderStatsDashboard(
+                            analysisResult.stats,
+                            'Performance Metrics'
+                        );
+                    }
+                }
+                break;
+            }
 
-                    // Apply the wrapper class to the div containing the pre
-                    html += `<div class="tool-content-wrapper group/codeblock">
-         <pre class="${isRawText ? 'tool-data-raw-text' : ''} text-sm overflow-auto max-h-60"><code class="language-${language} hljs whitespace-pre-wrap break-all">${highlightedContent}</code></pre>
-         ${this.createCopyButton(displayContent, 'result')}
-     </div>`;
+            default: {
+                // Default text rendering
+                if (analysisResult.rawText && analysisResult.rawText.length > 0) {
+                    const text = analysisResult.rawText[0].content;
+                    contentHTML += visualRenderer._isMarkdown(text)
+                        ? visualRenderer.renderMarkdown(text)
+                        : `<pre class="tool-plain-text">${DOMPurify.sanitize(text)}</pre>`;
+                } else if (block && block.content) {
+                    // Fallback to original content
+                    contentHTML += `<pre class="tool-plain-text">${DOMPurify.sanitize(String(block.content))}</pre>`;
+                } else {
+                    contentHTML += `<div class="tool-message">No content available</div>`;
+                }
+                break;
+            }
+        }
 
-                    html += `</div>`;
-                    return html;
-                }, // End renderUserProvidedToolResult
-
+        // Create the container with header and content
+        return `
+    <div class="tool-result-container">
+        <div class="tool-result-header">
+            <div class="tool-result-title">
+                <svg xmlns="http://www.w3.org/2000/svg" class="tool-result-icon" viewBox="0 0 24 24" stroke="currentColor" fill="none">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/>
+                </svg>
+                <span>Tool Data</span>
+            </div>
+            <div class="tool-result-actions">
+                ${visualRenderer.createCopyButton(block.content, 'Copy Raw')}
+            </div>
+        </div>
+        <div class="tool-result-content">
+            ${contentHTML}
+        </div>
+    </div>`;
+    } catch (error) {
+        console.error("Tool result rendering failed:", error);
+        return `<div class="bg-error/10 p-4 rounded border border-error/30 text-error">
+            <h3 class="font-medium mb-2">Tool Data Rendering Error</h3>
+            <p>Failed to render tool result: ${DOMPurify.sanitize(error.message)}</p>
+            <pre class="mt-2 p-2 bg-error/5 rounded text-xs max-h-40 overflow-auto">${DOMPurify.sanitize(JSON.stringify(block.content, null, 2) || 'No content')}</pre>
+        </div>`;
+    }
+},
                 renderMessageContent(message) {
                     try {
                         // --- Priority Handling ---
@@ -8192,8 +9738,23 @@
             </div>
         </div>
 
-        <!-- Right section (stats toggle and system info) -->
+        <!-- Right section (token stats, system stats toggle) -->
         <div class="flex items-center gap-3">
+            <!-- Token Usage Stats -->
+            <div class="status-item" title="Session Token Usage">
+                <i class="fas fa-arrow-right text-cyan-500 fa-fw"></i>
+                <span x-text="`In: ${tokenUsage.input_tokens?.toLocaleString() || 0}`"></span>
+            </div>
+            <div class="status-item" title="Session Token Output">
+                <i class="fas fa-arrow-left text-purple-500 fa-fw"></i>
+                <span x-text="`Out: ${tokenUsage.output_tokens?.toLocaleString() || 0}`"></span>
+            </div>
+            <div class="status-item" title="Session Cost">
+                <i class="fas fa-dollar-sign text-amber-500 fa-fw"></i>
+                <span x-text="`$${(tokenUsage.total_cost || 0).toFixed(4)}`"></span>
+            </div>
+
+            <!-- System Stats Toggle (existing) -->
             <div class="status-item cursor-pointer" @click="toggleSystemStats">
                 <i class="fas fa-chart-line fa-fw"></i>
                 <span>Stats</span>
