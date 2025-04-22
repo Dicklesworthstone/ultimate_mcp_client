@@ -1869,6 +1869,80 @@
             background-color: #111827 !important;
         }
 
+        /* Override marked output */
+        .markdown-content * {
+            color: white !important;
+        }
+
+        .markdown-content pre,
+        .markdown-content code {
+            background-color: rgba(0, 0, 0, 0.3) !important;
+            color: white !important;
+        }
+
+        .markdown-content a {
+            color: #38bdf8 !important;
+        }
+
+        /* Force all prose text in dark backgrounds to be white */
+        .bg-gray-800 .prose * {
+            color: white !important;
+        }
+
+        .bg-gray-800 p,
+        .bg-gray-800 span,
+        .bg-gray-800 div,
+        .bg-gray-800 h1,
+        .bg-gray-800 h2,
+        .bg-gray-800 h3,
+        .bg-gray-800 h4,
+        .bg-gray-800 h5,
+        .bg-gray-800 h6,
+        .bg-gray-800 li {
+            color: white !important;
+        }
+
+        /* ============================================= */
+        /* FIX FOR MULTI-PROVIDER PRE TAG STYLES       */
+        /* ============================================= */
+
+        /* Target <pre> elements specifically inside the card-body of provider cards */
+        .provider-result-card .card-body pre {
+            background-color: transparent !important;
+            /* FORCE transparent background */
+            color: #e5e7eb !important;
+            /* FORCE a light text color (e.g., text-gray-200) */
+            padding: 0 !important;
+            /* Reset padding, assuming code tag inside handles it */
+            margin: 0 !important;
+            /* Reset margin */
+            border: none !important;
+            /* Remove any borders */
+            border-radius: 0 !important;
+            /* Remove rounding if any */
+            /* Ensure it uses the parent's font if prose isn't setting it right */
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+        }
+
+        /* Ensure the <code> tag inside inherits the forced styles */
+        .provider-result-card .card-body pre code.hljs {
+            background-color: transparent !important;
+            /* Code tag itself is transparent */
+            color: inherit !important;
+            /* Inherit the #e5e7eb from the <pre> */
+            /* hljs usually adds padding here, which is often desired */
+            padding: 0.75rem !important;
+            /* Example: Adjust as needed for hljs */
+        }
+
+        /* If the text is NOT inside a <pre> but directly in card-body (less likely) */
+        .provider-result-card .card-body p,
+        .provider-result-card .card-body li,
+        .provider-result-card .card-body span {
+            color: #e5e7eb !important;
+            /* Force light color if directly in card-body */
+        }
+
         [x-cloak] {
             display: none;
         }
@@ -8128,940 +8202,899 @@
                     // Fallback - convert to JSON and render as structured data
                     return this.renderJson(content);
                 },
+                // ===== CONTENT ANALYSIS & EXTRACTION ENGINE (Component Property) =====
+                contentInspector: {
+                    // Core Analysis Functions
+                    inspectContent(content) {
+                        const result = { markdown: [], json: [], models: [], stats: null, rawText: [], detectedType: 'unknown' };
+                        try {
+                            this._analyzeDeep(content, result);
+                            result.detectedType = this._determineContentType(result);
+                        } catch (err) { console.error("Content inspection error:", err); }
+                        return result;
+                    },
+
+                    // Recursive analysis engine
+                    _analyzeDeep(content, result, path = '') {
+                        if (content === null || content === undefined) return;
+
+                        // --- CORRECTED STRING HANDLING ---
+                        if (typeof content === 'string') {
+                            // 1. Clean TextContent wrapper first
+                            const cleanedContent = this._cleanTextContentWrappers(content);
+                            let potentialJsonString = cleanedContent;
+
+                            // If cleaning occurred, log it
+                            if (cleanedContent !== content) {
+                                console.log("_analyzeDeep: TextContent cleaned, potential JSON:", potentialJsonString);
+                            } else {
+                                //console.log("_analyzeDeep: Processing raw string:", content); // Less verbose log
+                            }
+
+                            // 2. Attempt to parse the *result* of cleaning as JSON
+                            let parsedJson = null;
+                            try {
+                                const trimmed = potentialJsonString.trim();
+                                if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                                    parsedJson = JSON.parse(potentialJsonString);
+                                    //console.log("_analyzeDeep: Successfully parsed cleaned content as JSON.");
+                                } else {
+                                    //console.log("_analyzeDeep: Cleaned content doesn't look like JSON, skipping parse.");
+                                }
+                            } catch (e) {
+                                //console.log("_analyzeDeep: Failed to parse cleaned content as JSON, treating as text/markdown.", e.message);
+                            }
+
+                            // 3. If JSON parsed, analyze recursively
+                            if (parsedJson !== null) {
+                                this._analyzeDeep(parsedJson, result, path + '.parsed');
+                                return;
+                            }
+
+                            // 4. If no JSON, treat *cleaned* content as markdown or raw text
+                            const contentToRender = cleanedContent; // Always use the cleaned result
+                            if (this._isMarkdown(contentToRender)) {
+                                //console.log("_analyzeDeep: Treating cleaned content as Markdown.");
+                                result.markdown.push({ content: contentToRender, path: path });
+                            } else {
+                                //console.log("_analyzeDeep: Treating cleaned content as Raw Text.");
+                                result.rawText.push({ content: contentToRender, path: path });
+                            }
+                            return;
+                        }
+                        // --- END CORRECTED STRING HANDLING ---
+
+
+                        // Handle arrays
+                        if (Array.isArray(content)) {
+                            if (this._isModelResultsArray(content)) {
+                                content.forEach((model, index) => {
+                                    if (model && typeof model === 'object') result.models.push({ ...model, _index: index, _path: `${path}[${index}]` });
+                                });
+                                return;
+                            }
+                            content.forEach((item, index) => this._analyzeDeep(item, result, `${path}[${index}]`));
+                            return;
+                        }
+
+                        // Handle objects
+                        if (typeof content === 'object') {
+                            if (this._isModelResultObject(content)) {
+                                result.models.push({ ...content, _path: path });
+                                return;
+                            }
+                            if (this._isStatsObject(content)) {
+                                result.stats = result.stats ? { ...result.stats, ...content } : content;
+                                // Don't return here, still analyze deeper if necessary
+                            }
+
+                            // Store full object as JSON *unless* it was already identified as stats/model
+                            if (!this._isStatsObject(content) && !this._isModelResultObject(content)) {
+                                result.json.push({ content: content, path: path });
+                            }
+
+
+                            // Look deeper into object properties
+                            for (const key in content) {
+                                if (key.startsWith('_')) continue; // Skip internal keys
+
+                                // Special handling for common keys if they weren't part of a detected object type
+                                if (!this._isModelResultObject(content)) {
+                                    if ((key === 'text' || key === 'content' || key === 'message') && typeof content[key] === 'string') {
+                                        if (this._isMarkdown(content[key])) {
+                                            result.markdown.push({ content: content[key], path: `${path}.${key}` });
+                                            continue; // Don't recurse further into this specific key if handled as markdown
+                                        }
+                                    }
+                                    if (key === 'results' && typeof content[key] === 'object') {
+                                        for (const modelName in content[key]) {
+                                            const modelData = content[key][modelName];
+                                            if (typeof modelData === 'object') {
+                                                result.models.push({ ...modelData, provider: modelName.split('/')[0], model: modelName.split('/')[1] || modelName, _path: `${path}.${key}.${modelName}` });
+                                            }
+                                        }
+                                        // Recurse *into* the results object to find potential nested stats/markdown/etc.
+                                        // This was missing before.
+                                        this._analyzeDeep(content[key], result, `${path}.${key}`);
+                                        continue; // Already handled the 'results' structure
+                                    }
+                                }
+
+                                // Always recurse into other properties
+                                this._analyzeDeep(content[key], result, `${path}.${key}`);
+                            }
+                            return;
+                        }
+                    }, // End _analyzeDeep
+
+                    // Extract embedded JSON from strings
+                    _extractJsonFromString(str) {
+                        if (typeof str !== 'string') return null;
+                        const jsonRegexPatterns = [/\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}/g, /\[(?:[^\[\]]|(?:\[(?:[^\[\]]|(?:\[[^\[\]]*\]))*\]))*\]/g];
+                        for (const pattern of jsonRegexPatterns) {
+                            const matches = str.match(pattern);
+                            if (!matches) continue;
+                            for (const match of matches) {
+                                try { if (match.length < 10) continue; const parsed = JSON.parse(match); return parsed; } catch (e) { }
+                            }
+                        }
+                        // Removed TextContent matching here, handled by _cleanTextContentWrappers
+                        return null;
+                    }, // End _extractJsonFromString
+
+                    // Clean TextContent wrappers - Using Robust Version
+                    _cleanTextContentWrappers(str) {
+                        if (typeof str !== 'string') return str;
+                        let contentToProcess = str.trim();
+                        // 1. Strip surrounding brackets first
+                        if (contentToProcess.startsWith('[') && contentToProcess.endsWith(']')) {
+                            contentToProcess = contentToProcess.slice(1, -1).trim();
+                        }
+                        // 2. Apply the more robust TextContent regex
+                        const pattern = /^TextContent\(\s*(?:type\s*=\s*(['"])text\1(?:,\s*)?)?text\s*=\s*(['"])((?:\\.|(?!\2).)*?)\2(?:,\s*annotations\s*=\s*(?:None|\[\]))?\s*\)$/;
+                        const match = contentToProcess.match(pattern);
+
+                        if (match && match[3]) {
+                            try {
+                                let unescaped = match[3]
+                                    .replace(/\\"/g, '"')
+                                    .replace(/\\'/g, "'")
+                                    .replace(/\\n/g, '\n')
+                                    .replace(/\\\\/g, '\\');
+                                unescaped = unescaped.replace(/\\u([\da-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+                                unescaped = unescaped.replace(/\\U([\da-fA-F]{8})/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)));
+                                return unescaped;
+                            } catch (e) {
+                                console.error("Error unescaping TextContent text:", e);
+                                return match[3]; // Return raw matched text on error
+                            }
+                        }
+                        // If pattern didn't match, return the (potentially bracket-stripped) string
+                        return contentToProcess;
+                    }, // End _cleanTextContentWrappers
+
+                    // Check if string contains markdown
+                    _isMarkdown(str) {
+                        if (typeof str !== 'string' || str.length <= 20) return false;
+                        const markdownPatterns = [/^#{1,6}\s+.+$/m, /^[-*+]\s+.+$/m, /^>\s+.+$/m, /^```[\s\S]*?```$/m, /^(?:\d+\.)\s+.+$/m, /\*\*.*?\*\*/, /_.*?_/, /`.*?`/, /\[.*?\]\(.*?\)/, /!\[.*?\]\(.*?\)/, /\|[^|]+\|[^|]+\|/, /^---+$/m, /^===+$/m];
+                        return markdownPatterns.some(pattern => pattern.test(str));
+                    }, // End _isMarkdown
+
+                    // Check if object is a model result
+                    _isModelResultObject(obj) {
+                        if (!obj || typeof obj !== 'object') return false;
+                        const modelProperties = ['model', 'provider', 'text', 'tokens', 'cost', 'processing_time', 'success'];
+                        return ('text' in obj || 'content' in obj) && modelProperties.filter(prop => prop in obj).length >= 2;
+                    }, // End _isModelResultObject
+
+                    // Check if an array contains model results
+                    _isModelResultsArray(arr) {
+                        return Array.isArray(arr) && arr.length > 0 && arr.some(item => this._isModelResultObject(item));
+                    }, // End _isModelResultsArray
+
+                    // Check if object contains statistics
+                    _isStatsObject(obj) {
+                        if (!obj || typeof obj !== 'object') return false;
+                        const statsProps = ['tokens', 'cost', 'processing_time', 'total_requests', 'successful_requests', 'failed_requests', 'total_cost', 'average_processing_time'];
+                        return statsProps.filter(prop => prop in obj).length >= 2;
+                    }, // End _isStatsObject
+
+                    // Determine the primary content type based on the analysis - Using IMPROVED VERSION
+                    _determineContentType(result) {
+                        // Give priority to complex structures detected directly in the first JSON block
+                        if (result.json && result.json.length > 0) {
+                            const jsonData = result.json[0].content; // Analyze the primary JSON data found
+
+                            if (jsonData) { // Check if jsonData is valid
+                                // Check for multi-provider results with aggregate stats (highest priority)
+                                if (jsonData.results && typeof jsonData.results === 'object' &&
+                                    Object.keys(jsonData.results).length > 0 &&
+                                    jsonData.aggregate_stats && typeof jsonData.aggregate_stats === 'object') {
+                                    return 'multi_provider';
+                                }
+
+                                // Standard model comparison (multiple models without aggregate stats)
+                                if (jsonData.results && typeof jsonData.results === 'object' &&
+                                    Object.keys(jsonData.results).length > 1) {
+                                    return 'model_comparison';
+                                }
+
+                                // Check for providers status information
+                                if (jsonData.providers && typeof jsonData.providers === 'object') {
+                                    return 'providers_status';
+                                }
+
+                                // Check for models list
+                                if (jsonData.models && typeof jsonData.models === 'object') {
+                                    return 'models_list';
+                                }
+
+                                // Check if it's a single model result *within* the JSON
+                                if ((jsonData.text || jsonData.content) && jsonData.model && jsonData.provider) {
+                                    return 'single_model';
+                                }
+
+                                // Check for simple message object
+                                if (jsonData.message && typeof jsonData.message === 'string' &&
+                                    Object.keys(jsonData).length === 1) {
+                                    return 'simple_message';
+                                }
+                            }
+                        }
+
+                        // Fallback to checking collected arrays/types
+                        if (result.models.length > 1) {
+                            return 'models'; // Multiple models implies comparison or list
+                        }
+
+                        if (result.models.length === 1) {
+                            return 'single_model'; // Only one model found
+                        }
+
+                        if (result.markdown.length > 0) {
+                            return 'markdown';
+                        }
+
+                        if (result.json.length > 0) {
+                            return 'json'; // Generic JSON if no specific structure matched
+                        }
+
+                        if (result.rawText.length > 0) {
+                            return 'text'; // Plain text
+                        }
+
+                        return 'unknown'; // Default if nothing substantial was found
+                    } // End _determineContentType
+                }, // End contentInspector
+
+                // ===== VISUAL RENDERING ENGINE (Component Property) =====
+                visualRenderer: {
+                    // Internal reference to hljs, marked, DOMPurify (assuming they are globally available or passed in)
+                    _hljs: window.hljs,
+                    _marked: window.marked,
+                    _DOMPurify: window.DOMPurify,
+                    _parent: null, // Will be set to the Alpine component instance ('this')
+
+                    // Initialize with parent context
+                    init(parentContext) {
+                        this._parent = parentContext; // Store reference to Alpine component
+                        if (!this._hljs) console.error("VisualRenderer: highlight.js (hljs) not found globally.");
+                        if (!this._marked) console.error("VisualRenderer: marked.js (marked) not found globally.");
+                        if (!this._DOMPurify) console.error("VisualRenderer: DOMPurify not found globally.");
+                        return this; // Return self for chaining if needed
+                    },
+
+
+                    // Highlight code with proper language detection
+                    highlight(code, forcedLanguage = null) {
+                        if (!this._hljs || !code) return DOMPurify.sanitize(String(code || ''));
+                        const codeStr = typeof code === 'object' ? JSON.stringify(code, null, 2) : String(code);
+                        let language = forcedLanguage;
+                        if (!language) {
+                            if (codeStr.trim().startsWith('{') || codeStr.trim().startsWith('[')) language = 'json';
+                            else if (/^(function|const|let|var|import|class)\s/.test(codeStr)) language = 'javascript';
+                            else if (/^(def|class|import|from|print)\s/.test(codeStr)) language = 'python';
+                            else language = 'plaintext';
+                        }
+                        try { return this._hljs.highlight(codeStr, { language, ignoreIllegals: true }).value; }
+                        catch (e) { console.error("Highlighting error:", e); return this._DOMPurify.sanitize(codeStr); }
+                    },
+
+                    // Create copy button - uses parent's copyToClipboard method
+                    createCopyButton(content, label = 'Copy') {
+                        if (!this._parent || typeof this._parent.copyToClipboard !== 'function') {
+                            console.error("Cannot create copy button: Parent context or copyToClipboard function missing.");
+                            return '';
+                        }
+                        try {
+                            const encodedContent = btoa(encodeURIComponent(typeof content === 'object' ? JSON.stringify(content) : String(content)));
+                            // Note the @click calls a method assumed to be on the PARENT Alpine component
+                            return `<button class="copy-code-btn" x-data="{ copied: false }" @click.stop="$dispatch('copy-clipboard', '${encodedContent}'); copied = true; setTimeout(() => copied = false, 1500)"> <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i> <span x-text="copied ? 'Copied!' : '${label}'"></span> </button>`;
+                        } catch (e) { console.error("Error creating copy button:", e); return ''; }
+                    },
+
+                    // Render markdown content
+                    renderMarkdown(markdown) {
+                        if (!this._marked || !this._DOMPurify || !markdown) return `<pre class="tool-code-block">${DOMPurify.sanitize(String(markdown || ''))}</pre>`;
+                        try {
+                            const html = this._marked.parse(markdown);
+                            return `<div class="tool-markdown prose prose-invert prose-sm max-w-none">${this._DOMPurify.sanitize(html)}</div>`;
+                        } catch (e) { console.error("Markdown parsing error:", e); return `<pre class="tool-code-block">${this._DOMPurify.sanitize(markdown)}</pre>`; }
+                    },
+
+                    // Render syntax-highlighted code
+                    renderCodeBlock(code, language = null, title = null) {
+                        if (!this._DOMPurify) return ''; // Need DOMPurify for safety
+                        const highlighted = this.highlight(code, language); // Use internal highlight
+                        const copyButton = this.createCopyButton(code); // Use internal createCopyButton
+                        const sanitizedTitle = title ? `<div class="tool-code-title">${this._DOMPurify.sanitize(title)}</div>` : '';
+                        return `<div class="tool-code-container"> ${sanitizedTitle} <div class="tool-code-block-wrapper"> <pre class="tool-code-block"><code class="hljs language-${language || 'plaintext'}">${highlighted}</code></pre> ${copyButton} </div> </div>`;
+                    },
+
+                    // Format values with appropriate units
+                    formatValue(value, type) {
+                        if (value === undefined || value === null) return 'N/A';
+                        try { // Add try-catch for safety
+                            switch (type) {
+                                case 'cost': const cost = parseFloat(value); if (isNaN(cost)) return 'N/A'; if (cost < 0.0001 && cost !== 0) return `${(cost * 1000000).toFixed(2)}µ$`; if (cost < 0.01 && cost !== 0) return `${(cost * 1000).toFixed(2)}m$`; return `$${cost.toFixed(6)}`;
+                                case 'time': const time = parseFloat(value); if (isNaN(time)) return 'N/A'; if (time < 0.1) return `${(time * 1000).toFixed(0)}ms`; if (time < 60) return `${time.toFixed(2)}s`; const mins = Math.floor(time / 60); const secs = Math.round(time % 60); return `${mins}m ${secs}s`;
+                                case 'number': const num = parseInt(value); return isNaN(num) ? 'N/A' : num.toLocaleString();
+                                default: return String(value);
+                            }
+                        } catch (e) { console.error("Error formatting value:", value, type, e); return 'N/A'; }
+                    },
+
+                    // Create a badge with appropriate styling
+                    createBadge(text, type = 'default') {
+                        if (!this._DOMPurify) return '';
+                        const classMap = { 'success': 'tool-badge-success', 'error': 'tool-badge-error', 'warning': 'tool-badge-warning', 'info': 'tool-badge-info', 'default': 'tool-badge-default' };
+                        const className = classMap[type] || classMap['default'];
+                        return `<span class="tool-badge ${className}">${this._DOMPurify.sanitize(String(text))}</span>`;
+                    },
+
+                    // Check if string contains markdown (Helper needed internally)
+                    _isMarkdown(str) {
+                        if (typeof str !== 'string' || str.length <= 20) return false;
+                        const markdownPatterns = [/^#{1,6}\s+.+$/m, /^[-*+]\s+.+$/m, /^>\s+.+$/m, /^```[\s\S]*?```$/m, /^(?:\d+\.)\s+.+$/m, /\*\*.*?\*\*/, /_.*?_/, /`.*?`/, /\[.*?\]\(.*?\)/, /!\[.*?\]\(.*?\)/, /\|[^|]+\|[^|]+\|/, /^---+$/m, /^===+$/m];
+                        return markdownPatterns.some(pattern => pattern.test(str));
+                    }, // End _isMarkdown (internal helper)
+
+                    // Render a model result card
+                    renderModelResult(model, indexOrName = null) {
+                        if (!model || typeof model !== 'object') {
+                            return '<div class="text-error">Invalid model data</div>';
+                        }
+
+                        const {
+                            provider = 'unknown',
+                            model: modelName = 'unknown',
+                            text, content, message,
+                            tokens, cost, processing_time,
+                            success = true,
+                            error = null
+                        } = model;
+
+                        // Get the actual content from whatever field contains it
+                        const modelContent = text || content || message || '';
+
+                        // Create badges for provider and status
+                        const badgeProvider = this.createBadge(this._DOMPurify.sanitize(provider), 'info');
+                        const badgeStatus = success
+                            ? this.createBadge('Success', 'success')
+                            : this.createBadge(this._DOMPurify.sanitize(error || 'Error'), 'error');
+
+                        // Render the content appropriately based on whether it's markdown or not
+                        const renderedContent = this._isMarkdown(modelContent)
+                            ? this.renderMarkdown(modelContent)
+                            : `<pre class="tool-model-text whitespace-pre-wrap">${this._DOMPurify.sanitize(modelContent)}</pre>`;
+
+                        // Create metrics display
+                        const metricTokens = tokens
+                            ? `<div class="tool-metric"><i class="fas fa-hashtag mr-1"></i> ${typeof tokens === 'object' ? this.formatValue(tokens.total || 0, 'number') : this.formatValue(tokens, 'number')} tokens</div>`
+                            : '';
+
+                        const metricCost = cost !== undefined
+                            ? `<div class="tool-metric"><i class="fas fa-dollar-sign mr-1"></i> ${this.formatValue(cost, 'cost')}</div>`
+                            : '';
+
+                        const metricTime = processing_time !== undefined
+                            ? `<div class="tool-metric"><i class="fas fa-clock mr-1"></i> ${this.formatValue(processing_time, 'time')}</div>`
+                            : '';
+
+                        // Optional index display
+                        const indexHtml = indexOrName !== null
+                            ? `<div class="tool-model-index">#${indexOrName}</div>`
+                            : '';
+
+                        return `
+<div class="tool-model-card border rounded-lg overflow-hidden shadow-sm mb-4" data-provider="${this._DOMPurify.sanitize(provider.toLowerCase())}">
+    <div class="tool-model-header bg-base-300/50 p-3 flex items-center justify-between">
+        <div class="tool-model-info flex items-center gap-2">
+            ${badgeProvider}
+            <div class="tool-model-name font-medium">${this._DOMPurify.sanitize(modelName)}</div>
+            ${indexHtml}
+        </div>
+        <div class="tool-model-status">
+            ${badgeStatus}
+        </div>
+    </div>
+    <div class="tool-model-content p-4 bg-base-200">
+        ${renderedContent}
+    </div>
+    <div class="tool-model-metrics flex flex-wrap gap-3 p-2 bg-base-300/30 text-xs">
+        ${metricTokens}
+        ${metricCost}
+        ${metricTime}
+    </div>
+</div>`;
+                    },
+
+                    // Render a statistics dashboard
+                    renderStatsDashboard(stats, title = 'Performance Metrics') {
+                        if (!stats || typeof stats !== 'object') return '';
+                        const metrics = [
+                            ...(stats.total_cost !== undefined ? [{ icon: 'fa-dollar-sign', value: this.formatValue(stats.total_cost, 'cost'), label: 'Total Cost' }] : []),
+                            ...(stats.cost !== undefined && stats.total_cost === undefined ? [{ icon: 'fa-dollar-sign', value: this.formatValue(stats.cost, 'cost'), label: 'Cost' }] : []), // Show single cost if total isn't there
+                            ...(stats.average_processing_time !== undefined ? [{ icon: 'fa-clock', value: this.formatValue(stats.average_processing_time, 'time'), label: 'Avg Time' }] : []),
+                            ...(stats.processing_time !== undefined && stats.average_processing_time === undefined ? [{ icon: 'fa-clock', value: this.formatValue(stats.processing_time, 'time'), label: 'Time' }] : []), // Show single time if avg isn't there
+                            ...(stats.total_processing_time !== undefined ? [{ icon: 'fa-stopwatch', value: this.formatValue(stats.total_processing_time, 'time'), label: 'Total Time' }] : []),
+                            ...(stats.total_requests !== undefined ? [{ icon: 'fa-exchange-alt', value: this.formatValue(stats.total_requests, 'number'), label: 'Requests' }] : []),
+                            ...(stats.successful_requests !== undefined ? [{ icon: 'fa-check', value: this.formatValue(stats.successful_requests, 'number'), label: 'Successful' }] : []),
+                            ...(stats.failed_requests !== undefined ? [{ icon: 'fa-times', value: this.formatValue(stats.failed_requests, 'number'), label: 'Failed' }] : []),
+                            ...(stats.tokens && stats.tokens.total !== undefined ? [{ icon: 'fa-hashtag', value: this.formatValue(stats.tokens.total, 'number'), label: 'Total Tokens' }] : []),
+                            ...(stats.tokens && stats.tokens.input !== undefined ? [{ icon: 'fa-sign-in-alt', value: this.formatValue(stats.tokens.input, 'number'), label: 'Input Tokens' }] : []),
+                            ...(stats.tokens && stats.tokens.output !== undefined ? [{ icon: 'fa-sign-out-alt', value: this.formatValue(stats.tokens.output, 'number'), label: 'Output Tokens' }] : []),
+                            ...(stats.tokens && typeof stats.tokens !== 'object' ? [{ icon: 'fa-hashtag', value: this.formatValue(stats.tokens, 'number'), label: 'Tokens' }] : []) // Handle simple token number
+                        ];
+                        if (metrics.length === 0) return ''; // Don't render empty dashboard
+                        const gridContent = metrics.map(m => `<div class="tool-stat-card"><div class="tool-stat-icon"><i class="fas ${m.icon}"></i></div><div class="tool-stat-value">${m.value}</div><div class="tool-stat-label">${m.label}</div></div>`).join('');
+                        return `<div class="tool-stats-dashboard"><div class="tool-stats-header"><h3 class="tool-stats-title"><i class="fas fa-chart-line"></i> ${this._DOMPurify.sanitize(title)}</h3></div><div class="tool-stats-grid">${gridContent}</div></div>`;
+                    }, // End renderStatsDashboard
+
+                    // Render comparison table
+                    renderComparisonTable(models, title = 'Model Comparison') {
+                        if (!models || models.length === 0) return '';
+                        const headers = ['Provider', 'Model', 'Cost', 'Time', 'Tokens'];
+                        const headerRow = `<thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>`;
+                        const bodyRows = models.map(model => {
+                            const cost = model.cost !== undefined ? this.formatValue(model.cost, 'cost') : 'N/A';
+                            const time = model.processing_time !== undefined ? this.formatValue(model.processing_time, 'time') : 'N/A';
+                            const tokens = model.tokens ? (typeof model.tokens === 'object' ? this.formatValue(model.tokens.total || 0, 'number') : this.formatValue(model.tokens, 'number')) : 'N/A';
+                            const provider = this._DOMPurify.sanitize(model.provider || 'Unknown');
+                            const modelName = this._DOMPurify.sanitize(model.model || 'Unknown');
+                            return `<tr><td>${provider}</td><td>${modelName}</td><td>${cost}</td><td>${time}</td><td>${tokens}</td></tr>`;
+                        }).join('');
+                        return `<div class="tool-comparison">
+    <div class="tool-comparison-header"><h3 class="tool-comparison-title">
+        <i class="fas fa-balance-scale"></i> ${this._DOMPurify.sanitize(title)}</h3>
+    </div>
+    <div class="tool-comparison-table-wrapper">
+        <table class="tool-comparison-table bg-base-300/15">${headerRow}
+            <tbody class="bg-base-200/20">${bodyRows}</tbody>
+        </table>
+    </div>
+</div>`;
+                    }, // End renderComparisonTable
+
+                    // Render providers status
+                    renderProvidersStatus(providers) {
+                        if (!providers || typeof providers !== 'object' || Object.keys(providers).length === 0) return '';
+                        const headers = ['Provider', 'Status', 'API Key', 'Models'];
+                        const headerRow = `<thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>`;
+                        const bodyRows = Object.entries(providers).map(([name, info]) => {
+                            const statusBadge = info.available ? this.createBadge('Available', 'success') : this.createBadge('Unavailable', 'error');
+                            const keyBadge = info.api_key_configured ? this.createBadge('Configured', 'success') : this.createBadge('Missing', 'warning');
+                            const modelCount = typeof info.models_count === 'number' ? info.models_count : 'N/A';
+                            const providerName = this._DOMPurify.sanitize(name);
+                            return `<tr><td class="font-medium">${providerName}</td><td>${statusBadge}</td><td>${keyBadge}</td><td class="text-center">${modelCount}</td></tr>`;
+                        }).join('');
+                        return `<div class="tool-comparison"><div class="tool-comparison-header"><h3 class="tool-comparison-title"><i class="fas fa-server"></i> LLM Provider Status</h3></div><div class="tool-comparison-table-wrapper"><table class="tool-comparison-table">${headerRow}<tbody>${bodyRows}</tbody></table></div></div>`;
+                    }, // End renderProvidersStatus
+
+                    // Render models list
+                    renderModelsList(models) {
+                        if (!models || typeof models !== 'object' || Object.keys(models).length === 0) return '';
+                        const headers = ['Provider', 'Model ID', 'Description'];
+                        const headerRow = `<thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>`;
+                        const bodyRows = Object.entries(models).flatMap(([provider, modelsList]) => {
+                            if (!Array.isArray(modelsList)) return [];
+                            return modelsList.map(model => {
+                                const providerName = this._DOMPurify.sanitize(model.provider || provider);
+                                const modelId = this._DOMPurify.sanitize(model.id);
+                                const description = this._DOMPurify.sanitize(model.description || 'No description');
+                                return `<tr><td>${providerName}</td><td class="font-mono text-xs">${modelId}</td><td>${description}</td></tr>`;
+                            });
+                        }).join('');
+                        if (!bodyRows) return ''; // Don't render empty table
+                        return `<div class="tool-comparison"><div class="tool-comparison-header"><h3 class="tool-comparison-title"><i class="fas fa-brain"></i> Available Models</h3></div><div class="tool-comparison-table-wrapper"><table class="tool-comparison-table">${headerRow}<tbody>${bodyRows}</tbody></table></div></div>`;
+                    }, // End renderModelsList
+
+                    // Render simple message object
+                    renderSimpleMessage(messageObj) {
+                        if (!this._DOMPurify || !messageObj || typeof messageObj.message !== 'string') return '';
+                        return `<div class="tool-message">${this._DOMPurify.sanitize(messageObj.message)}</div>`;
+                    }, // End renderSimpleMessage
+
+                    // Add to the visualRenderer object
+                    renderMultiProviderResults(resultsData, aggregateStats) {
+                        if (!resultsData || typeof resultsData !== 'object') {
+                            return '<div class="tool-error-msg">Invalid multi-provider data</div>';
+                        }
+
+                        let html = '';
+
+                        // First render aggregate stats dashboard at the top
+                        if (aggregateStats && typeof aggregateStats === 'object') {
+                            html += this.renderStatsDashboard(aggregateStats, 'Overall Performance');
+                        }
+
+                        // Create a comparison table of providers
+                        const modelsList = Object.entries(resultsData).map(([name, data]) => {
+                            if (!data || typeof data !== 'object') return null;
+
+                            const nameParts = name.split('/');
+                            return {
+                                provider: data.provider || (nameParts.length > 1 ? nameParts[0] : 'unknown'),
+                                model: data.model || (nameParts.length > 1 ? nameParts[1] : name),
+                                ...data
+                            };
+                        }).filter(Boolean); // Remove null entries
+
+                        if (modelsList.length > 1) {
+                            html += this.renderComparisonTable(modelsList, 'Provider Comparison');
+                        }
+                        // Render individual model cards for each provider result
+                        html += '<div class="multi-provider-results space-y-4 mt-4">';
+                        modelsList.forEach((model, index) => {
+                            const providerName = this._DOMPurify.sanitize(model.provider || 'unknown');
+                            const modelName = this._DOMPurify.sanitize(model.model || 'unknown');
+                            const modelText = model.text || model.content || '';
+
+                            // Process text manually instead of calling external function
+                            let processedText = modelText;
+                            if (typeof processedText === 'string') {
+                                processedText = processedText
+                                    .replace(/\\n/g, '\n')
+                                    .replace(/\\"/g, '"')
+                                    .replace(/\\'/g, "'")
+                                    .replace(/\\\\/g, '\\');
+                            }
+
+                            html += `
+<div class="provider-result-card border rounded-lg overflow-hidden shadow-sm">
+    <div class="card-header bg-base-300/70 p-3 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+            ${this.createBadge(providerName, 'info')}
+            <span class="font-medium">${modelName}</span>
+        </div>
+        <div class="text-xs opacity-70">#${index + 1}</div>
+    </div>
+    <div class="card-body p-4" style="background-color: #1f2937; color-scheme: dark;">
+        ${this._isMarkdown(processedText) ?
+                                    this.renderMarkdown(processedText) :
+                                    `<pre style="color-scheme: dark;">${this._DOMPurify.sanitize(processedText)}</pre>`
+                                }
+    </div>
+    <div class="card-footer bg-base-300/50 p-2 flex flex-wrap gap-3 text-xs">
+        ${model.tokens ? `<div class="metric"><i class="fas fa-hashtag mr-1"></i> ${this.formatValue(typeof model.tokens === 'object' ? model.tokens.total : model.tokens, 'number')} tokens</div>` : ''}
+        ${model.cost !== undefined ? `<div class="metric"><i class="fas fa-dollar-sign mr-1"></i> ${this.formatValue(model.cost, 'cost')}</div>` : ''}
+        ${model.processing_time !== undefined ? `<div class="metric"><i class="fas fa-clock mr-1"></i> ${this.formatValue(model.processing_time, 'time')}</div>` : ''}
+    </div>
+</div>`;
+                        });
+                        html += '</div>';
+                        return html;
+                    }
+
+                }, // End visualRenderer
+
+                _extractAndUnescapePayload(rawContent) {
+                    if (rawContent === null || typeof rawContent === 'undefined') return null;
+
+                    // If already an object, return it directly
+                    if (typeof rawContent === 'object' && !Array.isArray(rawContent)) return rawContent;
+
+                    let contentString = '';
+
+                    // Convert to string if needed
+                    if (Array.isArray(rawContent)) {
+                        contentString = rawContent[0]?.toString() || '';
+                    } else {
+                        contentString = rawContent.toString();
+                    }
+
+                    // STEP 1: Check for and extract from TextContent wrapper
+                    let extractedContent = contentString;
+                    const textContentMatch = contentString.match(/TextContent\(.*?text=(['"])((?:\\.|(?!\1).)*?)\1/);
+
+                    if (textContentMatch && textContentMatch[2]) {
+                        extractedContent = textContentMatch[2];
+                        console.log("Extracted from TextContent wrapper");
+                    }
+
+                    // STEP 2: Fix escaped characters properly
+                    let unescapedContent = extractedContent
+                        .replace(/\\"/g, '"')       // Fix escaped double quotes
+                        .replace(/\\'/g, "'")       // Fix escaped single quotes
+                        .replace(/\\n/g, '\n')      // Fix escaped newlines
+                        .replace(/\\\\/g, '\\')     // Fix escaped backslashes
+                        .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));  // Fix unicode escapes
+
+                    // STEP 3: Try to parse as JSON if it looks like JSON
+                    if ((unescapedContent.trim().startsWith('{') && unescapedContent.trim().endsWith('}')) ||
+                        (unescapedContent.trim().startsWith('[') && unescapedContent.trim().endsWith(']'))) {
+                        try {
+                            // USE A JSON5 LIBRARY IF POSSIBLE, as some JSON might not be strictly valid
+                            // For now, we'll try to help regular JSON.parse by fixing some common issues
+
+                            // Fix unescaped control characters that might break JSON parsing
+                            unescapedContent = unescapedContent
+                                .replace(/[\u0000-\u001F]/g, match => {
+                                    // Replace control characters with proper escapes
+                                    return match === '\n' ? '\\n' :
+                                        match === '\r' ? '\\r' :
+                                            match === '\t' ? '\\t' :
+                                                match === '\b' ? '\\b' :
+                                                    match === '\f' ? '\\f' :
+                                                        `\\u${match.charCodeAt(0).toString(16).padStart(4, '0')}`;
+                                });
+
+                            // Fix any malformed escapes like \—
+                            unescapedContent = unescapedContent.replace(/\\([^"'\\\/bfnrtu])/g, '$1');
+
+                            // Now try parsing
+                            return JSON.parse(unescapedContent);
+                        } catch (e) {
+                            console.error("JSON parsing failed:", e.message, "\nContent:", unescapedContent.substring(0, 100) + "...");
+                            // Return the unescaped string if parsing fails
+                            return unescapedContent;
+                        }
+                    }
+
+                    // Return the unescaped string for non-JSON content
+                    return unescapedContent;
+                },
+
+                // ===== TOOL RESULT RENDERER (Component Method) =====
                 renderUserProvidedToolResult(block, message) {
-    if (!this.uiSettings.showToolDataMessages) return '<!-- tool message hidden -->';
+                    // 0. Hide if toggled off
+                    if (!this.uiSettings.showToolDataMessages) return '<!-- tool message hidden -->';
 
-    // Create proper references to external dependencies
-    const hljs = window.hljs || this.hljs;
-    const DOMPurify = window.DOMPurify || this.DOMPurify;
-    const marked = window.marked || this.marked;
-    
-    // Preserve reference to parent context
-    const self = this;
+                    // Initialize renderers
+                    const renderer = this.visualRenderer.init(this);
+                    const inspector = this.contentInspector;
 
-    // ===== CONTENT ANALYSIS & EXTRACTION ENGINE =====
-    const contentInspector = {
-        // Core Analysis Functions
-        inspectContent(content) {
-            // Initialize an empty result structure
-            const result = {
-                markdown: [],
-                json: [],
-                models: [],
-                stats: null,
-                rawText: [],
-                detectedType: 'unknown'
-            };
-
-            try {
-                // Deep recursive analysis
-                this._analyzeDeep(content, result);
-
-                // Determine the most appropriate content type
-                result.detectedType = this._determineContentType(result);
-            } catch (err) {
-                console.error("Content inspection error:", err);
-            }
-
-            return result;
-        },
-
-        // Recursive analysis engine
-        _analyzeDeep(content, result, path = '') {
-            // Base case: null or undefined
-            if (content === null || content === undefined) return;
-
-            // Handle strings - extract JSON or markdown
-            if (typeof content === 'string') {
-                // Clean TextContent wrappers (aggressive approach)
-                const cleanedContent = this._cleanTextContentWrappers(content);
-
-                // Check for embedded JSON patterns in the string
-                const extractedJson = this._extractJsonFromString(cleanedContent);
-                if (extractedJson) {
-                    // We found JSON within the string, analyze it recursively
-                    this._analyzeDeep(extractedJson, result, path + '.extracted');
-                    return;
-                }
-
-                // Check if it's markdown
-                if (this._isMarkdown(cleanedContent)) {
-                    result.markdown.push({
-                        content: cleanedContent,
-                        path: path
-                    });
-                    return;
-                }
-
-                // Store as raw text
-                result.rawText.push({
-                    content: cleanedContent,
-                    path: path
-                });
-                return;
-            }
-
-            // Handle arrays
-            if (Array.isArray(content)) {
-                // Check if this is a results array of model outputs
-                if (this._isModelResultsArray(content)) {
-                    content.forEach((model, index) => {
-                        if (model && typeof model === 'object') {
-                            result.models.push({
-                                ...model,
-                                _index: index,
-                                _path: `${path}[${index}]`
-                            });
-                        }
-                    });
-                    return;
-                }
-
-                // Process each array element recursively
-                content.forEach((item, index) => {
-                    this._analyzeDeep(item, result, `${path}[${index}]`);
-                });
-                return;
-            }
-
-            // Handle objects
-            if (typeof content === 'object') {
-                // Check if this is a model result object
-                if (this._isModelResultObject(content)) {
-                    result.models.push({
-                        ...content,
-                        _path: path
-                    });
-                    return;
-                }
-
-                // Check if this is a stats object
-                if (this._isStatsObject(content)) {
-                    // Merge stats data if we already have some
-                    if (result.stats) {
-                        result.stats = { ...result.stats, ...content };
-                    } else {
-                        result.stats = content;
-                    }
-                }
-
-                // Store full object as JSON for reference
-                result.json.push({
-                    content: content,
-                    path: path
-                });
-
-                // Look for specific keys that might contain valuable content
-                if (content && typeof content === 'object') {
-                    for (const key in content) {
-                        // Skip internal tracking properties
-                        if (key.startsWith('_')) continue;
-
-                        // Special handling for common key names
-                        if (key === 'text' || key === 'content' || key === 'message') {
-                            if (typeof content[key] === 'string') {
-                                if (this._isMarkdown(content[key])) {
-                                    result.markdown.push({
-                                        content: content[key],
-                                        path: `${path}.${key}`
-                                    });
-                                    continue;
-                                }
-                            }
-                        }
-
-                        // Results typically contain model outputs
-                        if (key === 'results' && typeof content[key] === 'object') {
-                            for (const modelName in content[key]) {
-                                const modelData = content[key][modelName];
-                                if (typeof modelData === 'object') {
-                                    result.models.push({
-                                        ...modelData,
-                                        provider: modelName.split('/')[0],
-                                        model: modelName.split('/')[1] || modelName,
-                                        _path: `${path}.${key}.${modelName}`
-                                    });
-                                }
-                            }
-                            continue;
-                        }
-
-                        // Recursively analyze all other properties
-                        this._analyzeDeep(content[key], result, `${path}.${key}`);
-                    }
-                }
-                return;
-            }
-        },
-
-        // Extract embedded JSON from strings
-        _extractJsonFromString(str) {
-            if (typeof str !== 'string') return null;
-
-            // Pattern matching for JSON objects
-            const jsonRegexPatterns = [
-                // Complex match for JSON objects with proper braces balancing
-                /\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}/g,
-                // Similar for arrays
-                /\[(?:[^\[\]]|(?:\[(?:[^\[\]]|(?:\[[^\[\]]*\]))*\]))*\]/g
-            ];
-
-            for (const pattern of jsonRegexPatterns) {
-                const matches = str.match(pattern);
-                if (!matches) continue;
-
-                // Try each match to see if it's valid JSON
-                for (const match of matches) {
                     try {
-                        // Skip if it's just a tiny fragment
-                        if (match.length < 10) continue;
+                        // 1. Extract and parse the actual payload
+                        const payload = this._extractAndUnescapePayload(block?.content);
 
-                        const parsed = JSON.parse(match);
-                        return parsed;
-                    } catch (e) {
-                        // Not valid JSON, continue to next match
-                    }
-                }
-            }
+                        if (payload === null || typeof payload === 'undefined') {
+                            return '<div class="tool-message opacity-70 italic">[Empty Tool Result]</div>';
+                        }
 
-            // Special case for TextContent objects
-            const textContentMatch = str.match(/TextContent\((?:.*text=['"])(.*?)(['"].*)\)/s);
-            if (textContentMatch && textContentMatch[1]) {
-                try {
-                    // Clean up escaped characters
-                    const cleaned = textContentMatch[1]
-                        .replace(/\\"/g, '"')
-                        .replace(/\\'/g, "'")
-                        .replace(/\\n/g, '\n')
-                        .replace(/\\\\/g, '\\');
+                        // 2. Analyze the extracted payload
+                        const analysisResult = inspector.inspectContent(payload);
+                        let contentHTML = '';
 
-                    // Try to parse as JSON
-                    try {
-                        return JSON.parse(cleaned);
-                    } catch {
-                        // If not JSON, return the cleaned string
-                        return cleaned;
-                    }
-                } catch (e) {
-                    // Failed to process, continue
-                }
-            }
+                        // 3. Render based on the analyzed payload type
+                        switch (analysisResult.detectedType) {
+                            case 'multi_provider':
+                                if (payload && typeof payload === 'object' && payload.results) {
+                                    contentHTML += renderer.renderMultiProviderResults(
+                                        payload.results,
+                                        payload.aggregate_stats
+                                    );
+                                } else {
+                                    contentHTML = renderer.renderCodeBlock(payload, 'json', 'Multi-Provider Results');
+                                }
+                                break;
 
-            return null;
-        },
+                            case 'model_comparison':
+                                // Handles the multi-completion case
+                                if (payload && typeof payload === 'object' && payload.results) {
+                                    const modelsList = Object.entries(payload.results || {}).map(([name, data]) => {
+                                        if (!data || typeof data !== 'object') return { provider: 'unknown', model: name };
+                                        const nameParts = String(name).split('/');
+                                        return {
+                                            provider: data.provider || (nameParts.length > 1 ? nameParts[0] : name),
+                                            model: data.model || (nameParts.length > 1 ? nameParts[1] : name),
+                                            ...data
+                                        };
+                                    });
+                                    contentHTML += renderer.renderComparisonTable(modelsList, 'Model Comparison Results');
+                                    modelsList.forEach((model, index) => {
+                                        contentHTML += renderer.renderModelResult(model, index + 1);
+                                    });
+                                    if (payload.aggregate_stats && typeof payload.aggregate_stats === 'object') {
+                                        contentHTML += renderer.renderStatsDashboard(payload.aggregate_stats, 'Aggregate Performance');
+                                    }
+                                } else {
+                                    contentHTML = renderer.renderCodeBlock(payload, 'json', 'Comparison Data');
+                                }
+                                break;
 
-        // Clean TextContent wrappers
-        _cleanTextContentWrappers(str) {
-            if (typeof str !== 'string') return str;
+                            case 'single_model':
+                            case 'models':
+                                const modelsToRender = analysisResult.models?.length > 0
+                                    ? analysisResult.models
+                                    : (typeof payload === 'object' && ((payload.text && payload.model) || (payload.content && payload.model))
+                                        ? [payload] : []);
 
-            // Match TextContent patterns and extract the actual text content
-            const pattern = /TextContent\(\s*(?:type\s*=\s*(?:"|')text(?:"|'),\s*)?text\s*=\s*(?:"|')((?:\\.|[^"\\])*?)(?:"|')(?:,\s*annotations\s*=\s*(?:None|\[\]))?/;
-            const match = str.match(pattern);
+                                modelsToRender.forEach((modelData, index) => {
+                                    if (modelData) {
+                                        contentHTML += renderer.renderModelResult(modelData, modelsToRender.length > 1 ? index + 1 : null);
+                                    }
+                                });
+                                // Add stats if found separately
+                                if (analysisResult.stats) {
+                                    contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
+                                }
+                                break;
+                            case 'providers_status':
+                                if (payload && typeof payload === 'object' && payload.providers) {
+                                    contentHTML += renderer.renderProvidersStatus(payload.providers);
+                                } else {
+                                    contentHTML = renderer.renderCodeBlock(payload, 'json', 'Provider Status Data');
+                                }
+                                break;
 
-            if (match && match[1]) {
-                // Unescape Python-style string escapes
-                return match[1]
-                    .replace(/\\"/g, '"')
-                    .replace(/\\'/g, "'")
-                    .replace(/\\n/g, '\n')
-                    .replace(/\\\\/g, '\\')
-                    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
-                        String.fromCharCode(parseInt(hex, 16)));
-            }
+                            case 'models_list':
+                                if (payload && typeof payload === 'object' && payload.models) {
+                                    contentHTML += renderer.renderModelsList(payload.models);
+                                } else {
+                                    contentHTML = renderer.renderCodeBlock(payload, 'json', 'Models List Data');
+                                }
+                                break;
 
-            return str;
-        },
+                            case 'markdown':
+                                // Render extracted markdown content
+                                if (analysisResult.markdown?.length > 0 && typeof analysisResult.markdown[0].content === 'string') {
+                                    contentHTML += renderer.renderMarkdown(analysisResult.markdown[0].content);
+                                    if (analysisResult.stats) {
+                                        contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
+                                    }
+                                } else if (typeof payload === 'string') { // Fallback if analysis missed it
+                                    contentHTML += renderer.renderMarkdown(payload);
+                                }
+                                break;
 
-        // Check if string contains markdown
-        _isMarkdown(str) {
-            if (typeof str !== 'string') return false;
+                            case 'simple_message':
+                                if (typeof payload === 'object' && payload.message) {
+                                    contentHTML += renderer.renderSimpleMessage(payload);
+                                } else if (typeof payload === 'string') { // Fallback
+                                    contentHTML += renderer.renderSimpleMessage({ message: payload });
+                                }
+                                break;
 
-            // Extended markdown detection patterns
-            const markdownPatterns = [
-                /^#{1,6}\s+.+$/m,                     // Headers
-                /^[-*+]\s+.+$/m,                      // Unordered lists
-                /^>\s+.+$/m,                          // Blockquotes
-                /^```[\s\S]*?```$/m,                  // Code blocks
-                /^(?:\d+\.)\s+.+$/m,                  // Ordered lists
-                /\*\*.*?\*\*/,                        // Bold
-                /_.*?_/,                              // Italic
-                /`.*?`/,                              // Inline code
-                /\[.*?\]\(.*?\)/,                     // Links
-                /!\[.*?\]\(.*?\)/,                    // Images
-                /\|[^|]+\|[^|]+\|/,                   // Tables
-                /^---+$/m,                            // Horizontal rule
-                /^===+$/m                             // Alternate heading style
-            ];
+                            case 'json':
+                                // Generic JSON object
+                                if (analysisResult.json?.length > 0) {
+                                    contentHTML += renderer.renderCodeBlock(analysisResult.json[0].content, 'json', 'JSON Data');
+                                    if (analysisResult.stats) {
+                                        contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
+                                    }
+                                } else if (typeof payload === 'object') { // Fallback
+                                    contentHTML += renderer.renderCodeBlock(payload, 'json', 'JSON Data');
+                                }
+                                break;
 
-            // Check if at least one markdown pattern is found and the string has substantial length
-            return str.length > 20 && markdownPatterns.some(pattern => pattern.test(str));
-        },
+                            case 'text':
+                            default:
+                                // If we couldn't determine the type but it's an object with text and model properties,
+                                // try to render it as a model result
+                                if (typeof payload === 'object' && payload !== null &&
+                                    ((payload.text && payload.model) || (payload.content && payload.model))) {
+                                    contentHTML += renderer.renderModelResult(payload);
+                                } else if (typeof payload === 'string') {
+                                    contentHTML += `<pre class="tool-plain-text">${renderer._DOMPurify.sanitize(payload)}</pre>`;
+                                } else {
+                                    contentHTML += renderer.renderCodeBlock(payload, 'json', 'Raw Data');
+                                }
+                                break;
+                        }
 
-        // Check if object is a model result
-        _isModelResultObject(obj) {
-            if (!obj || typeof obj !== 'object') return false;
+                        // 4. Wrap in container
+                        return `
+            <div class="tool-result-container">
+                <div class="tool-result-header">
+                    <div class="tool-result-title">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="tool-result-icon" viewBox="0 0 24 24" stroke="currentColor" fill="none">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/>
+                        </svg>
+                        <span>Tool Data (User Provided)</span>
+                    </div>
+                    <div class="tool-result-actions">${renderer.createCopyButton(block?.content || '', 'Copy Raw')}</div>
+                </div>
+                <div class="tool-result-content">${contentHTML}</div>
+            </div>`;
 
-            // Check for typical model result properties
-            const modelProperties = [
-                'model', 'provider', 'text', 'tokens',
-                'cost', 'processing_time', 'success'
-            ];
-
-            // Must have at least one of text and several model properties
-            return ('text' in obj || 'content' in obj) &&
-                modelProperties.filter(prop => prop in obj).length >= 2;
-        },
-
-        // Check if an array contains model results
-        _isModelResultsArray(arr) {
-            if (!Array.isArray(arr) || arr.length === 0) return false;
-
-            // Check if array elements look like model results
-            return arr.some(item => this._isModelResultObject(item));
-        },
-
-        // Check if object contains statistics
-        _isStatsObject(obj) {
-            if (!obj || typeof obj !== 'object') return false;
-
-            // Check for typical statistics properties
-            const statsProps = [
-                'tokens', 'cost', 'processing_time',
-                'total_requests', 'successful_requests', 'failed_requests',
-                'total_cost', 'average_processing_time'
-            ];
-
-            // Must have at least two stats properties
-            return statsProps.filter(prop => prop in obj).length >= 2;
-        },
-
-        // Determine the primary content type based on the analysis
-        _determineContentType(result) {
-            // Prioritize content types
-            if (result.models && result.models.length > 0) {
-                return 'models';
-            } else if (result.markdown && result.markdown.length > 0) {
-                return 'markdown';
-            } else if (result.json && result.json.length > 0) {
-                return 'json';
-            } else {
-                return 'text';
-            }
-        }
-    };
-
-    // ===== VISUAL RENDERING ENGINE =====
-    const visualRenderer = {
-        // Highlight code with proper language detection
-        highlight(code, forcedLanguage = null) {
-            if (!code) return '';
-
-            // Convert to string if object
-            const codeStr = typeof code === 'object'
-                ? JSON.stringify(code, null, 2)
-                : String(code);
-
-            // Detect language if not forced
-            let language = forcedLanguage;
-            if (!language) {
-                if (codeStr.trim().startsWith('{') || codeStr.trim().startsWith('[')) {
-                    language = 'json';
-                } else if (/^(function|const|let|var|import|class)\s/.test(codeStr)) {
-                    language = 'javascript';
-                } else if (/^(def|class|import|from|print)\s/.test(codeStr)) {
-                    language = 'python';
-                } else {
-                    language = 'plaintext';
-                }
-            }
-
-            // Apply syntax highlighting using parent component's hljs
-            try {
-                return hljs.highlight(codeStr, {
-                    language,
-                    ignoreIllegals: true
-                }).value;
-            } catch (e) {
-                console.error("Highlighting error:", e);
-                // Fallback to sanitized text
-                return DOMPurify.sanitize(codeStr);
-            }
-        },
-
-        // Create copy button for code blocks - using self reference to parent component
-        createCopyButton(content, label = 'Copy') {
-            try {
-                // Encode content safely for the attribute
-                const encodedContent = btoa(encodeURIComponent(
-                    typeof content === 'object'
-                        ? JSON.stringify(content)
-                        : String(content)
-                ));
-
-                return `
-                <button class="copy-code-btn" x-data="{ copied: false }" 
-                    @click.stop="copyToClipboard('${encodedContent}'); copied = true; setTimeout(() => copied = false, 1500)">
-                    <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i>
-                    <span x-text="copied ? 'Copied!' : '${label}'"></span>
-                </button>`;
-            } catch (e) {
-                console.error("Error creating copy button:", e);
-                return '';
-            }
-        },
-
-        // Render markdown content - using parent component's marked
-        renderMarkdown(markdown) {
-            if (!markdown) return '';
-
-            try {
-                const html = marked.parse(markdown);
-                return `
-                <div class="tool-markdown prose prose-invert prose-sm max-w-none">
-                    ${DOMPurify.sanitize(html)}
+                    } catch (error) {
+                        console.error("Tool result rendering failed:", error, block);
+                        return `<div class="bg-error/10 p-4 rounded border border-error/30 text-error">
+                    <h3 class="font-medium mb-2">Tool Data Rendering Error</h3>
+                    <p>Failed to render tool result: ${error.message}</p>
                 </div>`;
-            } catch (e) {
-                console.error("Markdown parsing error:", e);
-                return `<pre class="tool-code-block">${DOMPurify.sanitize(markdown)}</pre>`;
-            }
-        },
-
-        // Render syntax-highlighted code
-        renderCodeBlock(code, language = null, title = null) {
-            const highlighted = this.highlight(code, language);
-            const copyButton = this.createCopyButton(code);
-
-            return `
-            <div class="tool-code-container">
-                ${title ? `<div class="tool-code-title">${title}</div>` : ''}
-                <div class="tool-code-block-wrapper">
-                    <pre class="tool-code-block"><code class="hljs language-${language || 'plaintext'}">${highlighted}</code></pre>
-                    ${copyButton}
-                </div>
-            </div>`;
-        },
-
-        // Format values with appropriate units
-        formatValue(value, type) {
-            if (value === undefined || value === null) return 'N/A';
-
-            switch (type) {
-                case 'cost':
-                    const cost = typeof value === 'string' ? parseFloat(value) : value;
-                    if (isNaN(cost)) return 'N/A';
-                    if (cost < 0.0001) return `${(cost * 1000000).toFixed(2)}µ$`;
-                    if (cost < 0.01) return `${(cost * 1000).toFixed(2)}m$`;
-                    return `$${cost.toFixed(6)}`;
-
-                case 'time':
-                    const time = typeof value === 'string' ? parseFloat(value) : value;
-                    if (isNaN(time)) return 'N/A';
-                    if (time < 0.1) return `${(time * 1000).toFixed(0)}ms`;
-                    if (time < 60) return `${time.toFixed(2)}s`;
-                    const mins = Math.floor(time / 60);
-                    const secs = Math.round(time % 60);
-                    return `${mins}m ${secs}s`;
-
-                case 'number':
-                    return parseInt(value).toLocaleString();
-
-                default:
-                    return String(value);
-            }
-        },
-
-        // Create a badge with appropriate styling
-        createBadge(text, type = 'default') {
-            const classMap = {
-                'success': 'tool-badge-success',
-                'error': 'tool-badge-error',
-                'warning': 'tool-badge-warning',
-                'info': 'tool-badge-info',
-                'default': 'tool-badge-default'
-            };
-
-            const className = classMap[type] || classMap['default'];
-            return `<span class="tool-badge ${className}">${DOMPurify.sanitize(text)}</span>`;
-        },
-
-        // Render a model result card
-        renderModelResult(model, indexOrName = null) {
-            // Extract model data
-            const {
-                provider = 'unknown',
-                model: modelName = 'unknown',
-                text, content, message,
-                tokens, cost, processing_time,
-                success = true,
-                error = null
-            } = model || {};
-
-            // Get content from various possible properties
-            const modelContent = text || content || message || '';
-
-            // Generate a nice card for the model result
-            return `
-            <div class="tool-model-card" data-provider="${provider.toLowerCase()}">
-                <div class="tool-model-header">
-                    <div class="tool-model-info">
-                        <div class="tool-model-provider">
-                            ${this.createBadge(provider, 'info')}
-                        </div>
-                        <div class="tool-model-name">${modelName}</div>
-                        ${indexOrName !== null ? `<div class="tool-model-index">#${indexOrName}</div>` : ''}
-                    </div>
-                    <div class="tool-model-status">
-                        ${success
-                                    ? this.createBadge('Success', 'success')
-                                    : this.createBadge(error || 'Error', 'error')}
-                    </div>
-                </div>
-                
-                <div class="tool-model-content">
-                    ${this._isMarkdown(modelContent)
-                                    ? this.renderMarkdown(modelContent)
-                                    : `<pre class="tool-model-text">${DOMPurify.sanitize(modelContent)}</pre>`}
-                </div>
-                
-                <div class="tool-model-metrics">
-                    ${tokens ? `
-                    <div class="tool-metric">
-                        <div class="tool-metric-icon"><i class="fas fa-hashtag"></i></div>
-                        <div class="tool-metric-value">${typeof tokens === 'object'
-                                        ? this.formatValue(tokens.total || 0, 'number')
-                                        : this.formatValue(tokens, 'number')
-                                    }</div>
-                        <div class="tool-metric-label">Tokens</div>
-                    </div>` : ''}
-                    
-                    ${cost !== undefined ? `
-                    <div class="tool-metric">
-                        <div class="tool-metric-icon"><i class="fas fa-dollar-sign"></i></div>
-                        <div class="tool-metric-value">${this.formatValue(cost, 'cost')}</div>
-                        <div class="tool-metric-label">Cost</div>
-                    </div>` : ''}
-                    
-                    ${processing_time !== undefined ? `
-                    <div class="tool-metric">
-                        <div class="tool-metric-icon"><i class="fas fa-clock"></i></div>
-                        <div class="tool-metric-value">${this.formatValue(processing_time, 'time')}</div>
-                        <div class="tool-metric-label">Time</div>
-                    </div>` : ''}
-                </div>
-            </div>`;
-        },
-
-        // Render a statistics dashboard
-        renderStatsDashboard(stats, title = 'Performance Metrics') {
-            if (!stats || typeof stats !== 'object') return '';
-
-            // Prepare cost metrics
-            const costMetrics = [];
-            if (stats.cost !== undefined) {
-                costMetrics.push({
-                    icon: 'fa-dollar-sign',
-                    value: this.formatValue(stats.cost, 'cost'),
-                    label: 'Cost'
-                });
-            }
-            if (stats.total_cost !== undefined) {
-                costMetrics.push({
-                    icon: 'fa-dollar-sign',
-                    value: this.formatValue(stats.total_cost, 'cost'),
-                    label: 'Total Cost'
-                });
-            }
-
-            // Prepare time metrics
-            const timeMetrics = [];
-            if (stats.processing_time !== undefined) {
-                timeMetrics.push({
-                    icon: 'fa-clock',
-                    value: this.formatValue(stats.processing_time, 'time'),
-                    label: 'Processing Time'
-                });
-            }
-            if (stats.average_processing_time !== undefined) {
-                timeMetrics.push({
-                    icon: 'fa-clock',
-                    value: this.formatValue(stats.average_processing_time, 'time'),
-                    label: 'Avg Time'
-                });
-            }
-            if (stats.total_processing_time !== undefined) {
-                timeMetrics.push({
-                    icon: 'fa-stopwatch',
-                    value: this.formatValue(stats.total_processing_time, 'time'),
-                    label: 'Total Time'
-                });
-            }
-
-            // Prepare request metrics
-            const requestMetrics = [];
-            if (stats.total_requests !== undefined) {
-                requestMetrics.push({
-                    icon: 'fa-exchange-alt',
-                    value: this.formatValue(stats.total_requests, 'number'),
-                    label: 'Total Requests'
-                });
-            }
-            if (stats.successful_requests !== undefined) {
-                requestMetrics.push({
-                    icon: 'fa-check',
-                    value: this.formatValue(stats.successful_requests, 'number'),
-                    label: 'Successful'
-                });
-            }
-            if (stats.failed_requests !== undefined) {
-                requestMetrics.push({
-                    icon: 'fa-times',
-                    value: this.formatValue(stats.failed_requests, 'number'),
-                    label: 'Failed'
-                });
-            }
-
-            // Prepare token metrics
-            const tokenMetrics = [];
-            if (stats.tokens) {
-                if (typeof stats.tokens === 'object') {
-                    if (stats.tokens.total !== undefined) {
-                        tokenMetrics.push({
-                            icon: 'fa-hashtag',
-                            value: this.formatValue(stats.tokens.total, 'number'),
-                            label: 'Total Tokens'
-                        });
                     }
-                    if (stats.tokens.input !== undefined) {
-                        tokenMetrics.push({
-                            icon: 'fa-sign-in-alt',
-                            value: this.formatValue(stats.tokens.input, 'number'),
-                            label: 'Input Tokens'
-                        });
-                    }
-                    if (stats.tokens.output !== undefined) {
-                        tokenMetrics.push({
-                            icon: 'fa-sign-out-alt',
-                            value: this.formatValue(stats.tokens.output, 'number'),
-                            label: 'Output Tokens'
-                        });
-                    }
-                } else {
-                    tokenMetrics.push({
-                        icon: 'fa-hashtag',
-                        value: this.formatValue(stats.tokens, 'number'),
-                        label: 'Tokens'
-                    });
-                }
-            }
 
-            // Combine all metrics
-            const allMetrics = [
-                ...costMetrics,
-                ...timeMetrics,
-                ...requestMetrics,
-                ...tokenMetrics
-            ];
+                    // Find and fix the problematic provider cards
+                    document.querySelectorAll('.provider-result-card').forEach(card => {
+                        // Get the card body which needs fixing
+                        const cardBody = card.querySelector('.card-body');
+                        if (!cardBody) return;
 
-            // Generate the dashboard HTML
-            return `
-            <div class="tool-stats-dashboard">
-                <div class="tool-stats-header">
-                    <h3 class="tool-stats-title">
-                        <i class="fas fa-chart-line"></i> ${title}
-                    </h3>
-                </div>
-                <div class="tool-stats-grid">
-                    ${allMetrics.map(metric => `
-                    <div class="tool-stat-card">
-                        <div class="tool-stat-icon">
-                            <i class="fas ${metric.icon}"></i>
-                        </div>
-                        <div class="tool-stat-value">${metric.value}</div>
-                        <div class="tool-stat-label">${metric.label}</div>
-                    </div>
-                    `).join('')}
-                </div>
-            </div>`;
-        },
+                        // Check if this is one of the cards with a white/transparent background
+                        const bgColor = window.getComputedStyle(cardBody).backgroundColor;
+                        if (bgColor === 'rgba(0, 0, 0, 0)' || bgColor === 'rgb(255, 255, 255)') {
+                            // First set a proper background to ensure text contrast works correctly
+                            cardBody.style.backgroundColor = '#1f2937';
 
-        // Render comparison table
-        renderComparisonTable(models, title = 'Model Comparison') {
-            if (!models || models.length === 0) return '';
+                            // Now apply your existing contrast fixing functions
+                            fixContrastRecursively(cardBody);
 
-            // Create table header
-            let tableHTML = `
-            <div class="tool-comparison">
-                <div class="tool-comparison-header">
-                    <h3 class="tool-comparison-title">
-                        <i class="fas fa-balance-scale"></i> ${title}
-                    </h3>
-                </div>
-                <div class="tool-comparison-table-wrapper">
-                    <table class="tool-comparison-table">
-                        <thead>
-                            <tr>
-                                <th>Provider</th>
-                                <th>Model</th>
-                                <th>Cost</th>
-                                <th>Time</th>
-                                <th>Tokens</th>
-                            </tr>
-                        </thead>
-                        <tbody>`;
-
-            // Add rows for each model
-            models.forEach(model => {
-                tableHTML += `
-                <tr>
-                    <td>${model.provider || 'Unknown'}</td>
-                    <td>${model.model || 'Unknown'}</td>
-                    <td>${model.cost !== undefined ? this.formatValue(model.cost, 'cost') : 'N/A'}</td>
-                    <td>${model.processing_time !== undefined ? this.formatValue(model.processing_time, 'time') : 'N/A'}</td>
-                    <td>${model.tokens ? (
-                                        typeof model.tokens === 'object'
-                                            ? this.formatValue(model.tokens.total || 0, 'number')
-                                            : this.formatValue(model.tokens, 'number')
-                                    ) : 'N/A'}</td>
-                </tr>`;
-            });
-
-            // Close the table
-            tableHTML += `
-                        </tbody>
-                    </table>
-                </div>
-            </div>`;
-
-            return tableHTML;
-        },
-
-        // Utility to check if content is markdown
-        _isMarkdown(str) {
-            if (typeof str !== 'string') return false;
-
-            // Extended markdown detection patterns
-            const markdownPatterns = [
-                /^#{1,6}\s+.+$/m,                     // Headers
-                /^[-*+]\s+.+$/m,                      // Unordered lists
-                /^>\s+.+$/m,                          // Blockquotes
-                /^```[\s\S]*?```$/m,                  // Code blocks
-                /^(?:\d+\.)\s+.+$/m,                  // Ordered lists
-                /\*\*.*?\*\*/,                        // Bold
-                /_.*?_/,                              // Italic
-                /`.*?`/,                              // Inline code
-                /\[.*?\]\(.*?\)/,                     // Links
-                /!\[.*?\]\(.*?\)/,                    // Images
-                /\|[^|]+\|[^|]+\|/,                   // Tables
-                /^---+$/m,                            // Horizontal rule
-                /^===+$/m                             // Alternate heading style
-            ];
-
-            // Check if at least one markdown pattern is found and the string has substantial length
-            return str.length > 20 && markdownPatterns.some(pattern => pattern.test(str));
-        }
-    };
-
-    // ===== MAIN RENDERING FUNCTION =====
-    try {
-        // Analyze the content deeply
-        const analysisResult = contentInspector.inspectContent(block.content);
-
-        // Prepare the content sections
-        let contentHTML = '';
-
-        // Render based on the detected content type
-        switch (analysisResult.detectedType) {
-            case 'models': {
-                // Render model results
-                if (analysisResult.models && analysisResult.models.length > 1) {
-                    // Multiple models - create a comparison
-                    contentHTML += visualRenderer.renderComparisonTable(
-                        analysisResult.models,
-                        'Model Comparison'
-                    );
-
-                    // Render each model card separately
-                    analysisResult.models.forEach((model, index) => {
-                        contentHTML += visualRenderer.renderModelResult(model, index + 1);
-                    });
-                } else if (analysisResult.models && analysisResult.models.length === 1) {
-                    // Single model - render the card
-                    contentHTML += visualRenderer.renderModelResult(analysisResult.models[0]);
-                }
-
-                // Add stats dashboard if available
-                if (analysisResult.stats) {
-                    contentHTML += visualRenderer.renderStatsDashboard(
-                        analysisResult.stats,
-                        'Performance Metrics'
-                    );
-                }
-                break;
-            }
-
-            case 'markdown': {
-                // Render the first markdown content
-                if (analysisResult.markdown && analysisResult.markdown.length > 0) {
-                    contentHTML += visualRenderer.renderMarkdown(
-                        analysisResult.markdown[0].content
-                    );
-
-                    // Add stats dashboard if available
-                    if (analysisResult.stats) {
-                        contentHTML += visualRenderer.renderStatsDashboard(
-                            analysisResult.stats,
-                            'Performance Metrics'
-                        );
-                    }
-                }
-                break;
-            }
-
-            case 'json': {
-                // Check if the JSON is a structured report
-                if (analysisResult.json && analysisResult.json.length > 0) {
-                    const json = analysisResult.json[0].content;
-
-                    // Handle special cases for structured data
-                    if (json && json.message && typeof json.message === 'string') {
-                        // Simple message
-                        contentHTML += `<div class="tool-message">${DOMPurify.sanitize(json.message)}</div>`;
-                    } else if (json && (json.title || json.heading)) {
-                        // Structured report with title
-                        contentHTML += `<h2 class="tool-content-title">${DOMPurify.sanitize(json.title || json.heading)}</h2>`;
-
-                        if (json.content || json.text) {
-                            const content = json.content || json.text;
-                            contentHTML += visualRenderer._isMarkdown(content)
-                                ? visualRenderer.renderMarkdown(content)
-                                : `<div class="tool-message">${DOMPurify.sanitize(content)}</div>`;
-                        }
-
-                        // Handle sections
-                        if (json.sections && Array.isArray(json.sections)) {
-                            json.sections.forEach(section => {
-                                if (typeof section === 'string') {
-                                    contentHTML += visualRenderer.renderMarkdown(section);
-                                } else if (section && typeof section === 'object') {
-                                    if (section.title || section.heading) {
-                                        contentHTML += `<h3 class="tool-section-title">${DOMPurify.sanitize(section.title || section.heading)}</h3>`;
-                                    }
-
-                                    if (section.content || section.text) {
-                                        const content = section.content || section.text;
-                                        contentHTML += visualRenderer._isMarkdown(content)
-                                            ? visualRenderer.renderMarkdown(content)
-                                            : `<div class="tool-message">${DOMPurify.sanitize(content)}</div>`;
-                                    }
-                                }
+                            // Add specific fix for pre tags which may need special handling
+                            const preTags = cardBody.querySelectorAll('pre');
+                            preTags.forEach(pre => {
+                                // Force contrast check on pre elements
+                                checkAndFixElementContrast(pre);
                             });
                         }
-                    } else {
-                        // Default JSON rendering
-                        contentHTML += visualRenderer.renderCodeBlock(
-                            json,
-                            'json',
-                            'JSON Data'
-                        );
-                    }
+                    });
 
-                    // Add stats dashboard if available
-                    if (analysisResult.stats) {
-                        contentHTML += visualRenderer.renderStatsDashboard(
-                            analysisResult.stats,
-                            'Performance Metrics'
-                        );
-                    }
-                }
-                break;
-            }
+                }, // End renderUserProvidedToolResult
 
-            default: {
-                // Default text rendering
-                if (analysisResult.rawText && analysisResult.rawText.length > 0) {
-                    const text = analysisResult.rawText[0].content;
-                    contentHTML += visualRenderer._isMarkdown(text)
-                        ? visualRenderer.renderMarkdown(text)
-                        : `<pre class="tool-plain-text">${DOMPurify.sanitize(text)}</pre>`;
-                } else if (block && block.content) {
-                    // Fallback to original content
-                    contentHTML += `<pre class="tool-plain-text">${DOMPurify.sanitize(String(block.content))}</pre>`;
-                } else {
-                    contentHTML += `<div class="tool-message">No content available</div>`;
-                }
-                break;
-            }
-        }
-
-        // Create the container with header and content
-        return `
-    <div class="tool-result-container">
-        <div class="tool-result-header">
-            <div class="tool-result-title">
-                <svg xmlns="http://www.w3.org/2000/svg" class="tool-result-icon" viewBox="0 0 24 24" stroke="currentColor" fill="none">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/>
-                </svg>
-                <span>Tool Data</span>
-            </div>
-            <div class="tool-result-actions">
-                ${visualRenderer.createCopyButton(block.content, 'Copy Raw')}
-            </div>
-        </div>
-        <div class="tool-result-content">
-            ${contentHTML}
-        </div>
-    </div>`;
-    } catch (error) {
-        console.error("Tool result rendering failed:", error);
-        return `<div class="bg-error/10 p-4 rounded border border-error/30 text-error">
-            <h3 class="font-medium mb-2">Tool Data Rendering Error</h3>
-            <p>Failed to render tool result: ${DOMPurify.sanitize(error.message)}</p>
-            <pre class="mt-2 p-2 bg-error/5 rounded text-xs max-h-40 overflow-auto">${DOMPurify.sanitize(JSON.stringify(block.content, null, 2) || 'No content')}</pre>
-        </div>`;
-    }
-},
                 renderMessageContent(message) {
                     try {
                         // --- Priority Handling ---
 
-                        // 1. Handle the SPECIFIC user-role message containing a single tool_result with string content
+                        // 1. Handle SPECIFIC user-role message containing tool_result block(s)
+                        //    This now routes *all* user-role tool results to the dedicated renderer.
                         if (message.role === 'user' &&
                             Array.isArray(message.content) &&
-                            message.content.length === 1 &&
-                            message.content[0]?.type === 'tool_result' &&
-                            typeof message.content[0]?.content === 'string') {
-                            console.log("Rendering specific user tool result structure...");
-                            return this.renderUserProvidedToolResult(message.content[0], message);
+                            message.content.length > 0 && // Can be one or more blocks
+                            message.content.some(b => b?.type === 'tool_result')) {
+
+                            // Check if *all* blocks are tool_result - if so, render them all
+                            if (message.content.every(b => b?.type === 'tool_result')) {
+                                console.log("Rendering multiple user tool result blocks...");
+                                // Concatenate renderings of each block
+                                return message.content.map(block =>
+                                    this.renderUserProvidedToolResult(block, message)
+                                ).join(''); // Join HTML strings
+                            }
+                            // If it's mixed content *within* the user message (less common but possible)
+                            // Fall through to mixed content handling, but this is unlikely for user role.
+                            console.warn("User message has mixed tool_result and other blocks - unusual structure.");
                         }
+
 
                         // 2. Handle explicit Assistant/System Tool Results (non-string content or explicit type)
                         const isExplicitToolResult = message.content_type === 'tool_result';
                         const isSingleBlockToolResult = Array.isArray(message.content) && message.content.length === 1 && message.content[0]?.type === 'tool_result';
 
                         if (isExplicitToolResult || isSingleBlockToolResult) {
+                            console.log("Rendering assistant/system tool result...");
                             let resultBlock = isSingleBlockToolResult ? message.content[0] : null;
-                            let resultData = isSingleBlockToolResult ? resultBlock.content : message.content; // Use block content or message content
+                            let resultData = isSingleBlockToolResult ? resultBlock.content : message.content;
 
                             // Attempt to parse if the data is a JSON string
                             if (typeof resultData === 'string' && this.isProbablyJsonString(resultData)) {
-                                try { resultData = JSON.parse(resultData); } catch (e) { /* Leave as string if parse fails */ }
+                                try { resultData = JSON.parse(resultData); } catch (e) { /* Leave as string */ }
                             }
-
-                            // Pass combined message/block info to renderer
-                            return this.renderToolResult(resultData, { ...message, ...(resultBlock || {}) });
+                            // Use the standard visualRenderer for assistant results
+                            return this.visualRenderer.init(this).renderModelResult(resultData, { ...message, ...(resultBlock || {}) });
                         }
 
                         // --- Standard Content Handling ---
 
-                        // 3. Mixed Content Blocks (Assistant/System) - MUST contain at least one non-text block if it got here
+                        // 3. Mixed Content Blocks (Assistant/System)
                         if (Array.isArray(message.content) && message.content.some(b => typeof b === 'object' && b !== null && b.type && b.type !== 'text')) {
-                            console.log("Rendering mixed content...");
+                            console.log("Rendering mixed content (assistant/system)...");
                             return this.renderMixedMessageContent(message.content, message);
                         }
-                        // Check if it's an array of ONLY text blocks (should be caught by _applyProse now, but belt-and-suspenders)
-                        if (Array.isArray(message.content) && message.content.every(b => b && b.type === 'text')) {
+                        // Array of ONLY text blocks
+                        if (Array.isArray(message.content) && message.content.every(b => b?.type === 'text')) {
                             console.log("Rendering array of text blocks as single markdown...");
-                            const combinedText = message.content.map(b => b.text || '').join('\n\n');
+                            const combinedText = message.content.map(b => b?.text || '').join('\n\n');
                             return this.renderMarkdown(combinedText); // renderMarkdown adds prose
                         }
 
@@ -9081,9 +9114,8 @@
                         // --- FINAL FALLBACK ---
                         console.warn("renderMessageContent: Fallback rendering for unknown structure:", message.content);
                         if (message.content === null || message.content === undefined) {
-                            return '<span class="opacity-50 italic">[No Content]</span>'; // Handle null explicitly here too
+                            return '<span class="opacity-50 italic">[No Content]</span>';
                         }
-                        // Render as string within prose paragraph
                         return `<div class="prose prose-sm max-w-none"><p>${DOMPurify.sanitize(String(message.content))}</p></div>`;
 
                     } catch (err) {
@@ -9717,6 +9749,8 @@
 
             })); // End Alpine.data
         }); // End alpine:init listener
+
+
 
     </script>
 
