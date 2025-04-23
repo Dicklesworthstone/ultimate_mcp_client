@@ -399,7 +399,6 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True, markup=True, console=stderr_console)]
 )
 log = logging.getLogger("mcpclient")
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Create a global exit handler
 def force_exit_handler(is_force=False):
@@ -830,6 +829,7 @@ STATUS_EMOJI = {
     "failure": Emoji("collision"),
     "warning": Emoji("warning"),
     "model": Emoji("robot"),      
+    "package": Emoji("package"),
 }
 
 COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
@@ -1697,7 +1697,8 @@ class Config:
         self.registry_urls: List[str] = REGISTRY_URLS.copy()
         self.dashboard_refresh_rate: float = 2.0  # seconds
         self.summarization_model: str = "claude-3-7-sonnet-latest"  # Model used for conversation summarization
-        self.auto_summarize_threshold: int = 6000  # Auto-summarize when token count exceeds this
+        self.use_auto_summarization: bool = False
+        self.auto_summarize_threshold: int = 100000  # Auto-summarize when token count exceeds this
         self.max_summarized_tokens: int = 1500  # Target token count after summarization
         self.enable_port_scanning: bool = True # Enable by default? Or False? Let's start with True.
         self.port_scan_range_start: int = 8000
@@ -1729,6 +1730,7 @@ class Config:
             'registry_urls': self.registry_urls,
             'dashboard_refresh_rate': self.dashboard_refresh_rate,
             'summarization_model': self.summarization_model,
+            'use_auto_summarization': self.use_auto_summarization,
             'auto_summarize_threshold': self.auto_summarize_threshold,
             'max_summarized_tokens': self.max_summarized_tokens,
             'enable_port_scanning': self.enable_port_scanning,
@@ -4437,7 +4439,9 @@ class ServerManager:
         # Clear existing mapping
         self.sanitized_to_original.clear()
 
-        for tool in self.tools.values():
+        # Sort tools by name for consistent ordering
+        sorted_tools = sorted(self.tools.values(), key=lambda t: t.name)
+        for tool in sorted_tools:
             original_name = tool.name
 
             # Sanitize tool name to match Anthropic's requirements
@@ -4473,6 +4477,11 @@ class ServerManager:
                         log.debug(f"Corrected raw dict for {original_name}: {repr(tool_dict_for_api)}")
 
             tool_params.append(tool_dict_for_api)
+
+        # Add cache_control to the last tool if any tools are available
+        if tool_params:
+            # Add cache_control to the last tool to cache all tool definitions
+            tool_params[-1]["cache_control"] = {"type": "ephemeral"}
 
         return tool_params
 
@@ -4598,6 +4607,10 @@ class MCPClient:
         self.discovered_local_servers = set()
         self.local_discovery_task = None
 
+        # For auto-summarization
+        self.use_auto_summarization: bool = self.config.use_auto_summarization
+        self.auto_summarize_threshold: int = self.config.auto_summarize_threshold
+
         # Instantiate Conversation Graph
         self.conversation_graph_file = Path(self.config.conversation_graphs_dir) / "default_conversation.json"
         self.conversation_graph_file.parent.mkdir(parents=True, exist_ok=True) # Ensure directory exists
@@ -4626,6 +4639,9 @@ class MCPClient:
         self.session_input_tokens: int = 0
         self.session_output_tokens: int = 0
         self.session_total_cost: float = 0.0        
+        self.cache_hit_count = 0
+        self.cache_miss_count = 0
+        self.tokens_saved_by_cache = 0
 
         # Extract actual emoji characters, escaping any potential regex special chars
         self._emoji_chars = [re.escape(str(emoji)) for emoji in STATUS_EMOJI.values()]
@@ -5714,30 +5730,65 @@ class MCPClient:
                         # Explicitly get the final message object from the stream
                         final_message = await stream.get_final_message() # <-- Correct placement
 
-                    # --- Now process final_message for usage ---
+                    # When processing cache hits/misses in the streaming API response
                     if final_message and hasattr(final_message, 'usage') and final_message.usage:
                         current_call_input_tokens = final_message.usage.input_tokens # Get final input tokens
                         current_call_output_tokens = final_message.usage.output_tokens # Get final output tokens
+                        cache_created = getattr(final_message.usage, 'cache_creation_input_tokens', 0)
+                        cache_read = getattr(final_message.usage, 'cache_read_input_tokens', 0)
+                        non_cached = getattr(final_message.usage, 'input_tokens', 0)
+                        
+                        # Update cache statistics for display
+                        if cache_read > 0:
+                            self.cache_hit_count += 1
+                            self.tokens_saved_by_cache += cache_read
+                            log.info(f"CACHE HIT! Reused {cache_read:,} tokens from cache. Non-cached tokens: {non_cached:,}")
+                            yield f"@@STATUS@@\n{STATUS_EMOJI['cached']} Cache HIT: Read {cache_read:,} tokens from cache"
+                        elif cache_created > 0:
+                            self.cache_miss_count += 1
+                            log.info(f"CACHE CREATION: Cached {cache_created:,} tokens. Non-cached tokens: {non_cached:,}")
+                            yield f"@@STATUS@@\n{STATUS_EMOJI['package']} Cache MISS: Created new cache with {cache_created:,} tokens"
+                            
                         self.session_input_tokens += current_call_input_tokens
                         self.session_output_tokens += current_call_output_tokens
 
-                        # Ensure 'model' variable is accessible here (it should be from the function arguments)
                         model_cost = COST_PER_MILLION_TOKENS.get(model)
                         if model_cost:
-                            call_cost = (current_call_input_tokens * model_cost.get("input", 0) / 1_000_000) + \
-                                        (current_call_output_tokens * model_cost.get("output", 0) / 1_000_000)
+                            # Calculate cost for standard tokens
+                            standard_input_cost = non_cached * model_cost.get("input", 0) / 1_000_000
+                            output_cost = current_call_output_tokens * model_cost.get("output", 0) / 1_000_000
+                            
+                            # Calculate cost for cache operations
+                            cache_write_cost = 0
+                            cache_read_cost = 0
+                            
+                            if cache_created > 0:
+                                # Cache writes are 25% more expensive than base input tokens
+                                cache_write_cost = cache_created * (model_cost.get("input", 0) * 1.25) / 1_000_000
+                            
+                            if cache_read > 0:
+                                # Cache reads are 90% cheaper than base input tokens
+                                cache_read_cost = cache_read * (model_cost.get("input", 0) * 0.1) / 1_000_000
+                            
+                            # Total cost for this call
+                            call_cost = standard_input_cost + output_cost + cache_write_cost + cache_read_cost
                             self.session_total_cost += call_cost
-                        else:
-                            log.warning(f"Cost data not found for model: {model}. Session cost may be inaccurate.")
-
-                        # Ensure 'span' variable is accessible here
-                        if span:
-                            span.set_attribute("api.input_tokens", current_call_input_tokens)
-                            span.set_attribute("api.output_tokens", current_call_output_tokens)
-                            span.set_attribute("api.estimated_cost", call_cost if model_cost else 0)
-                        log.info(f"API Call Tokens - Input: {current_call_input_tokens}, Output: {current_call_output_tokens}. Cost: ${call_cost:.4f}")
-                        yield f"@@STATUS@@\n{STATUS_EMOJI['model']} API Call Tokens: In={current_call_input_tokens}, Out={current_call_output_tokens} (Cost: ${call_cost:.4f})"
-
+                            
+                            # Log detailed cost breakdown
+                            log.info(f"Cost breakdown - Standard Input: ${standard_input_cost:.4f}, Output: ${output_cost:.4f}, " +
+                                    f"Cache Write: ${cache_write_cost:.4f}, Cache Read: ${cache_read_cost:.4f}, Total: ${call_cost:.4f}")
+                            
+                            if span:
+                                span.set_attribute("api.input_tokens", current_call_input_tokens)
+                                span.set_attribute("api.output_tokens", current_call_output_tokens)
+                                span.set_attribute("api.estimated_cost", call_cost)
+                                # Add cache-specific attributes
+                                span.set_attribute("api.cache_created_tokens", cache_created)
+                                span.set_attribute("api.cache_read_tokens", cache_read)
+                            
+                            # Show cost breakdown in status
+                            yield f"@@STATUS@@\n{STATUS_EMOJI['model']} API Call Tokens: In={current_call_input_tokens}, Out={current_call_output_tokens} (Cost: ${call_cost:.4f})"
+                    
                     else: # Handle case where final_message or usage is missing
                         log.warning("Could not retrieve final usage data from the stream.")
                         if span: span.set_attribute("api.usage_retrieval_error", True)
@@ -6394,18 +6445,49 @@ class MCPClient:
             status.stop() # Stop the status indicator
 
             if response and hasattr(response, 'usage') and response.usage:
+                # Extract existing token counts
                 input_tokens = response.usage.input_tokens
                 output_tokens = response.usage.output_tokens
-                self.session_input_tokens += input_tokens
-                self.session_output_tokens += output_tokens
-
+                
+                # Add cache metrics extraction
+                cache_created = getattr(response.usage, 'cache_creation_input_tokens', 0)
+                cache_read = getattr(response.usage, 'cache_read_input_tokens', 0)
+                non_cached = getattr(response.usage, 'input_tokens', 0)
+                
+                # Update tracking metrics
+                if cache_read > 0:
+                    self.cache_hit_count += 1
+                    self.tokens_saved_by_cache += cache_read
+                    log.info(f"CACHE HIT! Read {cache_read:,} tokens from cache. Non-cached tokens: {non_cached:,}")
+                elif cache_created > 0:
+                    self.cache_miss_count += 1
+                    log.info(f"CACHE CREATION: Cached {cache_created:,} tokens. Non-cached tokens: {non_cached:,}")
+                    
+                # Update cost calculation to account for cache pricing
                 model_cost = COST_PER_MILLION_TOKENS.get(model)
                 if model_cost:
-                    call_cost = (input_tokens * model_cost.get("input", 0) / 1_000_000) + \
-                                (output_tokens * model_cost.get("output", 0) / 1_000_000)
+                    # Standard token costs
+                    standard_input_cost = non_cached * model_cost.get("input", 0) / 1_000_000
+                    output_cost = output_tokens * model_cost.get("output", 0) / 1_000_000
+                    
+                    # Cache-specific costs
+                    cache_write_cost = 0
+                    cache_read_cost = 0
+                    
+                    if cache_created > 0:
+                        # Cache writes are 25% more expensive
+                        cache_write_cost = cache_created * (model_cost.get("input", 0) * 1.25) / 1_000_000
+                        
+                    if cache_read > 0:
+                        # Cache reads are 90% cheaper
+                        cache_read_cost = cache_read * (model_cost.get("input", 0) * 0.1) / 1_000_000
+                        
+                    call_cost = standard_input_cost + output_cost + cache_write_cost + cache_read_cost
                     self.session_total_cost += call_cost
-                else:
-                    log.warning(f"Cost data not found for model: {model}. Session cost may be inaccurate.")
+                    
+                    # Detailed cost logging
+                    log.info(f"Cost breakdown - Standard Input: ${standard_input_cost:.4f}, Output: ${output_cost:.4f}, " +
+                            f"Cache Write: ${cache_write_cost:.4f}, Cache Read: ${cache_read_cost:.4f}, Total: ${call_cost:.4f}")
 
                 # Update span if desired
                 if span:
@@ -6493,49 +6575,63 @@ class MCPClient:
     
     async def _iterate_streaming_query(self, query: str, status_lines: deque):
         """Helper to run streaming query and store text for Live display."""
-        self._current_query_text = "" # Initialize temporary storage
+        self._current_query_text = ""  # Initialize response text storage
+        self._current_status_messages = []  # Initialize status messages storage
+        
         try:
             # Directly iterate the stream generator provided by process_streaming_query
             async for chunk in self.process_streaming_query(query):
-                 if chunk.startswith("@@STATUS@@"):
-                     status_message_markup = chunk[len("@@STATUS@@"):].strip()
-                     try:
-                         status_text_object = Text.from_markup(status_message_markup)
-                         # Add a newline Text object first for spacing
-                         status_lines.append(Text("\n"))
-                         status_lines.append(status_text_object) # Now append the actual status
-                     except Exception as parse_err:
-                         log.warning(f"Failed to parse status markup '{status_message_markup}': {parse_err}")
-                         # Fallback: append raw string but maybe style it as warning
-                         status_lines.append(Text("\n"))
-                         status_lines.append(Text(f"[RAW] {status_message_markup}", style="bright_red"))
-                 else:
-                     # It's a regular text chunk from Claude
-                     if asyncio.current_task().cancelled(): raise asyncio.CancelledError()
-                     self._current_query_text += chunk
-                 # Yield control briefly
-                 await asyncio.sleep(0.001)
+                if chunk.startswith("@@STATUS@@"):
+                    status_message = chunk[len("@@STATUS@@"):].strip()
+                    # Add to our status message list
+                    self._current_status_messages.append(status_message)
+                    # Also add to the deque for compatibility
+                    status_lines.append(Text.from_markup(status_message))
+                else:
+                    # It's a regular text chunk from Claude
+                    if asyncio.current_task().cancelled(): 
+                        raise asyncio.CancelledError()
+                    self._current_query_text += chunk
+                # Yield control briefly to allow display updates
+                await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             log.debug("Streaming query iteration cancelled internally.")
-            # No need to update status_lines here, handled by interactive_loop's handler
-            raise # Re-raise CancelledError
+            raise  # Re-raise CancelledError
         except Exception as e:
             log.error(f"Error in _iterate_streaming_query: {e}", exc_info=True)
             # Store error in status to be displayed
+            self._current_status_messages.append(f"[bold red]Query Error: {e}[/]")
             status_lines.append(Text(f"[bold red]Query Error: {e}[/]", style="red"))
-            # Do not raise here, let interactive_loop handle showing the error in the panel
+
+    # Inside class MCPClient:
 
     async def interactive_loop(self):
         """Run interactive command loop with smoother live streaming output and abort capability."""
-        # Always use get_safe_console for interactive mode
         interactive_console = get_safe_console()
 
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print("Type your query to Claude, or a command (type 'help' for available commands)")
         self.safe_print("[italic]Press Ctrl+C once to abort request, twice quickly to force exit[/italic]")
 
+        # --- Define constants for stability ---
+        RESPONSE_HEIGHT = 35 # Fixed height for the response panel
+        STATUS_HEIGHT = 13 # Number of status lines to show
+        TOTAL_PANEL_HEIGHT = RESPONSE_HEIGHT + STATUS_HEIGHT + 5 # Response + Status + Borders + Title + Abort message space
+        REFRESH_RATE = 10.0 # Increased refresh rate (10 times per second)
+
+        @contextmanager
+        def suppress_all_logs():
+            """Temporarily suppress ALL logging output."""
+            root_logger = logging.getLogger()
+            original_level = root_logger.level
+            try:
+                root_logger.setLevel(logging.CRITICAL + 1) # Suppress everything below CRITICAL
+                yield
+            finally:
+                root_logger.setLevel(original_level)
+
         while True:
-            live_display: Optional[Live] = None # To manage the Live instance
+            live_display: Optional[Live] = None
             self.current_query_task = None
             try:
                 user_input = Prompt.ask("\n[bold blue]>>[/]", console=interactive_console)
@@ -6560,161 +6656,259 @@ class MCPClient:
                 elif not user_input.strip():
                     continue
 
-                # Process as a query to Claude with task management
+                # Process as a query to Claude
                 else:
-                    status_lines = deque(maxlen=10) # Keep track of recent status lines
+                    # ================================================================
+                    # <<< FIX: RESET SESSION STATS BEFORE PROCESSING QUERY >>>
+                    # ================================================================
+                    self.session_input_tokens = 0
+                    self.session_output_tokens = 0
+                    self.session_total_cost = 0.0
+                    self.cache_hit_count = 0 # Reset per-query cache stats too
+                    self.cache_miss_count = 0
+                    self.tokens_saved_by_cache = 0
+                    # ================================================================
+
+                    status_lines = deque(maxlen=STATUS_HEIGHT) # Store recent status lines
                     abort_message = Text("Press Ctrl+C once to abort...", style="dim yellow")
                     first_response_received = False
-                    initial_status = Status("Claude is thinking...", spinner="dots", console=interactive_console)
-                    final_panel = None # Initialize final panel to None
-                    REFRESH_RATE = 60.0
-                    # Initialize Live display directly with the initial status Panel
-                    live_display = Live(
-                        Panel(initial_status, title="Claude", border_style="dim green"), # Start with initial panel
-                        console=interactive_console,
-                        refresh_per_second=REFRESH_RATE,
-                        transient=True, 
-                        vertical_overflow="visible" 
+
+                    # --- Pre-create empty placeholders ---
+                    empty_response_text = "\n" * (RESPONSE_HEIGHT - 2) # Approx lines inside panel
+                    empty_status_lines = [Text("", style="dim") for _ in range(STATUS_HEIGHT)]
+
+                    # --- Create the initial panel structure with fixed heights ---
+                    response_content = Panel(
+                        Text(f"Waiting for Claude's response...\n{empty_response_text}", style="dim"),
+                        title="Response",
+                        height=RESPONSE_HEIGHT, # Fixed height
+                        border_style="dim blue"
                     )
-                    try:
-                        live_display.start() # Start Live display
 
-                        log.debug("Creating query task...")
-                        query_task = asyncio.create_task(
-                            self._iterate_streaming_query(user_input, status_lines),
-                            name=f"query-{user_input[:20]}"
-                        )
-                        self.current_query_task = query_task
-                        log.debug(f"Query task {self.current_query_task.get_name()} started.")
+                    status_content = Panel(
+                        Group(*empty_status_lines),
+                        title="Status",
+                        height=STATUS_HEIGHT + 2, # Fixed height + borders/title
+                        border_style="dim blue"
+                    )
 
-                        # Update loop while the query task is running
-                        while not self.current_query_task.done():
-                            claude_text_content = getattr(self, "_current_query_text", "")
-                            if not first_response_received and (claude_text_content or status_lines):
-                                first_response_received = True
+                    initial_panel = Panel(
+                        Group(
+                            response_content,
+                            status_content,
+                            abort_message # Reserve space for this
+                        ),
+                        title="Claude",
+                        border_style="dim green",
+                        height=TOTAL_PANEL_HEIGHT # Fixed height
+                    )
 
-                            # Build the renderable content (Spinner or combined Markdown/Status)
-                            renderable_content: Union[Group, Status]
-                            panel_border_style = "green" # Default
+                    # Initialize Live display with updated settings
+                    live_display = Live(
+                        initial_panel,
+                        console=interactive_console,
+                        refresh_per_second=REFRESH_RATE, # Use the new rate
+                        transient=True, # Clears the display on exit
+                        vertical_overflow="crop" # Crop content outside panels
+                    )
 
-                            if not first_response_received:
-                                # Still waiting for the first chunk, show spinner status
-                                renderable_content = initial_status
-                                panel_border_style = "dim green"
-                            else:
-                                # Combine Markdown response and status lines into a Group
-                                md = Markdown(claude_text_content)
-                                status_group = Group(*list(status_lines))
-                                display_items = [md, status_group]
+                    # Suppress logs *only* during the live update part
+                    with suppress_all_logs():
+                        try:
+                            live_display.start()
+
+                            log.debug("Creating query task...")
+                            query_task = asyncio.create_task(
+                                self._iterate_streaming_query(user_input, status_lines),
+                                name=f"query-{user_input[:20]}"
+                            )
+                            self.current_query_task = query_task
+                            log.debug(f"Query task {self.current_query_task.get_name()} started.")
+
+                            # --- Live Update Loop ---
+                            while not self.current_query_task.done():
+                                claude_text_content = getattr(self, "_current_query_text", "")
+                                if not first_response_received and (claude_text_content or status_lines):
+                                    first_response_received = True
+
+                                # --- Prepare Response Renderable ---
+                                if claude_text_content:
+                                    response_renderable = Markdown(claude_text_content)
+                                else:
+                                    response_renderable = Text(f"Waiting for Claude's response...\n{empty_response_text}", style="dim")
+
+                                # --- Prepare Status Renderable ---
+                                current_status_list = list(status_lines)
+                                display_status_lines = current_status_list[-STATUS_HEIGHT:]
+                                if len(display_status_lines) < STATUS_HEIGHT:
+                                    padding = [Text("", style="dim") for _ in range(STATUS_HEIGHT - len(display_status_lines))]
+                                    display_status_lines = padding + display_status_lines
+                                status_renderable = Group(*display_status_lines)
+
+                                # --- Rebuild Panels ---
+                                response_panel = Panel(
+                                    response_renderable, title="Response", height=RESPONSE_HEIGHT,
+                                    border_style="blue" if first_response_received else "dim blue"
+                                )
+                                status_panel = Panel(
+                                    status_renderable, title="Status", height=STATUS_HEIGHT + 2,
+                                    border_style="blue" if status_lines else "dim blue"
+                                )
+
+                                # --- Check Abort ---
                                 abort_needed = self.current_query_task and not self.current_query_task.done()
-                                if abort_needed:
-                                    display_items.append(abort_message)
-                                renderable_content = Group(*display_items)
 
-                            # Create the single Panel containing the combined content
-                            panel_to_update = Panel(renderable_content, title="Claude", border_style=panel_border_style)
+                                # --- Assemble Panel ---
+                                updated_panel = Panel(
+                                    Group(response_panel, status_panel, abort_message if abort_needed else Text("")),
+                                    title="Claude", border_style="green" if first_response_received else "dim green",
+                                    height=TOTAL_PANEL_HEIGHT
+                                )
 
-                            # Update the Live display with the main response panel ONLY
-                            live_display.update(panel_to_update, refresh=False)
+                                # --- Update Live ---
+                                live_display.update(updated_panel)
 
-                            # Wait briefly or until task is done/cancelled
-                            try:
-                                await asyncio.wait_for(asyncio.shield(self.current_query_task), timeout=0.1)
-                            except asyncio.TimeoutError:
-                                if not first_response_received:
-                                     initial_status.update() # Keep spinner going if no response yet
-                                pass
-                            except asyncio.CancelledError:
-                                log.debug("Query task cancelled while display loop was waiting.")
-                                break # Exit this display loop
+                                # --- Wait ---
+                                try:
+                                    await asyncio.wait_for(asyncio.shield(self.current_query_task), timeout=1.0 / REFRESH_RATE)
+                                except asyncio.TimeoutError:
+                                    pass
+                                except asyncio.CancelledError:
+                                    log.debug("Query task cancelled while display loop was waiting.")
+                                    break
 
-                        # Await task completion to handle exceptions AFTER the loop
-                        await self.current_query_task
+                            # --- Await task completion ---
+                            await self.current_query_task
 
-                        # --- Prepare final panel after successful completion ---
-                        if not first_response_received:
-                            final_panel = Panel("[dim]No response received.[/dim]", title="Claude", border_style="yellow")
-                        else:
+                            # --- Prepare Final Display (Normal Completion) ---
                             claude_text_content = getattr(self, "_current_query_text", "")
-                            md = Markdown(claude_text_content)
-                            status_group = Group(*list(status_lines)) # No abort message
-                            renderable_group = Group(md, status_group)
-                            final_panel = Panel(renderable_group, title="Claude", border_style="green")
+                            final_response_renderable = Markdown(claude_text_content) if claude_text_content else Text("No response received.", style="dim")
 
-                    except asyncio.CancelledError:
-                        # Handle cancellation (SIGINT or API trigger)
-                        log.debug("Query task processing caught CancelledError in interactive_loop.")
-                        claude_text_content = getattr(self, "_current_query_text", "") # Get partial text
-                        status_lines.append(Text("[bold yellow]Request Aborted.[/]", style="yellow"))
+                            final_status_list = list(status_lines)[-STATUS_HEIGHT:]
+                            if len(final_status_list) < STATUS_HEIGHT:
+                                padding = [Text("", style="dim") for _ in range(STATUS_HEIGHT - len(final_status_list))]
+                                final_status_list = padding + final_status_list
+                            final_status_renderable = Group(*final_status_list)
 
-                        # --- Prepare final panel for aborted state ---
-                        md = Markdown(claude_text_content)
-                        status_group = Group(*list(status_lines))
-                        renderable_group = Group(md, status_group)
-                        final_panel = Panel(renderable_group, title="Claude - Aborted", border_style="yellow")
+                            final_response_panel = Panel(final_response_renderable, title="Response", height=RESPONSE_HEIGHT, border_style="blue")
+                            final_status_panel = Panel(final_status_renderable, title="Status", height=STATUS_HEIGHT + 2, border_style="blue")
+                            final_panel = Panel(Group(final_response_panel, final_status_panel), title="Claude", border_style="green", height=TOTAL_PANEL_HEIGHT)
 
-                    except Exception as stream_err:
-                         # Handle other errors during query processing
-                         log.error(f"Error during query task execution: {stream_err}", exc_info=True)
-                         claude_text_content = getattr(self, "_current_query_text", "") # Get partial text
-                         status_lines.append(Text.from_markup(f"[bold red]Error: {stream_err}[/]"))
 
-                         # --- Prepare final panel for error state ---
-                         md = Markdown(claude_text_content)
-                         status_group = Group(*list(status_lines))
-                         renderable_group = Group(md, status_group)
-                         final_panel = Panel(renderable_group, title="Claude - ERROR", border_style="red")
+                        except asyncio.CancelledError:
+                            # --- Prepare Final Display (Cancellation) ---
+                            log.debug("Query task caught CancelledError in live block.")
+                            claude_text_content = getattr(self, "_current_query_text", "")
+                            response_renderable = Markdown(claude_text_content) if claude_text_content else Text("Response aborted.", style="dim")
+                            status_lines.append(Text("[bold yellow]Request Aborted.[/]", style="yellow"))
 
-                    finally:
-                         # --- Cleanup *after* query attempt ---
-                         log.debug(f"Query task finalization. Task ref: {self.current_query_task.get_name() if self.current_query_task else 'None'}")
-                         self.current_query_task = None # Clear task reference
-                         if hasattr(self, "_current_query_text"):
-                             delattr(self, "_current_query_text") # Clean up temp text storage
-                         if live_display and live_display.is_started:
-                              live_display.stop() # Stop the live display cleanly
-                         live_display = None # Clear reference
+                            aborted_status_list = list(status_lines)[-STATUS_HEIGHT:]
+                            if len(aborted_status_list) < STATUS_HEIGHT:
+                                padding = [Text("", style="dim") for _ in range(STATUS_HEIGHT - len(aborted_status_list))]
+                                aborted_status_list = padding + aborted_status_list
+                            aborted_status_renderable = Group(*aborted_status_list)
 
-                         if final_panel:
-                             interactive_console.print(final_panel)
+                            aborted_response_panel = Panel(response_renderable, title="Response", height=RESPONSE_HEIGHT, border_style="yellow")
+                            aborted_status_panel = Panel(aborted_status_renderable, title="Status", height=STATUS_HEIGHT + 2, border_style="yellow")
+                            final_panel = Panel(Group(aborted_response_panel, aborted_status_panel), title="Claude - Aborted", border_style="yellow", height=TOTAL_PANEL_HEIGHT)
 
-                         final_footer_text = Text.assemble(
-                             "Tokens: ",
-                             ("Input: ", "dim cyan"), (f"{self.session_input_tokens:,}", "cyan"), " | ",
-                             ("Output: ", "dim magenta"), (f"{self.session_output_tokens:,}", "magenta"), " | ",
-                             ("Total: ", "dim white"), (f"{self.session_input_tokens + self.session_output_tokens:,}", "white"),
-                             " | ",
-                             ("Cost: ", "dim yellow"), (f"${self.session_total_cost:.4f}", "yellow")
-                         )
-                         interactive_console.print(final_footer_text)
-            # --- Outer Exception Handling ---
+
+                        except Exception as e:
+                             # --- Prepare Final Display (Error) ---
+                            log.error(f"Error during query/live update: {e}", exc_info=True)
+                            claude_text_content = getattr(self, "_current_query_text", "")
+                            response_renderable = Markdown(claude_text_content) if claude_text_content else Text("Error occurred.", style="dim")
+                            status_lines.append(Text(f"[bold red]Error: {e}[/]", style="red"))
+
+                            error_status_list = list(status_lines)[-STATUS_HEIGHT:]
+                            if len(error_status_list) < STATUS_HEIGHT:
+                                padding = [Text("", style="dim") for _ in range(STATUS_HEIGHT - len(error_status_list))]
+                                error_status_list = padding + error_status_list
+                            error_status_renderable = Group(*error_status_list)
+
+                            error_response_panel = Panel(response_renderable, title="Response", height=RESPONSE_HEIGHT, border_style="red")
+                            error_status_panel = Panel(error_status_renderable, title="Status", height=STATUS_HEIGHT + 2, border_style="red")
+                            final_panel = Panel(Group(error_response_panel, error_status_panel), title="Claude - ERROR", border_style="red", height=TOTAL_PANEL_HEIGHT)
+
+                        finally:
+                            # --- Cleanup Live Display ---
+                            log.debug(f"Query task cleanup. Task ref: {self.current_query_task.get_name() if self.current_query_task else 'None'}")
+                            self.current_query_task = None
+                            if hasattr(self, "_current_query_text"): delattr(self, "_current_query_text")
+                            if live_display and live_display.is_started: live_display.stop()
+                            live_display = None
+
+                            # Print the final state panel
+                            if 'final_panel' in locals():
+                                interactive_console.print(final_panel)
+
+                            # --- Print Final Stats (Now reflects *this query's* stats) ---
+                            # Calculate hit rate for *this query*
+                            hit_rate = 0
+                            if hasattr(self, 'cache_hit_count') and (self.cache_hit_count + self.cache_miss_count) > 0:
+                                hit_rate = self.cache_hit_count / (self.cache_hit_count + self.cache_miss_count) * 100
+
+                            # Calculate cost savings for *this query*
+                            cost_saved = 0
+                            if hasattr(self, 'tokens_saved_by_cache') and self.tokens_saved_by_cache > 0:
+                                model_cost_info = COST_PER_MILLION_TOKENS.get(self.current_model, {})
+                                input_cost_per_token = model_cost_info.get("input", 0) / 1_000_000
+                                cost_saved = self.tokens_saved_by_cache * input_cost_per_token * 0.9 # 90% saving
+
+                            # Assemble token stats text using the reset session variables
+                            token_stats = [
+                                "Tokens: ",
+                                ("Input: ", "dim cyan"), (f"{self.session_input_tokens:,}", "cyan"), " | ",
+                                ("Output: ", "dim magenta"), (f"{self.session_output_tokens:,}", "magenta"), " | ",
+                                ("Total: ", "dim white"), (f"{self.session_input_tokens + self.session_output_tokens:,}", "white"),
+                                " | ",
+                                ("Cost: ", "dim yellow"), (f"${self.session_total_cost:.4f}", "yellow")
+                            ]
+
+                            # Add cache stats if applicable for *this query*
+                            if hasattr(self, 'cache_hit_count') and (self.cache_hit_count + self.cache_miss_count) > 0:
+                                token_stats.extend([
+                                    "\n",
+                                    ("Cache: ", "dim green"),
+                                    (f"Hits: {self.cache_hit_count}", "green"), " | ",
+                                    (f"Misses: {self.cache_miss_count}", "yellow"), " | ",
+                                    (f"Hit Rate: {hit_rate:.1f}%", "green"), " | ",
+                                    (f"Tokens Saved: {self.tokens_saved_by_cache:,}", "green bold"), " | ",
+                                    (f"Cost Saved: ${cost_saved:.4f}", "green bold")
+                                ])
+
+                            # Create and print the final stats panel
+                            final_stats_panel = Panel(
+                                Text.assemble(*token_stats),
+                                title="Final Stats (This Query)", # Title reflects it's per-query now
+                                border_style="green"
+                            )
+                            interactive_console.print(final_stats_panel)
+
+            # --- Outer Loop Exception Handling ---
             except KeyboardInterrupt:
                 if live_display and live_display.is_started:
                     live_display.stop()
-                    live_display = None
                 self.safe_print("\n[yellow]Input interrupted.[/]")
-                continue # Go back to asking for input
-
-            except (anthropic.APIError, McpError, httpx.RequestError) as e:
-                if live_display and live_display.is_started:
-                    live_display.stop()
-                    live_display = None
-                self.safe_print(f"[bold red]Error ({type(e).__name__}):[/] {str(e)}")
-                log.error(f"API or Network Error in interactive loop: {e}", exc_info=True)
+                continue # Go to the next loop iteration
 
             except Exception as e:
                 if live_display and live_display.is_started:
                     live_display.stop()
-                    live_display = None
                 self.safe_print(f"[bold red]Unexpected Error:[/] {str(e)}")
                 log.error(f"Unexpected error in interactive loop: {e}", exc_info=True)
+                # Continue the loop after an unexpected error
+                continue
 
             finally:
-                # Final cleanup check
+                # Final cleanup for this loop iteration
                 if live_display and live_display.is_started:
-                    live_display.stop() # Ensure stopped
-                    live_display = None
-                self.current_query_task = None
+                    live_display.stop()
+                if self.current_query_task:
+                    # Ensure task is cancelled if loop exits unexpectedly
+                    if not self.current_query_task.done():
+                        self.current_query_task.cancel()
+                    self.current_query_task = None
                 if hasattr(self, "_current_query_text"):
                     delattr(self, "_current_query_text")
 
@@ -7888,6 +8082,10 @@ class MCPClient:
              cache_size += len(self.tool_cache.disk_cache) # Example
              pass 
         stats_text.append(f"{STATUS_EMOJI['package']} Cache Entries (Mem): {cache_size}\n")
+        if hasattr(self, 'cache_hit_count') and (self.cache_hit_count + self.cache_miss_count) > 0:
+            hit_rate = self.cache_hit_count / (self.cache_hit_count + self.cache_miss_count) * 100
+            stats_text.append(f"{STATUS_EMOJI['package']} Cache Efficiency: {hit_rate:.1f}% hits\n")
+            stats_text.append(f"{STATUS_EMOJI['package']} Est. Tokens Saved: {self.tokens_saved_by_cache:,}")        
         stats_text.append(f"{STATUS_EMOJI['trident_emblem']} Current Branch: [yellow]{self.conversation_graph.current_node.name}[/] ([cyan]{self.conversation_graph.current_node.id[:8]}[/])")
 
         layout["stats"].update(Panel(stats_text, title="[bold cyan]Client Info[/]", border_style="cyan"))
@@ -8215,8 +8413,14 @@ class MCPClient:
              "cache_entries_memory": len(self.tool_cache.memory_cache) if self.tool_cache else 0,
              "current_branch_id": self.conversation_graph.current_node.id,
              "current_branch_name": self.conversation_graph.current_node.name,
-         }
-
+             "cache_hit_count": getattr(self, 'cache_hit_count', 0),
+             "cache_miss_count": getattr(self, 'cache_miss_count', 0),
+             "tokens_saved_by_cache": getattr(self, 'tokens_saved_by_cache', 0),
+             "cache_hit_rate": (self.cache_hit_count / (self.cache_hit_count + self.cache_miss_count) * 100) 
+                                if hasattr(self, 'cache_hit_count') and (self.cache_hit_count + self.cache_miss_count) > 0 
+                                else 0
+            }
+            
          return {
              "timestamp": datetime.now().isoformat(),
              "client_info": client_info,
@@ -8400,11 +8604,12 @@ class MCPClient:
     
     async def auto_prune_context(self):
         """Auto-prune context based on token count"""
-        token_count = await self.count_tokens()
-        if token_count > self.config.auto_summarize_threshold:
-            self.safe_print(f"[yellow]Context size ({token_count} tokens) exceeds threshold "
-                         f"({self.config.auto_summarize_threshold}). Auto-summarizing...[/]")
-            await self.cmd_optimize(f"--tokens {self.config.max_summarized_tokens}")
+        if self.use_auto_summarization:
+            token_count = await self.count_tokens()
+            if token_count > self.config.auto_summarize_threshold:
+                self.safe_print(f"[yellow]Context size ({token_count} tokens) exceeds threshold "
+                                f"({self.config.auto_summarize_threshold}). Auto-summarizing...[/]")
+                await self.cmd_optimize(f"--tokens {self.config.max_summarized_tokens}")
 
     async def cmd_tool(self, args):
         """Directly execute a tool with parameters"""
@@ -8835,6 +9040,32 @@ class MCPClient:
 
         safe_console.print(status_table) # Use the regular safe_print
 
+        if hasattr(self, 'cache_hit_count') and (self.cache_hit_count + self.cache_miss_count) > 0:
+            cache_table = Table(title="Prompt Cache Statistics", box=box.ROUNDED)
+            cache_table.add_column("Metric", style="dim")
+            cache_table.add_column("Value", justify="right")
+            
+            hit_rate = self.cache_hit_count / (self.cache_hit_count + self.cache_miss_count) * 100
+            
+            cache_table.add_row(
+                Text.assemble(str(STATUS_EMOJI['package']), " Cache Hits"),
+                str(self.cache_hit_count)
+            )
+            cache_table.add_row(
+                Text.assemble(str(STATUS_EMOJI['warning']), " Cache Misses"),
+                str(self.cache_miss_count)
+            )
+            cache_table.add_row(
+                Text.assemble(str(STATUS_EMOJI['success']), " Hit Rate"),
+                f"{hit_rate:.1f}%"
+            )
+            cache_table.add_row(
+                Text.assemble(str(STATUS_EMOJI['speech_balloon']), " Tokens Saved"),
+                f"{self.tokens_saved_by_cache:,}"
+            )
+            
+            safe_console.print(cache_table)
+            
         # Only show server progress if we have servers
         if total_servers > 0:
             server_tasks = []
@@ -9212,6 +9443,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                      'dashboardRefreshRate': cfg.dashboard_refresh_rate,
                      'summarizationModel': cfg.summarization_model,
                      'autoSummarizeThreshold': cfg.auto_summarize_threshold,
+                     'useAutoSummarization': cfg.use_auto_summarization,
                      'maxSummarizedTokens': cfg.max_summarized_tokens,
                  }
 
@@ -9432,11 +9664,22 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
             @app.get("/api/usage")
             async def get_token_usage(mcp_client: MCPClient = Depends(get_mcp_client)):
+                # Calculate hit rate
+                hit_rate = 0
+                if hasattr(mcp_client, 'cache_hit_count') and (mcp_client.cache_hit_count + mcp_client.cache_miss_count) > 0:
+                    hit_rate = mcp_client.cache_hit_count / (mcp_client.cache_hit_count + mcp_client.cache_miss_count) * 100
+                    
                 return {
                     "input_tokens": mcp_client.session_input_tokens,
                     "output_tokens": mcp_client.session_output_tokens,
                     "total_tokens": mcp_client.session_input_tokens + mcp_client.session_output_tokens,
-                    "total_cost": mcp_client.session_total_cost
+                    "total_cost": mcp_client.session_total_cost,
+                    "cache_metrics": {
+                        "hit_count": getattr(mcp_client, 'cache_hit_count', 0),
+                        "miss_count": getattr(mcp_client, 'cache_miss_count', 0),
+                        "hit_rate_percent": hit_rate,
+                        "tokens_saved": getattr(mcp_client, 'tokens_saved_by_cache', 0)
+                    }
                 }
 
             @app.post("/api/conversation/optimize")
@@ -9562,6 +9805,41 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     return {"message": message, "newNodeId": new_node_id}
                 else:
                     raise HTTPException(status_code=500, detail=f"Import failed: {message}")
+
+            @app.get("/api/cache/statistics")
+            async def get_cache_statistics_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                # Only calculate hit rate if we have data
+                hit_rate = 0
+                if hasattr(mcp_client, 'cache_hit_count') and (mcp_client.cache_hit_count + mcp_client.cache_miss_count) > 0:
+                    hit_rate = mcp_client.cache_hit_count / (mcp_client.cache_hit_count + mcp_client.cache_miss_count) * 100
+                    
+                # Return comprehensive cache statistics
+                return {
+                    "tool_cache": {
+                        "memory_entries": len(mcp_client.tool_cache.memory_cache) if mcp_client.tool_cache else 0,
+                        "disk_entries": sum(1 for _ in mcp_client.tool_cache.disk_cache.iterkeys()) if mcp_client.tool_cache and mcp_client.tool_cache.disk_cache else 0
+                    },
+                    "prompt_cache": {
+                        "hit_count": getattr(mcp_client, 'cache_hit_count', 0),
+                        "miss_count": getattr(mcp_client, 'cache_miss_count', 0),
+                        "hit_rate_percent": hit_rate,
+                        "tokens_saved": getattr(mcp_client, 'tokens_saved_by_cache', 0),
+                        "estimated_cost_saved": getattr(mcp_client, 'tokens_saved_by_cache', 0) * 
+                                                (COST_PER_MILLION_TOKENS.get(mcp_client.current_model, {}).get("input", 0) * 0.9) / 1_000_000
+                                                if getattr(mcp_client, 'tokens_saved_by_cache', 0) > 0 else 0
+                    }
+                }
+            
+            @app.post("/api/cache/reset_stats")
+            async def reset_cache_stats_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                if hasattr(mcp_client, 'cache_hit_count'):
+                    mcp_client.cache_hit_count = 0
+                if hasattr(mcp_client, 'cache_miss_count'):
+                    mcp_client.cache_miss_count = 0
+                if hasattr(mcp_client, 'tokens_saved_by_cache'):
+                    mcp_client.tokens_saved_by_cache = 0
+                
+                return {"message": "Cache statistics reset successfully"}            
 
             @app.get("/api/cache/entries", response_model=List[CacheEntryDetail])
             async def get_cache_entries_api(mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -9740,7 +10018,13 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                         "input_tokens": mcp_client.session_input_tokens,
                                         "output_tokens": mcp_client.session_output_tokens,
                                         "total_tokens": mcp_client.session_input_tokens + mcp_client.session_output_tokens,
-                                        "total_cost": mcp_client.session_total_cost
+                                        "total_cost": mcp_client.session_total_cost,
+                                        "cache_hit_count": getattr(mcp_client, 'cache_hit_count', 0),
+                                        "cache_miss_count": getattr(mcp_client, 'cache_miss_count', 0),
+                                        "tokens_saved_by_cache": getattr(mcp_client, 'tokens_saved_by_cache', 0),
+                                        "cache_hit_rate": (mcp_client.cache_hit_count / (mcp_client.cache_hit_count + mcp_client.cache_miss_count) * 100) 
+                                                        if hasattr(mcp_client, 'cache_hit_count') and (mcp_client.cache_hit_count + mcp_client.cache_miss_count) > 0 
+                                                        else 0                                        
                                     }).model_dump())                                    
                                 except asyncio.CancelledError:
                                      log.debug("Query cancelled during WebSocket processing.")
