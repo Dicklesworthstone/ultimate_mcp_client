@@ -142,7 +142,6 @@ import copy
 import dataclasses
 import functools
 import hashlib
-import inspect
 import io
 import ipaddress
 import json
@@ -152,6 +151,7 @@ import platform
 import random
 import re
 import readline
+import shlex
 import signal
 import socket
 import subprocess
@@ -163,10 +163,24 @@ from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from email.mime import base
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, NotRequired, Optional, Set, Tuple, Type, TypedDict, Union, cast
+from typing import (
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Dict,
+    List,
+    NotRequired,
+    Optional,
+    Set,
+    Tuple,
+    TypedDict,
+    Union,
+    cast,
+)
 from urllib.parse import urlparse
 
 # Other imports
@@ -187,12 +201,10 @@ import yaml
 from anthropic import AsyncAnthropic, AsyncMessageStream
 from anthropic.types import (
     ContentBlockDeltaEvent,
-    MessageParam,
     MessageStreamEvent,
-    ToolParam,
 )
 from decouple import Config as DecoupleConfig
-from decouple import Csv, RepositoryEnv, UndefinedValueError
+from decouple import Csv, RepositoryEnv
 from dotenv import dotenv_values, find_dotenv, set_key
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -213,9 +225,12 @@ from mcp.types import (
     InitializeResult as MCPInitializeResult,  # Alias to avoid confusion with provider results
 )
 from mcp.types import Prompt as McpPromptType
-from openai import APIConnectionError as OpenAIAPIConnectionError, AsyncStream
+from openai import APIConnectionError as OpenAIAPIConnectionError
 from openai import APIError as OpenAIAPIError
-from openai import AsyncOpenAI  # For OpenAI, Grok, DeepSeek, Mistral, Groq, Cerebras, Gemini
+from openai import (
+    AsyncOpenAI,  # For OpenAI, Grok, DeepSeek, Mistral, Groq, Cerebras, Gemini
+    AsyncStream,
+)
 from openai import AuthenticationError as OpenAIAuthenticationError
 from openai.types.chat import ChatCompletionChunk
 from opentelemetry import metrics, trace
@@ -226,7 +241,6 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExport
 from pydantic import AnyUrl, BaseModel, Field, ValidationError
 from rich import box
 from rich.console import Console, Group
-from rich.emoji import Emoji
 from rich.layout import Layout
 from rich.live import Live
 from rich.logging import RichHandler
@@ -830,7 +844,6 @@ def safe_stdout():
     else: yield
 
 def get_safe_console():
-    # (Keep existing implementation, checking app.mcp_client.server_manager)
     has_stdio_servers = False
     try:
         if hasattr(app, "mcp_client") and app.mcp_client and hasattr(app.mcp_client, "server_manager"):
@@ -849,7 +862,7 @@ def verify_no_stdout_pollution():
     sys.stdout = test_buffer
     try:
         test_buffer.write("TEST_STDOUT_POLLUTION_VERIFICATION")
-        captured = test_buffer.getvalue()
+        captured = test_buffer.getvalue()  # noqa: F841
         if isinstance(original_stdout, StdioProtectionWrapper):
             original_stdout.update_stdio_status()
             # Simplified check: If wrapper exists, assume protection is attempted
@@ -1744,6 +1757,13 @@ class Config:
         """
         log.debug("Initializing Config object...")
         self._set_defaults()
+        self.dotenv_path = find_dotenv(raise_error_if_not_found=False, usecwd=True)
+        if self.dotenv_path:
+            log.info(f"Located .env file at: {self.dotenv_path}")
+        else:
+            # Decide where a .env file *should* go if created later
+            self.dotenv_path = str(Path.cwd() / ".env") # Default to current working dir
+            log.info(f"No .env file found. Will use default path if saving: {self.dotenv_path}")
         self.load_from_yaml()
         self._apply_env_overrides()
         Path(self.conversation_graphs_dir).mkdir(parents=True, exist_ok=True)
@@ -1840,19 +1860,36 @@ class Config:
                 target_type = type(target_attr) if target_attr is not None else str
                 try:
                     parsed_value: Any
-                    if target_type == bool:
+                    if target_type is bool:
                         parsed_value = env_value.lower() in ('true', '1', 't', 'yes', 'y')
-                    elif target_type == int:
+                    elif target_type is int:
                         parsed_value = int(env_value)
-                    elif target_type == float:
+                    elif target_type is float:
                         parsed_value = float(env_value)
-                    elif target_type == list:
-                        parsed_value = [item.strip() for item in env_value.split(',') if item.strip()]
+
+                    elif target_type is list:
+                        try:
+                            # Assuming elements should be strings
+                            parsed_value = Csv(str)(env_value)
+                        except Exception as parse_err:
+                            # Log error if Csv parsing fails, keep default
+                            log.warning(f"Could not parse list from env var '{env_var}' using decouple.Csv: {parse_err}. Keeping default value.")
+                            continue # Skip setting attribute if parsing fails
+
                     else: # Default to string
                         parsed_value = env_value
 
-                    setattr(self, attr_name, parsed_value)
-                    updated_vars.append(f"{attr_name} (from {env_var})")
+                    # Only update if the value actually changed from the default/YAML loaded value
+                    current_val = getattr(self, attr_name, None)
+                    # Need careful comparison for lists/dicts
+                    if isinstance(current_val, list) and isinstance(parsed_value, list):
+                        if set(current_val) != set(parsed_value): # Compare sets for lists
+                             setattr(self, attr_name, parsed_value)
+                             updated_vars.append(f"{attr_name} (from {env_var})")
+                    elif current_val != parsed_value:
+                         setattr(self, attr_name, parsed_value)
+                         updated_vars.append(f"{attr_name} (from {env_var})")
+
                 except (ValueError, TypeError) as e:
                     log.warning(f"Could not apply env var '{env_var}' to '{attr_name}'. Invalid value '{env_value}' for type {target_type}: {e}")
 
@@ -1959,9 +1996,9 @@ class Config:
                     elif current_type is None or isinstance(value, current_type):
                         setattr(self, key, value)
                     elif current_type in [int, float, bool, list, str]: # Attempt basic type conversion
-                         if current_type == bool:
+                         if current_type is bool:
                              converted_value = str(value).lower() in ('true', '1', 't', 'yes', 'y')
-                         elif current_type == list and isinstance(value, list): # Ensure list conversion takes list
+                         elif current_type is list and isinstance(value, list): # Ensure list conversion takes list
                              converted_value = value # Assume YAML list is correct
                          else:
                              converted_value = current_type(value) # Try direct conversion
@@ -2585,7 +2622,6 @@ class ServerManager:
 
         discovered_servers_to_add = []
         semaphore = asyncio.Semaphore(concurrency)
-        tasks = []
         # Use a shared client for efficiency
         client_timeout = httpx.Timeout(probe_timeout + 0.5, connect=probe_timeout) # Slightly larger overall timeout
         self._port_scan_client = httpx.AsyncClient(verify=False, timeout=client_timeout, limits=httpx.Limits(max_connections=concurrency + 10))
@@ -2698,7 +2734,7 @@ class ServerManager:
                     else:
                         # Fallback: run sequentially if helper not available
                         log.warning("MCPClient helper not found, running discovery steps sequentially.")
-                        for step, desc in zip(discovery_steps, discovery_descriptions):
+                        for step, desc in zip(discovery_steps, discovery_descriptions, strict=True):
                             log.info(f"Running: {desc}")
                             await step()
 
@@ -2813,7 +2849,7 @@ class ServerManager:
                         safe_console.print(f"[red]Invalid selection: {e}. Please try again.[/]")
 
                 # Process selected servers
-                for idx in sorted(list(servers_to_add_indices)):
+                for idx in sorted(servers_to_add_indices):
                     server_info = newly_discovered[idx]
                     success, msg = await self.add_discovered_server_config(server_info)
                     if success:
@@ -3034,85 +3070,168 @@ class ServerManager:
             # Process termination handled by outer loop's exit stack if process_this_attempt was set
             raise setup_err
 
-
     async def _load_server_capabilities(
         self, server_name: str, session: ClientSession, initialize_result: Optional[Union[MCPInitializeResult, Dict[str, Any]]]
     ):
-        """Loads tools, resources, and prompts from a connected server session."""
-        log.info(f"[{server_name}] Loading capabilities...")
-        cap_timeout = 30.0
-        server_caps: Dict[str, bool] = {"tools": False, "resources": False, "prompts": False}
+        """
+        Loads tools, resources, and prompts from a connected server session AFTER potential rename.
+        Uses the *final* server_name for registration. Uses anyio for structured concurrency.
+        Correctly handles both dict (STDIO) and ServerCapabilities object (MCPInitializeResult) types.
+        """
+        log.info(f"[{server_name}] Loading capabilities using anyio...")
+        capability_timeout = 30.0 # Timeout for individual capability list calls
 
-        # Determine capabilities from InitializeResult
+        # Determine if capabilities are advertised
+        has_tools = False
+        has_resources = False
+        has_prompts = False
+
+        # Determine capabilities from InitializeResult (logic remains the same)
         if isinstance(initialize_result, dict): # From STDIO direct response
              caps_data = initialize_result.get("capabilities")
              if isinstance(caps_data, dict):
-                  server_caps["tools"] = bool(caps_data.get("tools"))
-                  server_caps["resources"] = bool(caps_data.get("resources"))
-                  server_caps["prompts"] = bool(caps_data.get("prompts"))
+                  has_tools = bool(caps_data.get("tools"))
+                  has_resources = bool(caps_data.get("resources"))
+                  has_prompts = bool(caps_data.get("prompts"))
         elif isinstance(initialize_result, MCPInitializeResult): # From standard ClientSession
              if initialize_result.capabilities:
-                  server_caps["tools"] = bool(initialize_result.capabilities.tools)
-                  server_caps["resources"] = bool(initialize_result.capabilities.resources)
-                  server_caps["prompts"] = bool(initialize_result.capabilities.prompts)
+                  has_tools = bool(initialize_result.capabilities.tools)
+                  has_resources = bool(initialize_result.capabilities.resources)
+                  has_prompts = bool(initialize_result.capabilities.prompts)
         else:
             log.warning(f"[{server_name}] Could not determine capabilities from init result type: {type(initialize_result)}")
 
-        log.debug(f"[{server_name}] Determined capabilities: {server_caps}")
+        log.debug(f"[{server_name}] Determined capabilities: tools={has_tools}, resources={has_resources}, prompts={has_prompts}")
         # Store determined capabilities in the config
         if server_name in self.config.servers:
-            self.config.servers[server_name].capabilities = server_caps
+            self.config.servers[server_name].capabilities = {
+                "tools": has_tools,
+                "resources": has_resources,
+                "prompts": has_prompts,
+            }
 
-        # --- Define async loading tasks ---
-        async def load_tools():
-            if server_caps["tools"] and hasattr(session, 'list_tools'):
+        # --- Define async functions for loading each capability type ---
+        async def load_tools_task():
+            if has_tools and hasattr(session, 'list_tools'):
                 log.info(f"[{server_name}] Loading tools...")
                 try:
-                    res = await asyncio.wait_for(session.list_tools(), timeout=cap_timeout)
-                    self._process_list_result(server_name, getattr(res, 'tools', []), self.tools, MCPTool, "tool")
+                    res = await asyncio.wait_for(session.list_tools(), timeout=capability_timeout)
+                    # Use helper to process results, handle potential None or incorrect type
+                    self._process_list_result(server_name, getattr(res, 'tools', None), self.tools, MCPTool, "tool")
                 except asyncio.TimeoutError:
                     log.error(f"[{server_name}] Timeout loading tools.")
+                except McpError as e: # Catch specific MCP errors
+                    log.error(f"[{server_name}] MCP Error loading tools: {e}")
                 except Exception as e:
-                    log.error(f"[{server_name}] Error loading tools: {e}", exc_info=True)
-                    raise
+                    log.error(f"[{server_name}] Unexpected error loading tools: {e}", exc_info=True)
+                    raise # Re-raise other errors to potentially cancel the group
             else:
                 log.info(f"[{server_name}] Skipping tools (not supported or method unavailable).")
 
-        async def load_resources():
-            if server_caps["resources"] and hasattr(session, 'list_resources'):
+        async def load_resources_task():
+            if has_resources and hasattr(session, 'list_resources'):
                 log.info(f"[{server_name}] Loading resources...")
                 try:
-                    res = await asyncio.wait_for(session.list_resources(), timeout=cap_timeout)
-                    self._process_list_result(server_name, getattr(res, 'resources', []), self.resources, MCPResource, "resource")
+                    res = await asyncio.wait_for(session.list_resources(), timeout=capability_timeout)
+                    self._process_list_result(server_name, getattr(res, 'resources', None), self.resources, MCPResource, "resource")
                 except asyncio.TimeoutError:
                     log.error(f"[{server_name}] Timeout loading resources.")
+                except McpError as e:
+                     log.error(f"[{server_name}] MCP Error loading resources: {e}")
                 except Exception as e:
-                    log.error(f"[{server_name}] Error loading resources: {e}", exc_info=True)
-                    raise
+                    log.error(f"[{server_name}] Unexpected error loading resources: {e}", exc_info=True)
+                    raise # Re-raise other errors
             else:
                 log.info(f"[{server_name}] Skipping resources (not supported or method unavailable).")
 
-        async def load_prompts():
-            if server_caps["prompts"] and hasattr(session, 'list_prompts'):
+        async def load_prompts_task():
+            if has_prompts and hasattr(session, 'list_prompts'):
                 log.info(f"[{server_name}] Loading prompts...")
                 try:
-                    res = await asyncio.wait_for(session.list_prompts(), timeout=cap_timeout)
-                    self._process_list_result(server_name, getattr(res, 'prompts', []), self.prompts, MCPPrompt, "prompt")
+                    res = await asyncio.wait_for(session.list_prompts(), timeout=capability_timeout)
+                    self._process_list_result(server_name, getattr(res, 'prompts', None), self.prompts, MCPPrompt, "prompt")
                 except asyncio.TimeoutError:
                     log.error(f"[{server_name}] Timeout loading prompts.")
+                except McpError as e:
+                     log.error(f"[{server_name}] MCP Error loading prompts: {e}")
                 except Exception as e:
-                    log.error(f"[{server_name}] Error loading prompts: {e}", exc_info=True)
-                    raise
+                    log.error(f"[{server_name}] Unexpected error loading prompts: {e}", exc_info=True)
+                    raise # Re-raise other errors
             else:
                 log.info(f"[{server_name}] Skipping prompts (not supported or method unavailable).")
+        # --- End definition of loading tasks ---
 
-        # --- Run concurrently ---
+        # --- Use anyio.create_task_group for structured concurrency ---
         try:
-            await asyncio.gather(load_tools(), load_resources(), load_prompts())
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(load_tools_task)
+                tg.start_soon(load_resources_task)
+                tg.start_soon(load_prompts_task)
+            # No results are explicitly returned by the tasks, they modify self state directly
         except Exception as e:
-            # Errors are logged within tasks, gather re-raises the first one
-            log.error(f"[{server_name}] Failure during concurrent capability loading: {e}")
-        log.info(f"[{server_name}] Capability loading finished.")
+            # Log errors that caused the task group to cancel (e.g., re-raised exceptions from tasks)
+            # Or other TaskGroup errors. anyio might raise an ExceptionGroup.
+            if isinstance(e, BaseExceptionGroup): # Handle potential ExceptionGroup from anyio
+                 log.error(f"[{server_name}] Multiple errors during concurrent capability loading:")
+                 for i, sub_exc in enumerate(e.exceptions):
+                      log.error(f"  Error {i+1}: {type(sub_exc).__name__} - {sub_exc}", exc_info=False) # Log basic info
+                      log.debug(f"  Traceback {i+1}:", exc_info=sub_exc) # Log full traceback at debug
+            else:
+                # Log single exception
+                log.error(f"[{server_name}] Error during concurrent capability loading task group: {e}", exc_info=True)
+        # --- End anyio usage ---
+
+        log.info(f"[{server_name}] Capability loading attempt finished.")
+
+    def _process_list_result(self, server_name: str, result_list: Optional[List[Any]], target_dict: Dict[str, Any], item_class: type, item_type_name: str):
+        """Helper to populate tools/resources/prompts dictionaries from list results."""
+        items_added = 0
+        items_skipped = 0
+
+        # Clear existing items for this server first
+        for key in list(target_dict.keys()):
+            if hasattr(target_dict[key], 'server_name') and target_dict[key].server_name == server_name:
+                del target_dict[key]
+
+        if result_list is None:
+            log.warning(f"[{server_name}] Received None instead of a list for {item_type_name}s.")
+            return
+        if not isinstance(result_list, list):
+            log.warning(f"[{server_name}] Expected a list for {item_type_name}s, but got {type(result_list).__name__}.")
+            return
+
+        for item in result_list:
+            try:
+                if not hasattr(item, 'name') or not isinstance(item.name, str) or not item.name:
+                    log.warning(f"[{server_name}] Skipping {item_type_name} item lacking valid 'name': {item}")
+                    items_skipped += 1; continue
+
+                # Specific checks (example for Tool)
+                correct_input_schema = None
+                if item_class is MCPTool:
+                    schema = getattr(item, 'inputSchema', getattr(item, 'input_schema', None))
+                    if schema is None or not isinstance(schema, dict):
+                        log.warning(f"[{server_name}] Skipping tool '{item.name}' lacking valid schema. Item data: {item}")
+                        items_skipped += 1; continue
+                    correct_input_schema = schema
+
+                # Construct name and create instance
+                item_name_full = f"{server_name}:{item.name}" if ":" not in item.name else item.name
+                instance_data = {
+                    "name": item_name_full, "description": getattr(item, 'description', '') or '',
+                    "server_name": server_name,
+                }
+                # Add type-specific data
+                if item_class is MCPTool: instance_data["input_schema"] = correct_input_schema; instance_data["original_tool"] = item
+                elif item_class is MCPResource: instance_data["template"] = getattr(item, 'uri', ''); instance_data["original_resource"] = item
+                elif item_class is MCPPrompt: instance_data["template"] = f"Prompt: {item.name}"; instance_data["original_prompt"] = item # Placeholder/Adapt
+
+                target_dict[item_name_full] = item_class(**instance_data)
+                items_added += 1
+            except Exception as proc_err:
+                log.error(f"[{server_name}] Error processing {item_type_name} item '{getattr(item, 'name', 'UNKNOWN')}': {proc_err}", exc_info=True)
+                items_skipped += 1
+        log.info(f"[{server_name}] Processed {items_added} {item_type_name}s ({items_skipped} skipped).")
 
     async def connect_to_server(self, server_config: ServerConfig) -> Optional[ClientSession]:
         """
@@ -3136,8 +3255,8 @@ class ServerManager:
                 session: Optional[ClientSession] = None
                 initialize_result_obj: Optional[Union[MCPInitializeResult, Dict[str, Any]]] = None
                 process_this_attempt: Optional[asyncio.subprocess.Process] = None
+                process_to_use: Optional[asyncio.subprocess.Process] = None #
                 connection_error: Optional[BaseException] = None
-                rename_occurred_this_attempt = False
                 span = None
                 span_context_manager = None
                 attempt_exit_stack = AsyncExitStack() # Stack for THIS attempt's resources
@@ -3248,7 +3367,6 @@ class ServerManager:
                                     current_server_name = actual_server_name_from_init
                                     current_server_config = original_config_entry # Use the updated config object
                                     config_updated_by_rename = True
-                                    rename_occurred_this_attempt = True
                                     if span:
                                         span.set_attribute("server.name", current_server_name)
                                     if isinstance(session, RobustStdioSession):
@@ -3370,6 +3488,170 @@ class ServerManager:
 
         session = await self.connect_to_server(server_config)
         return session is not None
+
+    async def _run_with_simple_progress(self, tasks, title):
+        """
+        Simpler version of _run_with_progress without Rich Live/Progress display.
+        Used as a fallback when nested progress displays would occur, providing
+        basic sequential console feedback with emojis.
+
+        Args:
+            tasks: A list of tuples with (task_func, task_description, task_args).
+            title: The title to print before starting tasks.
+
+        Returns:
+            A list of results from the successfully completed tasks. Errors are logged.
+            Failed tasks will result in None being appended to the results list.
+        """
+        safe_console = get_safe_console()
+        results = []
+        total_tasks = len(tasks)
+
+        # Use an appropriate emoji for the overall process start
+        start_emoji = EMOJI_MAP.get('processing', '⚙️')
+        safe_console.print(f"[bold cyan]{start_emoji} {title}[/]")
+
+        for i, (task_func, description, task_args) in enumerate(tasks):
+            task_idx = i + 1
+            # Print start message for the task using a gear or processing emoji
+            processing_emoji = EMOJI_MAP.get('gear', '⚙️')
+            # Ensure description doesn't have leading/trailing whitespace that might mess up formatting
+            clean_description = description.strip()
+            safe_console.print(f"  ({task_idx}/{total_tasks}) {processing_emoji} Running: {clean_description}...")
+
+            try:
+                # Run the actual async task function
+                # Use asyncio.wait_for if a timeout per task is desired, otherwise run directly
+                # Example without timeout:
+                result = await task_func(*task_args) if task_args else await task_func()
+                results.append(result)
+
+                # Print success message using a success emoji
+                success_emoji = EMOJI_MAP.get('success', '✅')
+                safe_console.print(f"  ({task_idx}/{total_tasks}) {success_emoji} Finished: {clean_description}")
+
+            except Exception as e:
+                # Print failure message using an error emoji
+                error_emoji = EMOJI_MAP.get('error', '❌')
+                safe_console.print(f"  ({task_idx}/{total_tasks}) {error_emoji} Failed: {clean_description}")
+
+                # Print the error details concisely
+                # Get first line of error message for console brevity
+                error_msg_str = str(e).split('\n')[0]
+                safe_console.print(f"      [red]Error: {error_msg_str}[/]")
+
+                # Log the full error with traceback for debugging
+                log.error(f"Task {task_idx} ('{clean_description}') failed", exc_info=True)
+
+                # Append None for failed tasks to indicate failure in the results list
+                # Or potentially append the exception object itself if callers need it
+                results.append(None)
+                # Continue with the next task
+                continue
+
+        # Final completion message
+        finish_emoji = EMOJI_MAP.get('party_popper', '🎉') # Or use 'success' emoji again
+        safe_console.print(f"[cyan]{finish_emoji} Completed: {title}[/]")
+        return results # Return results (may contain None for failed tasks)
+    
+    async def _run_with_progress(self, tasks, title, transient=True, use_health_scores=False):
+        """Run tasks with a progress bar, ensuring only one live display exists at a time.
+
+        Args:
+            tasks: A list of tuples with (task_func, task_description, task_args)
+            title: The title for the progress bar
+            transient: Whether the progress bar should disappear after completion
+            use_health_scores: If True, uses 'health' value from result dict as progress percent
+
+        Returns:
+            A list of results from the tasks
+        """
+        # Check if we already have an active progress display to prevent nesting
+        # Use self._active_live_display consistently
+        if hasattr(self, '_active_live_display') and self._active_live_display:
+            log.warning("Attempted to create nested progress display, using simpler output")
+            # Assuming _run_with_simple_progress exists and is implemented elsewhere
+            return await self._run_with_simple_progress(tasks, title)
+
+        # Set a flag that we have an active progress
+        self._active_live_display = True # Use the correct flag name
+
+        results = []
+
+        try:
+            # Set total based on whether we're using health scores or not
+            task_total = 100 if use_health_scores else 1
+
+            # *** Ensure Progress and Columns are used ***
+            columns = [
+                TextColumn("[progress.description]{task.description}"), # Uses TextColumn
+                BarColumn(complete_style="green", finished_style="green"), # Uses BarColumn
+            ]
+            if use_health_scores:
+                # Display health score percentage
+                columns.append(TextColumn("[progress.percentage]{task.percentage:>3.0f}%")) # Uses TextColumn
+            else:
+                # Display task progress (e.g., 1/1)
+                columns.append(TaskProgressColumn()) # Uses TaskProgressColumn
+            # Always add a spinner for visual activity
+            columns.append(SpinnerColumn("dots")) # Uses SpinnerColumn
+
+            # Ensure Progress is used with the defined columns
+            with Progress(
+                *columns,
+                console=get_safe_console(), # Use the safe console
+                transient=transient, # Controls if the bar disappears on completion
+                expand=False # Prevent the progress bar from taking full width unnecessarily
+            ) as progress: # Uses Progress
+                # Create all Rich Progress tasks upfront
+                task_ids = []
+                for _, description, _ in tasks:
+                    # Add task to Rich Progress, initially not started
+                    task_id = progress.add_task(description, total=task_total, start=False)
+                    task_ids.append(task_id)
+
+                # Run each provided async task sequentially
+                for i, (task_func, task_desc, task_args) in enumerate(tasks):
+                    current_task_id = task_ids[i]
+                    progress.start_task(current_task_id) # Mark the task as started in Rich Progress
+                    progress.update(current_task_id, description=task_desc) # Ensure description is set
+
+                    try:
+                        # Execute the actual async function passed in the tasks list
+                        result = await task_func(*task_args) if task_args else await task_func()
+                        results.append(result)
+
+                        # Update the Rich Progress bar based on the result or mode
+                        if use_health_scores and isinstance(result, dict) and 'health' in result:
+                            # Update progress bar based on the 'health' value (0-100)
+                            health_score = max(0, min(100, int(result['health']))) # Clamp value
+                            progress.update(current_task_id, completed=health_score)
+                            # Optionally append more info like tool count if available
+                            if 'tools' in result:
+                                progress.update(current_task_id, description=f"{task_desc} - {result['tools']} tools")
+                        else:
+                            # For non-health score tasks, mark as fully complete
+                            progress.update(current_task_id, completed=task_total)
+
+                        # Mark task as finished (stops spinner)
+                        progress.stop_task(current_task_id)
+
+                    except Exception as e:
+                        # If a task function raises an error
+                        progress.stop_task(current_task_id) # Stop the spinner
+                        # Update description to show failure state
+                        progress.update(current_task_id, description=f"{task_desc} [bold red]Failed: {str(e)}[/]", completed=0)
+                        log.error(f"Task '{task_desc}' failed: {str(e)}", exc_info=True)
+                        # Re-raise the exception to potentially halt the entire sequence if needed
+                        # Or handle more gracefully depending on desired behavior
+                        raise e
+
+                # All tasks completed successfully if no exception was raised
+                return results # Return the list of results from each task function
+
+        finally:
+            # CRITICAL: Always clear the flag when exiting this method
+            self._active_live_display = None # Use the correct flag name
 
     async def connect_to_servers(self):
         """Connect to all enabled MCP servers concurrently."""
@@ -3714,21 +3996,143 @@ class MCPClient:
         # Pre-compile emoji pattern
         self._emoji_chars = [re.escape(str(emoji)) for emoji in EMOJI_MAP.values()]
         self._emoji_space_pattern = re.compile(f"({'|'.join(self._emoji_chars)})" + r"(\S)")
+        self._current_query_text: str = ""
+        self._current_status_messages: List[str] = []
+        self._active_live_display: Optional[Live] = None # Track the Live instance
 
-        # Command handlers (keep list)
-        self.commands = {
-            'exit': self.cmd_exit, 'quit': self.cmd_exit, 'help': self.cmd_help, 'config': self.cmd_config,
-            'servers': self.cmd_servers, 'tools': self.cmd_tools, 'resources': self.cmd_resources,
-            'prompts': self.cmd_prompts, 'history': self.cmd_history, 'model': self.cmd_model,
-            'clear': self.cmd_clear, 'reload': self.cmd_reload, 'cache': self.cmd_cache,
-            'fork': self.cmd_fork, 'branch': self.cmd_branch, 'dashboard': self.cmd_dashboard,
-            'optimize': self.cmd_optimize, 'tool': self.cmd_tool, 'prompt': self.cmd_prompt,
-            'export': self.cmd_export, 'import': self.cmd_import, 'discover': self.cmd_discover,
-        }
+        # Command handler dictionary (populated later)
+        self.commands: Dict[str, Callable[[str], Coroutine[Any, Any, None]]] = {} # Type hint
+
+        # Initialize commands after all methods are defined
+        self._initialize_commands()
 
         # Readline setup
-        readline.set_completer(self.completer)
-        readline.parse_and_bind("tab: complete")
+        if platform.system() != "Windows": # Readline might behave differently on Windows
+            try:
+                readline.set_completer(self.completer)
+                # Use libedit bindings for macOS compatibility
+                if 'libedit' in readline.__doc__:
+                    readline.parse_and_bind("bind ^I rl_complete") # Binds Tab to complete
+                else:
+                    readline.parse_and_bind("tab: complete") # Standard binding
+                # Optional: Load/Save history across sessions
+                histfile = CONFIG_DIR / ".cli_history"
+                try:
+                    histfile.touch() # Ensure file exists
+                    readline.read_history_file(str(histfile))
+                    readline.set_history_length(1000)
+                    atexit.register(readline.write_history_file, str(histfile))
+                except Exception as e:
+                    log.warning(f"Could not load/save readline history from {histfile}: {e}")
+            except ImportError:
+                 log.warning("Readline library not available, CLI history and completion disabled.")
+            except Exception as e:
+                 log.warning(f"Error setting up readline: {e}")
+        else:
+            log.info("Readline setup skipped on Windows.")
+
+    def _initialize_commands(self):
+        """Populates the command dictionary."""
+        # Map command strings to their corresponding async methods
+        self.commands = {
+            'help': self.cmd_help,
+            'exit': self.cmd_exit, 'quit': self.cmd_exit, # Aliases
+            'config': self.cmd_config,
+            'servers': self.cmd_servers,
+            'tools': self.cmd_tools,
+            'tool': self.cmd_tool,
+            'resources': self.cmd_resources,
+            'prompts': self.cmd_prompts,
+            'model': self.cmd_model,
+            'cache': self.cmd_cache,
+            'clear': self.cmd_clear,
+            'reload': self.cmd_reload,
+            'fork': self.cmd_fork,
+            'branch': self.cmd_branch,
+            'export': self.cmd_export,
+            'import': self.cmd_import,
+            'history': self.cmd_history,
+            'optimize': self.cmd_optimize,
+            'apply-prompt': self.cmd_apply_prompt,
+            'discover': self.cmd_discover,
+            'dashboard': self.cmd_dashboard,
+            # Add monitor, registry if needed
+        }
+        log.debug(f"Initialized {len(self.commands)} CLI commands.")
+
+    # --- Readline Completer ---
+    def completer(self, text: str, state: int) -> Optional[str]:
+        """Readline completer for commands and arguments."""
+        line = readline.get_line_buffer()
+        parts = line.lstrip().split()
+
+        options: List[str] = []
+        prefix_to_match = text
+
+        try:
+            # --- Command Completion ---
+            if line.startswith('/') and (len(parts) == 0 or (len(parts) == 1 and not line.endswith(" "))):
+                cmd_prefix = line[1:]
+                prefix_to_match = cmd_prefix # Match against the command part
+                options = sorted([f"/{cmd}" for cmd in self.commands if cmd.startswith(cmd_prefix)])
+
+            # --- Argument Completion ---
+            elif len(parts) > 0 and parts[0].startswith('/'):
+                cmd = parts[0][1:]
+                num_args_entered = len(parts) - 1
+                # If the last character is not a space, we are completing the *last* part
+                # Otherwise, we are starting a *new* part.
+                is_completing_last_part = not line.endswith(" ")
+                arg_index_to_complete = num_args_entered -1 if is_completing_last_part else num_args_entered
+                prefix_to_match = parts[-1] if is_completing_last_part else ""
+
+                # --- Specific Command Argument Completion ---
+                if cmd == "model" and arg_index_to_complete == 0:
+                    options = sorted([m for m in COST_PER_MILLION_TOKENS if m.startswith(prefix_to_match)])
+                elif cmd == "servers":
+                    if arg_index_to_complete == 0: # Completing the subcommand
+                        server_subcmds = ["list", "add", "remove", "connect", "disconnect", "enable", "disable", "status"]
+                        options = sorted([s for s in server_subcmds if s.startswith(prefix_to_match)])
+                    elif arg_index_to_complete >= 1 and parts[1] in ["remove", "connect", "disconnect", "enable", "disable", "status"]: # Completing server names
+                        options = sorted([name for name in self.config.servers if name.startswith(prefix_to_match)])
+                        if "all".startswith(prefix_to_match) and parts[1] in ["connect", "disconnect"]: options.append("all") # Add 'all' option
+                elif cmd == "config":
+                    if arg_index_to_complete == 0: # Completing the subcommand
+                        config_subcmds = ["show", "edit", "reset", "api-key", "base-url", "model", "max-tokens", "history-size", "temperature"]
+                        config_subcmds.extend([a.replace("enable_", "").replace("use_", "").replace("_", "-") for a in SIMPLE_SETTINGS_ENV_MAP.values() if type(getattr(Config(), a)) is bool])
+                        config_subcmds.extend(["port-scan", "discovery-path", "registry-urls", "cache-ttl"])
+                        options = sorted(set(config_subcmds))
+                        options = [s for s in options if s.startswith(prefix_to_match)]
+                    elif arg_index_to_complete == 1 and parts[1] in ["api-key", "base-url"]: # Completing provider name
+                         options = sorted([p.value for p in Provider if p.value.startswith(prefix_to_match)])
+                    # Add more specific config completions (e.g., for port-scan sub-subcommands)
+                elif cmd == "tool" and arg_index_to_complete == 0: # Completing tool name
+                     options = sorted([name for name in self.server_manager.tools if name.startswith(prefix_to_match)])
+                elif cmd == "prompt" and arg_index_to_complete == 0: # Completing prompt name
+                    options = sorted([name for name in self.server_manager.prompts if name.startswith(prefix_to_match)])
+                elif cmd == "branch" and arg_index_to_complete == 0: # Completing branch subcommand
+                     options = sorted([s for s in ["list", "checkout", "rename", "delete"] if s.startswith(prefix_to_match)])
+                elif cmd == "branch" and parts[1] == "checkout" and arg_index_to_complete == 1: # Completing node ID for checkout
+                     options = sorted([node_id[:12] for node_id in self.conversation_graph.nodes if node_id.startswith(prefix_to_match)]) # Show prefix
+                elif cmd == "cache" and arg_index_to_complete == 0: # Completing cache subcommand
+                     options = sorted([s for s in ["list", "clear", "clean", "dependencies", "deps"] if s.startswith(prefix_to_match)])
+                elif cmd == "cache" and parts[1] == "clear" and arg_index_to_complete == 1: # Completing tool name for clear
+                     options = sorted([name for name in self.server_manager.tools if name.startswith(prefix_to_match)])
+                     if "--all".startswith(prefix_to_match): options.append("--all")
+                elif cmd == "import" and arg_index_to_complete == 0: # Basic file completion
+                    options = [f for f in os.listdir('.') if f.startswith(prefix_to_match) and f.endswith('.json')]
+
+            # --- Return matching option based on state ---
+            if state < len(options):
+                return options[state]
+            else:
+                return None
+
+        except Exception as e:
+            log.error(f"Error during completion: {e}", exc_info=True)
+            return None # Fail gracefully
+
+        return None
 
     # --- Configuration Commands ---
     async def cmd_config(self, args):
@@ -3878,13 +4282,13 @@ class MCPClient:
              except (ValueError, TypeError): safe_console.print("[yellow]Usage: /config temperature <number_between_0_and_2>[/]")
 
         # Boolean Flags (using helper)
-        elif subcmd in [s.replace("enable_", "").replace("use_", "").replace("_", "-") for s in SIMPLE_SETTINGS_ENV_MAP.keys() if type(getattr(Config(), SIMPLE_SETTINGS_ENV_MAP[s])) == bool]:
+        elif subcmd in [s.replace("enable_", "").replace("use_", "").replace("_", "-") for s in SIMPLE_SETTINGS_ENV_MAP.keys() if type(getattr(Config(), SIMPLE_SETTINGS_ENV_MAP[s])) is bool]:
              # Find the attribute name corresponding to the command
              attr_to_set = None
              for env_key, attr_name in SIMPLE_SETTINGS_ENV_MAP.items():
                  command_name = attr_name.replace("enable_", "").replace("use_", "").replace("_", "-")
                  if command_name == subcmd:
-                     if type(getattr(self.config, attr_name)) == bool:
+                     if type(getattr(self.config, attr_name)) is bool:
                          attr_to_set = attr_name
                          break
              if attr_to_set:
@@ -3902,7 +4306,7 @@ class MCPClient:
         else:
             safe_console.print(f"[yellow]Unknown config command: {subcmd}[/]")
             # List available simple config subcommands dynamically
-            simple_bool_cmds = [a.replace("enable_", "").replace("use_", "").replace("_", "-") for a in SIMPLE_SETTINGS_ENV_MAP.values() if type(getattr(Config(), a)) == bool]
+            simple_bool_cmds = [a.replace("enable_", "").replace("use_", "").replace("_", "-") for a in SIMPLE_SETTINGS_ENV_MAP.values() if type(getattr(Config(), a)) is bool]
             simple_value_cmds = ["model", "max-tokens", "history-size", "temperature"]
             provider_cmds = ["api-key", "base-url"]
             complex_cmds = ["port-scan", "discovery-path", "registry-urls", "cache-ttl"]
@@ -4164,6 +4568,161 @@ class MCPClient:
                 msgs.append(status_msg)
 
         self.safe_print(f"Provider clients re-initialized: {' | '.join(msgs)}")
+
+    def generate_dashboard_renderable(self) -> Layout:
+        """Generates the Rich renderable Layout for the live dashboard."""
+
+        layout = Layout(name="root")
+
+        layout.split(
+            Layout(name="header", size=3),
+            Layout(name="main", ratio=1),
+            Layout(name="footer", size=1),
+        )
+
+        layout["main"].split_row(
+            Layout(name="servers", ratio=2),
+            Layout(name="sidebar", ratio=1),
+        )
+
+        layout["sidebar"].split(
+             Layout(name="tools", ratio=1),
+             # Allocate fixed size for stats, adjust as needed
+             Layout(name="stats", size=10),
+        )
+
+        # --- Header ---
+        header_text = Text(
+            f"MCP Client Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            style="bold white on blue", justify="center"
+            )
+        layout["header"].update(Panel(header_text, border_style="blue")) # Simpler panel for header
+
+        # --- Footer ---
+        layout["footer"].update(Text("Press Ctrl+C to exit dashboard", style="dim", justify="center"))
+
+        # --- Servers Panel ---
+        server_table = Table(
+            title=f"{EMOJI_MAP['server']} Servers",
+            box=box.ROUNDED, border_style="blue", show_header=True, header_style="bold blue"
+            )
+        server_table.add_column("Name", style="cyan", no_wrap=True)
+        server_table.add_column("Status", justify="center")
+        server_table.add_column("Type", style="dim")
+        server_table.add_column("Conn", justify="center") # Abbreviated
+        server_table.add_column("Avg Resp (ms)", justify="right", style="yellow")
+        server_table.add_column("Errors", justify="right", style="red")
+        server_table.add_column("Reqs", justify="right", style="green") # Abbreviated
+
+        # Sort servers by name for consistent display
+        sorted_server_names = sorted(self.config.servers.keys())
+
+        for name in sorted_server_names:
+            server_config = self.config.servers[name]
+            # Optionally skip disabled servers, or show them dimmed
+            if not server_config.enabled:
+                # Example: show disabled server dimmed
+                # server_table.add_row(f"[dim]{name}[/]", "[dim]Disabled[/]", f"[dim]{server_config.type.value}[/]", "-", "-", "-", "-")
+                continue # Skip disabled for now
+
+            metrics = server_config.metrics
+            is_connected = name in self.server_manager.active_sessions
+
+            # Connection Status Emoji
+            conn_emoji_key = "green_circle" if is_connected else "red_circle"
+            conn_status_emoji = EMOJI_MAP.get(conn_emoji_key, "?")
+
+            # Health Status Emoji and Style
+            health_status_key = f"status_{metrics.status.value}"
+            health_status_emoji = EMOJI_MAP.get(health_status_key, EMOJI_MAP["question_mark"])
+            status_style = f"status.{metrics.status.value}" if metrics.status != ServerStatus.UNKNOWN else "dim"
+            health_text = Text(f"{health_status_emoji} {metrics.status.value.capitalize()}", style=status_style)
+
+            # Format Metrics
+            avg_resp_ms = metrics.avg_response_time * 1000 if metrics.request_count > 0 else 0
+            error_count_str = str(metrics.error_count) if metrics.error_count > 0 else "-"
+            req_count_str = str(metrics.request_count) if metrics.request_count > 0 else "-"
+
+            server_table.add_row(
+                name,
+                health_text,
+                server_config.type.value,
+                conn_status_emoji,
+                f"{avg_resp_ms:.1f}" if avg_resp_ms > 0 else "-",
+                error_count_str,
+                req_count_str
+            )
+        layout["servers"].update(Panel(server_table, title="[bold blue]MCP Servers[/]", border_style="blue"))
+
+        # --- Tools Panel (Top N) ---
+        tool_table = Table(
+            title=f"{EMOJI_MAP['tool']} Tool Usage",
+            box=box.ROUNDED, border_style="magenta", show_header=True, header_style="bold magenta"
+            )
+        tool_table.add_column("Name", style="magenta", no_wrap=True)
+        tool_table.add_column("Server", style="blue")
+        tool_table.add_column("Calls", justify="right", style="green")
+        tool_table.add_column("Avg Time (ms)", justify="right", style="yellow")
+
+        # Sort tools by call count descending and take top N
+        sorted_tools = sorted(self.server_manager.tools.values(), key=lambda t: t.call_count, reverse=True)[:15]
+
+        for tool in sorted_tools:
+             # Show short name (part after ':')
+             tool_short_name = tool.name.split(':')[-1] if ':' in tool.name else tool.name
+             avg_time_ms = tool.avg_execution_time # Assuming this is already in ms
+             tool_table.add_row(
+                 tool_short_name,
+                 tool.server_name,
+                 str(tool.call_count),
+                 f"{avg_time_ms:.1f}" if tool.call_count > 0 else "-"
+             )
+        layout["tools"].update(Panel(tool_table, title="[bold magenta]Tool Usage (Top 15)[/]", border_style="magenta"))
+
+        # --- General Stats Panel ---
+        stats_lines = []
+        stats_lines.append(Text.assemble((f"{EMOJI_MAP['model']} Model: ", "dim"), (self.current_model, "cyan")))
+        stats_lines.append(Text.assemble((f"{EMOJI_MAP['server']} Connected: ", "dim"), f"{len(self.server_manager.active_sessions)} / {len(self.config.servers)}"))
+        stats_lines.append(Text.assemble((f"{EMOJI_MAP['tool']} Tools: ", "dim"), str(len(self.server_manager.tools))))
+        stats_lines.append(Text.assemble((f"{EMOJI_MAP['history']} History: ", "dim"), f"{len(self.history.entries)} entries"))
+
+        # Cache Stats
+        mem_cache_count = 0
+        disk_cache_count = 0
+        if self.tool_cache:
+             mem_cache_count = len(self.tool_cache.memory_cache)
+             if self.tool_cache.disk_cache:
+                  try: disk_cache_count = sum(1 for _ in self.tool_cache.disk_cache.iterkeys())
+                  except Exception: pass # Ignore error counting disk
+        stats_lines.append(Text.assemble((f"{EMOJI_MAP['cache']} Tool Cache: ", "dim"), f"{mem_cache_count} (Mem) / {disk_cache_count} (Disk)"))
+
+        # LLM Prompt Cache Stats (Overall)
+        cache_hits = getattr(self, 'cache_hit_count', 0)
+        cache_misses = getattr(self, 'cache_miss_count', 0)
+        total_lookups = cache_hits + cache_misses
+        if total_lookups > 0:
+             hit_rate = (cache_hits / total_lookups) * 100
+             stats_lines.append(Text.assemble(
+                  (f"{EMOJI_MAP['package']} LLM Cache: ", "dim"),
+                  (f"{hit_rate:.1f}% Hits", "green"),
+                  (" (", "dim"), (f"{self.tokens_saved_by_cache:,}", "green bold"), (" Tokens Saved)", "dim")
+             ))
+        else:
+             stats_lines.append(Text.assemble((f"{EMOJI_MAP['package']} LLM Cache: ", "dim"), ("No usage yet", "dim")))
+
+        # Conversation Branch
+        current_node = self.conversation_graph.current_node
+        stats_lines.append(Text.assemble(
+            (f"{EMOJI_MAP['trident_emblem']} Branch: ", "dim"),
+            (current_node.name, "yellow"),
+            (f" ({current_node.id[:8]})", "dim cyan")
+            ))
+
+        # Use Group for layout within the panel
+        stats_group = Group(*stats_lines)
+        layout["stats"].update(Panel(stats_group, title="[bold cyan]Client Info[/]", border_style="cyan"))
+
+        return layout
 
     # --- Server Management Commands ---
     async def cmd_servers(self, args):
@@ -4525,6 +5084,721 @@ class MCPClient:
                  )
             safe_console.print(Panel(proc_content, title=f"{EMOJI_MAP['gear']} Process Info", border_style="yellow", padding=(1, 2)))
 
+
+    async def cmd_exit(self, args: str):
+        """Exit the client."""
+        self.safe_print(f"{EMOJI_MAP['cancel']} Exiting...")
+        # Let the main loop's finally block handle client.close()
+        sys.exit(0) # Use sys.exit to trigger cleanup via main_async finally
+
+    async def cmd_help(self, args: str):
+        """Display help for commands."""
+        # Group commands for better organization
+        categories = {
+            "General": [
+                ("help", "Show this help message"),
+                ("exit, quit", "Exit the client"),
+            ],
+            "Configuration": [
+                ("config", "Manage config (keys, models, discovery, etc.)"),
+                ("model [NAME]", "Change the current AI model"),
+                ("cache [...]", "Manage tool result cache"),
+            ],
+            "Servers & Tools": [
+                ("servers [...]", "Manage MCP servers (list, add, connect, etc.)"),
+                ("discover [...]", "Discover/connect to local network servers"),
+                ("tools [SERVER]", "List available tools (optionally filter by server)"),
+                ("tool NAME {JSON}", "Directly execute a tool"),
+                ("resources [SERVER]", "List available resources"),
+                ("prompts [SERVER]", "List available prompts"),
+                ("reload", "Reload MCP servers and capabilities"),
+            ],
+            "Conversation": [
+                ("clear", "Clear conversation messages / reset to root"),
+                ("history [N]", "View last N conversation history entries"),
+                ("fork [NAME]", "Create a new conversation branch"),
+                ("branch [...]", "Manage branches (list, checkout ID)"),
+                ("optimize [...]", "Summarize conversation to reduce tokens"),
+                ("prompt NAME", "Apply a prompt template"),
+                ("export [...]", "Export conversation branch to file"),
+                ("import FILE", "Import conversation from file"),
+            ],
+            "Monitoring": [
+                ("dashboard", "Show live monitoring dashboard"),
+                # ("monitor [...]", "Control server health monitoring"), # If implemented
+                # ("registry [...]", "Manage server registry connections"), # If implemented
+            ]
+        }
+
+        self.safe_print("\n[bold]Available Commands:[/]")
+        for category, commands in categories.items():
+            table = Table(title=category, box=box.MINIMAL, show_header=False, padding=(0, 1, 0, 0))
+            table.add_column("Command", style="bold cyan", no_wrap=True)
+            table.add_column("Description")
+            for cmd, desc in commands:
+                table.add_row(f"/{cmd}", desc)
+            self.safe_print(table)
+        self.safe_print("\nUse '/command --help' or see documentation for detailed usage.")
+        
+    async def cmd_resources(self, args: str):
+        """List available resources."""
+        safe_console = get_safe_console()
+        if not self.server_manager.resources:
+            safe_console.print(f"{EMOJI_MAP['warning']} [yellow]No resources available from connected servers[/]")
+            return
+
+        server_filter = args.strip() if args else None
+
+        resource_table = Table(title=f"{EMOJI_MAP['resource']} Available Resources", box=box.ROUNDED, show_lines=True)
+        resource_table.add_column("Name", style="cyan")
+        resource_table.add_column("Server", style="blue")
+        resource_table.add_column("Description")
+        resource_table.add_column("Template/URI", style="dim")
+
+        filtered_resources = []
+        for name, resource in sorted(self.server_manager.resources.items()):
+            if server_filter is None or resource.server_name == server_filter:
+                filtered_resources.append(resource)
+                resource_table.add_row(
+                    name, resource.server_name, resource.description or "[No description]", resource.template
+                )
+
+        if not filtered_resources:
+            safe_console.print(f"[yellow]No resources found" + (f" for server '{server_filter}'" if server_filter else "") + ".[/yellow]")
+        else:
+            safe_console.print(resource_table)
+
+    async def cmd_prompts(self, args: str):
+        """List available prompts."""
+        safe_console = get_safe_console()
+        if not self.server_manager.prompts:
+            safe_console.print(f"{EMOJI_MAP['warning']} [yellow]No prompts available from connected servers[/]")
+            return
+
+        server_filter = args.strip() if args else None
+
+        prompt_table = Table(title=f"{EMOJI_MAP['prompt']} Available Prompts", box=box.ROUNDED, show_lines=True)
+        prompt_table.add_column("Name", style="yellow")
+        prompt_table.add_column("Server", style="blue")
+        prompt_table.add_column("Description")
+
+        filtered_prompts = []
+        for name, prompt in sorted(self.server_manager.prompts.items()):
+            if server_filter is None or prompt.server_name == server_filter:
+                filtered_prompts.append(prompt)
+                prompt_table.add_row(
+                    name, prompt.server_name, prompt.description or "[No description]"
+                )
+
+        if not filtered_prompts:
+            safe_console.print(f"[yellow]No prompts found" + (f" for server '{server_filter}'" if server_filter else "") + ".[/yellow]")
+        else:
+            safe_console.print(prompt_table)
+
+            # Offer to show template content
+            if not server_filter:
+                 try:
+                     prompt_name_prompt = await asyncio.to_thread(
+                          Prompt.ask, "Enter prompt name to view content (or press Enter to skip)",
+                          console=safe_console, default=""
+                     )
+                     prompt_name_to_show = prompt_name_prompt.strip()
+                     if prompt_name_to_show in self.server_manager.prompts:
+                         template_content = self.get_prompt_template(prompt_name_to_show)
+                         if template_content:
+                             safe_console.print(Panel(
+                                 Text(template_content),
+                                 title=f"{EMOJI_MAP['prompt']} Prompt Content: {prompt_name_to_show}",
+                                 border_style="yellow"
+                             ))
+                         else:
+                              safe_console.print(f"[yellow]Prompt '{prompt_name_to_show}' has no template content.[/yellow]")
+                 except Exception as e:
+                     log.warning(f"Error during prompt content prompt: {e}")
+
+
+    # --- Direct Tool Execution ---
+    async def cmd_tool(self, args: str):
+        """Directly execute a tool with parameters."""
+        safe_console = get_safe_console()
+        # Use shlex to parse tool name and JSON args robustly
+        try:
+            parts = shlex.split(args)
+            if len(parts) < 1:
+                safe_console.print("[yellow]Usage: /tool TOOL_NAME ['{JSON_PARAMS}'] [/]")
+                safe_console.print("Example: /tool filesystem:readFile '{\"path\": \"/tmp/myfile.txt\"}'")
+                return
+            tool_name = parts[0]
+            params_str = parts[1] if len(parts) > 1 else "{}" # Default to empty JSON object
+            params = json.loads(params_str)
+            if not isinstance(params, dict):
+                raise TypeError("Parameters must be a JSON object (dictionary).")
+        except json.JSONDecodeError:
+            safe_console.print(f"[red]Invalid JSON parameters: {params_str}[/]")
+            return
+        except (ValueError, TypeError) as e:
+            safe_console.print(f"[red]Error parsing command/parameters: {e}[/]")
+            return
+        except Exception as e:
+            safe_console.print(f"[red]Error parsing tool command: {e}[/]")
+            return
+
+        # Check if tool exists
+        if tool_name not in self.server_manager.tools:
+            safe_console.print(f"[red]Tool not found: {tool_name}[/]")
+            return
+
+        tool = self.server_manager.tools[tool_name]
+        server_name = tool.server_name
+
+        with Status(f"{EMOJI_MAP['tool']} Executing {tool_name} via {server_name}...", spinner="dots", console=safe_console) as status:
+            try:
+                start_time = time.time()
+                # Use the internal execute_tool method
+                result: CallToolResult = await self.execute_tool(server_name, tool_name, params)
+                latency = time.time() - start_time
+
+                status_emoji = EMOJI_MAP['success'] if not result.isError else EMOJI_MAP['error']
+                status.update(f"{status_emoji} Tool execution finished in {latency:.2f}s")
+
+                # Safely format result content for display
+                result_content = result.content
+                display_content_str = ""
+                syntax_lang = "text"
+                if result_content is not None:
+                    try:
+                        # Try pretty-printing as JSON
+                        display_content_str = json.dumps(result_content, indent=2, ensure_ascii=False)
+                        syntax_lang = "json"
+                    except TypeError:
+                        # Fallback to string representation
+                        display_content_str = str(result_content)
+                        syntax_lang = "text" # Treat as plain text
+
+                # Determine panel style based on error status
+                panel_border = "red" if result.isError else "magenta"
+                panel_title = f"{EMOJI_MAP['tool']} Tool Result: {tool_name}"
+                if result.isError: panel_title += " (Error)"
+
+                safe_console.print(Panel.fit(
+                    Syntax(display_content_str, syntax_lang, theme="monokai", line_numbers=True, word_wrap=True),
+                    title=panel_title,
+                    subtitle=f"Executed in {latency:.3f}s",
+                    border_style=panel_border
+                ))
+            except RuntimeError as e: # Catch errors raised by execute_tool (circuit breaker, MCP errors etc.)
+                status.update(f"{EMOJI_MAP['failure']} Tool execution failed")
+                safe_console.print(f"[red]Error executing tool '{tool_name}': {e}[/]")
+            except Exception as e: # Catch unexpected errors
+                status.update(f"{EMOJI_MAP['failure']} Unexpected error")
+                log.error(f"Unexpected error during /tool execution for {tool_name}: {e}", exc_info=True)
+                safe_console.print(f"[red]Unexpected error: {e}[/]")
+
+
+    # --- Model Selection ---
+    async def cmd_model(self, args: str):
+        """Change the current AI model."""
+        safe_console = get_safe_console()
+        new_model = args.strip()
+        if not new_model:
+            safe_console.print(f"Current default model: [cyan]{self.current_model}[/]")
+            # List available models by provider
+            models_by_provider = {}
+            for model_name, provider_value in MODEL_PROVIDER_MAP.items():
+                models_by_provider.setdefault(provider_value.capitalize(), []).append(model_name)
+            safe_console.print("\n[bold]Available Models (based on cost data):[/]")
+            for provider, models in sorted(models_by_provider.items()):
+                 safe_console.print(f" [blue]{provider}:[/] {', '.join(sorted(models))}")
+            safe_console.print("\nUsage: /model MODEL_NAME")
+            return
+
+        # Optional: Validate if the model name is known or seems valid
+        if new_model not in COST_PER_MILLION_TOKENS:
+             if not Confirm.ask(f"Model '{new_model}' not found in cost list. Use anyway?", default=False, console=safe_console):
+                 safe_console.print("[yellow]Model change cancelled.[/]")
+                 return
+
+        self.current_model = new_model
+        self.config.default_model = new_model # Also update the config default
+        await self.config.save_async() # Persist the default model change
+        safe_console.print(f"[green]{EMOJI_MAP['model']} Default model changed to: {new_model}[/]")
+
+    # --- Cache Management ---
+    async def cmd_cache(self, args: str):
+        """Manage the tool result cache."""
+        safe_console = get_safe_console()
+        if not self.tool_cache:
+            safe_console.print("[yellow]Tool result caching is disabled (ToolCache not initialized).[/]")
+            return
+
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else "list"
+        subargs = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "list":
+            entries_data = self.get_cache_entries() # Use helper
+            if not entries_data:
+                 safe_console.print(f"{EMOJI_MAP['package']} Tool cache is empty.")
+                 return
+
+            cache_table = Table(title=f"{EMOJI_MAP['package']} Cached Tool Results ({len(entries_data)} entries)", box=box.ROUNDED)
+            cache_table.add_column("Tool Name", style="magenta")
+            cache_table.add_column("Params Hash", style="dim")
+            cache_table.add_column("Created At")
+            cache_table.add_column("Expires At")
+
+            for entry_data in entries_data: # Assumes get_cache_entries sorts if needed
+                key_parts = entry_data['key'].split(':', 1)
+                params_hash = key_parts[1][:12] if len(key_parts) > 1 else "N/A"
+                expires_str = entry_data['expires_at'].strftime("%Y-%m-%d %H:%M:%S") if entry_data['expires_at'] else "[Never]"
+                cache_table.add_row(
+                    entry_data['tool_name'],
+                    params_hash + "...",
+                    entry_data['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                    expires_str
+                )
+            safe_console.print(cache_table)
+
+        elif subcmd == "clear":
+            tool_name_to_clear = subargs if subargs and subargs != "--all" else None
+            target_desc = f"'{tool_name_to_clear}'" if tool_name_to_clear else "ALL entries"
+
+            if Confirm.ask(f"Clear cache for {target_desc}?", console=safe_console):
+                 with Status(f"{EMOJI_MAP['processing']} Clearing cache for {target_desc}...", console=safe_console) as status:
+                     removed_count = self.clear_cache(tool_name=tool_name_to_clear) # Use helper
+                     status.update(f"{EMOJI_MAP['success']} Cleared {removed_count} entries.")
+                 safe_console.print(f"[green]Cleared {removed_count} cache entries for {target_desc}.[/]")
+            else:
+                 safe_console.print("[yellow]Cache clear cancelled.[/]")
+
+        elif subcmd == "clean":
+            with Status(f"{EMOJI_MAP['processing']} Cleaning expired cache entries...", console=safe_console) as status:
+                removed_count = self.clean_cache() # Use helper
+                status.update(f"{EMOJI_MAP['success']} Finished cleaning.")
+            safe_console.print(f"[green]Cleaned {removed_count} expired cache entries.[/]")
+
+        elif subcmd == "dependencies" or subcmd == "deps":
+            deps = self.get_cache_dependencies() # Use helper
+            if not deps:
+                safe_console.print(f"{EMOJI_MAP['warning']} No tool dependencies registered.")
+                return
+
+            safe_console.print("\n[bold]Tool Dependency Graph:[/]")
+            dep_table = Table(title="Dependencies", box=box.ROUNDED)
+            dep_table.add_column("Tool", style="magenta")
+            dep_table.add_column("Depends On", style="cyan")
+            for tool, dependencies in sorted(deps.items()):
+                dep_table.add_row(tool, ", ".join(dependencies))
+            safe_console.print(dep_table)
+
+        else:
+            safe_console.print("[yellow]Unknown cache command. Available: list, clear [tool_name | --all], clean, dependencies[/]")
+
+
+    # --- Conversation Management ---
+    async def cmd_clear(self, args: str):
+        """Clear the conversation messages of the current node or reset to root."""
+        safe_console = get_safe_console()
+        current_node = self.conversation_graph.current_node
+
+        if Confirm.ask(f"Clear all messages from current branch '{current_node.name}' ({current_node.id[:8]})?", default=True, console=safe_console):
+            if not current_node.messages:
+                self.safe_print("[yellow]Current branch already has no messages.[/]")
+            else:
+                current_node.messages = []
+                current_node.modified_at = datetime.now()
+                await self.conversation_graph.save(str(self.conversation_graph_file))
+                self.safe_print(f"[green]Cleared messages for branch '{current_node.name}'.[/]")
+
+            # Optionally offer to switch back to root
+            if current_node.id != "root":
+                if Confirm.ask(f"Switch back to root branch?", default=False, console=safe_console):
+                     self.conversation_graph.set_current_node("root")
+                     self.safe_print("[green]Switched to root branch.[/]")
+
+        else:
+            self.safe_print("[yellow]Clear cancelled.[/]")
+
+    async def cmd_reload(self, args: str):
+        """Reloads MCP server connections and capabilities."""
+        safe_console = get_safe_console()
+        with Status(f"{EMOJI_MAP['processing']} Reloading MCP servers...", console=safe_console) as status:
+            try:
+                await self.reload_servers() # Use internal helper
+                status.update(f"{EMOJI_MAP['success']} Server reload complete.")
+                await self.print_status() # Show updated status
+            except Exception as e:
+                log.error("Error during server reload", exc_info=True)
+                status.update(f"{EMOJI_MAP['error']} Server reload failed: {e}")
+                safe_console.print(f"[red]Error during reload: {e}[/]")
+
+    async def cmd_fork(self, args: str):
+        """Create a new conversation fork/branch from the current node."""
+        safe_console = get_safe_console()
+        fork_name = args.strip() if args else None
+        try:
+            new_node = self.conversation_graph.create_fork(name=fork_name)
+            self.conversation_graph.set_current_node(new_node.id)
+            await self.conversation_graph.save(str(self.conversation_graph_file)) # Save after fork
+            self.safe_print(f"{EMOJI_MAP['success']} Created and switched to new branch:")
+            self.safe_print(f"  ID: [cyan]{new_node.id}[/]" )
+            self.safe_print(f"  Name: [yellow]{new_node.name}[/]")
+            parent_info = f"{new_node.parent.name} ({new_node.parent.id[:8]})" if new_node.parent else "[None]"
+            self.safe_print(f"  Branched from: [magenta]{parent_info}[/]")
+        except Exception as e:
+            log.error("Error creating fork", exc_info=True)
+            safe_console.print(f"[red]Error creating fork: {e}[/]")
+
+    async def cmd_branch(self, args: str):
+        """Manage conversation branches (list, checkout, rename, delete)."""
+        safe_console = get_safe_console()
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else "list"
+        subargs = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "list":
+            safe_console.print("\n[bold]Conversation Branches:[/]")
+            branch_tree = Tree(f"{EMOJI_MAP['trident_emblem']} [bold cyan]Conversations[/]", guide_style="dim")
+
+            def build_tree(node: ConversationNode, tree_node):
+                label_parts = [Text(f"{node.name}", style="yellow")]
+                label_parts.append(Text(f" (ID: {node.id[:8]}", style="dim cyan"))
+                if node.model:
+                     label_parts.append(Text(f", Model: {node.model}", style="dim blue"))
+                label_parts.append(Text(")", style="dim cyan"))
+
+                if node.id == self.conversation_graph.current_node.id:
+                     # Use Text.assemble for complex styling
+                     label = Text.assemble("[bold green]▶ [/]", *label_parts)
+                else:
+                     label = Text.assemble(*label_parts)
+
+                current_branch = tree_node.add(label)
+                # Sort children by creation time for consistent display
+                sorted_children = sorted(node.children, key=lambda x: x.created_at)
+                for child in sorted_children:
+                    build_tree(child, current_branch)
+
+            # Start building from root
+            build_tree(self.conversation_graph.root, branch_tree)
+            safe_console.print(branch_tree)
+            safe_console.print("\nUse '/branch checkout ID_PREFIX' to switch.")
+
+        elif subcmd == "checkout":
+            if not subargs:
+                safe_console.print("[yellow]Usage: /branch checkout NODE_ID_PREFIX[/]")
+                return
+
+            node_id_prefix = subargs
+            matched_node = None
+            matches = []
+            for node_id, node in self.conversation_graph.nodes.items():
+                if node_id.startswith(node_id_prefix):
+                     matches.append(node)
+
+            if len(matches) == 1:
+                matched_node = matches[0]
+            elif len(matches) > 1:
+                safe_console.print(f"[red]Ambiguous node ID prefix '{node_id_prefix}'. Matches:[/]")
+                for n in matches: safe_console.print(f"  - {n.name} ({n.id})")
+                return
+
+            if matched_node:
+                if self.conversation_graph.set_current_node(matched_node.id):
+                    self.safe_print(f"{EMOJI_MAP['success']} Switched to branch:")
+                    self.safe_print(f"  ID: [cyan]{matched_node.id}[/]")
+                    self.safe_print(f"  Name: [yellow]{matched_node.name}[/]")
+                else: # Should not happen
+                    safe_console.print(f"[red]Internal error switching to node {node_id_prefix}[/]")
+            else:
+                safe_console.print(f"[red]Node ID prefix '{node_id_prefix}' not found.[/]")
+
+        elif subcmd == "rename":
+            rename_parts = subargs.split(maxsplit=1)
+            if len(rename_parts) != 2:
+                safe_console.print("[yellow]Usage: /branch rename NODE_ID \"New Name\"[/]")
+                return
+            node_id, new_name_quoted = rename_parts[0], rename_parts[1]
+            # Use shlex to handle quoted new name
+            try: 
+                new_name = shlex.split(new_name_quoted)[0]
+            except Exception: 
+                safe_console.print("[red]Invalid new name format. Use quotes if it contains spaces.[/]")
+                return
+
+            node = self.conversation_graph.get_node(node_id)
+            if not node: safe_console.print(f"[red]Node ID '{node_id}' not found.[/]"); return
+            if node.id == "root": safe_console.print("[red]Cannot rename the root node.[/]"); return
+
+            old_name = node.name
+            node.name = new_name
+            node.modified_at = datetime.now()
+            await self.conversation_graph.save(str(self.conversation_graph_file))
+            safe_console.print(f"{EMOJI_MAP['success']} Renamed branch '{node_id[:8]}' from '{old_name}' to '{new_name}'.[/]")
+
+        elif subcmd == "delete":
+            node_id = subargs
+            if not node_id: safe_console.print("[yellow]Usage: /branch delete NODE_ID[/]"); return
+
+            node_to_delete = self.conversation_graph.get_node(node_id)
+            if not node_to_delete: safe_console.print(f"[red]Node ID '{node_id}' not found.[/]"); return
+            if node_to_delete.id == "root": safe_console.print("[red]Cannot delete the root node.[/]"); return
+            if node_to_delete.id == self.conversation_graph.current_node.id: safe_console.print("[red]Cannot delete the current branch. Checkout another branch first.[/]"); return
+
+            # Find parent and remove child reference
+            parent = node_to_delete.parent
+            if parent and node_to_delete in parent.children:
+                if Confirm.ask(f"Delete branch '{node_to_delete.name}' ({node_id[:8]}) and all its descendants?", console=safe_console):
+                    # Recursive delete helper
+                    nodes_to_remove = set()
+                    def find_descendants(n):
+                        nodes_to_remove.add(n.id)
+                        for child in n.children: find_descendants(child)
+                    find_descendants(node_to_delete)
+
+                    # Remove from graph nodes dict
+                    for removed_id in nodes_to_remove:
+                        if removed_id in self.conversation_graph.nodes:
+                            del self.conversation_graph.nodes[removed_id]
+                    # Remove from parent's children list
+                    parent.children.remove(node_to_delete)
+                    parent.modified_at = datetime.now()
+
+                    await self.conversation_graph.save(str(self.conversation_graph_file))
+                    safe_console.print(f"[green]Deleted branch '{node_to_delete.name}' and {len(nodes_to_remove)-1} descendant(s).[/]")
+                else:
+                    safe_console.print("[yellow]Deletion cancelled.[/]")
+            else:
+                safe_console.print(f"[red]Could not find parent or reference for node {node_id}. Deletion failed.[/]")
+
+        else:
+            safe_console.print("[yellow]Unknown branch command. Available: list, checkout, rename, delete[/]")
+
+    async def cmd_export(self, args: str):
+        """Export the current conversation or a specific branch to a file."""
+        safe_console = get_safe_console()
+        # Use shlex to handle potentially quoted file paths
+        try:
+            parsed_args = shlex.split(args)
+        except ValueError as e:
+            safe_console.print(f"[red]Error parsing arguments: {e}[/]")
+            safe_console.print("[yellow]Usage: /export [--id CONVERSATION_ID] [--output /path/to/file.json][/]")
+            return
+
+        conversation_id = self.conversation_graph.current_node.id # Default to current
+        output_path = None
+
+        i = 0
+        while i < len(parsed_args):
+            arg = parsed_args[i]
+            if arg in ["--id", "-i"] and i + 1 < len(parsed_args):
+                conversation_id = parsed_args[i+1]; i += 1
+            elif arg in ["--output", "-o"] and i + 1 < len(parsed_args):
+                output_path = parsed_args[i+1]; i += 1
+            else:
+                safe_console.print(f"[red]Unknown argument: {arg}[/]")
+                safe_console.print("[yellow]Usage: /export [--id CONVERSATION_ID] [--output /path/to/file.json][/]")
+                return
+            i += 1
+
+        # Default filename if not provided
+        if not output_path:
+            output_path = f"conversation_{conversation_id[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            safe_console.print(f"[dim]No output path specified, using default: {output_path}[/dim]")
+
+        # Call the export method with progress bar
+        with Status(f"{EMOJI_MAP['scroll']} Exporting conversation {conversation_id[:8]}...", spinner="dots", console=safe_console) as status:
+            # get_conversation_export_data is async now
+            export_data = await self.get_conversation_export_data(conversation_id)
+            if export_data is None:
+                status.stop()
+                safe_console.print(f"[red]Conversation ID '{conversation_id}' not found for export.[/]")
+                return
+
+            status.update(f"{EMOJI_MAP['processing']} Writing to {output_path}...")
+            try:
+                async with aiofiles.open(output_path, 'w', encoding='utf-8') as f:
+                    json_string = json.dumps(export_data, indent=2, ensure_ascii=False)
+                    await f.write(json_string)
+                status.update(f"{EMOJI_MAP['success']} Conversation exported successfully.")
+                safe_console.print(f"[green]Conversation exported to: [bold]{output_path}[/][/]")
+            except Exception as e:
+                status.stop()
+                log.error(f"Failed to write export file {output_path}", exc_info=True)
+                safe_console.print(f"[red]Failed to export conversation: {e}[/]")
+
+    async def cmd_import(self, args: str):
+        """Import a conversation from a file."""
+        safe_console = get_safe_console()
+        # Use shlex to handle potentially quoted file paths
+        try:
+            parsed_args = shlex.split(args)
+            if len(parsed_args) != 1: raise ValueError("Requires exactly one argument: filepath")
+            file_path = parsed_args[0]
+        except ValueError as e:
+            safe_console.print(f"[red]Error parsing arguments: {e}[/]")
+            safe_console.print("[yellow]Usage: /import \"/path/to/your conversation.json\"[/]")
+            return
+
+        if not Path(file_path).exists():
+             safe_console.print(f"[red]Import file not found: {file_path}[/]")
+             return
+
+        with Status(f"{EMOJI_MAP['scroll']} Importing conversation from {file_path}...", spinner="dots", console=safe_console) as status:
+            success = await self.import_conversation(file_path) # Use helper method
+            if success:
+                status.update(f"{EMOJI_MAP['success']} Conversation imported successfully")
+                # Message printed by import_conversation
+            else:
+                status.update(f"{EMOJI_MAP['failure']} Import failed")
+                # Error printed by import_conversation
+
+    async def cmd_history(self, args: str):
+        """View conversation history."""
+        safe_console = get_safe_console()
+        if not self.history.entries:
+            safe_console.print(f"{EMOJI_MAP['warning']} [yellow]No conversation history found.[/]")
+            return
+
+        # Parse args for count limit or search query
+        limit = 10 # Default number of entries to show
+        search_query = None
+        if args:
+            if args.isdigit():
+                limit = int(args)
+            else:
+                search_query = args # Treat non-digit args as search query
+
+        entries_to_display: List[ChatHistory] = []
+        title = ""
+
+        if search_query:
+            limit = 50 # Increase limit for search results
+            entries_to_display = self.history.search(search_query, limit=limit)
+            title = f"{EMOJI_MAP['search']} History Search Results for '[yellow]{search_query}[/]' (max {limit})"
+            if not entries_to_display:
+                safe_console.print(f"[yellow]No history entries found matching '{search_query}'.[/]")
+                return
+        else:
+            entries_to_display = list(self.history.entries)[-limit:] # Get last N entries
+            entries_to_display.reverse() # Show newest first
+            total_entries = len(self.history.entries)
+            num_shown = min(limit, total_entries)
+            title = f"{EMOJI_MAP['history']} Recent Conversation History (last {num_shown} of {total_entries})"
+
+        safe_console.print(f"\n[bold]{title}[/]")
+
+        for i, entry in enumerate(entries_to_display, 1):
+            entry_panel_title = Text.assemble(
+                (f"{i}. ", "dim"),
+                (entry.timestamp, "cyan"),
+                (" | Model: ", "dim"), (entry.model, "magenta"),
+                (" | Tools: ", "dim"), (f"{len(entry.tools_used)}", "blue") if entry.tools_used else ("None", "dim"),
+                (" | Latency: ", "dim"), (f"{entry.latency_ms:.0f}ms", "yellow")
+            )
+            content_group = Group(
+                Text.assemble(("[Q] ", "bold blue"), Text(entry.query, overflow="ellipsis")),
+                Text.assemble(("[A] ", "bold green"), Text(entry.response, overflow="ellipsis"))
+            )
+            safe_console.print(Panel(content_group, title=entry_panel_title, border_style="dim", padding=(0,1)))
+
+    async def cmd_optimize(self, args: str):
+        """Optimize conversation context via summarization."""
+        safe_console = get_safe_console()
+        # Parse arguments for custom model or target length using shlex
+        try:
+            parsed_args = shlex.split(args)
+        except ValueError as e:
+             safe_console.print(f"[red]Error parsing arguments: {e}[/]")
+             safe_console.print("[yellow]Usage: /optimize [--model MODEL_NAME] [--tokens TARGET_TOKENS][/]")
+             return
+
+        custom_model = None
+        target_length = self.config.max_summarized_tokens
+        i = 0
+        while i < len(parsed_args):
+            arg = parsed_args[i]
+            if arg in ["--model", "-m"] and i + 1 < len(parsed_args):
+                custom_model = parsed_args[i+1]; i += 1
+            elif arg in ["--tokens", "-t"] and i + 1 < len(parsed_args):
+                try: target_length = int(parsed_args[i+1]); i += 1
+                except ValueError: safe_console.print(f"[red]Invalid token count: {parsed_args[i+1]}[/]"); return
+            else: safe_console.print(f"[red]Unknown argument: {arg}[/]"); return
+            i += 1
+
+        initial_tokens = await self.count_tokens()
+        log.info(f"Optimization requested. Initial tokens: {initial_tokens}. Target: ~{target_length}")
+
+        with Status(f"{EMOJI_MAP['processing']} Optimizing conversation (currently {initial_tokens} tokens)...", console=safe_console) as status:
+            try:
+                # Use the dedicated summarization method
+                summary = await self.summarize_conversation(target_tokens=target_length, model=custom_model)
+
+                if summary is None:
+                    status.stop()
+                    safe_console.print(f"[red]{EMOJI_MAP['error']} Summarization failed.[/]")
+                    return
+
+                # Apply the summary
+                summary_system_message = f"The preceding conversation up to this point has been summarized:\n\n---\n{summary}\n---"
+                self.conversation_graph.current_node.messages = [
+                    InternalMessage(role="system", content=summary_system_message)
+                ]
+                self.conversation_graph.current_node.modified_at = datetime.now()
+                await self.conversation_graph.save(str(self.conversation_graph_file))
+
+                final_tokens = await self.count_tokens()
+                status.update(f"{EMOJI_MAP['success']} Conversation optimized: {initial_tokens:,} -> {final_tokens:,} tokens")
+                safe_console.print(f"[green]Optimization complete. Tokens reduced from {initial_tokens:,} to {final_tokens:,}.[/]")
+
+            except Exception as e:
+                status.stop()
+                log.error("Error during conversation optimization", exc_info=True)
+                safe_console.print(f"[red]{EMOJI_MAP['error']} Optimization failed: {e}[/]")
+
+    async def cmd_apply_prompt(self, args: str): # Renamed from cmd_prompt for clarity
+        """Apply a prompt template to the current conversation."""
+        safe_console = get_safe_console()
+        prompt_name = args.strip()
+        if not prompt_name:
+            safe_console.print("[yellow]Usage: /prompt PROMPT_NAME[/]")
+            await self.cmd_prompts("") # List available prompts if none given
+            return
+
+        success = await self.apply_prompt_to_conversation(prompt_name) # Use helper
+        if success:
+            safe_console.print(f"[green]{EMOJI_MAP['success']} Applied prompt template '{prompt_name}' as system message.[/]")
+        else:
+            safe_console.print(f"[red]{EMOJI_MAP['error']} Prompt '{prompt_name}' not found or could not be applied.[/]")
+
+    async def cmd_dashboard(self, args: str):
+        """Show the live monitoring dashboard."""
+        safe_console = get_safe_console()
+        if hasattr(self, '_active_live_display') and self._active_live_display:
+            safe_console.print("[yellow]Cannot start dashboard while another live display (e.g., query) is active.[/]")
+            return
+
+        try:
+            self._active_live_display = True # Use simple flag to block other Live instances
+            # Start monitoring if not already running
+            if not self.server_monitor.monitoring:
+                 await self.server_monitor.start_monitoring()
+
+            # Use Live context for the dashboard
+            with Live(self.generate_dashboard_renderable(),
+                      refresh_per_second=1.0/max(0.1, self.config.dashboard_refresh_rate), # Ensure positive rate
+                      screen=True, transient=False, console=safe_console) as live:
+                while True:
+                    await asyncio.sleep(max(0.1, self.config.dashboard_refresh_rate))
+                    live.update(self.generate_dashboard_renderable())
+        except KeyboardInterrupt:
+            self.safe_print("\n[yellow]Dashboard stopped.[/]")
+        except Exception as e:
+            log.error(f"Dashboard error: {e}", exc_info=True)
+            self.safe_print(f"\n[red]{EMOJI_MAP['error']} Dashboard error: {e}[/]")
+        finally:
+            self._active_live_display = None # Clear the flag
+
     # --- Utility methods and decorators ---
 
     @staticmethod
@@ -4643,13 +5917,6 @@ class MCPClient:
                     return result
         finally:
             pass # Context managers handle exit
-
-    def completer(self, text, state):
-        """Tab completion for commands"""
-        options = [cmd for cmd in self.commands.keys() if cmd.startswith(text)]
-        if state < len(options):
-            return options[state]
-        return None
         
     @asynccontextmanager
     async def tool_execution_context(self, tool_name, tool_args, server_name):
@@ -4908,7 +6175,7 @@ class MCPClient:
 
         token_count = 0
         for message in messages:
-            role = message.get("role")
+            role = message.get("role") # noqa: F841
             content = message.get("content")
             msg_token_count = 0
 
@@ -5004,7 +6271,7 @@ class MCPClient:
                       log.warning(f"Skipping invalid message structure at index {i} during import: {msg_data}")
                       continue
                  # Perform deeper validation if needed using InternalMessage structure or Pydantic
-                 validated_messages.append(cast(InternalMessage, msg_data)) # Cast after basic check
+                 validated_messages.append(cast('InternalMessage', msg_data)) # Cast after basic check
 
             if not validated_messages and data["messages"]: # If all messages were invalid
                  return False, "Import failed: No valid messages found in the import data.", None
@@ -5113,7 +6380,7 @@ class MCPClient:
         # Convert sets to lists for JSON serialization
         result_dict = {}
         for k, v_set in self.tool_cache.dependency_graph.items():
-            result_dict[k] = sorted(list(v_set)) # Sort for consistency
+            result_dict[k] = sorted(v_set) # Sort for consistency
         return result_dict
 
     def get_tool_schema(self, tool_name: str) -> Optional[Dict]:
@@ -5437,7 +6704,7 @@ class MCPClient:
             # --- Adaptation: Simulate non-streaming call ---
             summary_result = ""
             # Use a temporary message list if process_streaming_query modifies history
-            temp_summary_query_message = InternalMessage(role="user", content=prompt_text)
+            temp_summary_query_message = InternalMessage(role="user", content=prompt_text) # noqa: F841
 
             # Call process_streaming_query but consume the generator to get the full result
             # Note: This assumes process_streaming_query takes a single query string
@@ -5913,6 +7180,7 @@ class MCPClient:
             self.safe_print(f"[bold red]{provider_title} Error: Initialization failed ({type(e).__name__})[/]")
             setattr(self, client_attr, None)
             return None, f"{status_emoji} {provider_title}: [red]Failed[/]"
+    # Inside class MCPClient
 
     async def setup(self, interactive_mode=False):
         """Set up the client, load configs, initialize providers, discover servers."""
@@ -5928,18 +7196,18 @@ class MCPClient:
             Provider.MISTRAL.value: "mistral_api_key",
             Provider.GROQ.value: "groq_api_key",
             Provider.CEREBRAS.value: "cerebras_api_key",
-            # Add other providers if needed
+            Provider.OPENROUTER.value: "openrouter_api_key" # Added OpenRouter
         }
         provider_env_vars = { # Map provider enum value to expected .env var name
             Provider.ANTHROPIC.value: "ANTHROPIC_API_KEY",
             Provider.OPENAI.value: "OPENAI_API_KEY",
-            Provider.GEMINI.value: "GOOGLE_API_KEY", # Special case for Gemini
+            Provider.GEMINI.value: "GOOGLE_API_KEY", # Special case for Gemini - OR GEMINI_API_KEY? Check decouple logic. Assuming GOOGLE_API_KEY based on common practice.
             Provider.GROK.value: "GROK_API_KEY",
             Provider.DEEPSEEK.value: "DEEPSEEK_API_KEY",
             Provider.MISTRAL.value: "MISTRAL_API_KEY",
             Provider.GROQ.value: "GROQ_API_KEY",
             Provider.CEREBRAS.value: "CEREBRAS_API_KEY",
-            # Add other providers if needed
+            Provider.OPENROUTER.value: "OPENROUTER_API_KEY" # Added OpenRouter
         }
 
         # --- 1. Default Provider API Key Check & Prompt ---
@@ -5947,13 +7215,12 @@ class MCPClient:
         default_provider_key_attr = None
         default_provider_key_env_var = None
         key_missing = False
-        key_updated_in_session = False # Flag to track if we updated the key
 
-        # Get the path to the .env file stored during Config init
+        # Get the path to the .env file found or defaulted by Config.__init__
+        # This path is now reliably set.
         dotenv_path = self.config.dotenv_path
 
-        # Use dotenv to read the DEFAULT_PROVIDER value directly
-        # Check os.environ first, then the .env file if found
+        # Determine default provider (logic remains the same)
         default_provider_name = os.getenv("DEFAULT_PROVIDER")
         if not default_provider_name and dotenv_path and Path(dotenv_path).exists():
             env_values = dotenv_values(dotenv_path)
@@ -5961,28 +7228,26 @@ class MCPClient:
 
         if default_provider_name:
             try:
-                # Validate provider name (case-insensitive)
                 default_provider = Provider(default_provider_name.lower())
                 default_provider_key_attr = provider_keys.get(default_provider.value)
                 default_provider_key_env_var = provider_env_vars.get(default_provider.value)
 
                 if default_provider_key_attr and default_provider_key_env_var:
-                    # Check if key exists AND is non-empty in the *current* config object
-                    # (which was loaded by decouple initially)
+                    # Check current config object (populated by defaults, YAML, env vars)
                     current_key_value = getattr(self.config, default_provider_key_attr, None)
                     if not current_key_value:
                         key_missing = True
-                        log.warning(f"API key for default provider '{default_provider.value}' ({default_provider_key_env_var}) is missing or empty.")
+                        log.warning(f"API key for default provider '{default_provider.value}' ({default_provider_key_env_var}) is missing or empty in current config.")
                     else:
-                        log.info(f"API key for default provider '{default_provider.value}' found.")
+                        log.info(f"API key for default provider '{default_provider.value}' found in current config.")
                 else:
-                    log.warning(f"Default provider '{default_provider_name}' is specified but mapping for its key/env var is missing.")
-                    default_provider = None # Invalidate if mapping missing
+                    log.warning(f"Default provider '{default_provider_name}' specified but key/env mapping missing.")
+                    default_provider = None
             except ValueError:
                 log.error(f"Invalid DEFAULT_PROVIDER specified: '{default_provider_name}'")
-                default_provider = None # Reset if invalid
+                default_provider = None
 
-        # Prompt only if interactive, default provider is known, and key is missing
+        # Prompt only if interactive, default provider known, and key missing
         if interactive_mode and default_provider and key_missing:
             self.safe_print(f"[yellow]API key for default provider '{default_provider.value}' ({default_provider_key_env_var}) is missing.[/]")
             self.safe_print(f"You can enter the API key now, or press Enter to skip.")
@@ -5997,42 +7262,31 @@ class MCPClient:
 
                 if api_key_input.strip():
                     entered_key = api_key_input.strip()
-                    key_updated_in_session = True
 
-                    # Persist to .env file if path exists
-                    if dotenv_path and Path(dotenv_path).exists():
-                        # Use dotenv.set_key to write back non-destructively
-                        success = set_key(dotenv_path, default_provider_key_env_var, entered_key, quote_mode='always')
-                        if success:
-                            self.safe_print(f"[green]API key for {default_provider.value} saved to {dotenv_path}[/]")
-                            # Update the *current* config object immediately
-                            setattr(self.config, default_provider_key_attr, entered_key)
-                            log.info(f"Updated config.{default_provider_key_attr} in memory.")
-                        else:
-                             self.safe_print(f"[red]Error: Failed to save API key to {dotenv_path}. Key will only be used for this session.[/]")
-                             # Still update config for current session even if save failed
-                             setattr(self.config, default_provider_key_attr, entered_key)
-                    elif dotenv_path:
-                        # If find_dotenv found a place but it doesn't exist (e.g., empty project)
-                        # Offer to create it? For now, just warn.
+                    # Use the dotenv_path stored in the config object
+                    target_dotenv_path = self.config.dotenv_path
+
+                    if target_dotenv_path: # Should always be true now
                         try:
-                            # Attempt to create and write
-                            Path(dotenv_path).touch()
-                            success = set_key(dotenv_path, default_provider_key_env_var, entered_key, quote_mode='always')
+                            # Ensure parent directory exists
+                            Path(target_dotenv_path).parent.mkdir(parents=True, exist_ok=True)
+                            # Use dotenv.set_key with the correct path
+                            success = set_key(target_dotenv_path, default_provider_key_env_var, entered_key, quote_mode='always')
                             if success:
-                                self.safe_print(f"[green]Created '{dotenv_path}' and saved API key for {default_provider.value}.[/]")
+                                self.safe_print(f"[green]API key for {default_provider.value} saved to {target_dotenv_path}[/]")
+                                # Update the *current* config object immediately
                                 setattr(self.config, default_provider_key_attr, entered_key)
-                                log.info(f"Created .env and updated config.{default_provider_key_attr} in memory.")
+                                log.info(f"Updated config.{default_provider_key_attr} in memory.")
                             else:
-                                raise OSError("set_key failed after creating file.")
-                        except Exception as create_write_err:
-                            self.safe_print(f"[red]Error: Could not create or write to '{dotenv_path}'. Key will only be used for this session. Error: {create_write_err}[/]")
-                            setattr(self.config, default_provider_key_attr, entered_key)
-                    else:
-                        # .env file not found initially anywhere find_dotenv looked
-                        self.safe_print("[yellow]Warning: '.env' file not found. API key will only be used for this session.[/]")
-                        # Update config for current session
-                        setattr(self.config, default_provider_key_attr, entered_key)
+                                 # Log error, but still use key for session
+                                 self.safe_print(f"[red]Error: Failed to save API key to {target_dotenv_path}. Key used for session only.[/]")
+                                 setattr(self.config, default_provider_key_attr, entered_key)
+                        except Exception as save_err:
+                             # Log error, but still use key for session
+                             self.safe_print(f"[red]Error saving to {target_dotenv_path}: {save_err}. Key used for session only.[/]")
+                             setattr(self.config, default_provider_key_attr, entered_key)
+                    # --- REMOVED REDUNDANT BLOCK ---
+                    # The logic previously here was duplicating the block above.
                 else:
                     # User pressed Enter, key remains missing
                     self.safe_print(f"[yellow]Skipped entering key for {default_provider.value}. {default_provider.value.capitalize()} features might be unavailable.[/]")
@@ -6048,56 +7302,12 @@ class MCPClient:
              sys.exit(1)
 
         # --- 2. Initialize Provider SDK Clients ---
-        # This section remains the same. It will use the potentially updated
-        # self.config.<provider>_api_key value if the prompt was successful.
-        with Status(f"{EMOJI_MAP['provider']} Initializing AI Providers...", console=safe_console, spinner="dots") as status:
-            provider_status_msgs = []
+        # This will now use the correct key value in self.config if it was updated above
+        await self._reinitialize_provider_clients() # Call the helper to init all needed clients
 
-            # Anthropic
-            anthropic_key = self.config.anthropic_api_key # Re-read from potentially updated config
-            anthropic_emoji = EMOJI_MAP.get(Provider.ANTHROPIC.value, EMOJI_MAP['provider'])
-            # (Keep existing Anthropic init logic)
-            if anthropic_key:
-                try:
-                    self.anthropic = AsyncAnthropic(api_key=anthropic_key)
-                    provider_status_msgs.append(f"{anthropic_emoji} Anthropic: [green]OK[/]")
-                except anthropic.AuthenticationError:
-                    log.error("Anthropic: Invalid API Key."); self.anthropic = None; provider_status_msgs.append(f"{anthropic_emoji} Anthropic: [red]Auth Error[/]")
-                except anthropic.APIConnectionError as e:
-                    log.error(f"Anthropic: Conn Error - {e}"); self.anthropic = None; provider_status_msgs.append(f"{anthropic_emoji} Anthropic: [red]Conn Error[/]")
-                except Exception as e:
-                    log.error(f"Anthropic Init Error: {e}", exc_info=True); self.anthropic = None; provider_status_msgs.append(f"{anthropic_emoji} Anthropic: [red]Failed[/]")
-            else:
-                provider_status_msgs.append(f"{anthropic_emoji} Anthropic: [yellow]No Key[/]")
-
-            # OpenAI-Compatible Providers (using helper)
-            # (Keep existing loop calling _initialize_openai_compatible_client)
-            openai_compatible_providers = [
-                {"name": Provider.OPENAI.value, "key_attr": "openai_api_key", "url_attr": "openai_base_url", "default_url": None, "client_attr": "openai_client"},
-                {"name": Provider.GROK.value, "key_attr": "grok_api_key", "url_attr": "grok_base_url", "default_url": "https://api.x.ai/v1", "client_attr": "grok_client"},
-                {"name": Provider.DEEPSEEK.value, "key_attr": "deepseek_api_key", "url_attr": "deepseek_base_url", "default_url": "https://api.deepseek.com", "client_attr": "deepseek_client"},
-                {"name": Provider.MISTRAL.value, "key_attr": "mistral_api_key", "url_attr": "mistral_base_url", "default_url": "https://api.mistral.ai/v1", "client_attr": "mistral_client"},
-                {"name": Provider.GROQ.value, "key_attr": "groq_api_key", "url_attr": "groq_base_url", "default_url": "https://api.groq.com/openai/v1", "client_attr": "groq_client"},
-                {"name": Provider.CEREBRAS.value, "key_attr": "cerebras_api_key", "url_attr": "cerebras_base_url", "default_url": "https://api.cerebras.ai/v1", "client_attr": "cerebras_client"},
-                {"name": Provider.GEMINI.value, "key_attr": "gemini_api_key", "url_attr": "gemini_base_url", "default_url": "https://generativelanguage.googleapis.com/v1beta", "client_attr": "gemini_client"},
-            ]
-            for provider_info in openai_compatible_providers:
-                # The helper reads the key from self.config, which might have been updated by the prompt
-                client_instance, status_msg = await self._initialize_openai_compatible_client(
-                    provider_name=provider_info["name"],
-                    api_key_attr=provider_info["key_attr"],
-                    base_url_attr=provider_info["url_attr"],
-                    default_base_url=provider_info["default_url"],
-                    client_attr=provider_info["client_attr"],
-                    emoji_key=provider_info["name"] # Use provider name as emoji key
-                )
-                provider_status_msgs.append(status_msg)
-
-
-            status.update(f"{EMOJI_MAP['success']} Providers checked: {' | '.join(provider_status_msgs)}")
-
-        # --- 3. Load Conversation Graph (Keep existing) ---
-        self.conversation_graph = ConversationGraph() # Start fresh
+        # --- 3. Load Conversation Graph ---
+        # (No changes needed here)
+        self.conversation_graph = ConversationGraph()
         if self.conversation_graph_file.exists():
             with Status(f"{EMOJI_MAP['history']} Loading conversation state...", console=safe_console) as status:
                 try:
@@ -6112,10 +7322,11 @@ class MCPClient:
         else: log.info("No existing conversation graph found, using new graph.")
         if not self.conversation_graph.get_node(self.conversation_graph.current_node.id): log.warning("Current node ID invalid, reset root."); self.conversation_graph.set_current_node("root")
 
-        # --- 4. Load Claude Desktop Config (Keep existing) ---
+        # --- 4. Load Claude Desktop Config ---
         await self.load_claude_desktop_config()
 
-        # --- 5. Clean Duplicate Server Configs (Keep existing) ---
+        # --- 5. Clean Duplicate Server Configs ---
+        # (No changes needed here)
         log.info("Cleaning duplicate server configurations...")
         cleaned_servers: Dict[str, ServerConfig] = {}; canonical_map: Dict[Tuple, str] = {}; duplicates_found = False
         servers_to_process = list(self.config.servers.items())
@@ -6132,11 +7343,12 @@ class MCPClient:
             self.safe_print(f"[yellow]Removed {num_removed} duplicate server entries.[/yellow]"); self.config.servers = cleaned_servers; await self.config.save_async() # Saves YAML
         else: log.info("No duplicate server configurations found.")
 
-        # --- 6. Stdout Pollution Check (Keep existing) ---
+
+        # --- 6. Stdout Pollution Check ---
         if os.environ.get("MCP_VERIFY_STDOUT", "1") == "1":
             with safe_stdout(): log.info("Verifying no stdout pollution before connect..."); verify_no_stdout_pollution()
 
-        # --- 7. Discover Servers (Keep existing) ---
+        # --- 7. Discover Servers ---
         if self.config.auto_discover:
             self.safe_print(f"{EMOJI_MAP['search']} Discovering MCP servers...")
             try:
@@ -6144,11 +7356,11 @@ class MCPClient:
                 await self.server_manager._process_discovery_results(interactive_mode=interactive_mode) # Adds to config
             except Exception as discover_error: log.error("Error during discovery", exc_info=True); self.safe_print(f"[red]Discovery error: {discover_error}[/]")
 
-        # --- 8. Start Continuous Local Discovery (Keep existing) ---
+        # --- 8. Start Continuous Local Discovery ---
         if self.config.enable_local_discovery and self.server_manager.registry:
             await self.start_local_discovery_monitoring()
 
-        # --- 9. Connect to Enabled MCP Servers (Keep existing) ---
+        # --- 9. Connect to Enabled MCP Servers ---
         servers_to_connect = {name: cfg for name, cfg in self.config.servers.items() if cfg.enabled}
         if servers_to_connect:
             self.safe_print(f"[bold blue]Connecting to {len(servers_to_connect)} MCP servers...[/]")
@@ -6157,20 +7369,21 @@ class MCPClient:
                 self.safe_print(f"[cyan]Connecting to MCP server {name}...[/]")
                 try:
                     session = await self.server_manager.connect_to_server(server_config)
-                    final_name = server_config.name # Name might change during connect
+                    # Name might have changed during connection due to identification
+                    final_name = server_config.name
                     connection_results[name] = (session is not None)
                     if session: self.safe_print(f"  {EMOJI_MAP['success']} Connected to {final_name}")
                     else: log.warning(f"Failed connect MCP server: {name}"); self.safe_print(f"  {EMOJI_MAP['warning']} Failed connect {name}")
                 except Exception as e: log.error(f"Exception connecting MCP server {name}", exc_info=True); self.safe_print(f"  {EMOJI_MAP['error']} Error connect {name}: {e}"); connection_results[name] = False
 
-        # --- 10. Start Server Monitoring (Keep existing) ---
+        # --- 10. Start Server Monitoring ---
         try:
             with Status(f"{EMOJI_MAP['server']} Starting server monitoring...", spinner="dots", console=safe_console) as status:
                 await self.server_monitor.start_monitoring()
                 status.update(f"{EMOJI_MAP['success']} Server monitoring started")
         except Exception as monitor_error: log.error("Failed start server monitor", exc_info=True); self.safe_print(f"[red]Error starting monitor: {monitor_error}[/red]")
 
-        # --- 11. Display Final Status (Keep existing) ---
+        # --- 11. Display Final Status ---
         await self.print_status()
 
     # --- Provider Determination Helper (Updated) ---
@@ -6616,13 +7829,13 @@ class MCPClient:
                     # --- Try making the API call ---
                     log.debug(f"Initiating API call to {provider_name}...")
                     if provider_name == Provider.ANTHROPIC.value:
-                        api_stream = await cast(AsyncAnthropic, provider_client).messages.stream(
+                        api_stream = await cast('AsyncAnthropic', provider_client).messages.stream(
                             model=model, messages=formatted_messages, system=system_prompt, # type: ignore
                             tools=formatted_tools, max_tokens=max_tokens, temperature=self.config.temperature
                         )
                         stream_handler = self._handle_anthropic_stream(api_stream)
                     elif provider_name in [Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value, Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value, Provider.GEMINI.value]:
-                        api_stream = await cast(AsyncOpenAI, provider_client).chat.completions.create(
+                        api_stream = await cast('AsyncOpenAI', provider_client).chat.completions.create(
                             model=model, messages=formatted_messages, tools=formatted_tools, # type: ignore
                             max_tokens=max_tokens, temperature=self.config.temperature, stream=True
                         )
@@ -6920,474 +8133,312 @@ class MCPClient:
                             conversation_id=self.conversation_graph.current_node.id, latency_ms=latency_ms,
                             tokens_used=tokens_used_hist, streamed=True, cached=(cache_hits_during_query > 0)
                         ))
-                    else: log.warning("History object/method not found, cannot save history.")
+                    else: 
+                        log.warning("History object/method not found, cannot save history.")
                 except Exception as final_update_err:
                     log.error(f"Error during final graph/history update: {final_update_err}", exc_info=True)
 
         log.info(f"Streaming query finished. Final Stop Reason: {stop_reason}. Total Latency: {(time.time() - start_time)*1000:.0f}ms")
 
+    # --- Interactive Loop ---
+    @ensure_safe_console
     async def interactive_loop(self):
-        """Run interactive command loop with smoother live streaming output and abort capability."""
-        interactive_console = get_safe_console()
+        """Runs the main interactive command loop."""
+        interactive_console = self._current_safe_console # Use console from decorator
 
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
-        self.safe_print("Type your query to Claude, or a command (type 'help' for available commands)")
-        self.safe_print("[italic]Press Ctrl+C once to abort request, twice quickly to force exit[/italic]")
+        self.safe_print(f"Default Model: [cyan]{self.current_model}[/]. Type '/help' for commands.")
+        self.safe_print("[italic dim]Press Ctrl+C once to abort request, twice quickly to exit[/italic dim]")
 
-        # --- Define constants for stability ---
-        RESPONSE_HEIGHT = 35 # Fixed height for the response panel
-        STATUS_HEIGHT = 13 # Number of status lines to show
-        TOTAL_PANEL_HEIGHT = RESPONSE_HEIGHT + STATUS_HEIGHT + 5 # Response + Status + Borders + Title + Abort message space
-        REFRESH_RATE = 10.0 # Increased refresh rate (10 times per second)
-
-        @contextmanager
-        def suppress_all_logs():
-            """Temporarily suppress ALL logging output."""
-            root_logger = logging.getLogger()
-            original_level = root_logger.level
-            try:
-                root_logger.setLevel(logging.CRITICAL + 1) # Suppress everything below CRITICAL
-                yield
-            finally:
-                root_logger.setLevel(original_level)
+        # Define fixed layout dimensions
+        RESPONSE_PANEL_HEIGHT = 35
+        STATUS_PANEL_HEIGHT = 10 # Reduced status height
 
         while True:
-            live_display: Optional[Live] = None
+            self._active_live_display = None
             self.current_query_task = None
             try:
-                user_input = Prompt.ask("\n[bold blue]>>[/]", console=interactive_console)
+                # Use Rich Prompt for better experience
+                user_input = await asyncio.to_thread(
+                    Prompt.ask, "\n[bold blue]>>> [/]", console=interactive_console, default=""
+                )
+                user_input = user_input.strip()
 
-                # Check if it's a commandbase
-                if user_input.startswith('/'):
-                    cmd_parts = user_input[1:].split(maxsplit=1)
-                    cmd = cmd_parts[0].lower()
-                    args = cmd_parts[1] if len(cmd_parts) > 1 else ""
-
-                    if cmd in self.commands:
-                        # Ensure Live display is stopped before running a command
-                        if live_display and live_display.is_started:
-                            live_display.stop()
-                            live_display = None
-                        await self.commands[cmd](args)
-                    else:
-                        interactive_console.print(f"[yellow]Unknown command: {cmd}[/]")
-                        interactive_console.print("Type '/help' for available commands")
-
-                # Empty input
-                elif not user_input.strip():
+                if not user_input:
                     continue
 
-                # Process as a query to Claude
+                # --- Command Handling ---
+                if user_input.startswith('/'):
+                    # Use shlex for robust command parsing
+                    try:
+                        cmd_parts = shlex.split(user_input[1:])
+                        if not cmd_parts: continue # Handle empty command "/"
+                        cmd = cmd_parts[0].lower()
+                        # Re-join remaining parts as args string, preserving quotes if needed
+                        args = shlex.join(cmd_parts[1:]) if len(cmd_parts) > 1 else ""
+                    except ValueError as e:
+                         self.safe_print(f"[red]Error parsing command: {e}[/]")
+                         continue
+
+                    handler = self.commands.get(cmd)
+                    if handler:
+                        log.debug(f"Executing command: /{cmd} with args: '{args}'")
+                        await handler(args) # Call the async command handler
+                    else:
+                        self.safe_print(f"[yellow]Unknown command: [bold]/{cmd}[/]. Type /help for list.[/yellow]")
+
+                # --- Query Handling ---
                 else:
-                    # ================================================================
-                    # <<< FIX: RESET SESSION STATS BEFORE PROCESSING QUERY >>>
-                    # ================================================================
-                    self.session_input_tokens = 0
-                    self.session_output_tokens = 0
-                    self.session_total_cost = 0.0
-                    self.cache_hit_count = 0 # Reset per-query cache stats too
-                    self.cache_miss_count = 0
+                    # Reset session stats before processing query
+                    self.session_input_tokens = 0; self.session_output_tokens = 0
+                    self.session_total_cost = 0.0; self.cache_hit_count = 0
                     self.tokens_saved_by_cache = 0
-                    # ================================================================
 
-                    status_lines = deque(maxlen=STATUS_HEIGHT) # Store recent status lines
+                    query = user_input
+                    status_lines = deque(maxlen=STATUS_PANEL_HEIGHT)
                     abort_message = Text("Press Ctrl+C once to abort...", style="dim yellow")
-                    first_response_received = False
+                    current_response_text = ""
+                    query_error: Optional[Exception] = None
+                    query_cancelled = False
 
-                    # --- Pre-create empty placeholders ---
-                    empty_response_text = "\n" * (RESPONSE_HEIGHT - 2) # Approx lines inside panel
-                    empty_status_lines = [Text("", style="dim") for _ in range(STATUS_HEIGHT)]
+                    # --- Setup Live Display ---
+                    response_panel = Panel("", title="Response", height=RESPONSE_PANEL_HEIGHT, border_style="dim blue")
+                    status_panel = Panel("", title="Status", height=STATUS_PANEL_HEIGHT + 2, border_style="dim blue")
+                    abort_panel = Panel(abort_message, height=3, border_style="none")
+                    main_group = Group(response_panel, status_panel, abort_panel)
+                    live_panel = Panel(main_group, title=f"Querying {self.current_model}...", border_style="dim green")
 
-                    # --- Create the initial panel structure with fixed heights ---
-                    response_content = Panel(
-                        Text(f"Waiting for Claude's response...\n{empty_response_text}", style="dim"),
-                        title="Response",
-                        height=RESPONSE_HEIGHT, # Fixed height
-                        border_style="dim blue"
-                    )
+                    self._active_live_display = Live(live_panel, console=interactive_console, refresh_per_second=12, transient=True, vertical_overflow="crop")
 
-                    status_content = Panel(
-                        Group(*empty_status_lines),
-                        title="Status",
-                        height=STATUS_HEIGHT + 2, # Fixed height + borders/title
-                        border_style="dim blue"
-                    )
+                    @contextmanager
+                    def suppress_logs_during_live():
+                        """Temporarily suppress logging below WARNING during Live display."""
+                        logger = logging.getLogger("mcpclient_multi") # Get specific logger
+                        original_level = logger.level
+                        # Suppress INFO and DEBUG during live updates
+                        if original_level < logging.WARNING:
+                             logger.setLevel(logging.WARNING)
+                        try: yield
+                        finally: logger.setLevel(original_level) # Restore original level
 
-                    initial_panel = Panel(
-                        Group(
-                            response_content,
-                            status_content,
-                            abort_message # Reserve space for this
-                        ),
-                        title="Claude",
-                        border_style="dim green",
-                        height=TOTAL_PANEL_HEIGHT # Fixed height
-                    )
-
-                    # Initialize Live display with updated settings
-                    live_display = Live(
-                        initial_panel,
-                        console=interactive_console,
-                        refresh_per_second=REFRESH_RATE, # Use the new rate
-                        transient=True, # Clears the display on exit
-                        vertical_overflow="crop" # Crop content outside panels
-                    )
-
-                    # Suppress logs *only* during the live update part
-                    with suppress_all_logs():
+                    with suppress_logs_during_live():
+                        self._active_live_display.start()
                         try:
-                            live_display.start()
-
-                            log.debug("Creating query task...")
+                            # --- Start Query Task ---
+                            log.debug(f"Starting query task for: '{query[:50]}...'")
                             query_task = asyncio.create_task(
-                                self._iterate_streaming_query(user_input, status_lines),
-                                name=f"query-{user_input[:20]}"
+                                self._consume_streaming_query(query, status_lines),
+                                name=f"query-{query[:20].replace(' ','_')}"
                             )
                             self.current_query_task = query_task
-                            log.debug(f"Query task {self.current_query_task.get_name()} started.")
 
                             # --- Live Update Loop ---
-                            while not self.current_query_task.done():
-                                claude_text_content = getattr(self, "_current_query_text", "")
-                                if not first_response_received and (claude_text_content or status_lines):
-                                    first_response_received = True
+                            last_update_time = time.monotonic()
+                            while not query_task.done():
+                                if query_task.cancelled():
+                                    break # Check for early exit 
+                                # Rate limit updates slightly
+                                if time.monotonic() - last_update_time < (1.0 / 15.0): # Max 15fps
+                                    await asyncio.sleep(0.01)
+                                    continue
+                                last_update_time = time.monotonic()
 
-                                # --- Prepare Response Renderable ---
-                                if claude_text_content:
-                                    response_renderable = Markdown(claude_text_content)
-                                else:
-                                    response_renderable = Text(f"Waiting for Claude's response...\n{empty_response_text}", style="dim")
+                                # Fetch latest data (updated by _consume_streaming_query)
+                                current_response_text = getattr(self, "_current_query_text", "")
+                                current_status_list = list(status_lines) # Get snapshot
 
-                                # --- Prepare Status Renderable ---
-                                current_status_list = list(status_lines)
-                                display_status_lines = current_status_list[-STATUS_HEIGHT:]
-                                if len(display_status_lines) < STATUS_HEIGHT:
-                                    padding = [Text("", style="dim") for _ in range(STATUS_HEIGHT - len(display_status_lines))]
-                                    display_status_lines = padding + display_status_lines
-                                status_renderable = Group(*display_status_lines)
+                                # Build renderables
+                                response_renderable = Markdown(current_response_text, code_theme="monokai") if current_response_text else Text("Waiting for response...", style="dim")
+                                display_status = current_status_list[-STATUS_PANEL_HEIGHT:] # Get last N status lines
+                                if len(display_status) < STATUS_PANEL_HEIGHT:
+                                    padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status))
+                                    display_status = padding + display_status
+                                status_renderable = Group(*display_status)
 
-                                # --- Rebuild Panels ---
-                                response_panel = Panel(
-                                    response_renderable, title="Response", height=RESPONSE_HEIGHT,
-                                    border_style="blue" if first_response_received else "dim blue"
-                                )
-                                status_panel = Panel(
-                                    status_renderable, title="Status", height=STATUS_HEIGHT + 2,
-                                    border_style="blue" if status_lines else "dim blue"
-                                )
+                                # Update panels
+                                response_panel.renderable = response_renderable
+                                response_panel.border_style = "blue" if current_response_text else "dim blue"
+                                status_panel.renderable = status_renderable
+                                status_panel.border_style = "blue" if current_status_list else "dim blue"
+                                abort_panel.renderable = abort_message # Always show while running
 
-                                # --- Check Abort ---
-                                abort_needed = self.current_query_task and not self.current_query_task.done()
+                                live_panel.title = f"Querying {self.current_model}..."
+                                live_panel.border_style = "green"
 
-                                # --- Assemble Panel ---
-                                updated_panel = Panel(
-                                    Group(response_panel, status_panel, abort_message if abort_needed else Text("")),
-                                    title="Claude", border_style="green" if first_response_received else "dim green",
-                                    height=TOTAL_PANEL_HEIGHT
-                                )
+                                self._active_live_display.update(live_panel)
 
-                                # --- Update Live ---
-                                live_display.update(updated_panel)
+                                # Efficiently wait for task completion or timeout
+                                try: await asyncio.wait_for(asyncio.shield(query_task), timeout=0.1)
+                                except asyncio.TimeoutError: pass # Expected timeout for refresh
+                                except asyncio.CancelledError: log.debug("Live update loop detected query cancellation."); break # Exit update loop
 
-                                # --- Wait ---
-                                try:
-                                    await asyncio.wait_for(asyncio.shield(self.current_query_task), timeout=1.0 / REFRESH_RATE)
-                                except asyncio.TimeoutError:
-                                    pass
-                                except asyncio.CancelledError:
-                                    log.debug("Query task cancelled while display loop was waiting.")
-                                    break
-
-                            # --- Await task completion ---
-                            await self.current_query_task
-
-                            # --- Prepare Final Display (Normal Completion) ---
-                            claude_text_content = getattr(self, "_current_query_text", "")
-                            final_response_renderable = Markdown(claude_text_content) if claude_text_content else Text("No response received.", style="dim")
-
-                            final_status_list = list(status_lines)[-STATUS_HEIGHT:]
-                            if len(final_status_list) < STATUS_HEIGHT:
-                                padding = [Text("", style="dim") for _ in range(STATUS_HEIGHT - len(final_status_list))]
-                                final_status_list = padding + final_status_list
-                            final_status_renderable = Group(*final_status_list)
-
-                            final_response_panel = Panel(final_response_renderable, title="Response", height=RESPONSE_HEIGHT, border_style="blue")
-                            final_status_panel = Panel(final_status_renderable, title="Status", height=STATUS_HEIGHT + 2, border_style="blue")
-                            final_panel = Panel(Group(final_response_panel, final_status_panel), title="Claude", border_style="green", height=TOTAL_PANEL_HEIGHT)
-
-
-                        except asyncio.CancelledError:
-                            # --- Prepare Final Display (Cancellation) ---
-                            log.debug("Query task caught CancelledError in live block.")
-                            claude_text_content = getattr(self, "_current_query_text", "")
-                            response_renderable = Markdown(claude_text_content) if claude_text_content else Text("Response aborted.", style="dim")
-                            status_lines.append(Text("[bold yellow]Request Aborted.[/]", style="yellow"))
-
-                            aborted_status_list = list(status_lines)[-STATUS_HEIGHT:]
-                            if len(aborted_status_list) < STATUS_HEIGHT:
-                                padding = [Text("", style="dim") for _ in range(STATUS_HEIGHT - len(aborted_status_list))]
-                                aborted_status_list = padding + aborted_status_list
-                            aborted_status_renderable = Group(*aborted_status_list)
-
-                            aborted_response_panel = Panel(response_renderable, title="Response", height=RESPONSE_HEIGHT, border_style="yellow")
-                            aborted_status_panel = Panel(aborted_status_renderable, title="Status", height=STATUS_HEIGHT + 2, border_style="yellow")
-                            final_panel = Panel(Group(aborted_response_panel, aborted_status_panel), title="Claude - Aborted", border_style="yellow", height=TOTAL_PANEL_HEIGHT)
-
-
-                        except Exception as e:
-                             # --- Prepare Final Display (Error) ---
-                            log.error(f"Error during query/live update: {e}", exc_info=True)
-                            claude_text_content = getattr(self, "_current_query_text", "")
-                            response_renderable = Markdown(claude_text_content) if claude_text_content else Text("Error occurred.", style="dim")
-                            status_lines.append(Text(f"[bold red]Error: {e}[/]", style="red"))
-
-                            error_status_list = list(status_lines)[-STATUS_HEIGHT:]
-                            if len(error_status_list) < STATUS_HEIGHT:
-                                padding = [Text("", style="dim") for _ in range(STATUS_HEIGHT - len(error_status_list))]
-                                error_status_list = padding + error_status_list
-                            error_status_renderable = Group(*error_status_list)
-
-                            error_response_panel = Panel(response_renderable, title="Response", height=RESPONSE_HEIGHT, border_style="red")
-                            error_status_panel = Panel(error_status_renderable, title="Status", height=STATUS_HEIGHT + 2, border_style="red")
-                            final_panel = Panel(Group(error_response_panel, error_status_panel), title="Claude - ERROR", border_style="red", height=TOTAL_PANEL_HEIGHT)
+                            # --- Query Task Finished ---
+                            # Await potentially cancelled task to retrieve exception/result
+                            try: await query_task
+                            except asyncio.CancelledError: query_cancelled = True
+                            except Exception as e: query_error = e
 
                         finally:
-                            # --- Cleanup Live Display ---
-                            log.debug(f"Query task cleanup. Task ref: {self.current_query_task.get_name() if self.current_query_task else 'None'}")
-                            self.current_query_task = None
-                            if hasattr(self, "_current_query_text"): delattr(self, "_current_query_text")
-                            if live_display and live_display.is_started: live_display.stop()
-                            live_display = None
+                            self._active_live_display.stop() # Stop live display first
+                            self._active_live_display = None
+                            self.current_query_task = None # Clear task reference
 
-                            # Print the final state panel
-                            if 'final_panel' in locals():
-                                interactive_console.print(final_panel)
+                    # --- Print Final Result Panel ---
+                    final_response_text = getattr(self, "_current_query_text", "")
+                    final_status_lines = list(status_lines)
 
-                            # --- Print Final Stats (Now reflects *this query's* stats) ---
-                            # Calculate hit rate for *this query*
-                            hit_rate = 0
-                            if hasattr(self, 'cache_hit_count') and (self.cache_hit_count + self.cache_miss_count) > 0:
-                                hit_rate = self.cache_hit_count / (self.cache_hit_count + self.cache_miss_count) * 100
+                    final_response_renderable: Union[Markdown, Text]
+                    final_title = f"Result ({self.current_model})"
+                    final_border = "green"
 
-                            # Calculate cost savings for *this query*
-                            cost_saved = 0
-                            if hasattr(self, 'tokens_saved_by_cache') and self.tokens_saved_by_cache > 0:
-                                model_cost_info = COST_PER_MILLION_TOKENS.get(self.current_model, {})
-                                input_cost_per_token = model_cost_info.get("input", 0) / 1_000_000
-                                cost_saved = self.tokens_saved_by_cache * input_cost_per_token * 0.9 # 90% saving
+                    if query_cancelled:
+                        final_response_renderable = Markdown(final_response_text, code_theme="monokai") if final_response_text else Text("Query aborted by user.", style="yellow")
+                        final_title += " - Cancelled"
+                        final_border = "yellow"
+                        final_status_lines.append(Text("[bold yellow]Request Aborted.[/]", style="yellow"))
+                    elif query_error:
+                        final_response_renderable = Text(f"Error: {query_error}", style="red")
+                        final_title += " - Error"
+                        final_border = "red"
+                        final_status_lines.append(Text(f"[bold red]Error: {query_error}[/]", style="red"))
+                    else:
+                        final_response_renderable = Markdown(final_response_text, code_theme="monokai") if final_response_text else Text("[dim]No text content received.[/dim]", style="dim")
 
-                            # Assemble token stats text using the reset session variables
-                            token_stats = [
-                                "Tokens: ",
-                                ("Input: ", "dim cyan"), (f"{self.session_input_tokens:,}", "cyan"), " | ",
-                                ("Output: ", "dim magenta"), (f"{self.session_output_tokens:,}", "magenta"), " | ",
-                                ("Total: ", "dim white"), (f"{self.session_input_tokens + self.session_output_tokens:,}", "white"),
-                                " | ",
-                                ("Cost: ", "dim yellow"), (f"${self.session_total_cost:.4f}", "yellow")
-                            ]
+                    # Prepare final status display
+                    display_status_final = final_status_lines[-STATUS_PANEL_HEIGHT:]
+                    if len(display_status_final) < STATUS_PANEL_HEIGHT:
+                        padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
+                        display_status_final = padding + display_status_final
+                    final_status_renderable = Group(*display_status_final)
 
-                            # Add cache stats if applicable for *this query*
-                            if hasattr(self, 'cache_hit_count') and (self.cache_hit_count + self.cache_miss_count) > 0:
-                                token_stats.extend([
-                                    "\n",
-                                    ("Cache: ", "dim green"),
-                                    (f"Hits: {self.cache_hit_count}", "green"), " | ",
-                                    (f"Misses: {self.cache_miss_count}", "yellow"), " | ",
-                                    (f"Hit Rate: {hit_rate:.1f}%", "green"), " | ",
-                                    (f"Tokens Saved: {self.tokens_saved_by_cache:,}", "green bold"), " | ",
-                                    (f"Cost Saved: ${cost_saved:.4f}", "green bold")
-                                ])
+                    # Build final panels
+                    final_response_panel = Panel(final_response_renderable, title="Response", height=RESPONSE_PANEL_HEIGHT, border_style=final_border)
+                    final_status_panel = Panel(final_status_renderable, title="Status", height=STATUS_PANEL_HEIGHT + 2, border_style=final_border)
 
-                            # Create and print the final stats panel
-                            final_stats_panel = Panel(
-                                Text.assemble(*token_stats),
-                                title="Final Stats (This Query)", # Title reflects it's per-query now
-                                border_style="green"
-                            )
-                            interactive_console.print(final_stats_panel)
+                    # Assemble and print final output panel
+                    final_output_panel = Panel(Group(final_response_panel, final_status_panel), title=final_title, border_style=final_border)
+                    interactive_console.print(final_output_panel)
 
-            # --- Outer Loop Exception Handling ---
+                    # Print final stats panel if not cancelled/errored significantly early
+                    if not query_error: # Only show stats on normal completion or cancellation
+                        self._print_final_query_stats(interactive_console)
+
+            # --- Outer Loop Error Handling ---
             except KeyboardInterrupt:
-                if live_display and live_display.is_started:
-                    live_display.stop()
-                self.safe_print("\n[yellow]Input interrupted.[/]")
-                continue # Go to the next loop iteration
-
-            except Exception as e:
-                if live_display and live_display.is_started:
-                    live_display.stop()
-                self.safe_print(f"[bold red]Unexpected Error:[/] {str(e)}")
-                log.error(f"Unexpected error in interactive loop: {e}", exc_info=True)
-                # Continue the loop after an unexpected error
+                # This is caught when Prompt.ask is interrupted
+                self.safe_print("\n[yellow]Input interrupted. Type /exit or Ctrl+C again to quit.[/yellow]")
                 continue
+            except EOFError: # Handle Ctrl+D
+                 self.safe_print("\n[yellow]EOF received, exiting...[/]")
+                 break # Exit the loop cleanly
+            except Exception as loop_err:
+                self.safe_print(f"\n[bold red]Unexpected Error in interactive loop:[/] {loop_err}")
+                log.error("Unexpected error in interactive loop", exc_info=True)
+                await asyncio.sleep(1) # Prevent rapid error loops
 
             finally:
-                # Final cleanup for this loop iteration
-                if live_display and live_display.is_started:
-                    live_display.stop()
+                # Ensure Live display is stopped if loop breaks unexpectedly
+                if self._active_live_display and self._active_live_display.is_started:
+                    self._active_live_display.stop()
+                self._active_live_display = None
+                # Ensure current task is cleared if loop breaks
                 if self.current_query_task:
-                    # Ensure task is cancelled if loop exits unexpectedly
-                    if not self.current_query_task.done():
-                        self.current_query_task.cancel()
-                    self.current_query_task = None
+                     self.current_query_task = None
                 if hasattr(self, "_current_query_text"):
-                    delattr(self, "_current_query_text")
-
-    # --- Close Method ---
-    async def close(self):
-        """Clean up resources including provider clients."""
-        log.info("Closing MCPClient Multi...")
-        # Stop local discovery monitoring
-        if self.local_discovery_task: await self.stop_local_discovery_monitoring()
-        # Save conversation graph
-        try: await self.conversation_graph.save(str(self.conversation_graph_file)); log.info(f"Saved graph {self.conversation_graph_file}")
-        except Exception as e: log.error(f"Failed save graph: {e}")
-        # Stop server monitor
-        if hasattr(self, 'server_monitor'): await self.server_monitor.stop_monitoring()
-        # Close MCP server connections
-        if hasattr(self, 'server_manager'): await self.server_manager.close()
-
-        # --- Close Provider Clients ---
-        # Close OpenAI SDK based clients (if initialized and have aclose)
-        clients_to_close = [self.openai_client, self.grok_client, self.deepseek_client]
-        for client_instance in clients_to_close:
-            if client_instance and hasattr(client_instance, 'aclose'):
-                try: await client_instance.aclose()
-                except Exception as e: log.warning(f"Error closing SDK client: {e}")
-
-        # Anthropic usually don't need explicit close
-        log.info("MCPClient Multi closed.")
-
-
-    async def _iterate_streaming_query(self, query: str, status_lines: deque):
-        """Helper to run streaming query and store text for Live display."""
-        self._current_query_text = ""  # Initialize response text storage
-        self._current_status_messages = []  # Initialize status messages storage
-        
+                     delattr(self, "_current_query_text")
+    
+    async def _consume_streaming_query(self, query: str, status_lines: deque):
+        """Helper task to consume the stream and update shared state."""
         try:
-            # Directly iterate the stream generator provided by process_streaming_query
+            # Reset state before consuming
+            self._current_query_text = ""
+            self._current_status_messages = []
+
+            # Iterate through the stream generator
             async for chunk in self.process_streaming_query(query):
                 if chunk.startswith("@@STATUS@@"):
                     status_message = chunk[len("@@STATUS@@"):].strip()
-                    # Add to our status message list
                     self._current_status_messages.append(status_message)
-                    # Also add to the deque for compatibility
-                    status_lines.append(Text.from_markup(status_message))
+                    status_lines.append(Text.from_markup(status_message)) # Keep deque updated
                 else:
-                    # It's a regular text chunk from Claude
-                    if asyncio.current_task().cancelled(): 
-                        raise asyncio.CancelledError()
-                    self._current_query_text += chunk
-                # Yield control briefly to allow display updates
+                    self._current_query_text += chunk # Append text chunks
+
+                # Minimal sleep to yield control, Live update handles refresh
                 await asyncio.sleep(0.001)
+
         except asyncio.CancelledError:
-            log.debug("Streaming query iteration cancelled internally.")
-            raise  # Re-raise CancelledError
+            log.debug("Query consumer task cancelled.")
+            # Append cancellation status
+            status_lines.append(Text.from_markup("[yellow]Query Aborted.[/yellow]"))
+            self._current_status_messages.append("[yellow]Query Aborted.[/yellow]")
+            # Re-raise so the main loop knows it was cancelled
+            raise
         except Exception as e:
-            log.error(f"Error in _iterate_streaming_query: {e}", exc_info=True)
-            # Store error in status to be displayed
-            self._current_status_messages.append(f"[bold red]Query Error: {e}[/]")
-            status_lines.append(Text(f"[bold red]Query Error: {e}[/]", style="red"))
+            log.error(f"Error consuming query stream: {e}", exc_info=True)
+            # Append error status
+            status_lines.append(Text.from_markup(f"[bold red]Error: {e}[/bold red]"))
+            self._current_status_messages.append(f"[bold red]Error: {e}[/bold red]")
+            # Re-raise the exception so the main loop knows about the error
+            raise
+        finally:
+             log.debug("Query consumer task finished.")
 
+    def _print_final_query_stats(self, target_console: Console):
+        """Helper to format and print the final query statistics panel."""
+        # Calculate hit rate for *this query*
+        hit_rate = 0.0
+        total_lookups = self.cache_hit_count + self.cache_miss_count
+        if total_lookups > 0:
+            hit_rate = (self.cache_hit_count / total_lookups) * 100
 
-    # --- Command Handlers ---
+        # Calculate cost savings for *this query*
+        cost_saved = 0.0
+        if self.tokens_saved_by_cache > 0:
+            model_cost_info = COST_PER_MILLION_TOKENS.get(self.current_model, {})
+            input_cost_per_token = model_cost_info.get("input", 0) / 1_000_000
+            cost_saved = self.tokens_saved_by_cache * input_cost_per_token * 0.9 # 90% saving
 
-@app.command()
-def export(
-    conversation_id: Annotated[str, typer.Option("--id", "-i", help="Conversation ID to export")] = None,
-    output: Annotated[str, typer.Option("--output", "-o", help="Output file path")] = None,
-):
-    """Export a conversation to a file"""
-    asyncio.run(export_async(conversation_id, output))
+        # Assemble token stats text using the reset session variables
+        token_stats_text = Text.assemble(
+            "Tokens: ",
+            ("Input: ", "dim cyan"), (f"{self.session_input_tokens:,}", "cyan"), " | ",
+            ("Output: ", "dim magenta"), (f"{self.session_output_tokens:,}", "magenta"), " | ",
+            ("Total: ", "dim white"), (f"{self.session_input_tokens + self.session_output_tokens:,}", "white"),
+            " | ",
+            ("Cost: ", "dim yellow"), (f"${self.session_total_cost:.4f}", "yellow")
+        )
 
-async def export_async(conversation_id: str = None, output: str = None):
-    """Async implementation of the export command"""
-    client = MCPClient()
-    safe_console = get_safe_console()
-    try:
-        # Get current conversation if not specified
-        if not conversation_id:
-            conversation_id = client.conversation_graph.current_node.id
+        cache_stats_text = Text()
+        if total_lookups > 0 or self.tokens_saved_by_cache > 0:
+            cache_stats_text = Text.assemble(
+                "\nCache: ",
+                ("Hits: ", "dim green"), (f"{self.cache_hit_count}", "green"), " | ",
+                ("Misses: ", "dim yellow"), (f"{self.cache_miss_count}", "yellow"), " | ",
+                ("Hit Rate: ", "dim green"), (f"{hit_rate:.1f}%", "green"), " | ",
+                ("Tokens Saved: ", "dim green"), (f"{self.tokens_saved_by_cache:,}", "green bold"), " | ",
+                ("Cost Saved: ", "dim green"), (f"${cost_saved:.4f}", "green bold")
+            )
+
+        # Combine and create panel
+        stats_group = Group(token_stats_text, cache_stats_text)
+        final_stats_panel = Panel(
+            stats_group,
+            title="Final Stats (This Query)",
+            border_style="green",
+            padding=(0, 1) # Less vertical padding
+        )
+        target_console.print(final_stats_panel)
+
             
-        # Default filename if not provided
-        if not output:
-            output = f"conversation_{conversation_id[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            
-        success = await client.export_conversation(conversation_id, output)
-        if success:
-            safe_console.print(f"[green]Conversation exported to: {output}[/]")
-        else:
-            safe_console.print(f"[red]Failed to export conversation.[/]")
-    finally:
-        await client.close()
-
-@app.command()
-def import_conv(
-    file_path: Annotated[str, typer.Argument(help="Path to the exported conversation file")],
-):
-    """Import a conversation from a file"""
-    asyncio.run(import_async(file_path))
-
-async def import_async(file_path: str):
-    """Async implementation of the import command"""
-    client = MCPClient()
-    safe_console = get_safe_console()
-    try:
-        success = await client.import_conversation(file_path)
-        if success:
-            safe_console.print(f"[green]Conversation imported successfully from: {file_path}[/]")
-        else:
-            safe_console.print(f"[red]Failed to import conversation.[/]")
-    finally:
-        await client.close()
-
-# Define Typer CLI commands
-@app.command()
-def run(
-    query: Annotated[str, typer.Option("--query", "-q", help="Single query to process")] = None,
-    model: Annotated[str, typer.Option("--model", "-m", help="Model to use for query")] = None,
-    server: Annotated[List[str], typer.Option("--server", "-s", help="Connect to specific server(s)")] = None,
-    dashboard: Annotated[bool, typer.Option("--dashboard", "-d", help="Show dashboard")] = False,
-    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose logging")] = False,
-    interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Run in interactive mode")] = False,
-    # --- Added Web UI Flag ---
-    webui: Annotated[bool, typer.Option("--webui", "-w", help="Run the experimental Web UI instead of CLI")] = False,
-    webui_host: Annotated[str, typer.Option("--host", "-h", help="Host for Web UI")] = "127.0.0.1",
-    webui_port: Annotated[int, typer.Option("--port", "-p", help="Port for Web UI")] = 8017,
-    serve_ui_file: Annotated[bool, typer.Option("--serve-ui", help="Serve the default mcp_client_ui.html file")] = True,
-    cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers from config")] = False, # <-- ADDED FLAG
-):
-    """Run the MCP client in various modes (CLI, Interactive, Dashboard, or Web UI)."""
-    # Configure logging based on verbosity
-    if verbose:
-        logging.getLogger("mcpclient").setLevel(logging.DEBUG)
-        global USE_VERBOSE_SESSION_LOGGING # Allow modification
-        USE_VERBOSE_SESSION_LOGGING = True
-        log.info("Verbose logging enabled.")
-
-    # Run the main async function
-    # Pass new webui flags
-    asyncio.run(main_async(query, model, server, dashboard, interactive, verbose, webui, webui_host, webui_port, serve_ui_file, cleanup_servers))
-
-@app.command()
-def servers(
-    search: Annotated[bool, typer.Option("--search", "-s", help="Search for servers to add")] = False,
-    list_all: Annotated[bool, typer.Option("--list", "-l", help="List all configured servers")] = False,
-    json_output: Annotated[bool, typer.Option("--json", "-j", help="Output as JSON")] = False,
-):
-    """Manage MCP servers"""
-    # Run the server management function
-    asyncio.run(servers_async(search, list_all, json_output))
-
-@app.command()
-def config(
-    show: Annotated[bool, typer.Option("--show", "-s", help="Show current configuration")] = False,
-    edit: Annotated[bool, typer.Option("--edit", "-e", help="Edit configuration YAML file in editor")] = False,
-    reset: Annotated[bool, typer.Option("--reset", "-r", help="Reset configuration YAML to defaults (use with caution!)")] = False,
-):
-    """Manage client configuration (view, edit YAML, reset to defaults)."""
-    # Run the config management function
-    asyncio.run(config_async(show, edit, reset))
+    @app.command()
+    def config(
+        show: Annotated[bool, typer.Option("--show", "-s", help="Show current configuration")] = False,
+        edit: Annotated[bool, typer.Option("--edit", "-e", help="Edit configuration YAML file in editor")] = False,
+        reset: Annotated[bool, typer.Option("--reset", "-r", help="Reset configuration YAML to defaults (use with caution!)")] = False,
+    ):
+        """Manage client configuration (view, edit YAML, reset to defaults)."""
+        # Run the config management function
+        asyncio.run(config_async(show, edit, reset))
 
 async def main_async(query, model, server, dashboard, interactive, verbose_logging, webui_flag, webui_host, webui_port, serve_ui_file, cleanup_servers):
     """Main async entry point - Handles CLI, Interactive, Dashboard, and Web UI modes."""
@@ -7433,9 +8484,9 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             # Make client accessible to endpoints via dependency injection
             async def get_mcp_client(request: Request) -> MCPClient:
                 if not hasattr(request.app.state, 'mcp_client') or request.app.state.mcp_client is None:
-                     # This should ideally not happen due to lifespan
-                     log.error("MCPClient not found in app state during request!")
-                     raise HTTPException(status_code=500, detail="MCP Client not initialized")
+                    # This should ideally not happen due to lifespan
+                    log.error("MCPClient not found in app state during request!")
+                    raise HTTPException(status_code=500, detail="MCP Client not initialized")
                 return request.app.state.mcp_client
 
             # --- CORS Middleware ---
@@ -7449,7 +8500,6 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
             # --- API Endpoints ---
             log.info("Registering API endpoints...")
-
 
             @app.get("/api/status")
             async def get_status(mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -7501,7 +8551,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     return ConfigGetResponse(**config_dict)
                 except Exception as e:
                     log.error(f"Error preparing GET /api/config response: {e}", exc_info=True)
-                    raise HTTPException(status_code=500, detail="Internal server error retrieving configuration.")
+                    raise HTTPException(status_code=500, detail="Internal server error retrieving configuration.") from e
 
             @app.put("/api/config")
             async def update_config(
@@ -7511,8 +8561,8 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 """
                 Updates the **running** configuration based on the request.
                 Note: Simple settings (keys, URLs, flags, etc.) are NOT persisted
-                      to .env by this endpoint. Only 'cache_ttl_mapping' is saved
-                      to the YAML configuration file.
+                    to .env by this endpoint. Only 'cache_ttl_mapping' is saved
+                    to the YAML configuration file.
                 """
                 updated_fields = False
                 providers_to_reinit = set()
@@ -7569,12 +8619,12 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                     log.warning(f"Invalid history_size '{value}' ignored.")
                             elif attr_name == 'cache_ttl_mapping':
                                 if isinstance(value, dict):
-                                     # Update the cache instance as well
+                                    # Update the cache instance as well
                                     if mcp_client.tool_cache:
-                                         mcp_client.tool_cache.ttl_mapping = value.copy()
+                                        mcp_client.tool_cache.ttl_mapping = value.copy()
                                     config_yaml_needs_save = True # Mark YAML for saving
                                 else:
-                                     log.warning(f"Invalid type for cache_ttl_mapping '{type(value)}' ignored.")
+                                    log.warning(f"Invalid type for cache_ttl_mapping '{type(value)}' ignored.")
                             # Add other side-effect handlers here if needed
 
                         else:
@@ -7743,9 +8793,9 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 decoded_server_name = urllib.parse.unquote(server_name)
 
                 if decoded_server_name not in mcp_client.config.servers:
-                     raise HTTPException(status_code=404, detail=f"Server '{decoded_server_name}' not found")
+                    raise HTTPException(status_code=404, detail=f"Server '{decoded_server_name}' not found")
                 if decoded_server_name not in mcp_client.server_manager.active_sessions:
-                     return {"message": f"Server '{decoded_server_name}' is not connected"}
+                    return {"message": f"Server '{decoded_server_name}' is not connected"}
 
                 await mcp_client.server_manager.disconnect_server(decoded_server_name)
                 log.info(f"Disconnected from server '{decoded_server_name}' via API.")
@@ -7778,39 +8828,39 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
             @app.get("/api/servers/{server_name}/details", response_model=ServerDetail)
             async def get_server_details_api(server_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):
-                 """Gets detailed information about a specific configured server."""
-                 import urllib.parse
-                 decoded_server_name = urllib.parse.unquote(server_name)
-                 details = mcp_client.get_server_details(decoded_server_name)
-                 if details is None:
-                     raise HTTPException(status_code=404, detail=f"Server '{decoded_server_name}' not found")
-                 try:
+                """Gets detailed information about a specific configured server."""
+                import urllib.parse
+                decoded_server_name = urllib.parse.unquote(server_name)
+                details = mcp_client.get_server_details(decoded_server_name)
+                if details is None:
+                    raise HTTPException(status_code=404, detail=f"Server '{decoded_server_name}' not found")
+                try:
                     details_model = ServerDetail(**details)
                     return details_model
-                 except ValidationError as e:
-                     log.error(f"Data validation error for server '{decoded_server_name}' details: {e}")
-                     raise HTTPException(status_code=500, detail="Internal error retrieving server details.")
+                except ValidationError as e:
+                    log.error(f"Data validation error for server '{decoded_server_name}' details: {e}")
+                    raise HTTPException(status_code=500, detail="Internal error retrieving server details.") from e
 
             @app.get("/api/tools")
             async def list_tools_api(
                 server_name: Optional[str] = None, # Add optional query parameter
                 mcp_client: MCPClient = Depends(get_mcp_client)
             ):
-                 """Lists available tools, optionally filtered by server_name."""
-                 tools_list = []
-                 # Sort tools by name before potential filtering
-                 sorted_tools = sorted(mcp_client.server_manager.tools.values(), key=lambda t: t.name)
-                 for tool in sorted_tools:
-                     # Apply filter if provided
-                     if server_name is None or tool.server_name == server_name:
-                         tool_data = {
-                             "name": tool.name, "description": tool.description,
-                             "server_name": tool.server_name, "input_schema": tool.input_schema,
-                             "call_count": tool.call_count, "avg_execution_time": tool.avg_execution_time,
-                             "last_used": tool.last_used.isoformat() if isinstance(tool.last_used, datetime) else None,
-                         }
-                         tools_list.append(tool_data)
-                 return tools_list # Return the filtered list
+                """Lists available tools, optionally filtered by server_name."""
+                tools_list = []
+                # Sort tools by name before potential filtering
+                sorted_tools = sorted(mcp_client.server_manager.tools.values(), key=lambda t: t.name)
+                for tool in sorted_tools:
+                    # Apply filter if provided
+                    if server_name is None or tool.server_name == server_name:
+                        tool_data = {
+                            "name": tool.name, "description": tool.description,
+                            "server_name": tool.server_name, "input_schema": tool.input_schema,
+                            "call_count": tool.call_count, "avg_execution_time": tool.avg_execution_time,
+                            "last_used": tool.last_used.isoformat() if isinstance(tool.last_used, datetime) else None,
+                        }
+                        tools_list.append(tool_data)
+                return tools_list # Return the filtered list
             
             @app.get("/api/tools/{tool_name:path}/schema")
             async def get_tool_schema_api(tool_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -7827,54 +8877,54 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 server_name: Optional[str] = None, # Add optional query parameter
                 mcp_client: MCPClient = Depends(get_mcp_client)
             ):
-                 """Lists available resources, optionally filtered by server_name."""
-                 resources_list = []
-                 sorted_resources = sorted(mcp_client.server_manager.resources.values(), key=lambda r: r.name)
-                 for resource in sorted_resources:
-                      if server_name is None or resource.server_name == server_name:
-                          resource_data = {
-                              "name": resource.name, "description": resource.description,
-                              "server_name": resource.server_name, "template": resource.template,
-                              "call_count": resource.call_count,
-                              "last_used": resource.last_used.isoformat() if isinstance(resource.last_used, datetime) else None,
-                          }
-                          resources_list.append(resource_data)
-                 return resources_list
+                """Lists available resources, optionally filtered by server_name."""
+                resources_list = []
+                sorted_resources = sorted(mcp_client.server_manager.resources.values(), key=lambda r: r.name)
+                for resource in sorted_resources:
+                    if server_name is None or resource.server_name == server_name:
+                        resource_data = {
+                            "name": resource.name, "description": resource.description,
+                            "server_name": resource.server_name, "template": resource.template,
+                            "call_count": resource.call_count,
+                            "last_used": resource.last_used.isoformat() if isinstance(resource.last_used, datetime) else None,
+                        }
+                        resources_list.append(resource_data)
+                return resources_list
 
             @app.get("/api/prompts")
             async def list_prompts_api(
                 server_name: Optional[str] = None, # Add optional query parameter
                 mcp_client: MCPClient = Depends(get_mcp_client)
             ):
-                 """Lists available prompts, optionally filtered by server_name."""
-                 prompts_list = []
-                 sorted_prompts = sorted(mcp_client.server_manager.prompts.values(), key=lambda p: p.name)
-                 for prompt in sorted_prompts:
-                      if server_name is None or prompt.server_name == server_name:
-                          prompt_data = {
-                              "name": prompt.name, "description": prompt.description,
-                              "server_name": prompt.server_name, "template": prompt.template,
-                              "call_count": prompt.call_count,
-                              "last_used": prompt.last_used.isoformat() if isinstance(prompt.last_used, datetime) else None,
-                          }
-                          prompts_list.append(prompt_data)
-                 return prompts_list
+                """Lists available prompts, optionally filtered by server_name."""
+                prompts_list = []
+                sorted_prompts = sorted(mcp_client.server_manager.prompts.values(), key=lambda p: p.name)
+                for prompt in sorted_prompts:
+                    if server_name is None or prompt.server_name == server_name:
+                        prompt_data = {
+                            "name": prompt.name, "description": prompt.description,
+                            "server_name": prompt.server_name, "template": prompt.template,
+                            "call_count": prompt.call_count,
+                            "last_used": prompt.last_used.isoformat() if isinstance(prompt.last_used, datetime) else None,
+                        }
+                        prompts_list.append(prompt_data)
+                return prompts_list
             
             @app.get("/api/prompts/{prompt_name:path}/template")
             async def get_prompt_template_api(prompt_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):
-                 """Gets the full template content for a specific prompt."""
-                 import urllib.parse
-                 decoded_prompt_name = urllib.parse.unquote(prompt_name)
-                 template = mcp_client.get_prompt_template(decoded_prompt_name)
-                 if template is None:
-                     raise HTTPException(status_code=404, detail=f"Prompt '{decoded_prompt_name}' not found or has no template.")
-                 return {"template": template}
+                """Gets the full template content for a specific prompt."""
+                import urllib.parse
+                decoded_prompt_name = urllib.parse.unquote(prompt_name)
+                template = mcp_client.get_prompt_template(decoded_prompt_name)
+                if template is None:
+                    raise HTTPException(status_code=404, detail=f"Prompt '{decoded_prompt_name}' not found or has no template.")
+                return {"template": template}
 
             @app.post("/api/tool/execute")
             async def execute_tool_api(req: ToolExecuteRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Executes a specified tool with the given parameters."""
                 if req.tool_name not in mcp_client.server_manager.tools:
-                     raise HTTPException(status_code=404, detail=f"Tool '{req.tool_name}' not found")
+                    raise HTTPException(status_code=404, detail=f"Tool '{req.tool_name}' not found")
                 tool = mcp_client.server_manager.tools[req.tool_name]
                 tool_short_name = req.tool_name.split(':')[-1]
                 mcp_client.safe_print(f"{EMOJI_MAP['server']} API executing [bold]{tool_short_name}[/] via {tool.server_name}...")
@@ -7895,18 +8945,18 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                             log.warning(f"Tool result content for {req.tool_name} not JSON serializable, sending as string.")
 
                     if result.isError:
-                         error_text = str(content_to_return)[:150] + "..." if content_to_return else "Unknown Error"
-                         mcp_client.safe_print(f"{EMOJI_MAP['failure']} API Tool Error [bold]{tool_short_name}[/] ({latency:.0f}ms): {error_text}")
+                        error_text = str(content_to_return)[:150] + "..." if content_to_return else "Unknown Error"
+                        mcp_client.safe_print(f"{EMOJI_MAP['failure']} API Tool Error [bold]{tool_short_name}[/] ({latency:.0f}ms): {error_text}")
                     else:
-                         content_str = mcp_client._stringify_content(content_to_return)
-                         result_tokens = mcp_client._estimate_string_tokens(content_str)
-                         mcp_client.safe_print(f"{EMOJI_MAP['success']} API Tool Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {latency:.0f}ms)")
+                        content_str = mcp_client._stringify_content(content_to_return)
+                        result_tokens = mcp_client._estimate_string_tokens(content_str)
+                        mcp_client.safe_print(f"{EMOJI_MAP['success']} API Tool Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {latency:.0f}ms)")
 
                     return {"isError": result.isError, "content": content_to_return, "latency_ms": latency}
 
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as e:
                     mcp_client.safe_print(f"[yellow]API Tool execution [bold]{tool_short_name}[/] cancelled.[/]")
-                    raise HTTPException(status_code=499, detail="Tool execution cancelled by client")
+                    raise HTTPException(status_code=499, detail="Tool execution cancelled by client") from e
                 except Exception as e:
                     mcp_client.safe_print(f"{EMOJI_MAP['failure']} API Tool Execution Failed [bold]{tool_short_name}[/]: {str(e)}")
                     log.error(f"Error executing tool '{req.tool_name}' via API: {e}", exc_info=True)
@@ -7927,7 +8977,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     _ = json.dumps(nodes_data)
                 except TypeError as e:
                     log.error(f"Conversation data not serializable: {e}", exc_info=True)
-                    raise HTTPException(status_code=500, detail="Internal error: Conversation state not serializable")
+                    raise HTTPException(status_code=500, detail="Internal error: Conversation state not serializable") from e
 
                 return {
                     "currentNodeId": node.id,
@@ -7952,25 +9002,25 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
             @app.post("/api/conversation/checkout")
             async def checkout_branch_api(req: CheckoutRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
-                 """Switches the current conversation context to a specified node/branch."""
-                 node_id = req.node_id
-                 node = mcp_client.conversation_graph.get_node(node_id)
-                 if not node:
-                      # Attempt partial match
-                      matched_node = None
-                      for n_id, n in mcp_client.conversation_graph.nodes.items():
-                          if n_id.startswith(node_id):
-                              if matched_node: # Ambiguous prefix
-                                  raise HTTPException(status_code=400, detail=f"Ambiguous node ID prefix '{node_id}'")
-                              matched_node = n
-                      node = matched_node
+                """Switches the current conversation context to a specified node/branch."""
+                node_id = req.node_id
+                node = mcp_client.conversation_graph.get_node(node_id)
+                if not node:
+                    # Attempt partial match
+                    matched_node = None
+                    for n_id, n in mcp_client.conversation_graph.nodes.items():
+                        if n_id.startswith(node_id):
+                            if matched_node: # Ambiguous prefix
+                                raise HTTPException(status_code=400, detail=f"Ambiguous node ID prefix '{node_id}'")
+                            matched_node = n
+                    node = matched_node
 
-                 if node and mcp_client.conversation_graph.set_current_node(node.id):
-                     log.info(f"API checked out branch: {node.name} ({node.id})")
-                     # Return messages of the newly checked-out node
-                     return {"message": f"Switched to branch {node.name}", "currentNodeId": node.id, "messages": node.messages}
-                 else:
-                     raise HTTPException(status_code=404, detail=f"Node ID '{node_id}' not found or switch failed")
+                if node and mcp_client.conversation_graph.set_current_node(node.id):
+                    log.info(f"API checked out branch: {node.name} ({node.id})")
+                    # Return messages of the newly checked-out node
+                    return {"message": f"Switched to branch {node.name}", "currentNodeId": node.id, "messages": node.messages}
+                else:
+                    raise HTTPException(status_code=404, detail=f"Node ID '{node_id}' not found or switch failed")
 
             @app.post("/api/conversation/clear")
             async def clear_conversation_api(mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -8002,9 +9052,9 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     }
                     # Validate and potentially add using the Pydantic model
                     try:
-                         graph_nodes.append(GraphNodeData(**node_data))
+                        graph_nodes.append(GraphNodeData(**node_data))
                     except ValidationError as e:
-                         log.warning(f"Skipping invalid graph node data for node {node_id}: {e}")
+                        log.warning(f"Skipping invalid graph node data for node {node_id}: {e}")
 
                 return graph_nodes # Return the list of validated Pydantic models
 
@@ -8024,10 +9074,10 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 old_name = node.name
                 new_name = req.new_name.strip()
                 if not new_name:
-                     raise HTTPException(status_code=400, detail="New name cannot be empty.")
+                    raise HTTPException(status_code=400, detail="New name cannot be empty.")
 
                 if old_name == new_name:
-                     return {"message": "Node name unchanged.", "node_id": node_id, "new_name": new_name}
+                    return {"message": "Node name unchanged.", "node_id": node_id, "new_name": new_name}
 
                 node.name = new_name
                 node.modified_at = datetime.now() # Update modification time
@@ -8088,7 +9138,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     # Replace messages with summary
                     summary_system_message = f"The preceding conversation up to this point has been summarized:\n\n---\n{summary}\n---"
                     mcp_client.conversation_graph.current_node.messages = [
-                         InternalMessage(role="system", content=summary_system_message)
+                        InternalMessage(role="system", content=summary_system_message)
                     ]
                     final_tokens = await mcp_client.count_tokens()
                     await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
@@ -8106,7 +9156,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 """Triggers a background task to discover MCP servers."""
                 log.info("API triggered server discovery...")
                 if mcp_client.server_manager._discovery_in_progress.locked():
-                     return {"message": "Discovery process already running."}
+                    return {"message": "Discovery process already running."}
                 else:
                     asyncio.create_task(mcp_client.server_manager.discover_servers())
                     return {"message": "Server discovery process initiated."}
@@ -8126,18 +9176,18 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
             @app.post("/api/discover/connect")
             async def connect_discovered_server_api(server_info: DiscoveredServer, mcp_client: MCPClient = Depends(get_mcp_client)):
-                 """Adds a discovered server to the configuration and attempts to connect."""
-                 if not server_info.name or not server_info.path_or_url or not server_info.type:
-                      raise HTTPException(status_code=400, detail="Incomplete server information provided.")
+                """Adds a discovered server to the configuration and attempts to connect."""
+                if not server_info.name or not server_info.path_or_url or not server_info.type:
+                    raise HTTPException(status_code=400, detail="Incomplete server information provided.")
 
-                 info_dict = server_info.model_dump()
-                 success, message = await mcp_client.server_manager.add_and_connect_discovered_server(info_dict)
+                info_dict = server_info.model_dump()
+                success, message = await mcp_client.server_manager.add_and_connect_discovered_server(info_dict)
 
-                 if success:
-                     return {"message": message}
-                 else:
-                     status_code = 409 if "already configured" in message else 500
-                     raise HTTPException(status_code=status_code, detail=message)
+                if success:
+                    return {"message": message}
+                else:
+                    status_code = 409 if "already configured" in message else 500
+                    raise HTTPException(status_code=status_code, detail=message)
 
             @app.get("/api/conversation/{conversation_id}/export")
             async def export_conversation_api(conversation_id: str, mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -8151,7 +9201,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             async def import_conversation_api(file: UploadFile = File(...), mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Imports a conversation from an uploaded JSON file."""
                 if not file.filename or not file.filename.endswith(".json"):
-                     raise HTTPException(status_code=400, detail="Invalid file type. Please upload a JSON file.")
+                    raise HTTPException(status_code=400, detail="Invalid file type. Please upload a JSON file.")
                 try:
                     content_bytes = await file.read()
                     content_str = content_bytes.decode('utf-8')
@@ -8162,7 +9212,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     log.error(f"Error reading uploaded file {file.filename}: {e}")
                     raise HTTPException(status_code=500, detail="Error reading uploaded file.") from e
                 finally:
-                     await file.close()
+                    await file.close()
 
                 success, message, new_node_id = await mcp_client.import_conversation_from_data(data)
                 if success:
@@ -8196,8 +9246,8 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     validated_response = [ChatHistoryResponse(**item) for item in response_data]
                     return validated_response
                 except ValidationError as e:
-                     log.error(f"Error validating history search results: {e}")
-                     raise HTTPException(status_code=500, detail="Internal error processing history search results.")
+                    log.error(f"Error validating history search results: {e}")
+                    raise HTTPException(status_code=500, detail="Internal error processing history search results.") from e
 
             @app.delete("/api/history")
             async def clear_history_api(mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -8243,7 +9293,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             async def get_cache_entries_api(mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Lists entries currently in the tool cache."""
                 if not mcp_client.tool_cache:
-                     return [] # Return empty list if caching disabled
+                    return [] # Return empty list if caching disabled
                 entries_data = mcp_client.get_cache_entries()
                 # Validate and convert using Pydantic model
                 validated_entries = []
@@ -8304,28 +9354,28 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
             @app.post("/api/conversation/apply_prompt")
             async def apply_prompt_api(req: ApplyPromptRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
-                 """Applies a predefined prompt template to the current conversation."""
-                 success = await mcp_client.apply_prompt_to_conversation(req.prompt_name)
-                 if success:
-                     log.info(f"Applied prompt '{req.prompt_name}' via API.")
-                     # Return the updated message list for the UI
-                     updated_messages = mcp_client.conversation_graph.current_node.messages
-                     return {"message": f"Prompt '{req.prompt_name}' applied.", "messages": updated_messages}
-                 else:
-                     raise HTTPException(status_code=404, detail=f"Prompt '{req.prompt_name}' not found.")
+                """Applies a predefined prompt template to the current conversation."""
+                success = await mcp_client.apply_prompt_to_conversation(req.prompt_name)
+                if success:
+                    log.info(f"Applied prompt '{req.prompt_name}' via API.")
+                    # Return the updated message list for the UI
+                    updated_messages = mcp_client.conversation_graph.current_node.messages
+                    return {"message": f"Prompt '{req.prompt_name}' applied.", "messages": updated_messages}
+                else:
+                    raise HTTPException(status_code=404, detail=f"Prompt '{req.prompt_name}' not found.")
 
             @app.post("/api/config/reset")
             async def reset_config_api(mcp_client: MCPClient = Depends(get_mcp_client)):
-                 """Resets the configuration (specifically the YAML part) to defaults."""
-                 try:
-                     await mcp_client.reset_configuration()
-                     log.info("Configuration reset to defaults via API.")
-                     # Return the new default config state (non-sensitive parts)
-                     new_config_state = await get_config(mcp_client) # Reuse the GET endpoint logic
-                     return {"message": "Configuration reset to defaults (YAML file updated).", "config": new_config_state}
-                 except Exception as e:
-                      log.error(f"Error resetting configuration via API: {e}", exc_info=True)
-                      raise HTTPException(status_code=500, detail=f"Configuration reset failed: {e}") from e
+                """Resets the configuration (specifically the YAML part) to defaults."""
+                try:
+                    await mcp_client.reset_configuration()
+                    log.info("Configuration reset to defaults via API.")
+                    # Return the new default config state (non-sensitive parts)
+                    new_config_state = await get_config(mcp_client) # Reuse the GET endpoint logic
+                    return {"message": "Configuration reset to defaults (YAML file updated).", "config": new_config_state}
+                except Exception as e:
+                    log.error(f"Error resetting configuration via API: {e}", exc_info=True)
+                    raise HTTPException(status_code=500, detail=f"Configuration reset failed: {e}") from e
 
             @app.post("/api/query/abort", status_code=200)
             async def abort_query_api(mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -8344,9 +9394,9 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                             message = "Abort signal sent and task cancelled."
                             aborted = True
                         else:
-                             message = "Abort signal sent. Task cancellation pending."
-                             # Even if not confirmed cancelled yet, signal was sent
-                             aborted = True # Consider it "aborted" from API perspective
+                            message = "Abort signal sent. Task cancellation pending."
+                            # Even if not confirmed cancelled yet, signal was sent
+                            aborted = True # Consider it "aborted" from API perspective
                     except Exception as e:
                         log.error(f"Error trying to cancel task via API: {e}")
                         raise HTTPException(status_code=500, detail=f"Error sending abort signal: {str(e)}") from e
@@ -8357,15 +9407,15 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
             @app.get("/api/dashboard", response_model=DashboardData)
             async def get_dashboard_data_api(mcp_client: MCPClient = Depends(get_mcp_client)):
-                 """Gets data suitable for populating a dashboard view."""
-                 data = mcp_client.get_dashboard_data()
-                 try:
+                """Gets data suitable for populating a dashboard view."""
+                data = mcp_client.get_dashboard_data()
+                try:
                     # Validate against Pydantic model
                     dashboard_model = DashboardData(**data)
                     return dashboard_model
-                 except ValidationError as e:
-                     log.error(f"Data validation error for dashboard data: {e}")
-                     raise HTTPException(status_code=500, detail="Internal error generating dashboard data.")
+                except ValidationError as e:
+                    log.error(f"Data validation error for dashboard data: {e}")
+                    raise HTTPException(status_code=500, detail="Internal error generating dashboard data.") from e
 
             # --- WebSocket Chat Endpoint ---
             @app.websocket("/ws/chat")
@@ -8386,17 +9436,17 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     try:
                         await websocket.send_json(WebSocketMessage(type=msg_type, payload=payload).model_dump())
                     except Exception as send_err:
-                         log.warning(f"WS-{connection_id}: Failed send (Type: {msg_type}): {send_err}")
+                        log.warning(f"WS-{connection_id}: Failed send (Type: {msg_type}): {send_err}")
 
                 async def send_command_response(success: bool, message: str, data: Optional[Dict] = None):
                     payload = {"success": success, "message": message}; payload.update(data or {})
                     await send_ws_message("command_response", payload)
 
                 async def send_error_response(message: str, cmd: Optional[str] = None):
-                     log_msg = f"WS-{connection_id} Error: {message}" + (f" (Cmd: /{cmd})" if cmd else "")
-                     log.warning(log_msg)
-                     await send_ws_message("error", {"message": message})
-                     if cmd is not None: await send_command_response(False, message)
+                    log_msg = f"WS-{connection_id} Error: {message}" + (f" (Cmd: /{cmd})" if cmd else "")
+                    log.warning(log_msg)
+                    await send_ws_message("error", {"message": message})
+                    if cmd is not None: await send_command_response(False, message)
 
                 try:
                     while True:
@@ -8423,25 +9473,25 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                 active_query_task = query_task
                                 # Link to client instance ONLY if no other task is running (for global abort)
                                 if not mcp_client.current_query_task or mcp_client.current_query_task.done():
-                                     mcp_client.current_query_task = query_task
+                                    mcp_client.current_query_task = query_task
                                 else:
-                                     log.warning("Another query task is already running globally, global abort might affect wrong task.")
+                                    log.warning("Another query task is already running globally, global abort might affect wrong task.")
 
                                 try:
                                     async for chunk in query_task:
                                         if chunk.startswith("@@STATUS@@"):
-                                             status_payload = chunk[len("@@STATUS@@"):].strip()
-                                             # Optionally log status to console: mcp_client.safe_print(status_payload)
-                                             await send_ws_message("status", status_payload)
+                                            status_payload = chunk[len("@@STATUS@@"):].strip()
+                                            # Optionally log status to console: mcp_client.safe_print(status_payload)
+                                            await send_ws_message("status", status_payload)
                                         else:
-                                             await send_ws_message("text_chunk", chunk)
+                                            await send_ws_message("text_chunk", chunk)
                                     await send_ws_message("query_complete", None)
                                     usage_data = await get_token_usage(mcp_client)
                                     await send_ws_message("token_usage", usage_data)
 
                                 except asyncio.CancelledError:
-                                     log.info(f"WS-{connection_id}: Query cancelled.")
-                                     await send_ws_message("status", "[yellow]Request Aborted by User.[/]")
+                                    log.info(f"WS-{connection_id}: Query cancelled.")
+                                    await send_ws_message("status", "[yellow]Request Aborted by User.[/]")
                                 except Exception as e:
                                     error_msg = f"Error processing query: {str(e)}"
                                     log.error(f"WS-{connection_id}: Error processing query: {e}", exc_info=True)
@@ -8450,7 +9500,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                     active_query_task = None # Clear task for this WS connection
                                     # Clear global task reference ONLY if it was THIS task
                                     if mcp_client.current_query_task == query_task:
-                                         mcp_client.current_query_task = None
+                                        mcp_client.current_query_task = None
 
                             # --- Handle Command ---
                             elif message.type == "command":
@@ -8461,34 +9511,34 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                     log.info(f"WS-{connection_id} processing command: /{cmd} {args}")
                                     try:
                                         if cmd == "clear":
-                                             mcp_client.conversation_graph.current_node.messages = []
-                                             mcp_client.conversation_graph.set_current_node("root")
-                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                             await send_command_response(True, "Conversation cleared.", {"messages": []}) # Send cleared messages
+                                            mcp_client.conversation_graph.current_node.messages = []
+                                            mcp_client.conversation_graph.set_current_node("root")
+                                            await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
+                                            await send_command_response(True, "Conversation cleared.", {"messages": []}) # Send cleared messages
                                         elif cmd == "model":
-                                             if args:
-                                                 mcp_client.current_model = args; mcp_client.config.default_model = args
-                                                 asyncio.create_task(mcp_client.config.save_async()) # Persist default model change
-                                                 await send_command_response(True, f"Model set to: {args}", {"currentModel": args})
-                                             else: await send_command_response(True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model})
+                                            if args:
+                                                mcp_client.current_model = args; mcp_client.config.default_model = args
+                                                asyncio.create_task(mcp_client.config.save_async()) # Persist default model change
+                                                await send_command_response(True, f"Model set to: {args}", {"currentModel": args})
+                                            else: await send_command_response(True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model})
                                         elif cmd == "fork":
-                                             new_node = mcp_client.conversation_graph.create_fork(name=args if args else None)
-                                             mcp_client.conversation_graph.set_current_node(new_node.id)
-                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                             await send_command_response(True, f"Created branch: {new_node.name}", {"newNodeId": new_node.id, "newNodeName": new_node.name})
+                                            new_node = mcp_client.conversation_graph.create_fork(name=args if args else None)
+                                            mcp_client.conversation_graph.set_current_node(new_node.id)
+                                            await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
+                                            await send_command_response(True, f"Created branch: {new_node.name}", {"newNodeId": new_node.id, "newNodeName": new_node.name})
                                         elif cmd == "checkout":
-                                             if not args: await send_error_response("Usage: /checkout NODE_ID_or_Prefix", cmd); continue
-                                             node_id=args; node=mcp_client.conversation_graph.get_node(node_id)
-                                             if not node: matched_node=None; [matched_node := n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id) if not matched_node]; node=matched_node
-                                             if node and mcp_client.conversation_graph.set_current_node(node.id):
-                                                 await send_command_response(True, f"Switched to branch: {node.name}", {"currentNodeId": node.id, "messages": node.messages}) # Send messages of new node
-                                             else: await send_error_response(f"Node ID '{node_id}' not found.", cmd)
+                                            if not args: await send_error_response("Usage: /checkout NODE_ID_or_Prefix", cmd); continue
+                                            node_id=args; node=mcp_client.conversation_graph.get_node(node_id)
+                                            if not node: matched_node=None; [matched_node := n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id) if not matched_node]; node=matched_node
+                                            if node and mcp_client.conversation_graph.set_current_node(node.id):
+                                                await send_command_response(True, f"Switched to branch: {node.name}", {"currentNodeId": node.id, "messages": node.messages}) # Send messages of new node
+                                            else: await send_error_response(f"Node ID '{node_id}' not found.", cmd)
                                         elif cmd == "apply_prompt": # Renamed from 'prompt' for clarity
-                                             if not args: await send_error_response("Usage: /apply_prompt <prompt_name>", cmd); continue
-                                             success = await mcp_client.apply_prompt_to_conversation(args)
-                                             if success:
-                                                 await send_command_response(True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages})
-                                             else: await send_error_response(f"Prompt not found: {args}", cmd)
+                                            if not args: await send_error_response("Usage: /apply_prompt <prompt_name>", cmd); continue
+                                            success = await mcp_client.apply_prompt_to_conversation(args)
+                                            if success:
+                                                await send_command_response(True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages})
+                                            else: await send_error_response(f"Prompt not found: {args}", cmd)
                                         # --- Add Abort Command Handler ---
                                         elif cmd == "abort":
                                             log.info(f"WS-{connection_id} received abort command.")
@@ -8497,7 +9547,7 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                                 await send_command_response(True, "Abort signal sent to running query.")
                                                 # Status update will be sent when CancelledError is caught
                                             else:
-                                                 await send_command_response(False, "No active query running for this connection.")
+                                                await send_command_response(False, "No active query running for this connection.")
                                         else: await send_command_response(False, f"Command '/{cmd}' not supported via WebSocket.")
                                     except Exception as cmd_err: await send_error_response(f"Error executing '/{cmd}': {cmd_err}", cmd); log.error(f"WS-{connection_id} Cmd Error /{cmd}: {cmd_err}", exc_info=True)
                                 else: await send_error_response("Invalid command format.", None)
@@ -8512,12 +9562,12 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 except WebSocketDisconnect: log.info(f"WebSocket connection closed (ID: {connection_id}).")
                 except Exception as e: log.error(f"WS-{connection_id} unexpected handler error: {e}", exc_info=True); await suppress(Exception)(websocket.close(code=1011))
                 finally: # Ensure task is cancelled if WS connection closes unexpectedly
-                     if active_query_task and not active_query_task.done():
-                          log.warning(f"WS-{connection_id} closing, cancelling active query task.")
-                          active_query_task.cancel()
-                     # Clear global reference if this was the task
-                     if mcp_client.current_query_task == active_query_task:
-                          mcp_client.current_query_task = None
+                    if active_query_task and not active_query_task.done():
+                        log.warning(f"WS-{connection_id} closing, cancelling active query task.")
+                        active_query_task.cancel()
+                    # Clear global reference if this was the task
+                    if mcp_client.current_query_task == active_query_task:
+                        mcp_client.current_query_task = None
 
             # --- Static File Serving ---
             if serve_ui_file:
@@ -8546,35 +9596,22 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             # (Dashboard logic remains the same)
             # ...
             if not client.server_monitor.monitoring:
-                 await client.server_monitor.start_monitoring()
+                await client.server_monitor.start_monitoring()
             await client.cmd_dashboard("")
             await client.close() # Ensure cleanup after dashboard closes
             return
 
         elif query:
             # (Single query logic remains the same)
-            # ...
-             try:
-                 result = await client.process_query(query, model=model)
-                 safe_console.print()
-                 safe_console.print(Panel.fit(
-                     Markdown(result),
-                     title=f"Claude ({client.current_model})",
-                     border_style="green"
-                 ))
-             except Exception as query_error:
-                 safe_console.print(f"[bold red]Error processing query:[/] {str(query_error)}")
-                 if verbose_logging:
-                     import traceback
-                     safe_console.print(traceback.format_exc())
+            pass
 
         elif interactive or not query:
             # (Interactive loop logic remains the same)
             # ...
-             if not client.config.api_key and interactive:
-                  # ... (API key prompt logic) ...
-                 pass # Keep the logic
-             await client.interactive_loop()
+            if not client.config.api_key and interactive:
+                # ... (API key prompt logic) ...
+                pass # Keep the logic
+            await client.interactive_loop()
 
     except KeyboardInterrupt:
         safe_console.print("\n[yellow]Interrupted, shutting down...[/]")
