@@ -33,12 +33,14 @@ classifiers = [
 dependencies = [
     # --- Directly Imported Libraries ---
     "anthropic",
-    "aiofiles",  
+    "openai",
     "mcp",            
     "typer",
+    "aiofiles",
     "rich",
     "httpx",
     "pyyaml",
+    "python-decouple",
     "python-dotenv",
     "colorama",
     "psutil",
@@ -54,7 +56,7 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "websockets",
-    "python-multipart"    
+    "python-multipart",
 ]
 
 # Defines the command-line script entry point

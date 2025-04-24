@@ -10483,4 +10483,3 @@ if __name__ == "__main__":
     # Instead, asyncio.run(main_async(...)) handles everything
     app() # This will parse args and call the appropriate command (run, servers, etc.)
           # The 'run' command will then call main_async which handles mode switching.
-
