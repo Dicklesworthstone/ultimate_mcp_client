@@ -276,14 +276,29 @@ class Provider(str, Enum):
     CEREBRAS = "cerebras"
 
 class TaskType(str, Enum): # Keep as is
-    COMPLETION = "completion"; CHAT = "chat"; SUMMARIZATION = "summarization"
-    EXTRACTION = "extraction"; GENERATION = "generation"; ANALYSIS = "analysis"
-    CLASSIFICATION = "classification"; TRANSLATION = "translation"; QA = "qa"
-    DATABASE = "database"; QUERY = "query"; BROWSER = "browser"; DOWNLOAD = "download"
-    UPLOAD = "upload"; DOCUMENT_PROCESSING = "document_processing"; DOCUMENT = "document"
+    COMPLETION = "completion"
+    CHAT = "chat"
+    SUMMARIZATION = "summarization"
+    EXTRACTION = "extraction"
+    GENERATION = "generation"
+    ANALYSIS = "analysis"
+    CLASSIFICATION = "classification"
+    TRANSLATION = "translation"
+    QA = "qa"
+    DATABASE = "database"
+    QUERY = "query"
+    BROWSER = "browser"
+    DOWNLOAD = "download"
+    UPLOAD = "upload"
+    DOCUMENT_PROCESSING = "document_processing"
+    DOCUMENT = "document"
 
 class LogLevel(str, Enum): # Keep as is
-    DEBUG = "DEBUG"; INFO = "INFO"; WARNING = "WARNING"; ERROR = "ERROR"; CRITICAL = "CRITICAL"
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
 
 # Cost estimates (Copied and slightly adjusted for consistency)
 COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
@@ -925,25 +940,37 @@ except Exception as e:
 
 # --- ServerStatus Enum ---
 class ServerStatus(Enum):
-    HEALTHY = "healthy"; DEGRADED = "degraded"; ERROR = "error"; UNKNOWN = "unknown"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    ERROR = "error"
+    UNKNOWN = "unknown"
 
 # --- ServerVersion Class ---
 @dataclass
 class ServerVersion:
-    major: int; minor: int; patch: int
+    major: int
+    minor: int
+    patch: int
+
     @classmethod
     def from_string(cls, version_str: str) -> "ServerVersion":
         parts = version_str.split(".") + ["0"] * 3
         return cls(major=int(parts[0]), minor=int(parts[1]), patch=int(parts[2]))
-    def __str__(self) -> str: return f"{self.major}.{self.minor}.{self.patch}"
-    def is_compatible_with(self, other: "ServerVersion") -> bool: return self.major == other.major
+    def __str__(self) -> str: 
+        return f"{self.major}.{self.minor}.{self.patch}"
+    def is_compatible_with(self, other: "ServerVersion") -> bool: 
+        return self.major == other.major
 
 # --- ServerMetrics Class ---
 @dataclass
 class ServerMetrics:
-    uptime: float = 0.0; request_count: int = 0; error_count: int = 0
-    avg_response_time: float = 0.0; last_checked: datetime = field(default_factory=datetime.now)
-    status: ServerStatus = ServerStatus.UNKNOWN; response_times: List[float] = field(default_factory=list)
+    uptime: float = 0.0
+    request_count: int = 0
+    error_count: int = 0
+    avg_response_time: float = 0.0
+    last_checked: datetime = field(default_factory=datetime.now)
+    status: ServerStatus = ServerStatus.UNKNOWN
+    response_times: List[float] = field(default_factory=list)
     error_rate: float = 0.0
     def update_response_time(self, response_time: float) -> None:
         self.response_times.append(response_time)
@@ -959,11 +986,21 @@ class ServerMetrics:
 # --- ServerConfig Class ---
 @dataclass
 class ServerConfig:
-    name: str; type: ServerType; path: str
-    args: List[str] = field(default_factory=list); enabled: bool = True; auto_start: bool = True
-    description: str = ""; trusted: bool = False; categories: List[str] = field(default_factory=list)
-    version: Optional[ServerVersion] = None; rating: float = 5.0; retry_count: int = 3; timeout: float = 250.0
-    metrics: ServerMetrics = field(default_factory=ServerMetrics); registry_url: Optional[str] = None
+    name: str
+    type: ServerType
+    path: str
+    args: List[str] = field(default_factory=list)
+    enabled: bool = True
+    auto_start: bool = True
+    description: str = ""
+    trusted: bool = False
+    categories: List[str] = field(default_factory=list)
+    version: Optional[ServerVersion] = None
+    rating: float = 5.0
+    retry_count: int = 3
+    timeout: float = 250.0
+    metrics: ServerMetrics = field(default_factory=ServerMetrics)
+    registry_url: Optional[str] = None
     last_updated: datetime = field(default_factory=datetime.now)
     retry_policy: Dict[str, Any] = field(default_factory=lambda: {"max_attempts": 3, "backoff_factor": 0.5, "timeout_increment": 5})
     capabilities: Dict[str, bool] = field(default_factory=lambda: {"tools": True, "resources": True, "prompts": True})
@@ -971,26 +1008,39 @@ class ServerConfig:
 # --- MCPTool, MCPResource, MCPPrompt Classes ---
 @dataclass
 class MCPTool:
-    name: str; description: str; server_name: str
-    input_schema: Dict[str, Any]; original_tool: Tool
-    call_count: int = 0; avg_execution_time: float = 0.0
+    name: str
+    description: str
+    server_name: str
+    input_schema: Dict[str, Any]
+    original_tool: Tool
+    call_count: int = 0
+    avg_execution_time: float = 0.0
     execution_times: deque = field(default_factory=lambda: deque(maxlen=100))
     last_used: datetime = field(default_factory=datetime.now)
     def update_execution_time(self, time_ms: float) -> None:
         self.execution_times.append(time_ms)
         if self.execution_times: self.avg_execution_time = sum(self.execution_times) / len(self.execution_times)
-        self.call_count += 1; self.last_used = datetime.now()
+        self.call_count += 1
+        self.last_used = datetime.now()
 
 @dataclass
 class MCPResource:
-    name: str; description: str; server_name: str; template: str
-    original_resource: Resource; call_count: int = 0
+    name: str
+    description: str
+    server_name: str
+    template: str
+    original_resource: Resource
+    call_count: int = 0
     last_used: datetime = field(default_factory=datetime.now)
 
 @dataclass
 class MCPPrompt:
-    name: str; description: str; server_name: str; template: str
-    original_prompt: McpPromptType; call_count: int = 0
+    name: str
+    description: str
+    server_name: str
+    template: str
+    original_prompt: McpPromptType
+    call_count: int = 0
     last_used: datetime = field(default_factory=datetime.now)
 
 # --- ConversationNode Class (Using Type Alias) ---
@@ -1028,10 +1078,17 @@ class ConversationNode:
 # --- ChatHistory Class ---
 @dataclass
 class ChatHistory:
-    query: str; response: str; model: str; timestamp: str
-    server_names: List[str]; tools_used: List[str] = field(default_factory=list)
-    conversation_id: Optional[str] = None; latency_ms: float = 0.0
-    tokens_used: int = 0; cached: bool = False; streamed: bool = False
+    query: str
+    response: str
+    model: str
+    timestamp: str
+    server_names: List[str]
+    tools_used: List[str] = field(default_factory=list)
+    conversation_id: Optional[str] = None
+    latency_ms: float = 0.0
+    tokens_used: int = 0
+    cached: bool = False
+    streamed: bool = False
 
 class ServerRegistry:
     """
@@ -1983,7 +2040,8 @@ class Config:
                           else: log.warning(f"Invalid YAML cache_ttl_mapping: K='{k}', V='{v}'.")
                      self.cache_ttl_mapping = valid_mapping
                  else:
-                     log.warning("'cache_ttl_mapping' in YAML is not a dict."); self.cache_ttl_mapping = {}
+                     log.warning("'cache_ttl_mapping' in YAML is not a dict.")
+                     self.cache_ttl_mapping = {}
             elif hasattr(self, key):
                 # Update simple attributes if type matches or can be converted
                 current_attr_value = getattr(self, key, None)
@@ -2054,9 +2112,12 @@ class History:
         self.load_sync()
 
     def add(self, entry: ChatHistory):
-        self.entries.append(entry); self.save_sync()
+        self.entries.append(entry)
+        self.save_sync()
+
     async def add_async(self, entry: ChatHistory):
-        self.entries.append(entry); await self.save()
+        self.entries.append(entry)
+        await self.save()
 
     def _load_history_data(self, data_str: str):
         """Helper to parse history data"""
@@ -2133,16 +2194,22 @@ class ServerMonitor:
     async def stop_monitoring(self):
         if not self.monitoring: return
         self.monitoring = False
-        if self.monitor_task: self.monitor_task.cancel(); await suppress(asyncio.CancelledError)(self.monitor_task)
-        self.monitor_task = None; log.info("Server health monitoring stopped")
+        if self.monitor_task: 
+            self.monitor_task.cancel()
+            await suppress(asyncio.CancelledError)(self.monitor_task)
+        self.monitor_task = None
+        log.info("Server health monitoring stopped")
 
     async def _monitor_loop(self):
         while self.monitoring:
             try:
                 await self._check_all_servers()
                 await asyncio.sleep(self.health_check_interval)
-            except asyncio.CancelledError: break
-            except Exception as e: log.error(f"Error in server monitor: {e}"); await asyncio.sleep(5)
+            except asyncio.CancelledError: 
+                break
+            except Exception as e: 
+                log.error(f"Error in server monitor: {e}")
+                await asyncio.sleep(5)
 
     async def _check_all_servers(self):
         for name, session in list(self.server_manager.active_sessions.items()):
@@ -2159,9 +2226,11 @@ class ServerMonitor:
         start_time = time.time()
         try:
             await session.list_tools() # Simple health check
-            response_time = time.time() - start_time; metrics.update_response_time(response_time)
+            response_time = time.time() - start_time
+            metrics.update_response_time(response_time)
         except Exception as e:
-            metrics.error_count += 1; log.warning(f"Health check fail {server_name}: {e}")
+            metrics.error_count += 1
+            log.warning(f"Health check fail {server_name}: {e}")
         metrics.update_status()
         if metrics.status == ServerStatus.ERROR: await self._recover_server(server_name)
 
@@ -2175,10 +2244,14 @@ class ServerMonitor:
 # --- RobustStdioSession Class ---
 class RobustStdioSession(ClientSession):
     def __init__(self, process: asyncio.subprocess.Process, server_name: str):
-        self._process = process; self._server_name = server_name; self._stdin = process.stdin
+        self._process = process
+        self._server_name = server_name
+        self._stdin = process.stdin
         self._stderr_reader_task: Optional[asyncio.Task] = None
         self._response_futures: Dict[str, asyncio.Future] = {}
-        self._request_id_counter = 0; self._lock = asyncio.Lock(); self._is_active = True
+        self._request_id_counter = 0
+        self._lock = asyncio.Lock()
+        self._is_active = True
         self._background_task_runner: Optional[asyncio.Task] = None
         log.debug(f"[{self._server_name}] Initializing RobustStdioSession")
         self._background_task_runner = asyncio.create_task(self._run_reader_processor_wrapper(), name=f"session-reader-{server_name}")
@@ -2193,16 +2266,24 @@ class RobustStdioSession(ClientSession):
         return result
 
     async def send_initialized_notification(self):
-        if not self._is_active: log.warning(f"[{self._server_name}] Session inactive, skip initialized."); return
+        if not self._is_active: 
+            log.warning(f"[{self._server_name}] Session inactive, skip initialized.")
+            return
         notification = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
         try:
-            notification_str = json.dumps(notification) + '\n'; notification_bytes = notification_str.encode('utf-8')
+            notification_str = json.dumps(notification) + '\n'
+            notification_bytes = notification_str.encode('utf-8')
             log.info(f"[{self._server_name}] Sending initialized notification...")
-            if self._stdin is None or self._stdin.is_closing(): raise ConnectionAbortedError("Stdin closed")
-            self._stdin.write(notification_bytes); await self._stdin.drain()
+            if self._stdin is None or self._stdin.is_closing(): 
+                raise ConnectionAbortedError("Stdin closed")
+            self._stdin.write(notification_bytes)
+            await self._stdin.drain()
             log.debug(f"[{self._server_name}] Initialized notification sent.")
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e: log.error(f"[{self._server_name}] Conn error sending initialized: {e}"); await self._close_internal_state(e)
-        except Exception as e: log.error(f"[{self._server_name}] Error sending initialized: {e}", exc_info=True)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e: 
+            log.error(f"[{self._server_name}] Conn error sending initialized: {e}")
+            await self._close_internal_state(e)
+        except Exception as e: 
+            log.error(f"[{self._server_name}] Error sending initialized: {e}", exc_info=True)
 
     async def _run_reader_processor_wrapper(self):
         close_exception: Optional[BaseException] = None
@@ -2210,8 +2291,12 @@ class RobustStdioSession(ClientSession):
             log.debug(f"[{self._server_name}] Entering reader/processor task wrapper.")
             await self._read_and_process_stdout_loop()
             log.info(f"[{self._server_name}] Reader/processor task finished normally.")
-        except asyncio.CancelledError: log.debug(f"[{self._server_name}] Reader/processor task wrapper cancelled."); close_exception = asyncio.CancelledError("Reader task cancelled")
-        except Exception as e: log.error(f"[{self._server_name}] Reader/processor task wrapper failed: {e}", exc_info=True); close_exception = e
+        except asyncio.CancelledError: 
+            log.debug(f"[{self._server_name}] Reader/processor task wrapper cancelled.")
+            close_exception = asyncio.CancelledError("Reader task cancelled")
+        except Exception as e: 
+            log.error(f"[{self._server_name}] Reader/processor task wrapper failed: {e}", exc_info=True)
+            close_exception = e
         finally:
             log.debug(f"[{self._server_name}] Reader/processor task wrapper exiting.")
             if self._is_active:
@@ -2221,16 +2306,23 @@ class RobustStdioSession(ClientSession):
                 await self._close_internal_state(final_exception)
 
     async def _read_and_process_stdout_loop(self):
-        handshake_complete = False; stream_limit = getattr(self._process.stdout, '_limit', 'Unknown')
+        handshake_complete = False
+        stream_limit = getattr(self._process.stdout, '_limit', 'Unknown')
         log.debug(f"[{self._server_name}] Starting combined reader/processor loop (Buffer limit: {stream_limit}).")
         try:
             while self._process.returncode is None:
-                if not self._is_active: log.info(f"[{self._server_name}] Session inactive, exiting loop."); break
+                if not self._is_active: 
+                    log.info(f"[{self._server_name}] Session inactive, exiting loop.")
+                    break
                 try:
                     line_bytes = await asyncio.wait_for(self._process.stdout.readline(), timeout=60.0)
                     if not line_bytes:
-                        if self._process.stdout.at_eof(): log.warning(f"[{self._server_name}] Stdout EOF."); break
-                        else: log.debug(f"[{self._server_name}] readline() timeout."); continue
+                        if self._process.stdout.at_eof(): 
+                            log.warning(f"[{self._server_name}] Stdout EOF.")
+                            break
+                        else: 
+                            log.debug(f"[{self._server_name}] readline() timeout.")
+                            continue
                     line_str_raw = line_bytes.decode('utf-8', errors='replace')
                     if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{self._server_name}] READ/PROC RAW <<< {repr(line_str_raw)}")
                     line_str = line_str_raw.strip()
@@ -2238,58 +2330,92 @@ class RobustStdioSession(ClientSession):
                     try:
                         message = json.loads(line_str)
                         is_valid_rpc = (isinstance(message, dict) and message.get("jsonrpc") == "2.0" and ('id' in message or 'method' in message))
-                        if not is_valid_rpc: log.debug(f"[{self._server_name}] Skipping non-MCP JSON: {line_str[:100]}..."); continue
-                        if not handshake_complete: log.info(f"[{self._server_name}] First valid JSON-RPC detected."); handshake_complete = True
+                        if not is_valid_rpc: 
+                            log.debug(f"[{self._server_name}] Skipping non-MCP JSON: {line_str[:100]}...")
+                            continue
+                        if not handshake_complete: 
+                            log.info(f"[{self._server_name}] First valid JSON-RPC detected.")
+                            handshake_complete = True
                         msg_id = message.get("id")
                         if msg_id is not None:
-                            str_msg_id = str(msg_id); future = self._response_futures.pop(str_msg_id, None)
+                            str_msg_id = str(msg_id)
+                            future = self._response_futures.pop(str_msg_id, None)
                             if future and not future.done():
-                                if "result" in message: log.debug(f"[{self._server_name}] READ/PROC: Resolving future ID {msg_id} with RESULT."); future.set_result(message["result"])
+                                if "result" in message: 
+                                    log.debug(f"[{self._server_name}] READ/PROC: Resolving future ID {msg_id} with RESULT.")
+                                    future.set_result(message["result"])
                                 elif "error" in message:
                                     err_data = message["error"]
                                     err_msg = f"Server error ID {msg_id}: {err_data.get('message', 'Unk')} (Code: {err_data.get('code', 'N/A')})"
                                     if err_data.get('data'): err_msg += f" Data: {repr(err_data.get('data'))[:100]}..."
                                     log.warning(f"[{self._server_name}] READ/PROC: Resolving future ID {msg_id} with ERROR: {err_msg}")
                                     future.set_exception(RuntimeError(err_msg))
-                                else: log.error(f"[{self._server_name}] READ/PROC: Invalid response format ID {msg_id}."); future.set_exception(RuntimeError(f"Invalid response format ID {msg_id}"))
-                            elif future: log.debug(f"[{self._server_name}] READ/PROC: Future for ID {msg_id} already done.")
+                                else: 
+                                    log.error(f"[{self._server_name}] READ/PROC: Invalid response format ID {msg_id}.")
+                                    future.set_exception(RuntimeError(f"Invalid response format ID {msg_id}"))
+                            elif future: 
+                                log.debug(f"[{self._server_name}] READ/PROC: Future for ID {msg_id} already done.")
                             else: log.warning(f"[{self._server_name}] READ/PROC: Received response for unknown/timed-out ID: {msg_id}.")
                         elif "method" in message:
-                             method_name = message['method']; log.debug(f"[{self._server_name}] READ/PROC: Received server message: {method_name}")
-                             # Handle notifications/requests here if needed
-                        else: log.warning(f"[{self._server_name}] READ/PROC: Unknown message structure: {repr(message)}")
+                            method_name = message['method']
+                            log.debug(f"[{self._server_name}] READ/PROC: Received server message: {method_name}")
+                            # Handle notifications/requests here if needed
+                        else: 
+                            log.warning(f"[{self._server_name}] READ/PROC: Unknown message structure: {repr(message)}")
                     except json.JSONDecodeError: log.debug(f"[{self._server_name}] Skipping noisy line: {line_str[:100]}...")
-                    except Exception as proc_err: log.error(f"[{self._server_name}] Error processing line '{line_str[:100]}...': {proc_err}", exc_info=True)
-                except asyncio.TimeoutError: log.debug(f"[{self._server_name}] Outer timeout reading stdout."); continue
-                except (BrokenPipeError, ConnectionResetError): log.warning(f"[{self._server_name}] Stdout pipe broken."); break
+                    except Exception as proc_err: 
+                        log.error(f"[{self._server_name}] Error processing line '{line_str[:100]}...': {proc_err}", exc_info=True)
+                except asyncio.TimeoutError: 
+                    log.debug(f"[{self._server_name}] Outer timeout reading stdout.")
+                    continue
+                except (BrokenPipeError, ConnectionResetError): 
+                    log.warning(f"[{self._server_name}] Stdout pipe broken.")
+                    break
                 except ValueError as e:
-                     if "longer than limit" in str(e) or "too long" in str(e): log.error(f"[{self._server_name}] Buffer limit ({stream_limit}) exceeded!", exc_info=True)
-                     else: log.error(f"[{self._server_name}] ValueError reading stdout: {e}", exc_info=True)
+                     if "longer than limit" in str(e) or "too long" in str(e): 
+                         log.error(f"[{self._server_name}] Buffer limit ({stream_limit}) exceeded!", exc_info=True)
+                     else: 
+                         log.error(f"[{self._server_name}] ValueError reading stdout: {e}", exc_info=True)
                      break
-                except Exception as read_err: log.error(f"[{self._server_name}] Error reading stdout: {read_err}", exc_info=True); break
+                except Exception as read_err: 
+                    log.error(f"[{self._server_name}] Error reading stdout: {read_err}", exc_info=True)
+                    break
             log.info(f"[{self._server_name}] Exiting combined reader/processor loop.")
-        except asyncio.CancelledError: log.info(f"[{self._server_name}] Reader/processor loop cancelled."); raise
-        except Exception as loop_err: log.error(f"[{self._server_name}] Unhandled error in reader/processor loop: {loop_err}", exc_info=True); raise
+        except asyncio.CancelledError: 
+            log.info(f"[{self._server_name}] Reader/processor loop cancelled.")
+            raise
+        except Exception as loop_err: 
+            log.error(f"[{self._server_name}] Unhandled error in reader/processor loop: {loop_err}", exc_info=True)
+            raise
 
     async def _send_request(self, method: str, params: Dict[str, Any], response_timeout: float) -> Any:
         if not self._is_active or (self._process and self._process.returncode is not None): raise ConnectionAbortedError("Session inactive or process terminated")
-        async with self._lock: self._request_id_counter += 1; request_id = str(self._request_id_counter)
+        async with self._lock: 
+            self._request_id_counter += 1
+            request_id = str(self._request_id_counter)
         request = {"jsonrpc": "2.0", "method": method, "params": params, "id": request_id}
-        loop = asyncio.get_running_loop(); future = loop.create_future()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
         self._response_futures[request_id] = future
         try:
-            request_str = json.dumps(request) + '\n'; request_bytes = request_str.encode('utf-8')
+            request_str = json.dumps(request) + '\n'
+            request_bytes = request_str.encode('utf-8')
             log.debug(f"[{self._server_name}] SEND: ID {request_id} ({method}): {request_bytes.decode('utf-8', errors='replace')[:100]}...")
-            if self._stdin is None or self._stdin.is_closing(): raise ConnectionAbortedError("Stdin closed")
-            if USE_VERBOSE_SESSION_LOGGING: log.debug(f"[{self._server_name}] RAW >>> {repr(request_bytes)}")
-            self._stdin.write(request_bytes); await self._stdin.drain()
+            if self._stdin is None or self._stdin.is_closing(): 
+                raise ConnectionAbortedError("Stdin closed")
+            if USE_VERBOSE_SESSION_LOGGING: 
+                log.debug(f"[{self._server_name}] RAW >>> {repr(request_bytes)}")
+            self._stdin.write(request_bytes)
+            await self._stdin.drain()
             if USE_VERBOSE_SESSION_LOGGING: log.info(f"[{self._server_name}] Drain complete for ID {request_id}.")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
-            log.error(f"[{self._server_name}] SEND FAIL ID {request_id}: Pipe broken: {e}"); self._response_futures.pop(request_id, None)
+            log.error(f"[{self._server_name}] SEND FAIL ID {request_id}: Pipe broken: {e}")
+            self._response_futures.pop(request_id, None)
             if not future.done(): future.set_exception(e)
             raise ConnectionAbortedError(f"Conn lost sending ID {request_id}: {e}") from e
         except Exception as e:
-            log.error(f"[{self._server_name}] SEND FAIL ID {request_id}: {e}", exc_info=True); self._response_futures.pop(request_id, None)
+            log.error(f"[{self._server_name}] SEND FAIL ID {request_id}: {e}", exc_info=True)
+            self._response_futures.pop(request_id, None)
             if not future.done(): future.set_exception(e)
             raise RuntimeError(f"Failed to send ID {request_id}: {e}") from e
         try:
@@ -2298,54 +2424,88 @@ class RobustStdioSession(ClientSession):
             log.debug(f"[{self._server_name}] WAIT: Future resolved for ID {request_id}. Result received.")
             return result
         except asyncio.TimeoutError as timeout_error:
-            log.error(f"[{self._server_name}] WAIT: Timeout waiting for future ID {request_id} ({method})"); self._response_futures.pop(request_id, None)
+            log.error(f"[{self._server_name}] WAIT: Timeout waiting for future ID {request_id} ({method})")
+            self._response_futures.pop(request_id, None)
             raise RuntimeError(f"Timeout waiting response {method} ID {request_id}") from timeout_error
-        except asyncio.CancelledError: log.debug(f"[{self._server_name}] WAIT: Wait cancelled ID {request_id} ({method})."); self._response_futures.pop(request_id, None); raise
+        except asyncio.CancelledError: 
+            log.debug(f"[{self._server_name}] WAIT: Wait cancelled ID {request_id} ({method}).")
+            self._response_futures.pop(request_id, None)
+            raise
         except Exception as wait_err:
-             if future.done() and future.exception(): server_error = future.exception(); log.warning(f"[{self._server_name}] WAIT: Future ID {request_id} failed server error: {server_error}"); raise server_error from wait_err
-             else: log.error(f"[{self._server_name}] WAIT: Error waiting future ID {request_id}: {wait_err}", exc_info=True); self._response_futures.pop(request_id, None); raise RuntimeError(f"Error processing response {method} ID {request_id}: {wait_err}") from wait_err
+            if future.done() and future.exception(): 
+                server_error = future.exception()
+                log.warning(f"[{self._server_name}] WAIT: Future ID {request_id} failed server error: {server_error}")
+                raise server_error from wait_err
+            else: 
+                log.error(f"[{self._server_name}] WAIT: Error waiting future ID {request_id}: {wait_err}", exc_info=True)
+                self._response_futures.pop(request_id, None)
+                raise RuntimeError(f"Error processing response {method} ID {request_id}: {wait_err}") from wait_err
 
     # MCP Method implementations (rely on _send_request)
     async def list_tools(self, response_timeout: float = 40.0) -> ListToolsResult:
-        log.debug(f"[{self._server_name}] Calling list_tools"); result = await self._send_request("tools/list", {}, response_timeout); return ListToolsResult(**result)
+        log.debug(f"[{self._server_name}] Calling list_tools")
+        result = await self._send_request("tools/list", {}, response_timeout)
+        return ListToolsResult(**result)
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any], response_timeout: float = 250.0) -> CallToolResult:
-        log.debug(f"[{self._server_name}] Calling call_tool: {tool_name}"); params = {"name": tool_name, "arguments": arguments}; result = await self._send_request("tools/call", params, response_timeout); return CallToolResult(**result)
+        log.debug(f"[{self._server_name}] Calling call_tool: {tool_name}")
+        params = {"name": tool_name, "arguments": arguments}
+        result = await self._send_request("tools/call", params, response_timeout)
+        return CallToolResult(**result)
     async def list_resources(self, response_timeout: float = 40.0) -> ListResourcesResult:
-        log.debug(f"[{self._server_name}] Calling list_resources"); result = await self._send_request("resources/list", {}, response_timeout); return ListResourcesResult(**result)
+        log.debug(f"[{self._server_name}] Calling list_resources")
+        result = await self._send_request("resources/list", {}, response_timeout)
+        return ListResourcesResult(**result)
     async def read_resource(self, uri: AnyUrl, response_timeout: float = 30.0) -> ReadResourceResult:
-        log.debug(f"[{self._server_name}] Calling read_resource: {uri}"); params = {"uri": str(uri)}; result = await self._send_request("resources/read", params, response_timeout); return ReadResourceResult(**result)
+        log.debug(f"[{self._server_name}] Calling read_resource: {uri}")
+        params = {"uri": str(uri)}
+        result = await self._send_request("resources/read", params, response_timeout)
+        return ReadResourceResult(**result)
     async def list_prompts(self, response_timeout: float = 40.0) -> ListPromptsResult:
-        log.debug(f"[{self._server_name}] Calling list_prompts"); result = await self._send_request("prompts/list", {}, response_timeout); return ListPromptsResult(**result)
+        log.debug(f"[{self._server_name}] Calling list_prompts")
+        result = await self._send_request("prompts/list", {}, response_timeout)
+        return ListPromptsResult(**result)
     async def get_prompt(self, prompt_name: str, variables: Dict[str, Any], response_timeout: float = 30.0) -> GetPromptResult:
-        log.debug(f"[{self._server_name}] Calling get_prompt: {prompt_name}"); params = {"name": prompt_name, "arguments": variables}; result = await self._send_request("prompts/get", params, response_timeout); return GetPromptResult(**result)
+        log.debug(f"[{self._server_name}] Calling get_prompt: {prompt_name}")
+        params = {"name": prompt_name, "arguments": variables}
+        result = await self._send_request("prompts/get", params, response_timeout)
+        return GetPromptResult(**result)
 
     async def _close_internal_state(self, exception: Exception):
-        if not self._is_active: return; self._is_active = False
+        if not self._is_active: return
+        self._is_active = False
         log.debug(f"[{self._server_name}] Closing internal state due to: {exception}")
         await self._cancel_pending_futures(exception)
 
     async def _cancel_pending_futures(self, exception: Exception):
         log.debug(f"[{self._server_name}] Cancelling {len(self._response_futures)} pending futures with: {exception}")
-        futures_to_cancel = list(self._response_futures.items()); self._response_futures.clear()
+        futures_to_cancel = list(self._response_futures.items())
+        self._response_futures.clear()
         for _, future in futures_to_cancel:
             if future and not future.done(): await suppress(asyncio.InvalidStateError)(future.set_exception(exception))
 
     async def aclose(self):
         log.info(f"[{self._server_name}] Closing RobustStdioSession...")
-        if not self._is_active: log.debug(f"[{self._server_name}] Already closed."); return
+        if not self._is_active: 
+            log.debug(f"[{self._server_name}] Already closed.")
+            return
         await self._close_internal_state(ConnectionAbortedError("Session closed by client"))
         if self._background_task_runner and not self._background_task_runner.done():
-            log.debug(f"[{self._server_name}] Cancelling reader task..."); self._background_task_runner.cancel()
+            log.debug(f"[{self._server_name}] Cancelling reader task...")
+            self._background_task_runner.cancel()
             await suppress(asyncio.CancelledError)(self._background_task_runner)
         if self._stderr_reader_task and not self._stderr_reader_task.done():
-             log.debug(f"[{self._server_name}] Cancelling stderr task..."); self._stderr_reader_task.cancel()
-             await suppress(asyncio.CancelledError)(self._stderr_reader_task)
+            log.debug(f"[{self._server_name}] Cancelling stderr task...")
+            self._stderr_reader_task.cancel()
+            await suppress(asyncio.CancelledError)(self._stderr_reader_task)
         if self._process and self._process.returncode is None:
             log.info(f"[{self._server_name}] Terminating process PID {self._process.pid} during aclose...")
             try:
-                self._process.terminate(); await asyncio.wait_for(self._process.wait(), timeout=2.0)
+                self._process.terminate()
+                await asyncio.wait_for(self._process.wait(), timeout=2.0)
                 if self._process.returncode is None:
-                    log.debug(f"[{self._server_name}] Killing process"); self._process.kill(); await asyncio.wait_for(self._process.wait(), timeout=1.0)
+                    log.debug(f"[{self._server_name}] Killing process")
+                    self._process.kill()
+                    await asyncio.wait_for(self._process.wait(), timeout=1.0)
             except ProcessLookupError: pass
             except Exception as e: log.error(f"Terminate/kill error: {e}")
         log.info(f"[{self._server_name}] RobustStdioSession closed.")
@@ -3204,7 +3364,8 @@ class ServerManager:
             try:
                 if not hasattr(item, 'name') or not isinstance(item.name, str) or not item.name:
                     log.warning(f"[{server_name}] Skipping {item_type_name} item lacking valid 'name': {item}")
-                    items_skipped += 1; continue
+                    items_skipped += 1
+                    continue
 
                 # Specific checks (example for Tool)
                 correct_input_schema = None
@@ -3212,7 +3373,8 @@ class ServerManager:
                     schema = getattr(item, 'inputSchema', getattr(item, 'input_schema', None))
                     if schema is None or not isinstance(schema, dict):
                         log.warning(f"[{server_name}] Skipping tool '{item.name}' lacking valid schema. Item data: {item}")
-                        items_skipped += 1; continue
+                        items_skipped += 1
+                        continue
                     correct_input_schema = schema
 
                 # Construct name and create instance
@@ -3222,9 +3384,15 @@ class ServerManager:
                     "server_name": server_name,
                 }
                 # Add type-specific data
-                if item_class is MCPTool: instance_data["input_schema"] = correct_input_schema; instance_data["original_tool"] = item
-                elif item_class is MCPResource: instance_data["template"] = getattr(item, 'uri', ''); instance_data["original_resource"] = item
-                elif item_class is MCPPrompt: instance_data["template"] = f"Prompt: {item.name}"; instance_data["original_prompt"] = item # Placeholder/Adapt
+                if item_class is MCPTool:
+                    instance_data["input_schema"] = correct_input_schema
+                    instance_data["original_tool"] = item
+                elif item_class is MCPResource:
+                    instance_data["template"] = getattr(item, 'uri', '')
+                    instance_data["original_resource"] = item
+                elif item_class is MCPPrompt:
+                    instance_data["template"] = f"Prompt: {item.name}"
+                    instance_data["original_prompt"] = item # Placeholder/Adapt
 
                 target_dict[item_name_full] = item_class(**instance_data)
                 items_added += 1
@@ -4172,7 +4340,10 @@ class MCPClient:
             # Print servers
             if self.config.servers:
                  server_table = Table(box=box.ROUNDED, title="Servers (from config.yaml)")
-                 server_table.add_column("Name"); server_table.add_column("Type"); server_table.add_column("Path/URL"); server_table.add_column("Enabled")
+                 server_table.add_column("Name")
+                 server_table.add_column("Type")
+                 server_table.add_column("Path/URL")
+                 server_table.add_column("Enabled")
                  for name, server in self.config.servers.items():
                       server_table.add_row(name, server.type.value, server.path, str(server.enabled))
                  safe_console.print(server_table)
@@ -4182,7 +4353,8 @@ class MCPClient:
             # Print TTL mapping
             if self.config.cache_ttl_mapping:
                  ttl_table = Table(box=box.ROUNDED, title="Cache TTLs (from config.yaml)")
-                 ttl_table.add_column("Tool Category/Name"); ttl_table.add_column("TTL (seconds)")
+                 ttl_table.add_column("Tool Category/Name")
+                 ttl_table.add_column("TTL (seconds)")
                  for name, ttl in self.config.cache_ttl_mapping.items(): ttl_table.add_row(name, str(ttl))
                  safe_console.print(ttl_table)
             else:
@@ -4233,13 +4405,15 @@ class MCPClient:
         elif subcmd == "api-key":
             key_parts = subargs.split(maxsplit=1)
             if len(key_parts) != 2:
-                safe_console.print("[yellow]Usage: /config api-key <provider> <api_key>[/]"); return
+                safe_console.print("[yellow]Usage: /config api-key <provider> <api_key>[/]")
+                return
             provider_str, key_value = key_parts[0].lower(), key_parts[1]
             try:
                 provider = Provider(provider_str)
                 attr_name = PROVIDER_CONFIG_KEY_ATTR_MAP.get(provider.value)
                 if attr_name:
-                    setattr(self.config, attr_name, key_value); config_changed = True
+                    setattr(self.config, attr_name, key_value)
+                    config_changed = True
                     safe_console.print(f"[green]API key set for {provider.value} (will save to config.yaml).[/]")
                     await self._reinitialize_provider_clients(providers=[provider.value])
                 else: safe_console.print(f"[red]Invalid provider for API key: {provider_str}[/]")
@@ -4248,37 +4422,54 @@ class MCPClient:
         elif subcmd == "base-url":
             url_parts = subargs.split(maxsplit=1)
             if len(url_parts) != 2:
-                safe_console.print("[yellow]Usage: /config base-url <provider> <url>[/]"); return
+                safe_console.print("[yellow]Usage: /config base-url <provider> <url>[/]")
+                return
             provider_str, url_value = url_parts[0].lower(), url_parts[1]
             try:
                 provider = Provider(provider_str)
                 attr_name = PROVIDER_CONFIG_URL_ATTR_MAP.get(provider.value)
                 if attr_name:
-                    setattr(self.config, attr_name, url_value); config_changed = True
+                    setattr(self.config, attr_name, url_value)
+                    config_changed = True
                     safe_console.print(f"[green]Base URL set for {provider.value} (will save to config.yaml).[/]")
                     await self._reinitialize_provider_clients(providers=[provider.value])
                 else: safe_console.print(f"[red]Base URL config not supported/invalid provider: {provider_str}[/]")
             except ValueError: safe_console.print(f"[red]Invalid provider: {provider_str}[/]")
 
         elif subcmd == "model":
-             if not subargs: safe_console.print("[yellow]Usage: /config model <model_name>[/]"); return
-             self.config.default_model = subargs; self.current_model = subargs
-             config_changed = True; safe_console.print(f"[green]Default model set to: {subargs}[/]")
+             if not subargs:
+                 safe_console.print("[yellow]Usage: /config model <model_name>[/]")
+                 return
+             self.config.default_model = subargs
+             self.current_model = subargs
+             config_changed = True
+             safe_console.print(f"[green]Default model set to: {subargs}[/]")
         elif subcmd == "max-tokens":
-             try: self.config.default_max_tokens = int(subargs); config_changed = True; safe_console.print(f"[green]Default max tokens set to: {subargs}[/]")
-             except (ValueError, TypeError): safe_console.print("[yellow]Usage: /config max-tokens <number>[/]")
+             try:
+                 self.config.default_max_tokens = int(subargs)
+                 config_changed = True
+                 safe_console.print(f"[green]Default max tokens set to: {subargs}[/]")
+             except (ValueError, TypeError):
+                 safe_console.print("[yellow]Usage: /config max-tokens <number>[/]")
         elif subcmd == "history-size":
              try:
                  new_size = int(subargs)
                  if new_size <= 0: raise ValueError("Must be positive")
-                 self.config.history_size = new_size; self.history = History(max_entries=new_size) # Recreate history
-                 config_changed = True; safe_console.print(f"[green]History size set to: {new_size}[/]")
-             except (ValueError, TypeError): safe_console.print("[yellow]Usage: /config history-size <positive_number>[/]")
+                 self.config.history_size = new_size
+                 self.history = History(max_entries=new_size) # Recreate history
+                 config_changed = True
+                 safe_console.print(f"[green]History size set to: {new_size}[/]")
+             except (ValueError, TypeError):
+                 safe_console.print("[yellow]Usage: /config history-size <positive_number>[/]")
         elif subcmd == "temperature":
              try:
                  temp = float(subargs)
-                 if 0.0 <= temp <= 2.0: self.config.temperature = temp; config_changed = True; safe_console.print(f"[green]Temperature set to: {temp}[/]")
-                 else: safe_console.print("[red]Temperature must be between 0.0 and 2.0[/]")
+                 if 0.0 <= temp <= 2.0:
+                     self.config.temperature = temp
+                     config_changed = True
+                     safe_console.print(f"[green]Temperature set to: {temp}[/]")
+                 else:
+                     safe_console.print("[red]Temperature must be between 0.0 and 2.0[/]")
              except (ValueError, TypeError): safe_console.print("[yellow]Usage: /config temperature <number_between_0_and_2>[/]")
 
         # Boolean Flags (using helper)
@@ -4292,7 +4483,9 @@ class MCPClient:
                          attr_to_set = attr_name
                          break
              if attr_to_set:
-                 if not subargs: safe_console.print(f"Current {attr_to_set}: {getattr(self.config, attr_to_set)}"); return
+                 if not subargs:
+                     safe_console.print(f"Current {attr_to_set}: {getattr(self.config, attr_to_set)}")
+                     return
                  config_changed = self._set_bool_config(attr_to_set, subargs)
              else:
                  safe_console.print(f"[red]Internal error finding boolean attribute for command '{subcmd}'[/]") # Should not happen
@@ -4356,7 +4549,9 @@ class MCPClient:
         config_changed = False
 
         if action == "enable":
-            if not value: safe_console.print("[yellow]Usage: /config port-scan enable [true|false][/]"); return False
+            if not value:
+                safe_console.print("[yellow]Usage: /config port-scan enable [true|false][/]")
+                return False
             config_changed = self._set_bool_config("enable_port_scanning", value)
         elif action == "range":
             range_parts = value.split()
@@ -4381,15 +4576,21 @@ class MCPClient:
         elif action == "concurrency":
             try:
                 val = int(value)
-                if self.config.port_scan_concurrency != val: self.config.port_scan_concurrency = val; config_changed = True
+                if self.config.port_scan_concurrency != val:
+                    self.config.port_scan_concurrency = val
+                    config_changed = True
                 safe_console.print(f"[green]Port scan concurrency set to: {val}[/]")
-            except (ValueError, TypeError): safe_console.print("[yellow]Usage: /config port-scan concurrency <number>[/]")
+            except (ValueError, TypeError):
+                safe_console.print("[yellow]Usage: /config port-scan concurrency <number>[/]")
         elif action == "timeout":
             try:
                 val = float(value)
-                if self.config.port_scan_timeout != val: self.config.port_scan_timeout = val; config_changed = True
+                if self.config.port_scan_timeout != val:
+                    self.config.port_scan_timeout = val
+                    config_changed = True
                 safe_console.print(f"[green]Port scan timeout set to: {val}s[/]")
-            except (ValueError, TypeError): safe_console.print("[yellow]Usage: /config port-scan timeout <seconds>[/]")
+            except (ValueError, TypeError):
+                safe_console.print("[yellow]Usage: /config port-scan timeout <seconds>[/]")
         elif action == "show":
              safe_console.print("\n[bold]Port Scanning Settings:[/]")
              safe_console.print(f"  Enabled: {'Yes' if self.config.enable_port_scanning else 'No'}")
@@ -4415,11 +4616,15 @@ class MCPClient:
 
         if action == "add" and path:
             if path not in current_paths:
-                current_paths.append(path); config_changed = True; safe_console.print(f"[green]Added discovery path: {path}[/]")
+                current_paths.append(path)
+                config_changed = True
+                safe_console.print(f"[green]Added discovery path: {path}[/]")
             else: safe_console.print(f"[yellow]Path already exists: {path}[/]")
         elif action == "remove" and path:
             if path in current_paths:
-                current_paths.remove(path); config_changed = True; safe_console.print(f"[green]Removed discovery path: {path}[/]")
+                current_paths.remove(path)
+                config_changed = True
+                safe_console.print(f"[green]Removed discovery path: {path}[/]")
             else: safe_console.print(f"[yellow]Path not found: {path}[/]")
         elif action == "list":
             safe_console.print("\n[bold]Discovery Paths:[/]")
@@ -4446,11 +4651,15 @@ class MCPClient:
 
         if action == "add" and url:
             if url not in current_urls:
-                current_urls.append(url); config_changed = True; safe_console.print(f"[green]Added registry URL: {url}[/]")
+                current_urls.append(url)
+                config_changed = True
+                safe_console.print(f"[green]Added registry URL: {url}[/]")
             else: safe_console.print(f"[yellow]URL already exists: {url}[/]")
         elif action == "remove" and url:
             if url in current_urls:
-                current_urls.remove(url); config_changed = True; safe_console.print(f"[green]Removed registry URL: {url}[/]")
+                current_urls.remove(url)
+                config_changed = True
+                safe_console.print(f"[green]Removed registry URL: {url}[/]")
             else: safe_console.print(f"[yellow]URL not found: {url}[/]")
         elif action == "list":
              safe_console.print("\n[bold]Registry URLs:[/]")
@@ -4499,8 +4708,11 @@ class MCPClient:
         elif action == "list":
              safe_console.print("\n[bold]Custom Cache TTLs (from config.yaml):[/]")
              if self.config.cache_ttl_mapping:
-                 ttl_table = Table(box=box.ROUNDED); ttl_table.add_column("Tool Category/Name"); ttl_table.add_column("TTL (seconds)")
-                 for name, ttl in self.config.cache_ttl_mapping.items(): ttl_table.add_row(name, str(ttl))
+                 ttl_table = Table(box=box.ROUNDED)
+                 ttl_table.add_column("Tool Category/Name")
+                 ttl_table.add_column("TTL (seconds)")
+                 for name, ttl in self.config.cache_ttl_mapping.items():
+                     ttl_table.add_row(name, str(ttl))
                  safe_console.print(ttl_table)
              else: safe_console.print("  [dim]No custom TTLs defined.[/]")
         else: safe_console.print("[yellow]Usage: /config cache-ttl [set|remove|list] [PARAMS...][/]")
@@ -5527,8 +5739,13 @@ class MCPClient:
                 return
 
             node = self.conversation_graph.get_node(node_id)
-            if not node: safe_console.print(f"[red]Node ID '{node_id}' not found.[/]"); return
-            if node.id == "root": safe_console.print("[red]Cannot rename the root node.[/]"); return
+            if not node:
+                safe_console.print(f"[red]Node ID '{node_id}' not found.[/]")
+                return
+
+            if node.id == "root":
+                safe_console.print("[red]Cannot rename the root node.[/]")
+                return
 
             old_name = node.name
             node.name = new_name
@@ -5538,12 +5755,22 @@ class MCPClient:
 
         elif subcmd == "delete":
             node_id = subargs
-            if not node_id: safe_console.print("[yellow]Usage: /branch delete NODE_ID[/]"); return
+            if not node_id:
+                safe_console.print("[yellow]Usage: /branch delete NODE_ID[/]")
+                return
 
             node_to_delete = self.conversation_graph.get_node(node_id)
-            if not node_to_delete: safe_console.print(f"[red]Node ID '{node_id}' not found.[/]"); return
-            if node_to_delete.id == "root": safe_console.print("[red]Cannot delete the root node.[/]"); return
-            if node_to_delete.id == self.conversation_graph.current_node.id: safe_console.print("[red]Cannot delete the current branch. Checkout another branch first.[/]"); return
+            if not node_to_delete:
+                safe_console.print(f"[red]Node ID '{node_id}' not found.[/]")
+                return
+
+            if node_to_delete.id == "root":
+                safe_console.print("[red]Cannot delete the root node.[/]")
+                return
+
+            if node_to_delete.id == self.conversation_graph.current_node.id:
+                safe_console.print("[red]Cannot delete the current branch. Checkout another branch first.[/]")
+                return
 
             # Find parent and remove child reference
             parent = node_to_delete.parent
@@ -5592,9 +5819,11 @@ class MCPClient:
         while i < len(parsed_args):
             arg = parsed_args[i]
             if arg in ["--id", "-i"] and i + 1 < len(parsed_args):
-                conversation_id = parsed_args[i+1]; i += 1
+                conversation_id = parsed_args[i+1]
+                i += 1
             elif arg in ["--output", "-o"] and i + 1 < len(parsed_args):
-                output_path = parsed_args[i+1]; i += 1
+                output_path = parsed_args[i+1]
+                i += 1
             else:
                 safe_console.print(f"[red]Unknown argument: {arg}[/]")
                 safe_console.print("[yellow]Usage: /export [--id CONVERSATION_ID] [--output /path/to/file.json][/]")
@@ -5705,7 +5934,7 @@ class MCPClient:
     async def cmd_optimize(self, args: str):
         """Optimize conversation context via summarization."""
         safe_console = get_safe_console()
-        # Parse arguments for custom model or target length using shlex
+        # (Keep argument parsing logic as is)
         try:
             parsed_args = shlex.split(args)
         except ValueError as e:
@@ -5719,24 +5948,35 @@ class MCPClient:
         while i < len(parsed_args):
             arg = parsed_args[i]
             if arg in ["--model", "-m"] and i + 1 < len(parsed_args):
-                custom_model = parsed_args[i+1]; i += 1
+                custom_model = parsed_args[i+1]
+                i += 1
             elif arg in ["--tokens", "-t"] and i + 1 < len(parsed_args):
-                try: target_length = int(parsed_args[i+1]); i += 1
-                except ValueError: safe_console.print(f"[red]Invalid token count: {parsed_args[i+1]}[/]"); return
-            else: safe_console.print(f"[red]Unknown argument: {arg}[/]"); return
+                try:
+                    target_length = int(parsed_args[i+1])
+                    i += 1
+                except ValueError:
+                    safe_console.print(f"[red]Invalid token count: {parsed_args[i+1]}[/]")
+                    return
+            else:
+                safe_console.print(f"[red]Unknown argument: {arg}[/]")
+                return
             i += 1
 
         initial_tokens = await self.count_tokens()
         log.info(f"Optimization requested. Initial tokens: {initial_tokens}. Target: ~{target_length}")
 
-        with Status(f"{EMOJI_MAP['processing']} Optimizing conversation (currently {initial_tokens} tokens)...", console=safe_console) as status:
+        with Status(f"{EMOJI_MAP['processing']} Optimizing conversation (currently {initial_tokens:,} tokens)...", console=safe_console) as status:
             try:
-                # Use the dedicated summarization method
-                summary = await self.summarize_conversation(target_tokens=target_length, model=custom_model)
+                # --- CALL THE REFACTORED METHOD ---
+                summary = await self.summarize_conversation(
+                    target_tokens=target_length,
+                    model=custom_model
+                )
+                # --- END CALL ---
 
                 if summary is None:
                     status.stop()
-                    safe_console.print(f"[red]{EMOJI_MAP['error']} Summarization failed.[/]")
+                    safe_console.print(f"[red]{EMOJI_MAP['error']} Summarization failed (LLM call returned no content or errored).[/]")
                     return
 
                 # Apply the summary
@@ -5753,7 +5993,7 @@ class MCPClient:
 
             except Exception as e:
                 status.stop()
-                log.error("Error during conversation optimization", exc_info=True)
+                log.error("Error during conversation optimization command", exc_info=True)
                 safe_console.print(f"[red]{EMOJI_MAP['error']} Optimization failed: {e}[/]")
 
     async def cmd_apply_prompt(self, args: str): # Renamed from cmd_prompt for clarity
@@ -5837,10 +6077,17 @@ class MCPClient:
         @functools.wraps(func)
         async def wrapper(self, *args, **kwargs):
             tool_name = kwargs.get("tool_name", args[1] if len(args) > 1 else "unknown")
-            try: return await func(self, *args, **kwargs)
-            except McpError as e: log.error(f"MCP error exec {tool_name}: {e}"); raise RuntimeError(f"MCP error: {e}") from e
-            except httpx.RequestError as e: log.error(f"Net error exec {tool_name}: {e}"); raise RuntimeError(f"Network error: {e}") from e
-            except Exception as e: log.error(f"Unexpected error exec {tool_name}: {e}"); raise RuntimeError(f"Unexpected error: {e}") from e
+            try: 
+                return await func(self, *args, **kwargs)
+            except McpError as e:
+                log.error(f"MCP error exec {tool_name}: {e}")
+                raise RuntimeError(f"MCP error: {e}") from e
+            except httpx.RequestError as e:
+                log.error(f"Net error exec {tool_name}: {e}")
+                raise RuntimeError(f"Network error: {e}") from e
+            except Exception as e:
+                log.error(f"Unexpected error exec {tool_name}: {e}")
+                raise RuntimeError(f"Unexpected error: {e}") from e
         return wrapper
 
     @staticmethod
@@ -6657,74 +6904,167 @@ class MCPClient:
 
         return success
 
+    async def _execute_llm_call_no_history(
+        self,
+        messages: InternalMessageList,
+        model: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None
+    ) -> Optional[str]:
+        """
+        Executes a non-streaming LLM call for internal purposes (like summarization)
+        without updating the main conversation graph or history.
+
+        Args:
+            messages: The list of messages in InternalMessage format to send.
+            model: The specific model name to use.
+            max_tokens: Maximum tokens for the response.
+            temperature: Temperature for the generation.
+
+        Returns:
+            The generated text content as a string, or None if the call fails.
+        """
+        provider_name = self.get_provider_from_model(model)
+        if not provider_name:
+            log.error(f"Cannot execute internal call: Unknown provider for model '{model}'")
+            return None
+
+        provider_client = getattr(self, f"{provider_name}_client", None)
+        if provider_name == Provider.ANTHROPIC.value and not provider_client:
+            provider_client = self.anthropic # Special case for anthropic client attribute name
+        if not provider_client:
+            log.error(f"Cannot execute internal call: Client not initialized for provider '{provider_name}'")
+            return None
+
+        max_tokens_to_use = max_tokens or self.config.default_max_tokens
+        temperature_to_use = temperature if temperature is not None else self.config.temperature
+
+        log.info(f"Executing internal LLM call (no history): Model='{model}', Provider='{provider_name}'")
+
+        # Format messages for the specific provider
+        formatted_messages, system_prompt, _ = self._format_messages_for_provider(
+            messages, provider_name, model
+        )
+
+        try:
+            response_text: Optional[str] = None
+
+            # --- Provider-Specific Non-Streaming Call ---
+            if provider_name == Provider.ANTHROPIC.value:
+                response = await cast('AsyncAnthropic', provider_client).messages.create(
+                    model=model,
+                    messages=formatted_messages, # type: ignore # Pydantic v2 compat
+                    system=system_prompt, # type: ignore # Pydantic v2 compat
+                    max_tokens=max_tokens_to_use,
+                    temperature=temperature_to_use,
+                )
+                # Extract text content (Anthropic usually returns content blocks)
+                if response.content and isinstance(response.content, list):
+                    text_parts = [block.text for block in response.content if block.type == 'text']
+                    response_text = "\n".join(text_parts).strip()
+                elif isinstance(response.content, str): # Should not happen based on API, but handle
+                    response_text = response.content
+
+            elif provider_name in [
+                Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
+                Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value, Provider.GEMINI.value
+            ]:
+                response = await cast('AsyncOpenAI', provider_client).chat.completions.create(
+                    model=model,
+                    messages=formatted_messages, # type: ignore # Pydantic v2 compat
+                    max_tokens=max_tokens_to_use,
+                    temperature=temperature_to_use,
+                    stream=False, # Explicitly non-streaming
+                    # tools=None, tool_choice=None # No tools needed for internal call
+                )
+                if response.choices and response.choices[0].message:
+                    response_text = response.choices[0].message.content
+
+            else:
+                log.error(f"Internal call not implemented for provider: {provider_name}")
+                return None
+
+            # --- Log completion and return ---
+            log.info(f"Internal LLM call completed. Response length: {len(response_text or '')} chars.")
+            return response_text.strip() if response_text else None
+
+        # --- Error Handling ---
+        except (anthropic.APIConnectionError, openai.APIConnectionError) as e:
+            log.error(f"Internal Call Connection Error ({provider_name}): {e}")
+        except (anthropic.AuthenticationError, openai.AuthenticationError):
+            log.error(f"Internal Call Authentication Error ({provider_name}). Check API Key.")
+        except (anthropic.RateLimitError, openai.RateLimitError):
+            log.warning(f"Internal Call Rate Limit Exceeded ({provider_name}).")
+        except (anthropic.APIError, openai.APIError) as e:
+            log.error(f"Internal Call API Error ({provider_name}): {e}", exc_info=True)
+        except Exception as e:
+            log.error(f"Unexpected error during internal LLM call ({provider_name}): {e}", exc_info=True)
+
+        return None # Return None on any failure        
+
+# Inside class MCPClient:
+
     async def summarize_conversation(self, target_tokens: Optional[int] = None, model: Optional[str] = None) -> Optional[str]:
         """
-        Generates a summary of the current conversation branch.
+        Generates a summary of the current conversation branch *without* modifying history.
 
         Args:
             target_tokens: Approximate target token length for the summary.
-            model: The model to use for summarization.
+            model: The model to use for summarization. Falls back to config default if None.
 
         Returns:
             The generated summary string, or None if summarization failed.
         """
         summarization_model = model or self.config.summarization_model
         target_length = target_tokens or self.config.max_summarized_tokens
-        current_messages = self.conversation_graph.current_node.messages
+        # Use the messages from the *current* node for context
+        current_messages_to_summarize = self.conversation_graph.current_node.messages
 
-        if not current_messages:
+        if not current_messages_to_summarize:
             log.info("Cannot summarize empty conversation.")
-            return "Conversation is empty."
+            # Return specific string or None based on desired behavior for empty history
+            return "Current conversation branch is empty."
 
-        log.info(f"Generating summary using {summarization_model} (target: ~{target_length} tokens)...")
+        log.info(f"Generating summary using {summarization_model} (target: ~{target_length} tokens) without history update...")
 
-        # Create the prompt for the summarization model
-        # Include context about the goal of the summary
-        prompt_text = (
+        # --- Create the Summarization Prompt ---
+        # Combine a system-like instruction with the actual history
+        summarization_prompt = (
             "You are an expert summarizer. Please summarize the following conversation history. "
             "Focus on preserving key facts, decisions, action items, important code snippets, "
             "numerical values, and the overall context needed to continue the conversation effectively. "
             "Be concise but comprehensive."
-            f" Aim for a summary that is roughly {target_length} tokens long.\n\n"
-            "CONVERSATION HISTORY:\n---\n"
+            f" Aim for a summary that is roughly {target_length} tokens long."
+            # "CONVERSATION HISTORY:" # Removed this header, just send messages
         )
 
-        # Append a string representation of the history
-        # This simplistic approach might lose some nuance compared to sending structured messages
-        history_text_parts = []
-        for msg in current_messages:
-            role = msg.get("role", "unknown")
-            content_str = self._extract_text_from_internal_content(msg.get("content"))
-            history_text_parts.append(f"{role.upper()}: {content_str}")
-        prompt_text += "\n\n".join(history_text_parts)
-        prompt_text += "\n---\nSUMMARY:"
+        # Prepare the message list for the internal call:
+        # System prompt + Current History
+        messages_for_summary_call: InternalMessageList = [
+            InternalMessage(role="system", content=summarization_prompt)
+        ]
+        messages_for_summary_call.extend(current_messages_to_summarize)
 
+        # --- Call the new internal helper ---
         try:
-            # Use process_query (non-streaming version needed) or adapt streaming
-            # --- Adaptation: Simulate non-streaming call ---
-            summary_result = ""
-            # Use a temporary message list if process_streaming_query modifies history
-            temp_summary_query_message = InternalMessage(role="user", content=prompt_text) # noqa: F841
+            # Execute the call without side effects
+            summary_text = await self._execute_llm_call_no_history(
+                messages=messages_for_summary_call,
+                model=summarization_model,
+                max_tokens=target_length + 500, # Allow slightly more tokens for the summary itself
+                temperature=0.5 # Lower temperature might be better for summarization
+            )
 
-            # Call process_streaming_query but consume the generator to get the full result
-            # Note: This assumes process_streaming_query takes a single query string
-            # If it needs a full message list, adapt accordingly.
-            # For this specific task, we might want a dedicated non-streaming call.
-            # Let's assume process_streaming_query works for this simulation:
-            async for chunk in self.process_streaming_query(prompt_text, model=summarization_model):
-                if not chunk.startswith("@@STATUS@@"):
-                    summary_result += chunk
-            # --- End Adaptation ---
-
-            if not summary_result:
-                log.warning("Summarization model returned an empty response.")
-                return None
-
-            log.info(f"Summarization successful. Summary length: {len(summary_result)} chars.")
-            return summary_result.strip()
+            if summary_text:
+                log.info(f"Summarization successful. Summary length: {len(summary_text)} chars.")
+                return summary_text.strip()
+            else:
+                log.warning("Summarization model returned no content.")
+                return None # Explicitly return None on empty response
 
         except Exception as e:
-            log.error(f"Error during summarization: {e}", exc_info=True)
+            # Error is logged within the helper, just return None here
+            log.error(f"Summarization failed: Error occurred during internal LLM call - {e}", exc_info=False) # Don't need full traceback here again
             return None
 
     def _format_messages_for_provider(
@@ -7126,17 +7466,7 @@ class MCPClient:
     ) -> Tuple[Optional[AsyncOpenAI], str]:
         """
         Initializes and validates an AsyncOpenAI client for a compatible provider.
-
-        Args:
-            provider_name: The canonical name of the provider (e.g., "openai").
-            api_key_attr: The attribute name in self.config for the API key.
-            base_url_attr: The attribute name in self.config for the base URL.
-            default_base_url: The default base URL if not found in config.
-            client_attr: The attribute name on self to store the client instance.
-            emoji_key: The key for the provider's emoji in EMOJI_MAP.
-
-        Returns:
-            A tuple containing the initialized client (or None if failed) and a status message string.
+        (Enhanced Error Handling)
         """
         status_emoji = EMOJI_MAP.get(emoji_key, EMOJI_MAP['provider'])
         provider_title = provider_name.capitalize()
@@ -7145,42 +7475,72 @@ class MCPClient:
         if not api_key:
             return None, f"{status_emoji} {provider_title}: [yellow]No Key[/]"
 
+        client_instance = None # Initialize to None
         try:
-            # Determine base URL: Use config value if present, otherwise use default
             base_url = getattr(self.config, base_url_attr, None) or default_base_url
-            if not base_url:
-                 # Should not happen if default_base_url is provided for relevant providers
-                 log.warning(f"No base URL configured or defaulted for {provider_title}. Using OpenAI default.")
-                 base_url = None # Let AsyncOpenAI use its default
+            if not base_url and provider_name != Provider.OPENAI.value: # OpenAI default is handled by SDK
+                 log.warning(f"No base URL found for {provider_title}.")
+                 # Allow SDK default ONLY for openai, fail others? Or use known defaults?
+                 # Sticking with explicit defaults where possible.
+                 # If default_base_url was None here, it's an issue.
+                 if default_base_url is None:
+                      raise ValueError(f"Default base URL is missing for {provider_title}")
+
 
             log.debug(f"Initializing {provider_title} client. Key: ***{api_key[-4:]}, Base URL: {base_url}")
-            # Initialize client
             client_instance = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-            # Lightweight validation check
-            await client_instance.models.list()
+            # Lightweight validation check (e.g., list models)
+            log.debug(f"Validating {provider_title} client by listing models...")
+            await client_instance.models.list() # Raises errors on failure
+            log.info(f"{provider_title} client initialized and validated successfully.")
 
-            # Store client on self using the provided attribute name
             setattr(self, client_attr, client_instance)
-            log.info(f"{provider_title} client initialized successfully.")
             return client_instance, f"{status_emoji} {provider_title}: [green]OK[/]"
 
+        # --- More Specific Error Handling ---
         except OpenAIAuthenticationError:
-            log.error(f"{provider_title} initialization failed: Invalid API Key.")
-            self.safe_print(f"[bold red]{provider_title} Error: Invalid API Key.[/]")
-            setattr(self, client_attr, None) # Ensure client is None on error
-            return None, f"{status_emoji} {provider_title}: [red]Auth Error[/]"
-        except OpenAIAPIConnectionError as e:
-            log.error(f"{provider_title} initialization failed: Connection Error - {e}")
-            self.safe_print(f"[bold red]{provider_title} Error: Connection Failed ({e})[/]")
+            error_msg = f"{provider_title} initialization failed: Invalid API Key."
+            log.error(error_msg)
+            self.safe_print(f"[bold red]{error_msg}[/]")
             setattr(self, client_attr, None)
-            return None, f"{status_emoji} {provider_title}: [red]Connection Error[/]"
-        except Exception as e:
-            log.error(f"Failed {provider_title} init: {e}", exc_info=True)
-            self.safe_print(f"[bold red]{provider_title} Error: Initialization failed ({type(e).__name__})[/]")
+            return None, f"{status_emoji} {provider_title}: [red]Auth Error[/]"
+        except OpenAIAPIConnectionError as e: # Often wraps httpx errors
+            error_msg = f"{provider_title} initialization failed: Connection Error ({e})"
+            log.error(error_msg, exc_info=True) # Include details
+            self.safe_print(f"[bold red]{error_msg}[/]")
+            setattr(self, client_attr, None)
+            return None, f"{status_emoji} {provider_title}: [red]Conn Error[/]"
+        except openai.BadRequestError as e: # e.g., Malformed URL during validation
+            error_msg = f"{provider_title} initialization failed: Bad Request ({e})"
+            log.error(error_msg, exc_info=True)
+            self.safe_print(f"[bold red]{error_msg}[/]")
+            setattr(self, client_attr, None)
+            return None, f"{status_emoji} {provider_title}: [red]Bad Request[/]"
+        except openai.NotFoundError as e: # e.g., Base URL valid but path incorrect
+            error_msg = f"{provider_title} initialization failed: Not Found ({e})"
+            log.error(error_msg, exc_info=True)
+            self.safe_print(f"[bold red]{error_msg}[/]")
+            setattr(self, client_attr, None)
+            return None, f"{status_emoji} {provider_title}: [red]Not Found[/]"
+        except httpx.RequestError as e: # Catch underlying network issues if not wrapped by OpenAI error
+            error_msg = f"{provider_title} initialization failed: Network Error ({e})"
+            log.error(error_msg, exc_info=True)
+            self.safe_print(f"[bold red]{error_msg}[/]")
+            setattr(self, client_attr, None)
+            return None, f"{status_emoji} {provider_title}: [red]Network Err[/]"
+        except ValueError as e: # Catch our manual ValueError for missing default URL
+             error_msg = f"{provider_title} initialization failed: Configuration Error ({e})"
+             log.error(error_msg)
+             self.safe_print(f"[bold red]{error_msg}[/]")
+             setattr(self, client_attr, None)
+             return None, f"{status_emoji} {provider_title}: [red]Config Error[/]"
+        except Exception as e: # Catch-all for unexpected init errors
+            error_msg = f"{provider_title} initialization failed: Unexpected Error ({type(e).__name__})"
+            log.error(error_msg, exc_info=True)
+            self.safe_print(f"[bold red]{error_msg}[/]")
             setattr(self, client_attr, None)
             return None, f"{status_emoji} {provider_title}: [red]Failed[/]"
-    # Inside class MCPClient
 
     async def setup(self, interactive_mode=False):
         """Set up the client, load configs, initialize providers, discover servers."""
@@ -7317,10 +7677,19 @@ class MCPClient:
                     if is_new_graph and self.conversation_graph_file.read_text().strip():
                         self.safe_print("[yellow]Could not parse previous conversation state, starting fresh.[/yellow]")
                         status.update(f"{EMOJI_MAP['warning']} Previous state invalid, starting fresh")
-                    else: log.info(f"Loaded conversation graph from {self.conversation_graph_file}"); status.update(f"{EMOJI_MAP['success']} Conversation state loaded")
-                except Exception as setup_load_err: log.error("Unexpected error during conversation graph loading", exc_info=True); self.safe_print(f"[red]Error loading state: {setup_load_err}[/red]"); status.update(f"{EMOJI_MAP['error']} Error loading state"); self.conversation_graph = ConversationGraph()
-        else: log.info("No existing conversation graph found, using new graph.")
-        if not self.conversation_graph.get_node(self.conversation_graph.current_node.id): log.warning("Current node ID invalid, reset root."); self.conversation_graph.set_current_node("root")
+                    else:
+                        log.info(f"Loaded conversation graph from {self.conversation_graph_file}")
+                        status.update(f"{EMOJI_MAP['success']} Conversation state loaded")
+                except Exception as setup_load_err:
+                    log.error("Unexpected error during conversation graph loading", exc_info=True)
+                    self.safe_print(f"[red]Error loading state: {setup_load_err}[/red]")
+                    status.update(f"{EMOJI_MAP['error']} Error loading state")
+                    self.conversation_graph = ConversationGraph()
+        else:
+            log.info("No existing conversation graph found, using new graph.")
+        if not self.conversation_graph.get_node(self.conversation_graph.current_node.id):
+            log.warning("Current node ID invalid, reset root.")
+            self.conversation_graph.set_current_node("root")
 
         # --- 4. Load Claude Desktop Config ---
         await self.load_claude_desktop_config()
@@ -7328,25 +7697,40 @@ class MCPClient:
         # --- 5. Clean Duplicate Server Configs ---
         # (No changes needed here)
         log.info("Cleaning duplicate server configurations...")
-        cleaned_servers: Dict[str, ServerConfig] = {}; canonical_map: Dict[Tuple, str] = {}; duplicates_found = False
+        cleaned_servers: Dict[str, ServerConfig] = {}
+        canonical_map: Dict[Tuple, str] = {}
+        duplicates_found = False
         servers_to_process = list(self.config.servers.items())
         for name, server_config in servers_to_process:
             identifier: Optional[Tuple] = None
             if server_config.type == ServerType.STDIO: identifier = (server_config.type, server_config.path, frozenset(server_config.args))
             elif server_config.type == ServerType.SSE: identifier = (server_config.type, server_config.path)
-            else: log.warning(f"Server '{name}' unknown type '{server_config.type}'"); identifier = (server_config.type, name)
+            else:
+                log.warning(f"Server '{name}' unknown type '{server_config.type}'")
+                identifier = (server_config.type, name)
             if identifier is not None:
-                if identifier not in canonical_map: canonical_map[identifier] = name; cleaned_servers[name] = server_config; log.debug(f"Keeping server: '{name}'")
-                else: duplicates_found = True; kept_name = canonical_map[identifier]; log.debug(f"Duplicate server detected. Removing '{name}', keep '{kept_name}'.")
+                if identifier not in canonical_map:
+                    canonical_map[identifier] = name
+                    cleaned_servers[name] = server_config
+                    log.debug(f"Keeping server: '{name}'")
+                else:
+                    duplicates_found = True
+                    kept_name = canonical_map[identifier]
+                    log.debug(f"Duplicate server detected. Removing '{name}', keep '{kept_name}'.")
         if duplicates_found:
             num_removed = len(self.config.servers) - len(cleaned_servers)
-            self.safe_print(f"[yellow]Removed {num_removed} duplicate server entries.[/yellow]"); self.config.servers = cleaned_servers; await self.config.save_async() # Saves YAML
-        else: log.info("No duplicate server configurations found.")
+            self.safe_print(f"[yellow]Removed {num_removed} duplicate server entries.[/yellow]")
+            self.config.servers = cleaned_servers
+            await self.config.save_async() # Saves YAML
+        else:
+            log.info("No duplicate server configurations found.")
 
 
         # --- 6. Stdout Pollution Check ---
         if os.environ.get("MCP_VERIFY_STDOUT", "1") == "1":
-            with safe_stdout(): log.info("Verifying no stdout pollution before connect..."); verify_no_stdout_pollution()
+            with safe_stdout():
+                log.info("Verifying no stdout pollution before connect...")
+                verify_no_stdout_pollution()
 
         # --- 7. Discover Servers ---
         if self.config.auto_discover:
@@ -7354,7 +7738,9 @@ class MCPClient:
             try:
                 await self.server_manager.discover_servers() # Populates cache
                 await self.server_manager._process_discovery_results(interactive_mode=interactive_mode) # Adds to config
-            except Exception as discover_error: log.error("Error during discovery", exc_info=True); self.safe_print(f"[red]Discovery error: {discover_error}[/]")
+            except Exception as discover_error:
+                log.error("Error during discovery", exc_info=True)
+                self.safe_print(f"[red]Discovery error: {discover_error}[/]")
 
         # --- 8. Start Continuous Local Discovery ---
         if self.config.enable_local_discovery and self.server_manager.registry:
@@ -7372,16 +7758,24 @@ class MCPClient:
                     # Name might have changed during connection due to identification
                     final_name = server_config.name
                     connection_results[name] = (session is not None)
-                    if session: self.safe_print(f"  {EMOJI_MAP['success']} Connected to {final_name}")
-                    else: log.warning(f"Failed connect MCP server: {name}"); self.safe_print(f"  {EMOJI_MAP['warning']} Failed connect {name}")
-                except Exception as e: log.error(f"Exception connecting MCP server {name}", exc_info=True); self.safe_print(f"  {EMOJI_MAP['error']} Error connect {name}: {e}"); connection_results[name] = False
+                    if session:
+                        self.safe_print(f"  {EMOJI_MAP['success']} Connected to {final_name}")
+                    else:
+                        log.warning(f"Failed connect MCP server: {name}")
+                        self.safe_print(f"  {EMOJI_MAP['warning']} Failed connect {name}")
+                except Exception as e:
+                    log.error(f"Exception connecting MCP server {name}", exc_info=True)
+                    self.safe_print(f"  {EMOJI_MAP['error']} Error connect {name}: {e}")
+                    connection_results[name] = False
 
         # --- 10. Start Server Monitoring ---
         try:
             with Status(f"{EMOJI_MAP['server']} Starting server monitoring...", spinner="dots", console=safe_console) as status:
                 await self.server_monitor.start_monitoring()
                 status.update(f"{EMOJI_MAP['success']} Server monitoring started")
-        except Exception as monitor_error: log.error("Failed start server monitor", exc_info=True); self.safe_print(f"[red]Error starting monitor: {monitor_error}[/red]")
+        except Exception as monitor_error:
+            log.error("Failed start server monitor", exc_info=True)
+            self.safe_print(f"[red]Error starting monitor: {monitor_error}[/red]")
 
         # --- 11. Display Final Status ---
         await self.print_status()
@@ -7553,76 +7947,165 @@ class MCPClient:
         return formatted_tools if formatted_tools else None
 
     # --- Streaming Handlers (_handle_*_stream) ---
-    # _handle_anthropic_stream (No changes needed)
     async def _handle_anthropic_stream(self, stream: AsyncMessageStream) -> AsyncGenerator[Tuple[str, Any], None]:
-        # (Implementation from previous response is complete)
-        current_text_block = None; current_tool_use_block = None; current_tool_input_json_accumulator = ""
-        input_tokens = 0; output_tokens = 0; stop_reason = "unknown"
+        """Process Anthropic stream and emit standardized events. (Enhanced Error Handling)"""
+        # (Keep variable initializations as before)
+        current_text_block = None
+        current_tool_use_block = None
+        current_tool_input_json_accumulator = ""
+        input_tokens = 0
+        output_tokens = 0
+        stop_reason = "unknown"
+
         try:
             async for event in stream:
-                event_type = event.type
-                if event_type == "message_start": input_tokens = event.message.usage.input_tokens
-                elif event_type == "content_block_start":
-                    block_type = event.content_block.type
-                    if block_type == "text": current_text_block = {"type": "text", "text": ""}
-                    elif block_type == "tool_use": tool_id = event.content_block.id; tool_name = event.content_block.name; original_tool_name = self.server_manager.sanitized_to_original.get(tool_name, tool_name); current_tool_use_block = {"id": tool_id, "name": original_tool_name}; current_tool_input_json_accumulator = ""; yield ("tool_call_start", {"id": tool_id, "name": original_tool_name})
-                elif event_type == "content_block_delta":
-                    delta = event.delta
-                    if delta.type == "text_delta":
-                        if current_text_block is not None: yield ("text_chunk", delta.text)
-                    elif delta.type == "input_json_delta":
-                        if current_tool_use_block is not None: current_tool_input_json_accumulator += delta.partial_json; yield ("tool_call_input_chunk", {"id": current_tool_use_block["id"], "json_chunk": delta.partial_json})
-                elif event_type == "content_block_stop":
-                    if current_text_block is not None: current_text_block = None
-                    elif current_tool_use_block is not None:
-                        parsed_input = {}
-                        try: parsed_input = json.loads(current_tool_input_json_accumulator) if current_tool_input_json_accumulator else {}
-                        except json.JSONDecodeError as e: log.error(f"Anthropic JSON parse failed: {e}. Raw: '{current_tool_input_json_accumulator}'"); parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
-                        yield ("tool_call_end", {"id": current_tool_use_block["id"], "parsed_input": parsed_input}); current_tool_use_block = None
-                elif event_type == "message_delta":
-                    if hasattr(event.delta, 'stop_reason') and event.delta.stop_reason: stop_reason = event.delta.stop_reason
-                    if hasattr(event, 'usage') and event.usage: output_tokens = event.usage.output_tokens
-                elif event_type == "message_stop": final_message = await stream.get_final_message(); stop_reason = final_message.stop_reason; output_tokens = final_message.usage.output_tokens; break
-        except anthropic.APIError as e: log.error(f"Anthropic stream API error: {e}"); yield ("error", f"Anthropic API Error: {e}"); stop_reason = "error"
-        except Exception as e: log.error(f"Unexpected Anthropic stream handler error: {e}", exc_info=True); yield ("error", f"Stream error: {e}"); stop_reason = "error"
-        finally: yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens}); yield ("stop_reason", stop_reason)
+                try: # Add inner try for processing each event
+                    event_type = event.type
+                    # --- Event Processing Logic (mostly unchanged) ---
+                    if event_type == "message_start": input_tokens = event.message.usage.input_tokens
+                    elif event_type == "content_block_start":
+                        block_type = event.content_block.type
+                        if block_type == "text": 
+                            current_text_block = {"type": "text", "text": ""}
+                        elif block_type == "tool_use": 
+                            tool_id = event.content_block.id
+                            tool_name = event.content_block.name
+                            original_tool_name = self.server_manager.sanitized_to_original.get(tool_name, tool_name)
+                            current_tool_use_block = {"id": tool_id, "name": original_tool_name}
+                            current_tool_input_json_accumulator = ""
+                            yield ("tool_call_start", {"id": tool_id, "name": original_tool_name})
+                    elif event_type == "content_block_delta":
+                        delta = event.delta
+                        if delta.type == "text_delta":
+                            if current_text_block is not None: 
+                                yield ("text_chunk", delta.text)
+                        elif delta.type == "input_json_delta":
+                            if current_tool_use_block is not None: 
+                                current_tool_input_json_accumulator += delta.partial_json
+                                yield ("tool_call_input_chunk", {"id": current_tool_use_block["id"], "json_chunk": delta.partial_json})
+                    elif event_type == "content_block_stop":
+                        if current_text_block is not None: current_text_block = None
+                        elif current_tool_use_block is not None:
+                            parsed_input = {}
+                            try: 
+                                parsed_input = json.loads(current_tool_input_json_accumulator) if current_tool_input_json_accumulator else {}
+                            except json.JSONDecodeError as e: 
+                                log.error(f"Anthropic JSON parse failed: {e}. Raw: '{current_tool_input_json_accumulator}'")
+                                parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
+                            yield ("tool_call_end", {"id": current_tool_use_block["id"], "parsed_input": parsed_input})
+                            current_tool_use_block = None
+                    elif event_type == "message_delta":
+                        if hasattr(event.delta, 'stop_reason') and event.delta.stop_reason:
+                            stop_reason = event.delta.stop_reason
+                        if hasattr(event, 'usage') and event.usage:
+                            output_tokens = event.usage.output_tokens
+                    elif event_type == "message_stop": 
+                        final_message = await stream.get_final_message()
+                        stop_reason = final_message.stop_reason
+                        output_tokens = final_message.usage.output_tokens
+                        break # Exit loop on message_stop
+                    elif event_type == "error": # Handle explicit stream error event from Anthropic
+                        stream_error = getattr(event, 'error', {})
+                        error_message = stream_error.get('message', 'Unknown stream error')
+                        log.error(f"Anthropic stream reported error event: {error_message}")
+                        yield ("error", f"Anthropic Stream Error: {error_message}")
+                        stop_reason = "error"
+                        break # Exit loop on explicit error
+                except Exception as event_proc_err:
+                     # Catch errors processing a specific event, log, yield error, and break
+                     log.error(f"Error processing Anthropic stream event ({event.type}): {event_proc_err}", exc_info=True)
+                     yield ("error", f"Error processing stream event: {event_proc_err}")
+                     stop_reason = "error"
+                     break # Exit loop on event processing error
+
+        # --- Catch errors related to the stream iteration itself ---
+        except anthropic.APIConnectionError as e: 
+            log.error(f"Anthropic stream connection error: {e}")
+            yield ("error", f"Anthropic Conn Error: {e}")
+            stop_reason = "error"
+        except anthropic.RateLimitError as e: 
+            log.warning(f"Anthropic stream rate limit error: {e}")
+            yield ("error", f"Anthropic Rate Limit: {e}")
+            stop_reason = "rate_limit" # Use specific reason
+        except anthropic.APIStatusError as e: 
+            log.error(f"Anthropic stream API status error ({e.status_code}): {e}")
+            yield ("error", f"Anthropic API Error ({e.status_code}): {e}")
+            stop_reason = "error"
+        except anthropic.APIError as e: 
+            log.error(f"Anthropic stream generic API error: {e}")
+            yield ("error", f"Anthropic API Error: {e}")
+            stop_reason = "error"
+        except Exception as e: 
+            log.error(f"Unexpected error in Anthropic stream handler: {e}", exc_info=True)
+            yield ("error", f"Unexpected stream error: {e}")
+            stop_reason = "error"
+        finally: 
+            yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
+            yield ("stop_reason", stop_reason)
 
     # _handle_openai_compatible_stream (No changes needed)
     async def _handle_openai_compatible_stream(self, stream: AsyncStream[ChatCompletionChunk], provider_name: str) -> AsyncGenerator[Tuple[str, Any], None]:
         # (Implementation from previous response is complete)
-        current_tool_calls: Dict[int, Dict] = {}; output_tokens = 0; input_tokens = 0; stop_reason = "stop"; finish_reason = None
+        current_tool_calls: Dict[int, Dict] = {}
+        output_tokens = 0
+        input_tokens = 0
+        stop_reason = "stop"
+        finish_reason = None
         try:
             async for chunk in stream:
                 choice = chunk.choices[0] if chunk.choices else None
-                if not choice: continue
-                delta = choice.delta; finish_reason = choice.finish_reason
-                if delta and delta.content: yield ("text_chunk", delta.content)
+                if not choice: 
+                    continue
+                delta = choice.delta
+                finish_reason = choice.finish_reason
+                if delta and delta.content: 
+                    yield ("text_chunk", delta.content)
                 if delta and delta.tool_calls:
                     for tc_chunk in delta.tool_calls:
                         idx = tc_chunk.index
                         if tc_chunk.id and tc_chunk.function and tc_chunk.function.name:
-                            tool_id = tc_chunk.id; sanitized_name = tc_chunk.function.name; original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
-                            current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}; yield ("tool_call_start", {"id": tool_id, "name": original_name})
+                            tool_id = tc_chunk.id
+                            sanitized_name = tc_chunk.function.name
+                            original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
+                            current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
+                            yield ("tool_call_start", {"id": tool_id, "name": original_name})
                         if tc_chunk.function and tc_chunk.function.arguments:
                             args_chunk = tc_chunk.function.arguments
-                            if idx in current_tool_calls: current_tool_calls[idx]["args_acc"] += args_chunk; yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
-                            else: log.warning(f"Args chunk unknown tool index {idx} from {provider_name}")
+                            if idx in current_tool_calls: 
+                                current_tool_calls[idx]["args_acc"] += args_chunk
+                                yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
+                            else: 
+                                log.warning(f"Args chunk unknown tool index {idx} from {provider_name}")
                 if provider_name == Provider.GROQ.value and hasattr(chunk, 'x_groq') and chunk.x_groq and hasattr(chunk.x_groq, 'usage'):
                     usage = chunk.x_groq.usage
-                    if usage: input_tokens = getattr(usage, 'prompt_tokens', input_tokens); current_chunk_output = getattr(usage, 'completion_tokens', 0); output_tokens = max(output_tokens, current_chunk_output) # Use max for cumulative
+                    if usage: 
+                        input_tokens = getattr(usage, 'prompt_tokens', input_tokens)
+                        current_chunk_output = getattr(usage, 'completion_tokens', 0)
+                        output_tokens = max(output_tokens, current_chunk_output) # Use max for cumulative
             for idx, tool_data in current_tool_calls.items():
-                accumulated_args = tool_data["args_acc"]; parsed_input = {}
+                accumulated_args = tool_data["args_acc"]
+                parsed_input = {}
                 try:
                     if accumulated_args: parsed_input = json.loads(accumulated_args)
-                except json.JSONDecodeError as e: log.error(f"{provider_name} JSON parse failed tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'"); parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
+                except json.JSONDecodeError as e: 
+                    log.error(f"{provider_name} JSON parse failed tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'")
+                    parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
                 yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
             stop_reason = finish_reason if finish_reason else "stop"
             if stop_reason == "tool_calls": stop_reason = "tool_use"
-        except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e: log.error(f"{provider_name} stream API error: {e}"); yield ("error", f"{provider_name} API Error: {e}"); stop_reason = "error"
-        except Exception as e: log.error(f"Unexpected error {provider_name} stream handler: {e}", exc_info=True); yield ("error", f"Unexpected stream processing error: {e}"); stop_reason = "error"
+        except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e: 
+            log.error(f"{provider_name} stream API error: {e}")
+            yield ("error", f"{provider_name} API Error: {e}")
+            stop_reason = "error"
+        except Exception as e: 
+            log.error(f"Unexpected error {provider_name} stream handler: {e}", exc_info=True)
+            yield ("error", f"Unexpected stream processing error: {e}")
+            stop_reason = "error"
         finally:
-            if input_tokens == 0 or output_tokens == 0: log.warning(f"{provider_name} stream no token counts. Estimate needed.")
-            yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens}); yield ("stop_reason", stop_reason)
+            if input_tokens == 0 or output_tokens == 0: 
+                log.warning(f"{provider_name} stream no token counts. Estimate needed.")
+            yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
+            yield ("stop_reason", stop_reason)
 
     def _filter_faulty_client_tool_results(self, messages_in: InternalMessageList) -> InternalMessageList:
         """
@@ -7721,6 +8204,22 @@ class MCPClient:
             log.debug("No client tool result parse errors found requiring filtering.")
         # Now use 'messages_to_send' for the API call
         return messages_to_send
+    
+    async def auto_prune_context(self):
+        """Auto-prune context based on token count if enabled."""
+        if not self.use_auto_summarization:
+            return
+        try:
+            token_count = await self.count_tokens()
+            if token_count > self.config.auto_summarize_threshold:
+                self.safe_print(f"[yellow]{EMOJI_MAP['warning']} Context size ({token_count:,} tokens) exceeds threshold "
+                                f"({self.config.auto_summarize_threshold:,}). Auto-summarizing...[/]")
+                # Use cmd_optimize which now calls the correct summarize_conversation
+                # We pass the target token argument specifically
+                await self.cmd_optimize(f"--tokens {self.config.max_summarized_tokens}")
+        except Exception as e:
+             log.error(f"Error during auto-pruning: {e}", exc_info=True)
+             self.safe_print(f"[red]Error during automatic context pruning: {e}[/]")
 
     async def process_streaming_query(self, query: str, model: Optional[str] = None,
                                     max_tokens: Optional[int] = None) -> AsyncIterator[str]:
@@ -7808,7 +8307,9 @@ class MCPClient:
                 accumulated_text_this_turn: str = ""
                 tool_calls_in_progress: Dict[str, Dict] = {}
                 completed_tool_calls: List[Dict] = []
-                turn_input_tokens: int = 0; turn_output_tokens: int = 0; turn_cost: float = 0.0
+                turn_input_tokens: int = 0
+                turn_output_tokens: int = 0
+                turn_cost: float = 0.0
                 turn_stop_reason: Optional[str] = None
                 turn_api_error: Optional[str] = None # Track API/Stream error for this turn
 
@@ -7905,28 +8406,38 @@ class MCPClient:
 
                 # --- Catch API Call / Connection Errors ---
                 except (anthropic.APIConnectionError, openai.APIConnectionError) as e:
-                    turn_api_error = f"Connection Error: {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True)
+                    turn_api_error = f"Connection Error: {e}"
+                    log.error(f"{provider_name} {turn_api_error}", exc_info=True)
                 except (anthropic.AuthenticationError, openai.AuthenticationError) as e:
-                    turn_api_error = f"Authentication Error (Check API Key): {e}"; log.error(f"{provider_name} {turn_api_error}")
+                    turn_api_error = f"Authentication Error (Check API Key): {e}"
+                    log.error(f"{provider_name} {turn_api_error}")
                 except (anthropic.PermissionDeniedError, openai.PermissionDeniedError) as e:
-                    turn_api_error = f"Permission Denied: {e}"; log.error(f"{provider_name} {turn_api_error}")
+                    turn_api_error = f"Permission Denied: {e}"
+                    log.error(f"{provider_name} {turn_api_error}")
                 except (anthropic.NotFoundError, openai.NotFoundError) as e:
-                    turn_api_error = f"API Endpoint or Model Not Found: {e}"; log.error(f"{provider_name} {turn_api_error}")
+                    turn_api_error = f"API Endpoint or Model Not Found: {e}"
+                    log.error(f"{provider_name} {turn_api_error}")
                 except (anthropic.RateLimitError, openai.RateLimitError) as e:
-                    turn_api_error = f"Rate Limit Exceeded: {e}"; log.warning(f"{provider_name} {turn_api_error}")
+                    turn_api_error = f"Rate Limit Exceeded: {e}"
+                    log.warning(f"{provider_name} {turn_api_error}")
                 except (anthropic.BadRequestError, openai.BadRequestError) as e:
-                    turn_api_error = f"Invalid Request / Bad Request: {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True)
+                    turn_api_error = f"Invalid Request / Bad Request: {e}"
+                    log.error(f"{provider_name} {turn_api_error}", exc_info=True)
                 except (anthropic.APIStatusError, openai.APIStatusError) as e:
-                    turn_api_error = f"API Status Error ({e.status_code}): {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True)
+                    turn_api_error = f"API Status Error ({e.status_code}): {e}"
+                    log.error(f"{provider_name} {turn_api_error}", exc_info=True)
                 except (anthropic.APIError, openai.APIError) as e: # Catch other provider base errors
-                    turn_api_error = f"API Error: {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True)
+                    turn_api_error = f"API Error: {e}"
+                    log.error(f"{provider_name} {turn_api_error}", exc_info=True)
                 except httpx.RequestError as e: # Catch general network errors
-                     turn_api_error = f"Network Error: {e}"; log.error(f"{provider_name} Network Error: {turn_api_error}", exc_info=True)
+                    turn_api_error = f"Network Error: {e}"
+                    log.error(f"{provider_name} Network Error: {turn_api_error}", exc_info=True)
                 except asyncio.CancelledError: # Catch cancellation during API call/stream setup
                     log.debug(f"API call/stream setup cancelled for {provider_name}")
                     raise # Propagate cancellation immediately
                 except NotImplementedError as e: # Catch our own error
-                     turn_api_error = str(e); log.error(turn_api_error)
+                    turn_api_error = str(e)
+                    log.error(turn_api_error)
                 except Exception as api_err: # Catch unexpected errors
                     turn_api_error = f"Unexpected API/Stream Error: {api_err}"
                     log.error(f"Unexpected error during API call/stream for {provider_name}: {api_err}", exc_info=True)
@@ -7978,33 +8489,43 @@ class MCPClient:
                             tool_start_time = time.time()
                             tool_result_content: Union[str, List[Dict], Dict] = "Error: Tool execution failed unexpectedly."
                             log_content_for_history: Any = tool_result_content
-                            is_error_flag = True; cache_used_flag = False
+                            is_error_flag = True
+                            cache_used_flag = False
 
                             if isinstance(tool_args, dict) and "_tool_input_parse_error" in tool_args:
-                                error_text = f"Client JSON parse error for '{original_tool_name}'."; tool_result_content = f"Error: {error_text}"
+                                error_text = f"Client JSON parse error for '{original_tool_name}'."
+                                tool_result_content = f"Error: {error_text}"
                                 log_content_for_history = {"error": error_text, "raw_json": tool_args.get("_raw_json")}
                                 yield f"@@STATUS@@\n{EMOJI_MAP['failure']} Input Error [bold]{tool_short_name}[/]: Client parse failed."
                                 log.error(f"{error_text} Raw: {tool_args.get('_raw_json', 'N/A')}")
                             else:
                                 mcp_tool_obj = self.server_manager.tools.get(original_tool_name)
                                 if not mcp_tool_obj:
-                                    error_text = f"Tool '{original_tool_name}' not found by client."; tool_result_content = f"Error: {error_text}"
+                                    error_text = f"Tool '{original_tool_name}' not found by client."
+                                    tool_result_content = f"Error: {error_text}"
                                     log_content_for_history = {"error": error_text}
                                     yield f"@@STATUS@@\n{EMOJI_MAP['failure']} Tool Error: Tool '[bold]{original_tool_name}[/]' not found."
                                 else:
-                                    server_name = mcp_tool_obj.server_name; servers_used.add(server_name); tools_used.append(original_tool_name)
+                                    server_name = mcp_tool_obj.server_name
+                                    servers_used.add(server_name)
+                                    tools_used.append(original_tool_name)
                                     cached_result = None
                                     if self.tool_cache and self.config.enable_caching:
                                         try: cached_result = self.tool_cache.get(original_tool_name, tool_args)
                                         except TypeError: cached_result = None
                                         if cached_result is not None and not (isinstance(cached_result, str) and cached_result.startswith("Error:")):
-                                            tool_result_content = cached_result; log_content_for_history = cached_result
-                                            is_error_flag = False; cache_used_flag = True; cache_hits_during_query += 1
+                                            tool_result_content = cached_result
+                                            log_content_for_history = cached_result
+                                            is_error_flag = False
+                                            cache_used_flag = True
+                                            cache_hits_during_query += 1
                                             content_str_tokens = self._stringify_content(cached_result)
                                             cached_tokens = self._estimate_string_tokens(content_str_tokens)
                                             yield f"@@STATUS@@\n{EMOJI_MAP['cached']} Using cache [bold]{tool_short_name}[/] ({cached_tokens:,} tokens)"
                                             log.info(f"Using cached result for {original_tool_name}")
-                                        elif cached_result is not None: log.info(f"Ignoring cached error for {original_tool_name}"); cached_result = None
+                                        elif cached_result is not None:
+                                            log.info(f"Ignoring cached error for {original_tool_name}")
+                                            cached_result = None
 
                                     if not cache_used_flag:
                                         yield f"@@STATUS@@\n{EMOJI_MAP['server']} Executing [bold]{tool_short_name}[/] via {server_name}..."
@@ -8022,7 +8543,8 @@ class MCPClient:
                                                 log.warning(f"Tool '{original_tool_name}' failed on '{server_name}': {error_detail}")
                                             else:
                                                 tool_result_content = mcp_result.content if mcp_result.content is not None else ""
-                                                log_content_for_history = mcp_result.content; is_error_flag = False
+                                                log_content_for_history = mcp_result.content
+                                                is_error_flag = False
                                                 content_str_tokens = self._stringify_content(tool_result_content)
                                                 result_tokens = self._estimate_string_tokens(content_str_tokens)
                                                 yield f"@@STATUS@@\n{EMOJI_MAP['success']} Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {tool_latency:.1f}s)"
@@ -8032,12 +8554,16 @@ class MCPClient:
                                                     except TypeError: log.warning(f"Failed cache {original_tool_name}: unhashable args")
                                         except asyncio.CancelledError:
                                             log.debug(f"Tool execution cancelled: {original_tool_name}")
-                                            tool_result_content = "Error: Tool execution cancelled by user."; log_content_for_history = {"error": "Tool execution cancelled"}
-                                            is_error_flag = True; yield f"@@STATUS@@\n[yellow]Tool [bold]{tool_short_name}[/] aborted.[/]"; raise
+                                            tool_result_content = "Error: Tool execution cancelled by user."
+                                            log_content_for_history = {"error": "Tool execution cancelled"}
+                                            is_error_flag = True
+                                            yield f"@@STATUS@@\n[yellow]Tool [bold]{tool_short_name}[/] aborted.[/]"
+                                            raise
                                         except Exception as exec_err:
                                             tool_latency = time.time() - tool_start_time
                                             log.error(f"Client error during tool execution {original_tool_name}: {exec_err}", exc_info=True)
-                                            error_text = f"Client error: {str(exec_err)}"; tool_result_content = f"Error: {error_text}"
+                                            error_text = f"Client error: {str(exec_err)}"
+                                            tool_result_content = f"Error: {error_text}"
                                             log_content_for_history = {"error": error_text}
                                             yield f"@@STATUS@@\n{EMOJI_MAP['failure']} Client Error [bold]{tool_short_name}[/] ({tool_latency:.2f}s): {str(exec_err)}"
 
@@ -8057,7 +8583,9 @@ class MCPClient:
                     except Exception as tool_loop_err: # Catch unexpected errors in the loop itself
                         log.error(f"Unexpected error during tool execution loop: {tool_loop_err}", exc_info=True)
                         yield f"@@STATUS@@\n[bold red]Error during tool processing: {tool_loop_err}[/]"
-                        error_occurred = True; stop_reason = "error"; break # Mark error and break outer loop
+                        error_occurred = True
+                        stop_reason = "error"
+                        break # Mark error and break outer loop
 
                     # If tool loop finished without error/cancellation
                     messages.extend(tool_results_for_api)
@@ -8123,7 +8651,8 @@ class MCPClient:
                     self.conversation_graph.current_node.model = model # Record model used
                     await self.conversation_graph.save(str(self.conversation_graph_file))
 
-                    end_time = time.time(); latency_ms = (end_time - start_time) * 1000
+                    end_time = time.time()
+                    latency_ms = (end_time - start_time) * 1000
                     tokens_used_hist = self.session_input_tokens + self.session_output_tokens
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     if hasattr(self, 'history') and hasattr(self.history, 'add_async'):
@@ -8190,8 +8719,10 @@ class MCPClient:
                 # --- Query Handling ---
                 else:
                     # Reset session stats before processing query
-                    self.session_input_tokens = 0; self.session_output_tokens = 0
-                    self.session_total_cost = 0.0; self.cache_hit_count = 0
+                    self.session_input_tokens = 0
+                    self.session_output_tokens = 0
+                    self.session_total_cost = 0.0
+                    self.cache_hit_count = 0
                     self.tokens_saved_by_cache = 0
 
                     query = user_input
@@ -8268,15 +8799,22 @@ class MCPClient:
                                 self._active_live_display.update(live_panel)
 
                                 # Efficiently wait for task completion or timeout
-                                try: await asyncio.wait_for(asyncio.shield(query_task), timeout=0.1)
-                                except asyncio.TimeoutError: pass # Expected timeout for refresh
-                                except asyncio.CancelledError: log.debug("Live update loop detected query cancellation."); break # Exit update loop
+                                try: 
+                                    await asyncio.wait_for(asyncio.shield(query_task), timeout=0.1)
+                                except asyncio.TimeoutError: 
+                                    pass # Expected timeout for refresh
+                                except asyncio.CancelledError: 
+                                    log.debug("Live update loop detected query cancellation.")
+                                break # Exit update loop
 
                             # --- Query Task Finished ---
                             # Await potentially cancelled task to retrieve exception/result
-                            try: await query_task
-                            except asyncio.CancelledError: query_cancelled = True
-                            except Exception as e: query_error = e
+                            try: 
+                                await query_task
+                            except asyncio.CancelledError: 
+                                query_cancelled = True
+                            except Exception as e: 
+                                query_error = e
 
                         finally:
                             self._active_live_display.stop() # Stop live display first
@@ -9425,7 +9963,8 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                     mcp_client: MCPClient = websocket.app.state.mcp_client
                 except AttributeError:
                     log.error("app.state.mcp_client not available during WebSocket connection!")
-                    await websocket.close(code=1011); return
+                    await websocket.close(code=1011)
+                    return
 
                 await websocket.accept()
                 connection_id = str(uuid.uuid4())[:8]
@@ -9439,7 +9978,8 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                         log.warning(f"WS-{connection_id}: Failed send (Type: {msg_type}): {send_err}")
 
                 async def send_command_response(success: bool, message: str, data: Optional[Dict] = None):
-                    payload = {"success": success, "message": message}; payload.update(data or {})
+                    payload = {"success": success, "message": message}
+                    payload.update(data or {})
                     await send_ws_message("command_response", payload)
 
                 async def send_error_response(message: str, cmd: Optional[str] = None):
@@ -9464,8 +10004,10 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                     await send_error_response("Previous query still running.")
                                     continue
 
-                                mcp_client.session_input_tokens = 0; mcp_client.session_output_tokens = 0
-                                mcp_client.session_total_cost = 0.0; mcp_client.cache_hit_count = 0
+                                mcp_client.session_input_tokens = 0
+                                mcp_client.session_output_tokens = 0
+                                mcp_client.session_total_cost = 0.0
+                                mcp_client.cache_hit_count = 0
                                 mcp_client.tokens_saved_by_cache = 0
 
                                 # Create and track the task
@@ -9507,7 +10049,8 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                 command_str = str(message.payload).strip()
                                 if command_str.startswith('/'):
                                     parts = command_str[1:].split(maxsplit=1)
-                                    cmd = parts[0].lower(); args = parts[1] if len(parts) > 1 else ""
+                                    cmd = parts[0].lower()
+                                    args = parts[1] if len(parts) > 1 else ""
                                     log.info(f"WS-{connection_id} processing command: /{cmd} {args}")
                                     try:
                                         if cmd == "clear":
@@ -9517,7 +10060,8 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                             await send_command_response(True, "Conversation cleared.", {"messages": []}) # Send cleared messages
                                         elif cmd == "model":
                                             if args:
-                                                mcp_client.current_model = args; mcp_client.config.default_model = args
+                                                mcp_client.current_model = args
+                                                mcp_client.config.default_model = args
                                                 asyncio.create_task(mcp_client.config.save_async()) # Persist default model change
                                                 await send_command_response(True, f"Model set to: {args}", {"currentModel": args})
                                             else: await send_command_response(True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model})
@@ -9527,18 +10071,28 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
                                             await send_command_response(True, f"Created branch: {new_node.name}", {"newNodeId": new_node.id, "newNodeName": new_node.name})
                                         elif cmd == "checkout":
-                                            if not args: await send_error_response("Usage: /checkout NODE_ID_or_Prefix", cmd); continue
-                                            node_id=args; node=mcp_client.conversation_graph.get_node(node_id)
-                                            if not node: matched_node=None; [matched_node := n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id) if not matched_node]; node=matched_node
+                                            if not args: 
+                                                await send_error_response("Usage: /checkout NODE_ID_or_Prefix", cmd) 
+                                                continue
+                                            node_id=args
+                                            node=mcp_client.conversation_graph.get_node(node_id)
+                                            if not node: 
+                                                matched_node=None
+                                                [matched_node := n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id) if not matched_node]
+                                                node=matched_node
                                             if node and mcp_client.conversation_graph.set_current_node(node.id):
                                                 await send_command_response(True, f"Switched to branch: {node.name}", {"currentNodeId": node.id, "messages": node.messages}) # Send messages of new node
-                                            else: await send_error_response(f"Node ID '{node_id}' not found.", cmd)
+                                            else: 
+                                                await send_error_response(f"Node ID '{node_id}' not found.", cmd)
                                         elif cmd == "apply_prompt": # Renamed from 'prompt' for clarity
-                                            if not args: await send_error_response("Usage: /apply_prompt <prompt_name>", cmd); continue
+                                            if not args: 
+                                                await send_error_response("Usage: /apply_prompt <prompt_name>", cmd)
+                                                continue
                                             success = await mcp_client.apply_prompt_to_conversation(args)
                                             if success:
                                                 await send_command_response(True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages})
-                                            else: await send_error_response(f"Prompt not found: {args}", cmd)
+                                            else: 
+                                                await send_error_response(f"Prompt not found: {args}", cmd)
                                         # --- Add Abort Command Handler ---
                                         elif cmd == "abort":
                                             log.info(f"WS-{connection_id} received abort command.")
@@ -9549,18 +10103,28 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                                             else:
                                                 await send_command_response(False, "No active query running for this connection.")
                                         else: await send_command_response(False, f"Command '/{cmd}' not supported via WebSocket.")
-                                    except Exception as cmd_err: await send_error_response(f"Error executing '/{cmd}': {cmd_err}", cmd); log.error(f"WS-{connection_id} Cmd Error /{cmd}: {cmd_err}", exc_info=True)
-                                else: await send_error_response("Invalid command format.", None)
+                                    except Exception as cmd_err: 
+                                        await send_error_response(f"Error executing '/{cmd}': {cmd_err}", cmd)
+                                        log.error(f"WS-{connection_id} Cmd Error /{cmd}: {cmd_err}", exc_info=True)
+                                else: 
+                                    await send_error_response("Invalid command format.", None)
 
                             # Ignore other message types for now
                             # elif message.type == "other_type": ...
 
-                        except (json.JSONDecodeError, ValidationError) as e: log.warning(f"WS-{connection_id} invalid message: {raw_data[:100]}... Error: {e}"); await send_ws_message("error", {"message": "Invalid message format."})
+                        except (json.JSONDecodeError, ValidationError) as e: 
+                            log.warning(f"WS-{connection_id} invalid message: {raw_data[:100]}... Error: {e}")
+                            await send_ws_message("error", {"message": "Invalid message format."})
                         except WebSocketDisconnect: raise
-                        except Exception as e: log.error(f"WS-{connection_id} error processing message: {e}", exc_info=True); await suppress(Exception)(send_ws_message("error", {"message": f"Internal error: {str(e)}"}))
+                        except Exception as e: 
+                            log.error(f"WS-{connection_id} error processing message: {e}", exc_info=True)
+                            await suppress(Exception)(send_ws_message("error", {"message": f"Internal error: {str(e)}"}))
 
-                except WebSocketDisconnect: log.info(f"WebSocket connection closed (ID: {connection_id}).")
-                except Exception as e: log.error(f"WS-{connection_id} unexpected handler error: {e}", exc_info=True); await suppress(Exception)(websocket.close(code=1011))
+                except WebSocketDisconnect: 
+                    log.info(f"WebSocket connection closed (ID: {connection_id}).")
+                except Exception as e: 
+                    log.error(f"WS-{connection_id} unexpected handler error: {e}", exc_info=True)
+                    await suppress(Exception)(websocket.close(code=1011))
                 finally: # Ensure task is cancelled if WS connection closes unexpectedly
                     if active_query_task and not active_query_task.done():
                         log.warning(f"WS-{connection_id} closing, cancelling active query task.")
@@ -9717,11 +10281,21 @@ async def main():
     is_webui_mode = "--webui" in sys.argv
     if not is_webui_mode:
         try: app()
-        except McpError as e: get_safe_console().print(f"[bold red]MCP Error:[/] {str(e)}"); sys.exit(1)
-        except httpx.RequestError as e: get_safe_console().print(f"[bold red]Network Error:[/] {str(e)}"); sys.exit(1)
-        except anthropic.APIError as e: get_safe_console().print(f"[bold red]Anthropic API Error:[/] {str(e)}"); sys.exit(1)
-        except openai.APIError as e: get_safe_console().print(f"[bold red]OpenAI Compatible API Error:[/] {str(e)}"); sys.exit(1)
-        except (OSError, yaml.YAMLError, json.JSONDecodeError) as e: get_safe_console().print(f"[bold red]File/Config Error:[/] {str(e)}"); sys.exit(1)
+        except McpError as e: 
+            get_safe_console().print(f"[bold red]MCP Error:[/] {str(e)}")
+            sys.exit(1)
+        except httpx.RequestError as e: 
+            get_safe_console().print(f"[bold red]Network Error:[/] {str(e)}")
+            sys.exit(1)
+        except anthropic.APIError as e: 
+            get_safe_console().print(f"[bold red]Anthropic API Error:[/] {str(e)}")
+            sys.exit(1)
+        except openai.APIError as e: 
+            get_safe_console().print(f"[bold red]OpenAI Compatible API Error:[/] {str(e)}")
+            sys.exit(1)
+        except (OSError, yaml.YAMLError, json.JSONDecodeError) as e: 
+            get_safe_console().print(f"[bold red]File/Config Error:[/] {str(e)}")
+            sys.exit(1)
         except Exception as e:
             get_safe_console().print(f"[bold red]Unexpected Error:[/] {str(e)}")
             if os.environ.get("MCP_CLIENT_DEBUG"): get_safe_console().print_exception(show_locals=True)
