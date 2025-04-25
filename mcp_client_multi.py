@@ -545,6 +545,9 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True, markup=True, console=stderr_console)]
 )
 log = logging.getLogger("mcpclient_multi") # Use a unique logger name
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("anthropic").setLevel(logging.WARNING)
 
 # --- Signal Handling (force_exit_handler, atexit_handler, sigint_handler) ---
 def force_exit_handler(is_force=False):
@@ -2909,7 +2912,8 @@ class ServerManager:
                     log.debug(f"Port probe task failed with expected exception: {type(result).__name__}")
 
         self._discovered_port_scan = discovered_servers_to_add
-        log.info(f"Port Scan Discovery: Added {len(self._discovered_port_scan)} potential new servers to results.")
+        log.info(f"Port Scan Discovery: Identified {len(discovered_servers_to_add)} potential new, unconfigured servers.")
+
 
     async def discover_servers(self):
         """
@@ -3528,13 +3532,16 @@ class ServerManager:
         backoff_factor = current_server_config.retry_policy.get("backoff_factor", 0.5)
         timeout_increment = current_server_config.retry_policy.get("timeout_increment", 5.0)
 
+        # process_to_use is scoped outside the loop to track the *running* process if reused
+        process_to_use: Optional[asyncio.subprocess.Process] = self.processes.get(current_server_name)
+
         with safe_stdout(): # Protect stdout during connection attempts
             while retry_count <= max_retries:
                 start_time = time.time()
                 session: Optional[ClientSession] = None
                 initialize_result_obj: Optional[Union[MCPInitializeResult, Dict[str, Any]]] = None
+                # process_this_attempt tracks if a *new* process was started in this specific attempt
                 process_this_attempt: Optional[asyncio.subprocess.Process] = None
-                process_to_use: Optional[asyncio.subprocess.Process] = None #
                 connection_error: Optional[BaseException] = None
                 span = None
                 span_context_manager = None
@@ -3559,12 +3566,14 @@ class ServerManager:
                     # --- Connection & Handshake ---
                     if current_server_config.type == ServerType.STDIO:
                         # Helper handles process start/reuse and handshake
+                        # _connect_stdio_server returns the active session, the initialize result, and the process *if* it started a new one
                         session, initialize_result_obj, process_this_attempt = await self._connect_stdio_server(
                             current_server_config, current_server_name, retry_count
                         )
                         # If a new process was started, manage its lifetime for this attempt
                         if process_this_attempt:
                             await attempt_exit_stack.enter_async_context(self._manage_process_lifetime(process_this_attempt, f"attempt-{current_server_name}-{retry_count}"))
+                            process_to_use = process_this_attempt # Track the newly started process for later use
                         # Manage session lifetime for this attempt
                         if session:
                             await attempt_exit_stack.enter_async_context(session)
@@ -3604,23 +3613,37 @@ class ServerManager:
                     else:
                         raise RuntimeError(f"Unknown server type: {current_server_config.type}")
 
+                    # Check if session was successfully created
                     if not session:
                         raise RuntimeError(f"Session object is None after connection attempt for {current_server_name}")
 
-                    # --- Rename Logic ---
+                    # --- Rename Logic (Start - Placed *after* initialize_result_obj is obtained) ---
                     original_name_before_rename = current_server_name
                     actual_server_name_from_init: Optional[str] = None
-                    if isinstance(initialize_result_obj, dict): # STDIO Result
+
+                    # CORRECTED: Check the type of the result object before accessing
+                    if isinstance(initialize_result_obj, dict): # STDIO Result (raw dict)
                         server_info = initialize_result_obj.get("serverInfo", {})
                         if isinstance(server_info, dict):
                             actual_server_name_from_init = server_info.get("name")
-                    elif isinstance(initialize_result_obj, MCPInitializeResult): # Standard Result
+                        else:
+                            log.warning(f"[{current_server_name}] STDIO initialize result 'serverInfo' is not a dict: {server_info}")
+                        # Capabilities handled by _load_server_capabilities using the dict
+
+                    elif isinstance(initialize_result_obj, MCPInitializeResult): # Standard Result (Pydantic model)
                         if initialize_result_obj.serverInfo:
                             actual_server_name_from_init = initialize_result_obj.serverInfo.name
+                        # Capabilities handled by _load_server_capabilities using the Pydantic model
 
+                    else:
+                        # Handle case where initialize_result_obj is None or unexpected type
+                        log.warning(f"[{current_server_name}] Unexpected type or None for initialize_result_obj: {type(initialize_result_obj)}. Cannot extract server name.")
+
+                    # Perform rename if needed
                     if actual_server_name_from_init and actual_server_name_from_init != current_server_name:
                         if actual_server_name_from_init in self.config.servers and actual_server_name_from_init != initial_server_name:
-                            log.warning(f"Server '{initial_server_name}' reported name '{actual_server_name_from_init}', conflicts with existing. Keeping '{current_server_name}'.")
+                            log.warning(f"Server '{initial_server_name}' reported name '{actual_server_name_from_init}', which conflicts with another existing server. Keeping original name '{current_server_name}'.")
+                            # Keep current_server_name, do not rename
                         else:
                             log.info(f"Server '{initial_server_name}' identified as '{actual_server_name_from_init}'. Renaming config.")
                             self._safe_printer(f"[yellow]Server '{initial_server_name}' identified as '{actual_server_name_from_init}', updating config.[/]")
@@ -3632,10 +3655,15 @@ class ServerManager:
                                     self.config.servers[actual_server_name_from_init] = original_config_entry # Add with new key
 
                                     # Update process mapping if STDIO
-                                    if server_config.type == ServerType.STDIO:
-                                        if original_name_before_rename in self.processes:
-                                            proc = self.processes.pop(original_name_before_rename)
-                                            self.processes[actual_server_name_from_init] = proc
+                                    if current_server_config.type == ServerType.STDIO:
+                                         existing_proc_for_old_name = self.processes.pop(original_name_before_rename, None)
+                                         if existing_proc_for_old_name:
+                                             self.processes[actual_server_name_from_init] = existing_proc_for_old_name
+                                             # Ensure process_to_use reflects the final name mapping
+                                             process_to_use = existing_proc_for_old_name
+                                         else:
+                                             log.warning(f"Could not find process entry for old name '{original_name_before_rename}' during rename.")
+
 
                                     # Update the current loop variables
                                     current_server_name = actual_server_name_from_init
@@ -3643,26 +3671,33 @@ class ServerManager:
                                     config_updated_by_rename = True
                                     if span:
                                         span.set_attribute("server.name", current_server_name)
+                                    # Update session's internal name if it's the custom type
                                     if isinstance(session, RobustStdioSession):
-                                        session._server_name = current_server_name # Update session's internal name
+                                        session._server_name = current_server_name
                                     log.info(f"Renamed config entry '{initial_server_name}' -> '{current_server_name}'.")
                                 else:
-                                    log.warning(f"Cannot rename: '{initial_server_name}' no longer in config.")
+                                    log.warning(f"Cannot rename: Original name '{initial_server_name}' no longer in config (maybe already renamed?).")
                             except Exception as rename_err:
                                 log.error(f"Failed rename '{initial_server_name}' to '{actual_server_name_from_init}': {rename_err}", exc_info=True)
                                 raise RuntimeError(f"Failed during server rename: {rename_err}") from rename_err
+                    # --- Rename Logic (End) ---
 
-                    # --- Load Capabilities (AFTER potential rename) ---
+                    # --- Load Capabilities (Uses the *final* current_server_name) ---
                     await self._load_server_capabilities(current_server_name, session, initialize_result_obj)
 
                     # --- Success Path ---
                     connection_time_ms = (time.time() - start_time) * 1000
+                    # Use the potentially updated server name to find the config entry for metrics
                     server_config_in_dict = self.config.servers.get(current_server_name)
                     if server_config_in_dict:
                         metrics = server_config_in_dict.metrics
                         metrics.request_count += 1 # Count connection attempt
                         metrics.update_response_time(connection_time_ms / 1000.0)
                         metrics.update_status()
+                    else:
+                        # This should ideally not happen if rename logic is correct
+                        log.error(f"Could not find server config '{current_server_name}' after connection success for metrics.")
+
 
                     if latency_histogram:
                         try:
@@ -3683,8 +3718,9 @@ class ServerManager:
                     self.active_sessions[current_server_name] = session
 
                     # Track the *persistent* process object under the final name
-                    if process_to_use and server_config.type == ServerType.STDIO:
-                        # Ensure it's the correct process, especially if reused
+                    # process_to_use holds the reference to the process that was actually used (reused or newly started)
+                    if process_to_use and current_server_config.type == ServerType.STDIO:
+                        # Ensure it's tracked under the potentially renamed server name
                         if current_server_name not in self.processes or self.processes[current_server_name] != process_to_use:
                             self.processes[current_server_name] = process_to_use
 
@@ -3695,10 +3731,13 @@ class ServerManager:
 
                     # Advertise via Zeroconf if it's a newly connected STDIO server
                     if current_server_config.type == ServerType.STDIO:
+                        # Pass the potentially updated server config object
                         await self.register_local_server(current_server_config)
 
-                    if span_context_manager:
+                    # Exit span context if it exists
+                    if span_context_manager and hasattr(span_context_manager, '__exit__'):
                         span_context_manager.__exit__(None, None, None)
+
                     return session # Return the successful session
 
                 # --- Outer Exception Handling for Connection Attempt ---
@@ -3710,13 +3749,17 @@ class ServerManager:
                 # --- End Connection Attempt Try/Except ---
                 finally:
                     # Ensure attempt-specific resources are cleaned up *before* retry/failure
+                    # This will close the session and terminate the process *if* it was started in this attempt
+                    await attempt_exit_stack.aclose()
+                    # Close the OpenTelemetry span if connection failed within the attempt
                     if span_context_manager and hasattr(span_context_manager, '__exit__'):
                         try:
-                            # Exit the context manager, passing exception info if any
                             exc_type, exc_val, exc_tb = sys.exc_info()
-                            span_context_manager.__exit__(exc_type, exc_val, exc_tb)
+                            # Only exit if it wasn't already exited successfully
+                            if session is None: # Check if success path was reached
+                                 span_context_manager.__exit__(exc_type, exc_val, exc_tb)
                         except Exception as span_exit_err:
-                            log.warning(f"Error closing OpenTelemetry span context: {span_exit_err}")
+                            log.warning(f"Error closing OpenTelemetry span context on failure: {span_exit_err}")
 
                 # --- Shared Error Handling & Retry Logic ---
                 retry_count += 1
@@ -3726,10 +3769,17 @@ class ServerManager:
                     config_for_metrics.metrics.error_count += 1
                     config_for_metrics.metrics.update_status()
                 else:
-                    log.error(f"Could not find server config '{current_server_name}' for error metric update.")
+                    # Log error if config entry cannot be found (should not happen after rename logic fix)
+                    log.error(f"Could not find server config '{current_server_name}' for error metric update after failed attempt.")
 
                 if span:
-                    span.set_status(trace.StatusCode.ERROR, f"Attempt {retry_count-1} failed: {type(connection_error).__name__}")
+                    # Set span status to error if an error occurred in this attempt
+                    if connection_error:
+                         span.set_status(trace.StatusCode.ERROR, f"Attempt {retry_count-1} failed: {type(connection_error).__name__}")
+                         # Optionally record the exception details
+                         if hasattr(span, 'record_exception'):
+                             span.record_exception(connection_error)
+
 
                 if retry_count <= max_retries:
                     delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.1, 10.0)
@@ -7385,7 +7435,7 @@ class MCPClient:
         log.info(f"Executing internal LLM call (no history): Model='{model}', Provider='{provider_name}'")
 
         # Format messages for the specific provider
-        formatted_messages, system_prompt, _ = self._format_messages_for_provider(
+        formatted_messages, system_prompt = self._format_messages_for_provider(
             messages, provider_name, model
         )
 
@@ -8568,89 +8618,92 @@ class MCPClient:
             A new list of InternalMessage objects with the faulty pairs removed.
         """
         messages_to_send: InternalMessageList = []
-        # More specific signature if possible, otherwise keep the general one
-        client_error_signature = "Client failed to parse JSON input"
-        # Use the more specific error if available from the new code's error handling
-        # client_error_signature = "Client JSON parse error for tool" # Example if error changed
+        # Use the more specific error signature
+        client_error_signature = "_tool_input_parse_error" # From the stream handler
 
         skipped_indices = set() # To track indices of messages to skip
 
         log.debug(f"Filtering history ({len(messages_in)} messages) for known client tool result parse errors...")
 
         # First pass: identify indices of faulty interactions to skip
-        # Stores index of assistant message -> set of tool_use_ids from that message
         assistant_tool_uses_to_check: Dict[int, Set[str]] = {}
 
         for idx, msg in enumerate(messages_in):
-            # Ensure msg and msg.content are not None before proceeding
-            if not msg or not msg.content:
+            # Ensure msg is a dict before accessing keys
+            if not isinstance(msg, dict):
+                log.warning(f"Skipping non-dict message at index {idx} in history filtering.")
                 continue
 
-            if msg.role == "assistant":
+            # Use .get() for safer access
+            role = msg.get('role')
+            content = msg.get('content')
+
+            if not role or content is None: # Skip if essential keys missing
+                continue
+
+            if role == "assistant":
                 # Check if content is a list (it should be for tool_use)
-                if isinstance(msg.content, list):
+                if isinstance(content, list):
                     tool_use_ids: Set[str] = set()
-                    for block in msg.content:
-                        # Use isinstance for type checking with Pydantic models/objects
-                        if isinstance(block, ToolUseContentBlock) and block.id:
-                            tool_use_ids.add(block.id)
+                    for block in content:
+                        # Check block type correctly
+                        if isinstance(block, dict) and block.get('type') == 'tool_use':
+                            tool_use_id = block.get('id')
+                            if tool_use_id:
+                                tool_use_ids.add(tool_use_id)
 
                     if tool_use_ids:
                         assistant_tool_uses_to_check[idx] = tool_use_ids
 
-            elif msg.role == "user":
+            elif role == "user":
                 # Check if this user message corresponds to a preceding assistant tool use
                 prev_idx = idx - 1
                 if prev_idx in assistant_tool_uses_to_check:
                     # Ensure content is a list (it should be for tool_result)
-                    if isinstance(msg.content, list):
+                    if isinstance(content, list):
                         corresponding_ids = assistant_tool_uses_to_check[prev_idx]
                         found_faulty_result = False
-                        for block in msg.content:
-                            # Use isinstance for type checking
-                            if isinstance(block, ToolResultContentBlock) and block.tool_use_id in corresponding_ids:
-                                result_content = block.content # Access the content attribute
-                                # Check if the content contains our specific client error signature.
-                                # The content might be a string, or sometimes structured error dict.
-                                # We need a robust check. Let's check if it's a string first.
-                                error_found_in_content = False
-                                if isinstance(result_content, str):
-                                    if client_error_signature in result_content:
+                        for block in content:
+                            # Check block type correctly
+                            if isinstance(block, dict) and block.get('type') == 'tool_result':
+                                block_tool_use_id = block.get('tool_use_id')
+                                if block_tool_use_id in corresponding_ids:
+                                    result_content = block.get('content')
+                                    # Check if the result_content itself is the error dict
+                                    error_found_in_content = False
+                                    if isinstance(result_content, dict) and client_error_signature in result_content:
                                         error_found_in_content = True
-                                # Optional: Add check if result_content is a dict containing the error
-                                # elif isinstance(result_content, dict) and "error" in result_content:
-                                #     if client_error_signature in str(result_content["error"]):
-                                #          error_found_in_content = True
+                                    # Less likely, but check if it's a string containing the key
+                                    elif isinstance(result_content, str) and client_error_signature in result_content:
+                                        error_found_in_content = True
 
-                                if error_found_in_content:
-                                    found_faulty_result = True
-                                    log.warning(f"Found faulty client tool result for tool_use_id {block.tool_use_id} "
-                                                f"at history index {idx}. Marking preceding assistant request "
-                                                f"(index {prev_idx}) and this user result for filtering.")
-                                    break # Found one faulty result for this user message turn
+                                    if error_found_in_content:
+                                        found_faulty_result = True
+                                        log.warning(f"Found faulty client tool result for tool_use_id {block_tool_use_id} "
+                                                    f"at history index {idx}. Marking preceding assistant request "
+                                                    f"(index {prev_idx}) and this user result for filtering.")
+                                        break # Found one faulty result for this user message turn
 
                         if found_faulty_result:
                             # Mark both the assistant request and the user result for skipping
                             skipped_indices.add(prev_idx)
                             skipped_indices.add(idx)
-                            # We found a faulty result for this user message, potentially remove
-                            # the corresponding entry from assistant_tool_uses_to_check to avoid
-                            # accidentally matching it again if structure allows (though unlikely here).
-                            del assistant_tool_uses_to_check[prev_idx]
+                            del assistant_tool_uses_to_check[prev_idx] # Avoid re-matching
+
         # Second pass: build the filtered list
         for idx, msg in enumerate(messages_in):
             if idx not in skipped_indices:
                 messages_to_send.append(msg)
             else:
                 # More informative log about *what* is being skipped
-                role = msg.role if msg else "UnknownRole"
-                content_preview = repr(msg.content)[:50] + "..." if msg and msg.content else "NoContent"
+                role = msg.get('role', 'UnknownRole') if isinstance(msg, dict) else 'NonDict'
+                content_preview = repr(msg.get('content','NoContent'))[:50] + "..." if isinstance(msg, dict) else repr(msg)[:50] + "..."
                 log.debug(f"Skipping message at index {idx} (Role: {role}, Content Preview: {content_preview}) due to client tool result parse error linkage.")
+
         if len(messages_in) != len(messages_to_send):
             log.info(f"Filtered {len(messages_in) - len(messages_to_send)} messages due to client tool result parse errors.")
         else:
             log.debug("No client tool result parse errors found requiring filtering.")
-        # Now use 'messages_to_send' for the API call
         return messages_to_send
     
     async def auto_prune_context(self):
@@ -8763,7 +8816,7 @@ class MCPClient:
 
                 # --- 1b. Format Inputs for Provider ---
                 messages_to_send_this_turn = self._filter_faulty_client_tool_results(messages)
-                formatted_messages, system_prompt, _ = self._format_messages_for_provider(
+                formatted_messages, system_prompt = self._format_messages_for_provider(
                     messages_to_send_this_turn, provider_name, model
                 )
                 formatted_tools = self._format_tools_for_provider(provider_name)
@@ -9192,13 +9245,19 @@ class MCPClient:
                     @contextmanager
                     def suppress_logs_during_live():
                         """Temporarily suppress logging below WARNING during Live display."""
-                        logger = logging.getLogger("mcpclient_multi") # Get specific logger
-                        original_level = logger.level
-                        # Suppress INFO and DEBUG during live updates
-                        if original_level < logging.WARNING:
+                        TURN_LOG_SUPPRESSION_OFF = False # For debugging, set to True
+                        if TURN_LOG_SUPPRESSION_OFF:
+                            yield
+                        else:
+                            logger = logging.getLogger("mcpclient_multi") # Get specific logger
+                            original_level = logger.level
+                            # Suppress INFO and DEBUG during live updates
+                            if original_level < logging.WARNING:
                              logger.setLevel(logging.WARNING)
-                        try: yield
-                        finally: logger.setLevel(original_level) # Restore original level
+                            try: 
+                                yield
+                            finally: 
+                                logger.setLevel(original_level) # Restore original level
 
                     with suppress_logs_during_live():
                         self._active_live_display.start()
