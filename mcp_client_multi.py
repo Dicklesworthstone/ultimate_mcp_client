@@ -354,6 +354,8 @@ DEFAULT_MODELS = {
     Provider.CEREBRAS: "llama-4-scout-17b-16e-instruct",
 }
 
+OPENAI_MAX_TOOL_COUNT = 128 # Maximum tools to send to OpenAI-compatible APIs
+
 # Emoji mapping
 EMOJI_MAP = {
     "start": "🚀",
@@ -8773,7 +8775,7 @@ class MCPClient:
                 formatted_tools[-1]["cache_control"] = {"type": "ephemeral"}
                 log.debug("Added ephemeral cache_control to the last Anthropic tool.")
 
-        # --- OpenAI / Grok / DeepSeek / Groq / Gemini / Mistral / Cerebras (using OpenAI compatibility) ---
+        # --- OpenAI / Grok / DeepSeek / Groq / Gemini / Mistral / Cerebras / OpenRouter (using OpenAI compatibility) ---
         elif provider_enum_val in [
             Provider.OPENAI.value,
             Provider.GROK.value,
@@ -8781,10 +8783,12 @@ class MCPClient:
             Provider.GROQ.value,
             Provider.MISTRAL.value,
             Provider.CEREBRAS.value,
-            Provider.GROK.value,
             Provider.GEMINI.value,
+            Provider.OPENROUTER.value,
         ]:
             log.debug(f"Formatting tools for OpenAI-compatible provider: {provider_enum_val}")
+            # Initial formatting loop (same as before)
+            initially_formatted_tools: List[Dict[str, Any]] = [] # Store formatted tools here first
             for tool in sorted(mcp_tools, key=lambda t: t.name):
                 original_name = tool.name
                 # OpenAI names: ^[a-zA-Z0-9_-]{1,64}$
@@ -8818,7 +8822,7 @@ class MCPClient:
                     )
                     validated_schema = {"type": "object", "properties": {}, "required": []}  # Default empty
 
-                formatted_tools.append(
+                initially_formatted_tools.append(
                     {
                         "type": "function",
                         "function": {
@@ -8829,11 +8833,33 @@ class MCPClient:
                     }
                 )
 
-        # --- Unknown Provider ---
+            if len(initially_formatted_tools) > OPENAI_MAX_TOOL_COUNT:
+                original_count = len(initially_formatted_tools)
+                # Truncate the list (tools are already sorted by name)
+                formatted_tools = initially_formatted_tools[:OPENAI_MAX_TOOL_COUNT]
+                truncated_count = len(formatted_tools)
+
+                # Identify excluded tools for logging (using original names)
+                truncated_sanitized_names = {t['function']['name'] for t in formatted_tools}
+                excluded_original_names = []
+                for tool_dict in initially_formatted_tools:
+                    sanitized_name = tool_dict['function']['name']
+                    if sanitized_name not in truncated_sanitized_names:
+                        original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name) # Fallback just in case
+                        excluded_original_names.append(original_name)
+
+                log.warning(
+                    f"Tool list for {provider_enum_val} ({original_count} tools) exceeds OpenAI limit ({OPENAI_MAX_TOOL_COUNT}). "
+                    f"Truncating to {truncated_count} tools. "
+                    f"Excluded {len(excluded_original_names)} tools: {', '.join(sorted(excluded_original_names))}"
+                )
+            else:
+                # No truncation needed
+                formatted_tools = initially_formatted_tools
         else:
             log.warning(f"Tool formatting not implemented or provider '{provider}' unknown. Returning no tools.")
             return None
-
+        # Log the *final* count being returned
         log.info(f"Formatted {len(formatted_tools)} tools for provider '{provider}'.")
         return formatted_tools if formatted_tools else None
 
@@ -8936,73 +8962,125 @@ class MCPClient:
             yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
             yield ("stop_reason", stop_reason)
 
-    # _handle_openai_compatible_stream (No changes needed)
     async def _handle_openai_compatible_stream(
-        self, stream: AsyncStream[ChatCompletionChunk], provider_name: str
-    ) -> AsyncGenerator[Tuple[str, Any], None]:
-        # (Implementation from previous response is complete)
-        current_tool_calls: Dict[int, Dict] = {}
-        output_tokens = 0
-        input_tokens = 0
-        stop_reason = "stop"
-        finish_reason = None
-        try:
-            async for chunk in stream:
-                choice = chunk.choices[0] if chunk.choices else None
-                if not choice:
-                    continue
-                delta = choice.delta
-                finish_reason = choice.finish_reason
-                if delta and delta.content:
-                    yield ("text_chunk", delta.content)
-                if delta and delta.tool_calls:
-                    for tc_chunk in delta.tool_calls:
-                        idx = tc_chunk.index
-                        if tc_chunk.id and tc_chunk.function and tc_chunk.function.name:
-                            tool_id = tc_chunk.id
-                            sanitized_name = tc_chunk.function.name
-                            original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
-                            current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
-                            yield ("tool_call_start", {"id": tool_id, "name": original_name})
-                        if tc_chunk.function and tc_chunk.function.arguments:
-                            args_chunk = tc_chunk.function.arguments
-                            if idx in current_tool_calls:
-                                current_tool_calls[idx]["args_acc"] += args_chunk
-                                yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
-                            else:
-                                log.warning(f"Args chunk unknown tool index {idx} from {provider_name}")
-                if provider_name == Provider.GROQ.value and hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
-                    usage = chunk.x_groq.usage
-                    if usage:
-                        input_tokens = getattr(usage, "prompt_tokens", input_tokens)
-                        current_chunk_output = getattr(usage, "completion_tokens", 0)
-                        output_tokens = max(output_tokens, current_chunk_output)  # Use max for cumulative
-            for idx, tool_data in current_tool_calls.items():
-                accumulated_args = tool_data["args_acc"]
-                parsed_input = {}
-                try:
-                    if accumulated_args:
-                        parsed_input = json.loads(accumulated_args)
-                except json.JSONDecodeError as e:
-                    log.error(f"{provider_name} JSON parse failed tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'")
-                    parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
-                yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
-            stop_reason = finish_reason if finish_reason else "stop"
-            if stop_reason == "tool_calls":
-                stop_reason = "tool_use"
-        except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e:
-            log.error(f"{provider_name} stream API error: {e}")
-            yield ("error", f"{provider_name} API Error: {e}")
-            stop_reason = "error"
-        except Exception as e:
-            log.error(f"Unexpected error {provider_name} stream handler: {e}", exc_info=True)
-            yield ("error", f"Unexpected stream processing error: {e}")
-            stop_reason = "error"
-        finally:
-            if input_tokens == 0 or output_tokens == 0:
-                log.warning(f"{provider_name} stream no token counts. Estimate needed.")
-            yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
-            yield ("stop_reason", stop_reason)
+            self, stream: AsyncStream[ChatCompletionChunk], provider_name: str
+        ) -> AsyncGenerator[Tuple[str, Any], None]:
+            """Process OpenAI/Grok/DeepSeek/etc. stream and emit standardized events."""
+            current_tool_calls: Dict[int, Dict] = {}  # {index: {'id':..., 'name':..., 'args_acc':...}}
+            input_tokens = 0  # Often not available until the end
+            output_tokens = 0 # Often not available until the end
+            stop_reason = "stop"  # Default
+            finish_reason = None
+            final_usage_obj = None # To store usage from get_final_usage()
+
+            try:
+                async for chunk in stream:
+                    # --- Process Chunk Data (Text, Tools) ---
+                    choice = chunk.choices[0] if chunk.choices else None
+                    if not choice:
+                        continue
+
+                    delta = choice.delta
+                    finish_reason = choice.finish_reason # Store the latest finish_reason
+
+                    # 1. Text Chunks
+                    if delta and delta.content:
+                        yield ("text_chunk", delta.content)
+
+                    # 2. Tool Calls (Parsing logic remains the same)
+                    if delta and delta.tool_calls:
+                        for tc_chunk in delta.tool_calls:
+                            idx = tc_chunk.index
+                            # Start of a new tool call
+                            if tc_chunk.id and tc_chunk.function and tc_chunk.function.name:
+                                tool_id = tc_chunk.id
+                                sanitized_name = tc_chunk.function.name
+                                # --- Get Original Name ---
+                                original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
+                                # -------------------------
+                                current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
+                                yield ("tool_call_start", {"id": tool_id, "name": original_name})
+
+                            # Argument chunks for an existing tool call
+                            if tc_chunk.function and tc_chunk.function.arguments:
+                                args_chunk = tc_chunk.function.arguments
+                                if idx in current_tool_calls:
+                                    current_tool_calls[idx]["args_acc"] += args_chunk
+                                    # Yield incremental input chunk
+                                    yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
+                                else:
+                                    log.warning(f"Args chunk for unknown tool index {idx} from {provider_name}")
+
+                    # --- Provider-Specific Stream Data (e.g., Groq Usage) ---
+                    if provider_name == Provider.GROQ.value and hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
+                        usage = chunk.x_groq.usage
+                        if usage:
+                            # Groq provides usage per-chunk, update totals
+                            input_tokens = getattr(usage, "prompt_tokens", input_tokens) # Prompt tokens usually fixed
+                            current_chunk_output = getattr(usage, "completion_tokens", 0)
+                            # Use max as completion_tokens seems cumulative in Groq's per-chunk usage
+                            output_tokens = max(output_tokens, current_chunk_output)
+                            log.debug(f"Groq chunk usage: In={input_tokens}, Out={output_tokens} (Chunk Out={current_chunk_output})")
+
+
+                # --- After Stream Ends: Finalize Tool Calls ---
+                for idx, tool_data in current_tool_calls.items():
+                    accumulated_args = tool_data["args_acc"]
+                    parsed_input = {}
+                    try:
+                        if accumulated_args: # Only parse if not empty
+                            parsed_input = json.loads(accumulated_args)
+                    except json.JSONDecodeError as e:
+                        log.error(f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'")
+                        parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
+                    yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
+
+                # Determine final stop reason
+                stop_reason = finish_reason if finish_reason else "stop"
+                if stop_reason == "tool_calls":
+                    stop_reason = "tool_use" # Standardize
+
+            # --- Error Handling ---
+            except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e:
+                log.error(f"{provider_name} stream API error: {e}")
+                yield ("error", f"{provider_name} API Error: {e}")
+                stop_reason = "error"
+            except Exception as e:
+                log.error(f"Unexpected error in {provider_name} stream handler: {e}", exc_info=True)
+                yield ("error", f"Unexpected stream processing error: {e}")
+                stop_reason = "error"
+            # --- End Main Try/Except ---
+            finally:
+                # --- Get Final Usage (Correct Method) ---
+                # Do this *after* the stream loop finishes, but *before* yielding final usage
+                # Skip for Groq, as we accumulated it during the stream
+                if provider_name != Provider.GROQ.value:
+                    try:
+                        # Call get_final_usage() on the stream object AFTER iteration
+                        final_usage_obj = stream.get_final_usage()
+                        if final_usage_obj:
+                            input_tokens = getattr(final_usage_obj, "prompt_tokens", 0)
+                            output_tokens = getattr(final_usage_obj, "completion_tokens", 0)
+                            log.debug(f"Retrieved final usage via get_final_usage() for {provider_name}: In={input_tokens}, Out={output_tokens}")
+                        else:
+                            log.warning(f"stream.get_final_usage() returned None for {provider_name}. Usage may be inaccurate.")
+                    except AttributeError:
+                        # Handle cases where get_final_usage might not exist (though it should for OpenAI v1+)
+                        log.warning(f"Stream object for {provider_name} does not have get_final_usage(). Usage will be 0.")
+                    except Exception as e:
+                        # Catch any other error during the final usage call
+                        log.warning(f"Error calling get_final_usage() for {provider_name}: {e}. Usage may be inaccurate.")
+
+                # --- Log and Yield Final Events ---
+                if input_tokens == 0 or output_tokens == 0:
+                    # Adjust warning based on whether usage was expected vs unavailable
+                    if final_usage_obj or provider_name == Provider.GROQ.value: # If we got an object but values are 0
+                        log.warning(f"{provider_name} usage details reported as zero (Input: {input_tokens}, Output: {output_tokens}).")
+                    else: # If we couldn't get the usage object at all
+                        log.warning(f"{provider_name} usage details unavailable. Cannot calculate cost accurately.")
+
+                yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
+                yield ("stop_reason", stop_reason)
 
     def _filter_faulty_client_tool_results(self, messages_in: InternalMessageList) -> InternalMessageList:
         """
@@ -9814,38 +9892,41 @@ class MCPClient:
 
     async def interactive_loop(self):
         """Runs the main interactive command loop with direct stream handling."""
-        interactive_console = get_safe_console()  # Get console instance once
+        interactive_console = get_safe_console() # Get console instance once
 
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print(f"Default Model: [cyan]{self.current_model}[/]. Type '/help' for commands.")
         self.safe_print("[italic dim]Press Ctrl+C once to abort request, twice quickly to exit[/italic dim]")
 
         # Define fixed layout dimensions
-        RESPONSE_PANEL_HEIGHT = 35
-        STATUS_PANEL_HEIGHT = 10  # Reduced status height
+        RESPONSE_PANEL_HEIGHT = 55
+        STATUS_PANEL_HEIGHT = 10 # Reduced status height
+        # --- Throttling Config ---
+        TEXT_UPDATE_INTERVAL = 0.2 # Update Markdown max ~5 times/sec
 
         @contextmanager
         def suppress_logs_during_live():
             """Temporarily suppress logging below WARNING during Live display."""
-            logger = logging.getLogger("mcpclient_multi") # Get specific logger
-            original_level = logger.level
+            logger_instance = logging.getLogger("mcpclient_multi") # Get specific logger
+            original_level = logger_instance.level
             # Suppress INFO and DEBUG during live updates
             if original_level < logging.WARNING:
-                 logger.setLevel(logging.WARNING)
+                 logger_instance.setLevel(logging.WARNING)
             try:
                 yield
             finally:
-                logger.setLevel(original_level) # Restore original level
+                 logger_instance.setLevel(original_level) # Restore original level
 
         while True:
             # --- Reset state for this iteration ---
-            live_display: Optional[Live] = None  # Track the Live instance itself
-            self.current_query_task = None  # Task reference for cancellation
-            self._current_query_text = ""  # Reset accumulated text for the next query
-            self._current_status_messages = []  # Reset status messages
+            live_display: Optional[Live] = None
+            self.current_query_task = None
+            self._current_query_text = ""
+            self._current_status_messages = []
             query_error: Optional[Exception] = None
             query_cancelled = False
-            final_stats_to_print = {}  # Store stats from the query run
+            final_stats_to_print = {}
+            last_text_update_time = 0.0 # For throttling
 
             try:
                 user_input = await asyncio.to_thread(Prompt.ask, "\n[bold blue]>>> [/]", console=interactive_console, default="")
@@ -9856,21 +9937,17 @@ class MCPClient:
 
                 # --- Command Handling ---
                 if user_input.startswith("/"):
-                    # --- Ensure Live display is stopped before running commands ---
+                    # (Command handling logic remains the same - ensure active display check)
                     if hasattr(self, "_active_live_display") and self._active_live_display:
                         log.warning("Attempting to run command while Live display might be active. Stopping display.")
-                        # Explicitly stop if Live instance exists (though it shouldn't here)
                         if live_display and live_display.is_started:
-                            with suppress(Exception):
-                                live_display.stop()
-                        self._active_live_display = None  # Clear flag just in case
+                            with suppress(Exception): live_display.stop()
+                        self._active_live_display = None
                         live_display = None
 
                     try:
-                        # Use shlex for robust command parsing
                         cmd_parts = shlex.split(user_input[1:])
-                        if not cmd_parts:
-                            continue
+                        if not cmd_parts: continue
                         cmd = cmd_parts[0].lower()
                         args = shlex.join(cmd_parts[1:]) if len(cmd_parts) > 1 else ""
                     except ValueError as e:
@@ -9880,67 +9957,70 @@ class MCPClient:
                     handler = self.commands.get(cmd)
                     if handler:
                         log.debug(f"Executing command: /{cmd} with args: '{args}'")
-                        # Commands might print directly or manage their own status
-                        await handler(args)  # Call the async command handler
+                        await handler(args)
                     else:
                         self.safe_print(f"[yellow]Unknown command: [bold]/{cmd}[/]. Type /help for list.[/yellow]")
 
                 # --- Query Handling ---
                 else:
                     query = user_input
-                    status_lines = deque(maxlen=STATUS_PANEL_HEIGHT)  # For status panel display
+                    status_lines = deque(maxlen=STATUS_PANEL_HEIGHT)
                     abort_message = Text("Press Ctrl+C once to abort...", style="dim yellow")
-                    current_response_text = ""  # Text accumulated *during* the live update
+                    current_response_text = "" # Text accumulated *during* the live update
+                    needs_render_update = False # Flag to trigger render
 
                     # --- Setup Live Display Placeholders ---
                     response_panel = Panel(Text("Waiting...", style="dim"), title="Response", height=RESPONSE_PANEL_HEIGHT, border_style="dim blue")
-                    status_panel = Panel(
-                        Group(*[Text("")] * STATUS_PANEL_HEIGHT), title="Status", height=STATUS_PANEL_HEIGHT + 2, border_style="dim blue"
-                    )
+                    status_panel = Panel(Group(*[Text("")]*STATUS_PANEL_HEIGHT), title="Status", height=STATUS_PANEL_HEIGHT+2, border_style="dim blue")
                     abort_panel = Panel(abort_message, height=3, border_style="none")
                     main_group = Group(response_panel, status_panel, abort_panel)
                     live_panel = Panel(main_group, title=f"Querying {self.current_model}...", border_style="dim green")
 
-                    self._active_live_display = True  # Set flag to prevent nested progress
-
-                    # Store reference to the current task running this loop iteration
-                    # This is the task that needs to be cancelled by Ctrl+C or API
+                    self._active_live_display = True # Set flag
                     consuming_task = asyncio.current_task()
                     self.current_query_task = consuming_task
 
                     # --- Start Live Display and Consume Stream ---
                     with suppress_logs_during_live():
-                        with Live(live_panel, console=interactive_console, refresh_per_second=30, transient=True, vertical_overflow="crop") as live:
-                            live_display = live  # Store reference to the live object
+                        with Live(live_panel, console=interactive_console, refresh_per_second=12, transient=True, vertical_overflow="crop") as live:
+                            live_display = live
                             try:
+                                current_time = time.time()
+                                last_text_update_time = current_time # Initialize time
+
                                 # Directly iterate over the wrapped generator stream
                                 async for chunk_type, chunk_data in self._stream_wrapper(self.process_streaming_query(query)):
-                                    # Check for cancellation *within* the loop
+                                    current_time = time.time()
+                                    needs_render_update = False # Reset flag for this chunk
+
                                     if consuming_task.cancelled():
                                         query_cancelled = True
                                         log.info("Query consuming loop cancelled.")
-                                        break  # Exit the async for loop
+                                        break
 
-                                    # Handle different chunk types to update the Live display
+                                    # Handle different chunk types
                                     if chunk_type == "text":
                                         current_response_text += chunk_data
-                                        response_panel.renderable = Markdown(current_response_text, code_theme="monokai")
-                                        response_panel.border_style = "blue"
-                                        live_panel.border_style = "green"
+                                        # --- Throttle Markdown Update ---
+                                        if current_time - last_text_update_time >= TEXT_UPDATE_INTERVAL:
+                                            response_panel.renderable = Markdown(current_response_text, code_theme="monokai")
+                                            response_panel.border_style = "blue" # Update style as text comes in
+                                            live_panel.border_style = "green"
+                                            last_text_update_time = current_time
+                                            needs_render_update = True
+                                        # --- End Throttle ---
                                     elif chunk_type == "status":
-                                        # Clean markup potentially returned from status messages
                                         clean_status_text = Text.from_markup(chunk_data)
                                         status_lines.append(clean_status_text)
-                                        # Prepare lines for display, ensuring fixed height
                                         display_status = list(status_lines)[-STATUS_PANEL_HEIGHT:]
                                         if len(display_status) < STATUS_PANEL_HEIGHT:
                                             padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status))
                                             display_status = padding + display_status
                                         status_panel.renderable = Group(*display_status)
                                         status_panel.border_style = "blue"
+                                        needs_render_update = True # Update immediately for status
                                     elif chunk_type == "error":
-                                        query_error = RuntimeError(chunk_data)  # Store error from stream
-                                        # Format error message for status panel
+                                        query_error = RuntimeError(chunk_data)
                                         status_lines.append(Text.from_markup(f"[bold red]Error: {chunk_data}[/bold red]"))
                                         display_status = list(status_lines)[-STATUS_PANEL_HEIGHT:]
                                         if len(display_status) < STATUS_PANEL_HEIGHT:
@@ -9948,36 +10028,56 @@ class MCPClient:
                                             display_status = padding + display_status
                                         status_panel.renderable = Group(*display_status)
                                         status_panel.border_style = "red"
+                                        needs_render_update = True # Update immediately for error
                                     elif chunk_type == "final_stats":
-                                        final_stats_to_print = chunk_data  # Store final stats
+                                        final_stats_to_print = chunk_data
 
-                                    # Update abort message visibility - check consuming_task directly
+                                    # Update abort message visibility & title
                                     abort_panel.renderable = abort_message if not consuming_task.done() else Text("")
-                                    live_panel.title = (
-                                        f"Querying {self.current_model}..." if not consuming_task.done() else f"Result ({self.current_model})"
-                                    )
+                                    live_panel.title = f"Querying {self.current_model}..." if not consuming_task.done() else f"Result ({self.current_model})"
+                                    # Always need to update if title/abort message changes
+                                    needs_render_update = True
 
-                                    # Refresh the Live display with updated panels
-                                    live.update(live_panel)
+                                    # Refresh the Live display if needed
+                                    if needs_render_update:
+                                        live.update(live_panel)
 
-                                # --- End of stream consumption ---
+                                # --- Perform one final update after the loop ---
+                                # Ensure the last text chunk is rendered
+                                response_panel.renderable = Markdown(current_response_text, code_theme="monokai")
+                                response_panel.border_style = "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                # Update final status state
+                                display_status_final = list(status_lines)[-STATUS_PANEL_HEIGHT:]
+                                if len(display_status_final) < STATUS_PANEL_HEIGHT:
+                                     padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
+                                     display_status_final = padding + display_status_final
+                                status_panel.renderable = Group(*display_status_final)
+                                status_panel.border_style = "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                # Update final title/abort message
+                                abort_panel.renderable = Text("")
+                                live_panel.title = f"Result ({self.current_model})" + (" - Cancelled" if query_cancelled else (" - Error" if query_error else ""))
+                                live_panel.border_style = "green" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                # Trigger final refresh
+                                live.update(live_panel)
+                                # --- End Final Update ---
 
                             except asyncio.CancelledError:
                                 query_cancelled = True
                                 log.info("Query task was cancelled (caught in Live context).")
                                 status_lines.append(Text("[yellow]Request Aborted.[/yellow]", style="yellow"))
+                                # Final update happens above
                             except Exception as e:
                                 query_error = e
                                 log.error(f"Error consuming query stream in interactive loop: {e}", exc_info=True)
                                 status_lines.append(Text(f"[bold red]Error: {e}[/bold red]", style="red"))
+                                # Final update happens above
                             finally:
-                                # Ensure the consuming task reference is cleared after this query attempt
                                 if self.current_query_task == consuming_task:
                                     self.current_query_task = None
 
                     # --- Live display stops automatically here ---
-                    self._active_live_display = None  # Clear flag
-                    live_display = None  # Clear Live instance reference
+                    self._active_live_display = None
+                    live_display = None
 
                     # --- Print Final Result Panel (outside Live) ---
                     final_response_renderable: Union[Markdown, Text]
@@ -9993,25 +10093,23 @@ class MCPClient:
                         final_title += " - Cancelled"
                         final_border = "yellow"
                     elif query_error:
-                        # Display accumulated text (if any) even on error
                         final_response_renderable = (
                             Markdown(current_response_text) if current_response_text else Text(f"Error: {query_error}", style="red")
                         )
                         final_title += " - Error"
                         final_border = "red"
                     else:
-                        # Handle case where model returned no text content but no error/cancellation
                         final_response_renderable = (
                             Markdown(current_response_text, code_theme="monokai")
                             if current_response_text
                             else Text("[dim]No text content received.[/dim]", style="dim")
                         )
 
-                    # Prepare final status display from the accumulated lines
+                    # Rebuild final status renderable using the final state of status_lines
                     display_status_final = list(status_lines)[-STATUS_PANEL_HEIGHT:]
                     if len(display_status_final) < STATUS_PANEL_HEIGHT:
-                        padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
-                        display_status_final = padding + display_status_final
+                         padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
+                         display_status_final = padding + display_status_final
                     final_status_renderable = Group(*display_status_final)
 
                     # Build final panels
@@ -10024,44 +10122,37 @@ class MCPClient:
 
                     # Print final stats panel if available and no error/cancellation
                     if final_stats_to_print and not query_error and not query_cancelled:
+                        # Call the *correct* method definition
                         self._print_final_query_stats(interactive_console, final_stats_to_print)
                     elif not query_error and not query_cancelled:
                         log.warning("Final stats were not received from query processor.")
 
             # --- Outer Loop Error Handling ---
             except KeyboardInterrupt:
-                # Caught when Prompt.ask is interrupted by Ctrl+C
                 self.safe_print("\n[yellow]Input interrupted. Type /exit or Ctrl+C again to quit.[/yellow]")
-                # Ensure any active Live display is stopped if user interrupts Prompt.ask
                 if live_display and live_display.is_started:
-                    with suppress(Exception):
-                        live_display.stop()
+                    with suppress(Exception): live_display.stop()
                     self._active_live_display = None
                     live_display = None
-                continue  # Continue to the next prompt
-            except EOFError:  # Handle Ctrl+D during Prompt.ask
+                continue
+            except EOFError:
                 self.safe_print("\n[yellow]EOF received, exiting...[/]")
-                break  # Exit the main while loop cleanly
+                break
             except Exception as loop_err:
                 self.safe_print(f"\n[bold red]Unexpected Error in interactive loop:[/] {loop_err}")
                 log.error("Unexpected error in interactive loop", exc_info=True)
-                # Ensure Live display is stopped if an error occurs unexpectedly
                 if live_display and live_display.is_started:
-                    with suppress(Exception):
-                        live_display.stop()
+                    with suppress(Exception): live_display.stop()
                     self._active_live_display = None
                     live_display = None
-                await asyncio.sleep(1)  # Prevent rapid error loops
+                await asyncio.sleep(1)
 
             finally:
-                # Final safety net: Ensure Live display is stopped and flags cleared
                 if live_display and live_display.is_started:
-                    with suppress(Exception):
-                        live_display.stop()
+                    with suppress(Exception): live_display.stop()
                 self._active_live_display = None
-                if self.current_query_task == asyncio.current_task():  # Clear if it was the consuming task
+                if self.current_query_task == asyncio.current_task():
                     self.current_query_task = None
-                # Reset accumulated text/status for safety, though it should be reset at loop start
                 self._current_query_text = ""
                 self._current_status_messages = []
 
