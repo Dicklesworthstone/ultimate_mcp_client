@@ -1,0 +1,55 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Conversation Management
+
+The MCP Client implements a sophisticated conversation management system in [mcp_client.py](mdc:mcp_client.py) that goes beyond simple chat history.
+
+## Conversation Graph
+
+### Core Structure
+- Non-linear conversation history with branching support
+- Each branch point is a `ConversationNode` with its own message history
+- Forkable conversations allow exploring different interaction paths
+- Supported in both CLI and Web UI interfaces
+
+### Persistence
+- Complete conversation graphs saved to JSON files
+- Preserves all branches and messages across sessions
+- Supports import/export for sharing or backup
+
+## Context Management
+
+### Working Memory
+- Automatic or manual optimization of conversation context
+- Summarization of long histories to stay within context limits
+- Focus mechanisms for highlighting important info
+
+### Dynamic Prompts
+- Inject pre-defined prompt templates from servers
+- Apply templates to current conversation context
+
+## Web UI Visualization
+
+### Branch Visualization
+- Interactive tree view showing the conversation structure
+- Visual indicators for current branch and branch points
+- Click-to-checkout functionality for navigating between branches
+
+### Branch Management
+- Create new branches from any point
+- Clear the current branch without losing history
+- Import/export specific branches as needed
+
+## CLI Commands
+
+Key conversation management commands include:
+- `/fork [name]` - Create a new branch
+- `/branch list` - Show available branches
+- `/branch checkout <id>` - Switch to a different branch
+- `/export [--id <id>] [--output <file>]` - Export conversations
+- `/import <file>` - Import conversation from file
+- `/optimize` - Summarize conversation context
+- `/clear` - Clear current branch messages

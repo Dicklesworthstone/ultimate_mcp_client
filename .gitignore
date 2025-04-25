@@ -171,3 +171,5 @@ claude_desktop_config.json
 __pycache__/
 .env
 claude_desktop_config.jsonOLD
+.mcpclient_multi_config/
+default_conversation.json

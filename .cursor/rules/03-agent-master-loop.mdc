@@ -1,0 +1,52 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Agent Master Loop (AML) Architecture
+
+The Agent Master Loop module in [agent_master_loop.py](mdc:agent_master_loop.py) orchestrates AI agents with complex cognitive functions. It manages the think-act cycle, integrates with the Unified Memory System (UMS), and leverages LLMs for decision-making.
+
+## Key Components
+
+### AgentState
+Holds the complete runtime state of the agent including:
+- Workflow context and workflow stack
+- Goal stack for hierarchical task management
+- Current plan with structured steps
+- Error tracking and meta-cognition metrics
+- Adaptive thresholds for reflection and consolidation
+
+### AgentMasterLoop
+Main orchestrator class implementing:
+- Think-act-learn cycles with LLM interaction
+- Context gathering and management
+- Tool execution and error handling
+- Meta-cognitive processes (reflection, consolidation)
+- Background task management
+
+## Core Functionality
+
+### Planning & Execution
+- Maintains explicit, modifiable plans with sequential steps
+- Validates plan steps and detects dependency cycles
+- Executes tools via MCPClient with argument sanitization
+- Records detailed action history with dependencies
+
+### Memory & Goal Management
+- Goal Stack: Hierarchical goal decomposition and tracking
+- Working Memory: Smart optimization based on relevance
+- Memory Promotion: Background elevation of memories to higher cognitive levels
+- Memory Linking: Automatic creation of semantic relationships
+
+### Meta-Cognition
+- Reflection: Self-analysis for progress monitoring
+- Consolidation: Synthesizing information into insights
+- Adaptive Thresholds: Dynamic adjustment based on performance
+- Mental Momentum: Bias for maintaining productive workflows
+
+## Error Handling
+- Retry logic with exponential backoff
+- Structured error categorization for recovery
+- Consecutive error tracking with safety limits
+- Graceful degradation and shutdown mechanisms

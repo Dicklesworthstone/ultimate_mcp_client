@@ -59,10 +59,11 @@ dependencies = [
     "python-multipart",
 ]
 
-# Defines the command-line script entry point
+# Defines the command-line script entry points
 [project.scripts]
 # Fixed to match the actual filename
 mcpclient = "mcp_client:app"
+mcpclientm = "mcp_client_multi:app"
 
 [project.urls]
 # Optional: Add links to your project repository or homepage
@@ -71,7 +72,7 @@ mcpclient = "mcp_client:app"
 
 # Configure Hatchling to handle the single-file module properly
 [tool.hatch.build.targets.wheel]
-packages = ["mcp_client.py"]
+packages = ["mcp_client.py", "mcp_client_multi.py"]
 
 # Exclude directories that aren't Python packages
 [tool.hatch.build.targets.wheel.exclude]

@@ -1,0 +1,53 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Server Discovery & Integration
+
+The MCP Client provides multiple mechanisms to discover and integrate with MCP servers as implemented in [mcp_client.py](mdc:mcp_client.py).
+
+## Discovery Methods
+
+### File System Discovery
+- Searches configured directories for potential STDIO server scripts
+- Default paths include `.mcpclient_config/servers`, `~/mcp-servers`, etc.
+- Auto-detected on startup when enabled in config
+
+### mDNS/Zeroconf Discovery
+- Real-time discovery of MCP servers on the local network
+- Listens for services advertised under `_mcp._tcp.local.`
+- Managed via the `/discover` command suite
+- Can be automated with background scanning
+
+### Local Port Scanning
+- Actively scans configured port ranges for potential MCP servers
+- Attempts MCP `initialize` handshake to detect compatible servers
+- Configured via `/config port-scan` commands
+- Useful for discovering servers not using mDNS advertisement
+
+### Remote Registries
+- Connects to defined MCP registry URLs to find shared servers
+- Typically used for discovering SSE-based MCP servers
+
+### Claude Desktop Integration
+- Auto-detects and imports configs from `claude_desktop_config.json`
+- Intelligently adapts Windows/WSL paths and command structures
+- Remaps Windows-style paths to their Linux/WSL equivalents
+
+## Server Management
+
+### Connection Types
+- STDIO: Process-based servers using standard input/output
+- SSE: HTTP Server-Sent Events based servers (REST endpoints)
+
+### Server Lifecycle
+- Health monitoring with automatic recovery attempts
+- Connection retries with exponential backoff
+- Circuit breakers for consistently failing servers
+
+### STDIO Safety
+The client implements multiple layers to prevent accidental STDIO corruption:
+- Output redirection to stderr when STDIO servers are active
+- Context managers for critical operations
+- Safe console utilities for UI display

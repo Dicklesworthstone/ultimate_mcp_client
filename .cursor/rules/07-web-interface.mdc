@@ -1,0 +1,68 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Web Interface
+
+The MCP Client provides a modern, responsive web interface as defined in [mcp_client.py](mdc:mcp_client.py) and [mcp_client_ui.html](mdc:mcp_client_ui.html).
+
+## Technology Stack
+
+### Backend
+- FastAPI for API server
+- WebSockets for bidirectional real-time communication
+- Uvicorn as the ASGI server
+- API endpoints for programmatic access
+
+### Frontend
+- Alpine.js for lightweight reactivity
+- Tailwind CSS and DaisyUI for styling
+- Marked.js for Markdown rendering
+- Highlight.js for code syntax highlighting
+- Tippy.js for tooltips
+
+## Key Features
+
+### Real-time Chat
+- Streamed responses via WebSockets
+- Rich Markdown rendering with syntax highlighting
+- Visual separation of tool calls and results
+- Status indicators for connection and processing
+
+### Server Management
+- Add, remove, connect, and disconnect servers
+- Status indicators for server health
+- Enable/disable servers with one click
+- Tool and capability counts per server
+
+### Discovery Integration
+- Trigger discovery scans (filesystem, registry, mDNS)
+- One-click adding of discovered servers
+- Real-time server health monitoring
+
+### Conversation View
+- Interactive tree visualization of conversation branches
+- Click-to-checkout branch navigation
+- Branch creation, clearing, and optimization
+- Import/export functionality
+
+### Tool Interaction
+- Direct tool execution with JSON parameter editing
+- In-context display of tool calls and results
+- Copy buttons for code blocks
+
+### Settings Panel
+- API key management
+- Model selection and parameter tuning
+- Feature toggles (streaming, caching, discovery)
+- Theme customization
+
+## API Server
+
+When running with `--webui`, a RESTful API is exposed with endpoints for:
+- Status information and configuration
+- Server management and connection control
+- Tool and resource listing
+- Conversation management
+- WebSocket streaming endpoints

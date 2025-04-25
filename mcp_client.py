@@ -631,7 +631,6 @@ def adapt_path_for_platform(command: str, args: List[str]) -> Tuple[str, List[st
     else:
          log.debug(f"Command part '{command}' likely not a path, skipping conversion.")
 
-
     # Apply conversion to each argument if it's a string
     adapted_args = []
     for i, arg in enumerate(args):
@@ -10239,23 +10238,13 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
 
             log.info("Web UI server shut down.")
             # Cleanup is handled by the lifespan manager
-
-        # --- Original CLI/Dashboard/Interactive Logic ---
-        # (Connect to specific server block remains the same)
-        # ... (Connect to specific server logic - Keep this) ...
-
         elif dashboard:
-            # (Dashboard logic remains the same)
-            # ...
             if not client.server_monitor.monitoring:
                  await client.server_monitor.start_monitoring()
             await client.cmd_dashboard("")
             await client.close() # Ensure cleanup after dashboard closes
             return
-
         elif query:
-            # (Single query logic remains the same)
-            # ...
              try:
                  result = await client.process_query(query, model=model)
                  safe_console.print()

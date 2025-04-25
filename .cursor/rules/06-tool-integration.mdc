@@ -1,0 +1,56 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Tool Integration
+
+The MCP Client implements comprehensive tool integration in [mcp_client.py](mdc:mcp_client.py) with intelligent routing, execution, and caching.
+
+## Tool Management
+
+### Discovery & Registration
+- Tools discovered from connected MCP servers
+- Aggregated tool registry with metadata and schemas
+- Automatic tool capability introspection
+- Tool categorization and organization
+
+### Intelligent Routing
+- Tools routed to their originating server
+- Name sanitization for API compatibility
+- Original name tracking for proper display
+
+## Execution
+
+### Direct Tool Execution
+- Run specific tools with custom JSON parameters
+- Web UI modal interface for testing tools
+- CLI `/tool` command for direct execution
+- Structured parameter validation
+
+### Real-time Streaming
+- Streams AI responses and tool status updates
+- WebSockets for Web UI streaming
+- Rich CLI rendering for interactive mode
+- Partial JSON accumulation for structured inputs
+
+## Smart Caching
+
+### Multi-Level Caching
+- Disk (diskcache) and in-memory caching layers
+- Configurable Time-To-Live (TTL) per tool category
+- Intelligent cache invalidation strategies
+
+### Dependency Tracking
+- Define relationships between tools
+- Invalidating one tool's cache cascades to dependent caches
+- Graph visualization of cache dependencies
+
+## Management Commands
+
+Key tool-related commands include:
+- `/tools [server_name]` - List available tools with optional filtering
+- `/tool <tool_name> '{"param": "value"}'` - Execute a specific tool
+- `/cache list` - Show cached tools
+- `/cache clear [--all|tool_name]` - Clear the cache
+- `/cache dependencies [tool_name]` - View cache dependency relationships

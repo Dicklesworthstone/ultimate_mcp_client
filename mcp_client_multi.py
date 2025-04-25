@@ -205,7 +205,7 @@ from anthropic.types import (
 )
 from decouple import Config as DecoupleConfig
 from decouple import Csv, RepositoryEnv
-from dotenv import dotenv_values, find_dotenv, set_key
+from dotenv import dotenv_values, find_dotenv, load_dotenv, set_key
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from mcp import ClientSession
@@ -473,9 +473,19 @@ FunctionCallDict = Dict[str, Any]
 USE_VERBOSE_SESSION_LOGGING = False
 
 # --- Set up Typer app ---
-app = typer.Typer(help="🔌 Ultimate MCP Client - Multi-Provider Edition")
+app = typer.Typer(
+    help="🔌 Ultimate MCP Client - Multi-Provider Edition",
+    context_settings={"help_option_names": ["--help", "-h"]}
+)
 
-# --- StdioProtectionWrapper ---
+@app.callback(invoke_without_command=True)
+def callback(ctx: typer.Context):
+    """Show help if no command is provided."""
+    if ctx.invoked_subcommand is None:
+        print(ctx.get_help())
+        raise typer.Exit()
+
+
 class StdioProtectionWrapper:
     """Wrapper that prevents accidental writes to stdout when stdio servers are active."""
     def __init__(self, original_stdout):
@@ -802,45 +812,83 @@ class DashboardData(BaseModel):
 web_app: Optional[FastAPI] = None
 
 # --- Path Adaptation Helper (adapt_path_for_platform) ---
+# Helper function to adapt paths for different platforms, used for processing Claude Desktop JSON config file
 def adapt_path_for_platform(command: str, args: List[str]) -> Tuple[str, List[str]]:
-    # (Keep existing implementation)
+    """
+    ALWAYS assumes running on Linux/WSL.
+    Converts Windows-style paths (e.g., 'C:\\Users\\...') found in the command
+    or arguments to their corresponding /mnt/ drive equivalents
+    (e.g., '/mnt/c/Users/...').
+    """
+
+    # --- Added Debug Logging ---
     log.debug(f"adapt_path_for_platform: Initial input - command='{command}', args={args}")
+    # --- End Added Debug Logging ---
+
     def convert_windows_path_to_linux(path_str: str) -> str:
+        """
+        Directly converts 'DRIVE:\\path' or 'DRIVE:/path' to '/mnt/drive/path'.
+        Handles drive letters C-Z, case-insensitive.
+        Replaces backslashes (represented as '\\' in Python strings) with forward slashes.
+        """
         log.debug(f"convert_windows_path_to_linux: Checking path string: {repr(path_str)}")
+
+        # Check for DRIVE:\ or DRIVE:/ pattern (case-insensitive)
+        # Note: It checks the actual string value, which might be 'C:\\Users\\...'
         if isinstance(path_str, str) and len(path_str) > 2 and path_str[1] == ':' and path_str[2] in ['\\', '/'] and path_str[0].isalpha():
-            try:
+            try: # Added try-except for robustness during conversion
                 drive_letter = path_str[0].lower()
-                rest_of_path = path_str[3:].replace("\\", "/")
+                # path_str[2:] correctly gets the part after 'C:'
+                # .replace("\\", "/") correctly handles the single literal backslash in the Python string
+                rest_of_path = path_str[3:].replace("\\", "/") # Use index 3 to skip ':\' or ':/'
+                # Ensure rest_of_path doesn't start with / after C: (redundant if using index 3, but safe)
+                # if rest_of_path.startswith('/'):
+                #     rest_of_path = rest_of_path[1:]
                 linux_path = f"/mnt/{drive_letter}/{rest_of_path}"
+                # Use logger configured elsewhere in your script
                 log.debug(f"Converted Windows path '{path_str}' to Linux path '{linux_path}'")
                 return linux_path
             except Exception as e:
                 log.error(f"Error during path conversion for '{path_str}': {e}", exc_info=True)
+                # Return original path on conversion error
                 return path_str
+        # If it doesn't look like a Windows path, return it unchanged
         log.debug(f"convert_windows_path_to_linux: Path '{path_str}' did not match Windows pattern or wasn't converted.")
         return path_str
 
-    adapted_command = command
+    # Apply conversion to the command string itself only if it looks like a path
+    # Check if the command itself looks like a potential path that needs conversion
+    # (e.g., "C:\path\to\executable.exe" vs just "npx")
+    # A simple check: does it contain ':' and '\' or '/'? More robust checks could be added.
+    adapted_command = command # Default to original command
     if isinstance(command, str) and ':' in command and ('\\' in command or '/' in command):
          log.debug(f"Attempting conversion for command part: '{command}'")
          adapted_command = convert_windows_path_to_linux(command)
     else:
          log.debug(f"Command part '{command}' likely not a path, skipping conversion.")
 
+    # Apply conversion to each argument if it's a string
     adapted_args = []
     for i, arg in enumerate(args):
+        # Make sure we only try to convert strings
         if isinstance(arg, str):
+            # --- Added Debug Logging for Arg ---
             log.debug(f"adapt_path_for_platform: Processing arg {i}: {repr(arg)}")
+            # --- End Added Debug Logging ---
             converted_arg = convert_windows_path_to_linux(arg)
             adapted_args.append(converted_arg)
         else:
+            # --- Added Debug Logging for Non-String Arg ---
             log.debug(f"adapt_path_for_platform: Skipping non-string arg {i}: {repr(arg)}")
-            adapted_args.append(arg)
+            # --- End Added Debug Logging ---
+            adapted_args.append(arg) # Keep non-string args (like numbers, bools) as is
 
+    # Log if changes were made (using DEBUG level)
     if adapted_command != command or adapted_args != args:
         log.debug(f"Path adaptation final result: command='{adapted_command}', args={adapted_args}")
     else:
         log.debug("Path adaptation: No changes made to command or arguments.")
+
     return adapted_command, adapted_args
 
 # --- Stdio Safety (get_safe_console, safe_stdout, verify_no_stdout_pollution) ---
@@ -871,7 +919,6 @@ def get_safe_console():
     return stderr_console if has_stdio_servers else console
 
 def verify_no_stdout_pollution():
-    # (Keep existing implementation)
     original_stdout = sys.stdout
     test_buffer = io.StringIO()
     sys.stdout = test_buffer
@@ -1817,6 +1864,8 @@ class Config:
         self.dotenv_path = find_dotenv(raise_error_if_not_found=False, usecwd=True)
         if self.dotenv_path:
             log.info(f"Located .env file at: {self.dotenv_path}")
+            load_dotenv(dotenv_path=self.dotenv_path, override=True) # Load .env into os.environ
+            log.debug(f"Loaded environment variables from {self.dotenv_path}")
         else:
             # Decide where a .env file *should* go if created later
             self.dotenv_path = str(Path.cwd() / ".env") # Default to current working dir
@@ -2015,7 +2064,6 @@ class Config:
                     for server_name, server_data in value.items():
                         if not isinstance(server_data, dict): continue
                         try:
-                            # (Keep the existing robust server loading logic)
                             srv_type = ServerType(server_data.get('type', 'stdio'))
                             version_str = server_data.get('version')
                             version = ServerVersion.from_string(version_str) if version_str else None
@@ -2027,6 +2075,7 @@ class Config:
                             server_kwargs['type'] = srv_type
                             server_kwargs['version'] = version
                             server_kwargs['metrics'] = metrics
+                            server_kwargs['name'] = server_name
                             self.servers[server_name] = ServerConfig(**server_kwargs)
                         except Exception as server_load_err:
                             log.warning(f"Skipping server '{server_name}' from YAML: {server_load_err}", exc_info=True)
@@ -2194,9 +2243,15 @@ class ServerMonitor:
     async def stop_monitoring(self):
         if not self.monitoring: return
         self.monitoring = False
-        if self.monitor_task: 
+        if self.monitor_task:
             self.monitor_task.cancel()
-            await suppress(asyncio.CancelledError)(self.monitor_task)
+            try:
+                await self.monitor_task
+            except asyncio.CancelledError:
+                log.debug("Server monitor task successfully cancelled.")
+            except Exception as e:
+                # Log other potential errors during await if needed
+                log.warning(f"Error awaiting cancelled monitor task: {e}")
         self.monitor_task = None
         log.info("Server health monitoring stopped")
 
@@ -2531,6 +2586,29 @@ class ServerManager:
         self._discovery_in_progress = asyncio.Lock()
         log.info("ServerManager initialized.")
 
+    async def close(self):
+        """Gracefully shut down the server manager and release resources."""
+        log.info("Closing ServerManager...")
+        # 1. Stop Monitor
+        if hasattr(self, 'monitor') and self.monitor:
+            await self.monitor.stop_monitoring()
+        # 2. Close Registry (handles mDNS unregister and HTTP client)
+        if hasattr(self, 'registry') and self.registry:
+            await self.registry.close()
+        # 3. Close the main ExitStack (this manages session/process cleanup)
+        log.debug(f"Closing ServerManager AsyncExitStack (cleans up {len(self.active_sessions)} sessions)...")
+        await self.exit_stack.aclose()
+        log.debug("ServerManager AsyncExitStack closed.")
+        # 4. Clear internal state (optional, as instance is being destroyed)
+        self.active_sessions.clear()
+        self.processes.clear()
+        self.tools.clear()
+        self.resources.clear()
+        self.prompts.clear()
+        self._session_tasks.clear()
+        self.registered_services.clear()
+        log.info("ServerManager closed.")
+        
     @property
     def tools_by_server(self) -> Dict[str, List[MCPTool]]:
         """Group tools by server name for easier lookup."""
@@ -2652,7 +2730,6 @@ class ServerManager:
             await asyncio.sleep(3)
         else:
             log.info("mDNS listener already running. Checking current discoveries.")
-            # Optionally trigger an immediate re-query or just use existing cache
             # For simplicity, we use the current cache populated by the listener.
             pass
 
@@ -2977,58 +3054,86 @@ class ServerManager:
 
         # --- Add Logic ---
         added_count = 0
+        servers_added_this_run = [] # Track names of successfully added servers
+
         if interactive_mode:
             if Confirm.ask("\nAdd selected discovered servers to configuration?", default=True, console=safe_console):
-                while True:
-                    choice = Prompt.ask("Enter number(s) to add (e.g., 1, 3-5), 'all', or 'none'", default="none", console=safe_console)
-                    if choice.lower() == 'none':
-                        break
-                    servers_to_add_indices = set()
-                    try:
-                        if choice.lower() == 'all':
-                            servers_to_add_indices = set(range(len(newly_discovered)))
-                        else:
-                            parts = choice.replace(" ", "").split(',')
-                            for part in parts:
-                                if '-' in part:
-                                    range_parts = part.split('-')
-                                    if len(range_parts) != 2: raise ValueError("Invalid range format")
-                                    start, end = map(int, range_parts)
-                                    if 1 <= start <= end <= len(newly_discovered):
-                                        servers_to_add_indices.update(range(start - 1, end))
-                                    else:
-                                        raise ValueError("Range index out of bounds")
-                                else:
-                                    idx = int(part)
-                                    if 1 <= idx <= len(newly_discovered):
-                                        servers_to_add_indices.add(idx - 1)
-                                    else:
-                                        raise ValueError("Index out of bounds")
-                        break # Valid selection processed
-                    except ValueError as e:
-                        safe_console.print(f"[red]Invalid selection: {e}. Please try again.[/]")
+                servers_to_add_indices = set() # Initialize empty set
 
-                # Process selected servers
-                for idx in sorted(servers_to_add_indices):
-                    server_info = newly_discovered[idx]
-                    success, msg = await self.add_discovered_server_config(server_info)
-                    if success:
-                        added_count += 1
-                        # Offer immediate connection
-                        if Confirm.ask(f"Connect to added server '{server_info['name']}' now?", default=False, console=safe_console):
-                             await self.connect_to_server_by_name(server_info['name'])
-                    else:
-                        safe_console.print(f"[red]Failed to add '{server_info['name']}': {msg}[/]")
+                # --- Auto-select if only one server ---
+                if len(newly_discovered) == 1:
+                    safe_console.print("[dim]Only one server found, selecting index 1 automatically.[/dim]")
+                    servers_to_add_indices = {0} # Auto-select the first (and only) index
+                # --- End Auto-select ---
+                else: # More than one server, ask for selection
+                    while True:
+                        choice = Prompt.ask("Enter number(s) to add (e.g., 1, 3-5), 'all', or 'none'", default="none", console=safe_console)
+                        if choice.lower() == 'none':
+                            break # Exit loop if user chooses none
+                        servers_to_add_indices = set() # Reset for each attempt inside the loop
+                        try:
+                            if choice.lower() == 'all':
+                                servers_to_add_indices = set(range(len(newly_discovered)))
+                            else:
+                                parts = choice.replace(" ", "").split(',')
+                                for part in parts:
+                                    if '-' in part:
+                                        range_parts = part.split('-')
+                                        if len(range_parts) != 2: raise ValueError("Invalid range format")
+                                        start, end = map(int, range_parts)
+                                        if 1 <= start <= end <= len(newly_discovered):
+                                            servers_to_add_indices.update(range(start - 1, end))
+                                        else:
+                                            raise ValueError("Range index out of bounds")
+                                    else:
+                                        idx = int(part)
+                                        if 1 <= idx <= len(newly_discovered):
+                                            servers_to_add_indices.add(idx - 1)
+                                        else:
+                                            raise ValueError("Index out of bounds")
+                            break # Valid selection processed, exit the while True loop
+                        except ValueError as e:
+                            safe_console.print(f"[red]Invalid selection: {e}. Please try again.[/]")
+                        # Loop continues if selection was invalid
+
+                # Process selected servers if any were chosen
+                if servers_to_add_indices:
+                    for idx in sorted(servers_to_add_indices):
+                        server_info = newly_discovered[idx]
+                        success, msg = await self.add_discovered_server_config(server_info)
+                        if success:
+                            added_count += 1
+                            # Store the *actual* name added (might be renamed)
+                            added_config = next((s for s in self.config.servers.values() if s.path == server_info["path_or_url"]), None)
+                            if added_config:
+                                servers_added_this_run.append(added_config.name)
+                            else:
+                                log.warning(f"Could not find added server config for path {server_info['path_or_url']} after successful add.")
+                            # --- REMOVED individual connection prompt ---
+                            # if Confirm.ask(f"Connect to added server '{server_info['name']}' now?", default=False, console=safe_console):
+                            #      await self.connect_to_server_by_name(server_info['name']) # Use actual name added
+                        else:
+                            safe_console.print(f"[red]Failed to add '{server_info['name']}': {msg}[/]")
             else:
                 safe_console.print("[yellow]No servers added.[/]")
 
         else: # Non-interactive: Just log
              log.info(f"Non-interactive mode. Found {len(newly_discovered)} new servers. Add manually or via API.")
 
-        # Save config if servers were added
+        # --- Save config and offer to connect *after* processing all selections ---
         if added_count > 0:
             await self.config.save_async() # Save YAML changes
             safe_console.print(f"\n[green]{EMOJI_MAP['success']} Added {added_count} server(s) to configuration.[/]")
+
+            # --- Offer to connect to the group ---
+            if servers_added_this_run and Confirm.ask(f"Connect to the {len(servers_added_this_run)} newly added server(s) now?", default=True, console=safe_console):
+                log.info(f"Attempting to connect to newly added servers: {servers_added_this_run}")
+                connect_tasks = [self.connect_to_server_by_name(name) for name in servers_added_this_run]
+                results = await asyncio.gather(*connect_tasks, return_exceptions=True)
+                success_conn = sum(1 for r in results if isinstance(r, bool) and r)
+                fail_conn = len(results) - success_conn
+                safe_console.print(f"[cyan]Connection attempt finished. Success: {success_conn}, Failed: {fail_conn}[/]")
+            # --- End group connection ---
 
     async def add_discovered_server_config(self, server_info: Dict) -> Tuple[bool, str]:
         """Adds a server from discovery results to the config ONLY."""
@@ -3246,21 +3351,30 @@ class ServerManager:
         has_resources = False
         has_prompts = False
 
-        # Determine capabilities from InitializeResult (logic remains the same)
+        server_caps_obj = None
         if isinstance(initialize_result, dict): # From STDIO direct response
              caps_data = initialize_result.get("capabilities")
              if isinstance(caps_data, dict):
-                  has_tools = bool(caps_data.get("tools"))
-                  has_resources = bool(caps_data.get("resources"))
-                  has_prompts = bool(caps_data.get("prompts"))
-        elif isinstance(initialize_result, MCPInitializeResult): # From standard ClientSession
-             if initialize_result.capabilities:
-                  has_tools = bool(initialize_result.capabilities.tools)
-                  has_resources = bool(initialize_result.capabilities.resources)
-                  has_prompts = bool(initialize_result.capabilities.prompts)
-        else:
-            log.warning(f"[{server_name}] Could not determine capabilities from init result type: {type(initialize_result)}")
+                 # If STDIO returns a dict, we might need to map its keys
+                 # Assuming simple boolean flags for now based on previous code
+                 has_tools = bool(caps_data.get("tools"))
+                 has_resources = bool(caps_data.get("resources"))
+                 has_prompts = bool(caps_data.get("prompts"))
+        elif isinstance(initialize_result, MCPInitializeResult): # From standard ClientSession result object
+             # Access the capabilities attribute directly from the MCPInitializeResult object
+             server_caps_obj = initialize_result.capabilities # This is the ServerCapabilities object
 
+        # Check the ServerCapabilities object if obtained from MCPInitializeResult
+        if server_caps_obj and hasattr(server_caps_obj, 'tools') and hasattr(server_caps_obj, 'resources') and hasattr(server_caps_obj, 'prompts'):
+             has_tools = bool(server_caps_obj.tools)
+             has_resources = bool(server_caps_obj.resources)
+             has_prompts = bool(server_caps_obj.prompts)
+        elif server_caps_obj:
+            # Log if capabilities object exists but lacks expected fields
+            log.warning(f"[{server_name}] InitializeResult.capabilities object present but lacks expected fields (tools, resources, prompts). Type: {type(server_caps_obj)}")
+        else: # Add an else to catch the case where initialize_result was neither dict nor MCPInitializeResult
+            log.warning(f"[{server_name}] Unexpected initialize_result type ({type(initialize_result)}), cannot determine capabilities.")
+        
         log.debug(f"[{server_name}] Determined capabilities: tools={has_tools}, resources={has_resources}, prompts={has_prompts}")
         # Store determined capabilities in the config
         if server_name in self.config.servers:
@@ -3355,9 +3469,6 @@ class ServerManager:
 
         if result_list is None:
             log.warning(f"[{server_name}] Received None instead of a list for {item_type_name}s.")
-            return
-        if not isinstance(result_list, list):
-            log.warning(f"[{server_name}] Expected a list for {item_type_name}s, but got {type(result_list).__name__}.")
             return
 
         for item in result_list:
@@ -3488,7 +3599,6 @@ class ServerManager:
                         log.info(f"[{current_server_name}] Performing MCP handshake (initialize) via SSE...")
                         initialize_result_obj = await asyncio.wait_for(session.initialize(), timeout=handshake_timeout)
                         log.info(f"[{current_server_name}] Initialize successful (SSE). Server reported: {getattr(initialize_result_obj, 'serverInfo', 'N/A')}")
-                        await session.send_initialized_notification() # Send initialized notification for SSE too
                         process_this_attempt = None # No process for SSE
 
                     else:
@@ -3500,17 +3610,13 @@ class ServerManager:
                     # --- Rename Logic ---
                     original_name_before_rename = current_server_name
                     actual_server_name_from_init: Optional[str] = None
-                    server_capabilities_from_init: Optional[Union[Dict, Any]] = None # Store capabilities object/dict
-
                     if isinstance(initialize_result_obj, dict): # STDIO Result
                         server_info = initialize_result_obj.get("serverInfo", {})
                         if isinstance(server_info, dict):
                             actual_server_name_from_init = server_info.get("name")
-                        server_capabilities_from_init = initialize_result_obj.get("capabilities")
                     elif isinstance(initialize_result_obj, MCPInitializeResult): # Standard Result
                         if initialize_result_obj.serverInfo:
                             actual_server_name_from_init = initialize_result_obj.serverInfo.name
-                        server_capabilities_from_init = initialize_result_obj.capabilities
 
                     if actual_server_name_from_init and actual_server_name_from_init != current_server_name:
                         if actual_server_name_from_init in self.config.servers and actual_server_name_from_init != initial_server_name:
@@ -3547,7 +3653,7 @@ class ServerManager:
                                 raise RuntimeError(f"Failed during server rename: {rename_err}") from rename_err
 
                     # --- Load Capabilities (AFTER potential rename) ---
-                    await self._load_server_capabilities(current_server_name, session, server_capabilities_from_init)
+                    await self._load_server_capabilities(current_server_name, session, initialize_result_obj)
 
                     # --- Success Path ---
                     connection_time_ms = (time.time() - start_time) * 1000
@@ -3559,7 +3665,10 @@ class ServerManager:
                         metrics.update_status()
 
                     if latency_histogram:
-                        await suppress(Exception)(latency_histogram.record(connection_time_ms, {"server.name": current_server_name}))
+                        try:
+                            latency_histogram.record(connection_time_ms, {"server.name": current_server_name})
+                        except Exception as histo_err:
+                            log.warning(f"Failed to record latency histogram for {current_server_name}: {histo_err}")
                     if span:
                         span.set_status(trace.StatusCode.OK)
 
@@ -3601,9 +3710,13 @@ class ServerManager:
                 # --- End Connection Attempt Try/Except ---
                 finally:
                     # Ensure attempt-specific resources are cleaned up *before* retry/failure
-                    await attempt_exit_stack.aclose()
-                    if span_context_manager:
-                        await suppress(Exception)(span_context_manager.__exit__(*sys.exc_info()))
+                    if span_context_manager and hasattr(span_context_manager, '__exit__'):
+                        try:
+                            # Exit the context manager, passing exception info if any
+                            exc_type, exc_val, exc_tb = sys.exc_info()
+                            span_context_manager.__exit__(exc_type, exc_val, exc_tb)
+                        except Exception as span_exit_err:
+                            log.warning(f"Error closing OpenTelemetry span context: {span_exit_err}")
 
                 # --- Shared Error Handling & Retry Logic ---
                 retry_count += 1
@@ -3836,29 +3949,34 @@ class ServerManager:
 
         connection_tasks = []
         for name, server_config in enabled_servers.items():
+            if name in self.active_sessions:
+                log.debug(f"Server '{name}' is already connected, skipping redundant connection attempt.")
+                continue
             # Create a task for each connection attempt
             connection_tasks.append(
                 (self.connect_to_server, # The function to call
-                 f"{EMOJI_MAP['server']} Connecting to {name}...", # Description for progress
-                 (server_config,) # Args tuple for the function
-                 )
+                f"{EMOJI_MAP['server']} Connecting to {name}...", # Description for progress
+                (server_config,) # Args tuple for the function
+                )
             )
 
         # Use the progress helper to run connections concurrently
-        try:
-            # Assuming MCPClient instance is available via app.mcp_client
-            if hasattr(app, "mcp_client") and hasattr(app.mcp_client, "_run_with_progress"):
-                results = await app.mcp_client._run_with_progress(connection_tasks, "Connecting Servers", transient=False, use_health_scores=False) # Don't use health score here
-                success_count = sum(1 for r in results if r is not None)
-                log.info(f"Finished connecting. Successfully connected to {success_count}/{len(enabled_servers)} servers.")
-            else:
-                log.warning("MCPClient progress helper not found, connecting sequentially.")
-                for task_func, desc, args_tuple in connection_tasks:
-                    log.info(desc)
-                    await task_func(*args_tuple)
+        if connection_tasks: # Only run progress if there are tasks to run
+            try:
+                if hasattr(app, "mcp_client") and hasattr(app.mcp_client, "_run_with_progress"):
+                    results = await app.mcp_client._run_with_progress(connection_tasks, "Connecting Servers", transient=False, use_health_scores=False) # Don't use health score here
+                    success_count = sum(1 for r in results if r is not None)
+                    log.info(f"Finished connecting. Successfully connected to {success_count}/{len(connection_tasks)} servers.") # Log count based on tasks run
+                else:
+                    log.warning("MCPClient progress helper not found, connecting sequentially.")
+                    for task_func, desc, args_tuple in connection_tasks:
+                        log.info(desc)
+                        await task_func(*args_tuple)
 
-        except Exception as e:
-            log.error(f"Error during concurrent server connection: {e}", exc_info=True)
+            except Exception as e:
+                log.error(f"Error during concurrent server connection: {e}", exc_info=True)
+        else:
+            log.info("No new servers needed connection.")
 
         # Verify stdout pollution after connecting
         if os.environ.get("MCP_VERIFY_STDOUT", "1") == "1":
@@ -3995,7 +4113,6 @@ class ServerManager:
                     session = ClientSession(read_stream=read_stream, write_stream=write_stream, read_timeout_seconds=timedelta(seconds=current_timeout + 15.0))
                     await test_exit_stack.enter_async_context(session)
                     await asyncio.wait_for(session.initialize(), timeout=current_timeout + 10.0)
-                    await session.send_initialized_notification()
                 else:
                     raise RuntimeError(f"Unknown server type: {server_config.type}")
 
@@ -4183,15 +4300,42 @@ class MCPClient:
                     readline.parse_and_bind("bind ^I rl_complete") # Binds Tab to complete
                 else:
                     readline.parse_and_bind("tab: complete") # Standard binding
-                # Optional: Load/Save history across sessions
-                histfile = CONFIG_DIR / ".cli_history"
+
+                # --- Robust History Handling ---
+                histfile_path = CONFIG_DIR / ".cli_history"
+                histfile = str(histfile_path.resolve()) # Use resolved absolute path
+
                 try:
-                    histfile.touch() # Ensure file exists
-                    readline.read_history_file(str(histfile))
+                    # Ensure parent directory exists
+                    histfile_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Try reading history
+                    if histfile_path.exists():
+                        # Only read if the file exists AND has content
+                        if histfile_path.stat().st_size > 0:
+                            log.debug(f"Attempting to load readline history from non-empty file: {histfile}")
+                            try:
+                                readline.read_history_file(histfile)
+                            except OSError as read_err:
+                                # Log specifically if the read fails, but continue
+                                log.warning(f"Could not load readline history from '{histfile}': {read_err}", exc_info=False)
+                            except Exception as read_generic_err: # Catch other potential read errors
+                                log.warning(f"Unexpected error loading readline history from '{histfile}': {read_generic_err}", exc_info=False)
+                        else:
+                            log.debug(f"Readline history file exists but is empty, skipping read: {histfile}")
+                    else:
+                        try:
+                            histfile_path.touch() # Create if not exists
+                            log.debug(f"Created empty readline history file: {histfile}")
+                        except OSError as touch_err:
+                            log.warning(f"Could not create readline history file '{histfile}': {touch_err}")
                     readline.set_history_length(1000)
-                    atexit.register(readline.write_history_file, str(histfile))
+                    # Register saving history at exit
+                    atexit.register(readline.write_history_file, histfile)
+                    log.debug(f"Readline history configured using: {histfile}")
+                # --- Keep the outer Exception block for other setup errors ---
                 except Exception as e:
-                    log.warning(f"Could not load/save readline history from {histfile}: {e}")
+                    # Catch specific potential errors if needed (e.g., PermissionError, OSError)
+                    log.warning(f"Could not load/save readline history from '{histfile}': {e}", exc_info=False) # Less verbose log
             except ImportError:
                  log.warning("Readline library not available, CLI history and completion disabled.")
             except Exception as e:
@@ -4399,7 +4543,7 @@ class MCPClient:
                      safe_console.print("[green]Configuration reset to defaults and saved to config.yaml.[/]")
                  except Exception as e: safe_console.print(f"[red]Error during reset: {e}[/]")
             else: safe_console.print("[yellow]Reset cancelled.[/]")
-            return # Reset handles its own save
+            return # Reset handles its own save   
 
         # --- Subcommands for Specific Settings ---
         elif subcmd == "api-key":
@@ -4729,7 +4873,7 @@ class MCPClient:
 
         # Define provider details map inside method or load from class/global scope
         provider_details_map = {
-            Provider.OPENAI.value: {"key_attr": "openai_api_key", "url_attr": "openai_base_url", "default_url": None, "client_attr": "openai_client"},
+            Provider.OPENAI.value: {"key_attr": "openai_api_key", "url_attr": "openai_base_url", "default_url": "https://api.openai.com/v1", "client_attr": "openai_client"},
             Provider.GROK.value: {"key_attr": "grok_api_key", "url_attr": "grok_base_url", "default_url": "https://api.x.ai/v1", "client_attr": "grok_client"},
             Provider.DEEPSEEK.value: {"key_attr": "deepseek_api_key", "url_attr": "deepseek_base_url", "default_url": "https://api.deepseek.com/v1", "client_attr": "deepseek_client"},
             Provider.MISTRAL.value: {"key_attr": "mistral_api_key", "url_attr": "mistral_base_url", "default_url": "https://api.mistral.ai/v1", "client_attr": "mistral_client"},
@@ -5188,6 +5332,25 @@ class MCPClient:
         # Status is printed within disconnect_server
         return True
 
+    # --- Local Discovery Monitoring Control ---
+    async def start_local_discovery_monitoring(self):
+        """Starts the background mDNS listener if enabled."""
+        if self.config.enable_local_discovery and self.server_manager and self.server_manager.registry:
+            if not self.server_manager.registry.zeroconf:
+                log.info("Starting background local discovery listener...")
+                self.server_manager.registry.start_local_discovery()
+                # Note: We don't explicitly wait here, it runs in background.
+            else:
+                log.debug("Local discovery listener already running.")
+        else:
+            log.debug("Local discovery monitoring skipped (disabled or registry unavailable).")
+
+    async def stop_local_discovery_monitoring(self):
+        """Stops the background mDNS listener."""
+        if self.server_manager and self.server_manager.registry:
+            log.info("Stopping background local discovery listener...")
+            self.server_manager.registry.stop_local_discovery()             
+
     async def enable_server(self, names: List[str], enable: bool) -> bool:
         """Enables or disables multiple servers. Returns True if any config changed."""
         safe_console = get_safe_console()
@@ -5428,6 +5591,67 @@ class MCPClient:
                  except Exception as e:
                      log.warning(f"Error during prompt content prompt: {e}")
 
+    async def cmd_tools(self, args: str):
+        """List available tools, optionally filtering by server."""
+        safe_console = get_safe_console()
+        if not self.server_manager.tools:
+            safe_console.print(f"{EMOJI_MAP['warning']} [yellow]No tools available from connected servers[/]")
+            return
+
+        server_filter = args.strip() if args else None
+
+        tool_table = Table(title=f"{EMOJI_MAP['tool']} Available Tools", box=box.ROUNDED, show_lines=True)
+        tool_table.add_column("Name", style="magenta", no_wrap=True)
+        tool_table.add_column("Server", style="blue")
+        tool_table.add_column("Description")
+        # Optional: Add input schema summary if desired
+        # tool_table.add_column("Inputs", style="dim")
+
+        filtered_tools = []
+        # Sort by name for consistent listing
+        for name, tool in sorted(self.server_manager.tools.items()):
+            if server_filter is None or tool.server_name == server_filter:
+                filtered_tools.append(tool)
+                # Example schema summary: list keys
+                # input_keys = ", ".join(tool.input_schema.get('properties', {}).keys())
+                # input_summary = f"Keys: {input_keys}" if input_keys else "[No defined inputs]"
+                tool_table.add_row(
+                    name,
+                    tool.server_name,
+                    tool.description or "[No description]",
+                    # input_summary # Add if column exists
+                )
+
+        if not filtered_tools:
+            safe_console.print(f"[yellow]No tools found" + (f" for server '{server_filter}'" if server_filter else "") + ".[/yellow]")
+        else:
+            safe_console.print(tool_table)
+
+    async def cmd_discover(self, args: str):
+        """Discover MCP servers on the network and filesystem."""
+        safe_console = get_safe_console()
+
+        # Optional: Parse args if you want flags (e.g., --no-prompt, --source=mdns)
+        # For now, assume no arguments, just trigger discovery and processing.
+        if args:
+            safe_console.print("[yellow]Warning: /discover command currently takes no arguments.[/yellow]")
+
+        if not self.server_manager:
+            safe_console.print("[red]Error: ServerManager not initialized. Cannot run discovery.[/]")
+            return
+
+        safe_console.print(f"{EMOJI_MAP['search']} Starting server discovery...")
+        try:
+            # Call the server manager's discovery orchestrator
+            await self.server_manager.discover_servers() # Step 1: Populates cache
+
+            # Process the results (prompts user if interactive)
+            # Assuming interactive mode is True for CLI command execution
+            await self.server_manager._process_discovery_results(interactive_mode=True) # Step 2: Uses cache, interacts
+
+        except Exception as e:
+            log.error("Error during /discover command execution", exc_info=True)
+            safe_console.print(f"[red]Error during discovery: {e}[/]")
 
     # --- Direct Tool Execution ---
     async def cmd_tool(self, args: str):
@@ -5800,6 +6024,225 @@ class MCPClient:
 
         else:
             safe_console.print("[yellow]Unknown branch command. Available: list, checkout, rename, delete[/]")
+
+
+
+    async def load_claude_desktop_config(self):
+        """
+        Look for and load the Claude desktop config file (claude_desktop_config.json),
+        transforming wsl.exe commands for direct execution within the Linux environment,
+        and adapting Windows paths in arguments for other commands.
+        """
+        config_path = Path("claude_desktop_config.json")
+        if not config_path.exists():
+            log.debug("claude_desktop_config.json not found, skipping.")
+            return # No file, nothing to do
+
+        try:
+            # Use safe_print for user-facing status messages
+            self.safe_print(f"{EMOJI_MAP['config'] }  Found Claude desktop config file, processing...")
+
+            # Read the file content asynchronously
+            async with aiofiles.open(config_path, 'r') as f:
+                content = await f.read()
+
+            # Attempt to parse JSON
+            try:
+                desktop_config = json.loads(content)
+                log.debug(f"Claude desktop config keys: {list(desktop_config.keys())}")
+            except json.JSONDecodeError as json_error:
+                # Print user-facing error and log details
+                self.safe_print(f"[red]Invalid JSON in Claude desktop config: {json_error}[/]")
+                try:
+                    # Try to log the specific line from the content for easier debugging
+                    problem_line = content.splitlines()[max(0, json_error.lineno - 1)]
+                    log.error(f"JSON error in {config_path} at line {json_error.lineno}, col {json_error.colno}: '{problem_line}'", exc_info=True)
+                except Exception:
+                    log.error(f"Failed to parse JSON from {config_path}", exc_info=True) # Log generic parse error with traceback
+                return # Stop processing if JSON is invalid
+
+            # --- Find the mcpServers key ---
+            mcp_servers_key = 'mcpServers'
+            if mcp_servers_key not in desktop_config:
+                found_alt = False
+                # Check alternative keys just in case
+                for alt_key in ['mcp_servers', 'servers', 'MCP_SERVERS']:
+                    if alt_key in desktop_config:
+                        log.info(f"Using alternative key '{alt_key}' for MCP servers")
+                        mcp_servers_key = alt_key
+                        found_alt = True
+                        break
+                if not found_alt:
+                    self.safe_print(f"{EMOJI_MAP['warning']} No MCP servers key ('mcpServers' or alternatives) found in {config_path}")
+                    return # Stop if no server list found
+
+            mcp_servers = desktop_config.get(mcp_servers_key) # Use .get for safety
+            if not mcp_servers or not isinstance(mcp_servers, dict):
+                self.safe_print(f"{EMOJI_MAP['warning']} No valid MCP server entries found under key '{mcp_servers_key}' in {config_path}")
+                return # Stop if server list is empty or not a dictionary
+
+            # --- Process Servers ---
+            imported_servers = []
+            skipped_servers = []
+
+            for server_name, server_data in mcp_servers.items():
+                # Inner try block for processing each server individually
+                try:
+                    # Check if server already exists in the current configuration
+                    if server_name in self.config.servers:
+                        log.info(f"Server '{server_name}' already exists in local config, skipping import.")
+                        skipped_servers.append((server_name, "already exists"))
+                        continue
+
+                    log.debug(f"Processing server '{server_name}' from desktop config: {server_data}")
+
+                    # Ensure the 'command' field is present
+                    if 'command' not in server_data:
+                        log.warning(f"Skipping server '{server_name}': Missing 'command' field.")
+                        skipped_servers.append((server_name, "missing command field"))
+                        continue
+
+                    original_command = server_data['command']
+                    original_args = server_data.get('args', [])
+
+                    # Variables to store the final executable and arguments for ServerConfig
+                    final_executable = None
+                    final_args = []
+                    is_shell_command = False # Flag to indicate if we need `create_subprocess_shell` later
+
+                    # --- Detect and transform WSL commands ---
+                    if isinstance(original_command, str) and original_command.lower().endswith("wsl.exe"):
+                        log.info(f"Detected WSL command for '{server_name}'. Extracting Linux command.")
+                        # Search for a known shell ('bash', 'sh', 'zsh') followed by '-c'
+                        shell_path = None
+                        shell_arg_index = -1
+                        possible_shells = ["bash", "sh", "zsh"]
+
+                        for i, arg in enumerate(original_args):
+                            if isinstance(arg, str):
+                                # Check if argument is one of the known shells (can be full path or just name)
+                                arg_base = os.path.basename(arg.lower())
+                                if arg_base in possible_shells:
+                                    shell_path = arg # Keep the original path/name provided
+                                    shell_arg_index = i
+                                    break
+
+                        # Check if shell was found, followed by '-c', and the command string exists
+                        if shell_path is not None and shell_arg_index + 2 < len(original_args) and original_args[shell_arg_index + 1] == '-c':
+                            # The actual command string to execute inside the Linux shell
+                            linux_command_str = original_args[shell_arg_index + 2]
+                            log.debug(f"Extracted Linux command string for shell '{shell_path}': {linux_command_str}")
+
+                            # Find the absolute path of the shell if possible, default to /bin/<shell_name>
+                            try:
+                                import shutil
+                                found_path = shutil.which(shell_path)
+                                final_executable = found_path if found_path else f"/bin/{os.path.basename(shell_path)}"
+                            except Exception:
+                                final_executable = f"/bin/{os.path.basename(shell_path)}" # Fallback
+
+                            final_args = ["-c", linux_command_str]
+                            is_shell_command = True # Mark that this needs shell execution later
+
+                            log.info(f"Remapped '{server_name}' to run directly via shell: {final_executable} -c '...'")
+
+                        else:
+                            # If parsing fails (e.g., no 'bash -c' found)
+                            log.warning(f"Could not parse expected 'shell -c command' structure in WSL args for '{server_name}': {original_args}. Skipping.")
+                            skipped_servers.append((server_name, "WSL command parse failed"))
+                            continue # Skip this server
+                    # --- End WSL command transformation ---
+                    else:
+                        # --- Handle Direct Command + Adapt Paths in Args ---
+                        # Assume it's a direct Linux command (like 'npx')
+                        final_executable = original_command
+                        # *** APPLY PATH ADAPTATION TO ARGUMENTS HERE ***
+                        # adapt_path_for_platform expects (command, args) but only modifies args usually.
+                        # We only need to adapt the args, the command itself ('npx') is fine.
+                        _, adapted_args = adapt_path_for_platform(original_command, original_args)
+                        final_args = adapted_args
+                        # *** END PATH ADAPTATION ***
+                        is_shell_command = False # Will use create_subprocess_exec later
+                        log.info(f"Using command directly for '{server_name}' with adapted args: {final_executable} {' '.join(map(str, final_args))}")
+                    # --- End Direct Command Handling ---
+
+
+                    # Create the ServerConfig if we successfully determined the command
+                    if final_executable is not None:
+                        server_config = ServerConfig(
+                            name=server_name,
+                            type=ServerType.STDIO, # Claude desktop config implies STDIO
+                            path=final_executable, # The direct executable or the shell
+                            args=final_args, # Args for the executable, or ['-c', cmd_string] for shell
+                            enabled=True, # Default to enabled
+                            auto_start=True, # Default to auto-start
+                            description=f"Imported from Claude desktop config ({'Direct Shell' if is_shell_command else 'Direct Exec'})",
+                            trusted=True, # Assume trusted if coming from local desktop config
+                            # Add other fields like categories if available in server_data and needed
+                        )
+                        # Add the prepared config to the main configuration object
+                        self.config.servers[server_name] = server_config
+                        imported_servers.append(server_name)
+                        log.info(f"Prepared server '{server_name}' for import with direct execution.")
+
+                # Catch errors processing a single server definition within the loop
+                except Exception as server_proc_error:
+                    log.error(f"Error processing server definition '{server_name}' from desktop config", exc_info=True)
+                    skipped_servers.append((server_name, f"processing error: {server_proc_error}"))
+                    continue # Skip this server and continue with the next
+
+            # --- Save Config and Report Results ---
+            if imported_servers:
+                try:
+                    # Save the updated configuration asynchronously
+                    await self.config.save_async()
+                    self.safe_print(f"{EMOJI_MAP['success']} Imported {len(imported_servers)} servers from Claude desktop config.")
+
+                    # Report imported servers using a Rich Table
+                    server_table = Table(title="Imported Servers (Direct Execution)")
+                    server_table.add_column("Name")
+                    server_table.add_column("Executable/Shell")
+                    server_table.add_column("Arguments")
+                    for name in imported_servers:
+                        server = self.config.servers[name]
+                        # Format arguments for display
+                        args_display = ""
+                        if len(server.args) == 2 and server.args[0] == '-c':
+                             # Special display for shell commands
+                             args_display = f"-c \"{server.args[1][:60]}{'...' if len(server.args[1]) > 60 else ''}\""
+                        else:
+                             args_display = " ".join(map(str, server.args))
+
+                        server_table.add_row(name, server.path, args_display)
+                    self.safe_print(server_table)
+
+                except Exception as save_error:
+                    # Handle errors during saving
+                    log.error("Error saving config after importing servers", exc_info=True)
+                    self.safe_print(f"[red]Error saving imported server config: {save_error}[/]")
+            else:
+                self.safe_print(f"{EMOJI_MAP['warning']}  No new servers were imported from Claude desktop config (they might already exist or failed processing).")
+
+            # Report skipped servers, if any
+            if skipped_servers:
+                skipped_table = Table(title="Skipped Servers During Import")
+                skipped_table.add_column("Name")
+                skipped_table.add_column("Reason")
+                for name, reason in skipped_servers:
+                    skipped_table.add_row(name, reason)
+                self.safe_print(skipped_table)
+
+        # --- Outer Exception Handling ---
+        except FileNotFoundError:
+            # This is normal if the file doesn't exist, already handled by the initial check.
+            log.debug(f"{config_path} not found.")
+        except Exception as outer_config_error:
+            # Catch any other unexpected error during the whole process (file read, json parse, server loop)
+            self.safe_print(f"[bold red]An unexpected error occurred while processing {config_path}: {outer_config_error}[/]")
+            # Print traceback directly to stderr for diagnostics, bypassing logging/safe_print
+            print(f"\n--- Traceback for Claude Desktop Config Error ({type(outer_config_error).__name__}) ---", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            print("--- End Traceback ---", file=sys.stderr)
 
     async def cmd_export(self, args: str):
         """Export the current conversation or a specific branch to a file."""
@@ -7491,7 +7934,7 @@ class MCPClient:
             client_instance = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
             # Lightweight validation check (e.g., list models)
-            log.debug(f"Validating {provider_title} client by listing models...")
+            log.debug(f"Validating {provider_title} client by listing models (URL: {client_instance.base_url})...")
             await client_instance.models.list() # Raises errors on failure
             log.info(f"{provider_title} client initialized and validated successfully.")
 
@@ -7580,7 +8023,7 @@ class MCPClient:
         # This path is now reliably set.
         dotenv_path = self.config.dotenv_path
 
-        # Determine default provider (logic remains the same)
+        # Determine default provider
         default_provider_name = os.getenv("DEFAULT_PROVIDER")
         if not default_provider_name and dotenv_path and Path(dotenv_path).exists():
             env_values = dotenv_values(dotenv_path)
@@ -7743,8 +8186,7 @@ class MCPClient:
                 self.safe_print(f"[red]Discovery error: {discover_error}[/]")
 
         # --- 8. Start Continuous Local Discovery ---
-        if self.config.enable_local_discovery and self.server_manager.registry:
-            await self.start_local_discovery_monitoring()
+        await self.start_local_discovery_monitoring()
 
         # --- 9. Connect to Enabled MCP Servers ---
         servers_to_connect = {name: cfg for name, cfg in self.config.servers.items() if cfg.enabled}
@@ -7778,9 +8220,15 @@ class MCPClient:
             self.safe_print(f"[red]Error starting monitor: {monitor_error}[/red]")
 
         # --- 11. Display Final Status ---
-        await self.print_status()
+        try:
+            log.info("Displaying simple status at end of setup...")
+            await self.print_simple_status()
+            log.info("Simple status display complete.")
+        except Exception as status_err:
+            log.error(f"Error calling print_simple_status: {status_err}", exc_info=True)
+            self.safe_print(f"[bold red]Error displaying final status: {status_err}[/bold red]")
 
-    # --- Provider Determination Helper (Updated) ---
+    # --- Provider Determination Helper ---
     def get_provider_from_model(self, model_name: str) -> Optional[str]:
         """Determine the provider based on the model name using MODEL_PROVIDER_MAP."""
         if not model_name:
@@ -8670,10 +9118,10 @@ class MCPClient:
         log.info(f"Streaming query finished. Final Stop Reason: {stop_reason}. Total Latency: {(time.time() - start_time)*1000:.0f}ms")
 
     # --- Interactive Loop ---
-    @ensure_safe_console
     async def interactive_loop(self):
         """Runs the main interactive command loop."""
-        interactive_console = self._current_safe_console # Use console from decorator
+        # *** GET the console EXPLICITLY inside the loop ***
+        interactive_console = get_safe_console() # Get it once here
 
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print(f"Default Model: [cyan]{self.current_model}[/]. Type '/help' for commands.")
@@ -8921,6 +9369,52 @@ class MCPClient:
         finally:
              log.debug("Query consumer task finished.")
 
+    async def close(self):
+        """Gracefully shut down the client and release resources."""
+        log.info("Closing MCPClient...")
+        # Stop monitoring first
+        if hasattr(self, 'server_monitor'):
+            await self.server_monitor.stop_monitoring()
+
+        # Stop local discovery listener
+        await self.stop_local_discovery_monitoring() # ADDED CALL
+
+        # Close server manager (handles sessions/processes)
+        if hasattr(self, 'server_manager'):
+            await self.server_manager.close()
+
+        # Close provider clients
+        async def _safe_aclose(client):
+            if client and hasattr(client, 'aclose'):
+                try: await client.aclose()
+                except Exception as e: log.warning(f"Error closing client {type(client).__name__}: {e}")
+
+        await _safe_aclose(self.anthropic)
+        await _safe_aclose(self.openai_client)
+        await _safe_aclose(self.gemini_client)
+        await _safe_aclose(self.grok_client)
+        await _safe_aclose(self.deepseek_client)
+        await _safe_aclose(self.mistral_client)
+        await _safe_aclose(self.groq_client)
+        await _safe_aclose(self.cerebras_client)
+        # Add openrouter if needed
+
+        # Close tool cache
+        if hasattr(self, 'tool_cache') and hasattr(self.tool_cache, 'close'):
+            self.tool_cache.close()
+
+        # Cancel any lingering query task (should be handled elsewhere, but belt-and-suspenders)
+        if self.current_query_task and not self.current_query_task.done():
+            self.current_query_task.cancel()
+            try:
+                await self.current_query_task
+            except asyncio.CancelledError:
+                log.debug("Lingering query task successfully cancelled during close.")
+            except Exception as e:
+                log.warning(f"Error awaiting cancelled query task during close: {e}")
+
+        log.info("MCPClient cleanup finished.")
+
     def _print_final_query_stats(self, target_console: Console):
         """Helper to format and print the final query statistics panel."""
         # Calculate hit rate for *this query*
@@ -8966,7 +9460,6 @@ class MCPClient:
             padding=(0, 1) # Less vertical padding
         )
         target_console.print(final_stats_panel)
-
             
     @app.command()
     def config(
@@ -8978,7 +9471,7 @@ class MCPClient:
         # Run the config management function
         asyncio.run(config_async(show, edit, reset))
 
-async def main_async(query, model, server, dashboard, interactive, verbose_logging, webui_flag, webui_host, webui_port, serve_ui_file, cleanup_servers):
+async def main_async(query, model, server, dashboard, interactive, webui_flag, webui_host, webui_port, serve_ui_file, cleanup_servers):
     """Main async entry point - Handles CLI, Interactive, Dashboard, and Web UI modes."""
     client = None # Initialize client to None
     safe_console = get_safe_console()
@@ -8988,14 +9481,15 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
     try:
         log.info("Initializing MCPClient...")
         client = MCPClient() # Instantiation inside the try block
-        await client.setup(interactive_mode=interactive or webui_flag) # Pass interactive if either mode uses it
+        # Pass interactive_mode=True if any mode *might* need it later (safer default)
+        await client.setup(interactive_mode=(interactive or webui_flag or dashboard))
 
         if cleanup_servers:
             log.info("Cleanup flag detected. Testing and removing unreachable servers...")
             await client.cleanup_non_working_servers()
             log.info("Server cleanup process complete.")
 
-        # --- Mode Selection ---
+        # --- Mode Selection and Execution ---
         if webui_flag:
             # --- Start Web UI Server ---
             log.info(f"Starting Web UI server on {webui_host}:{webui_port}")
@@ -10139,68 +10633,107 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                 if ui_file.exists():
                     log.info(f"Serving static UI file from {ui_file.resolve()}")
                     @app.get("/", response_class=FileResponse, include_in_schema=False)
-                    async def serve_html(): return FileResponse(str(ui_file.resolve()))
-                else: log.warning(f"UI file {ui_file} not found. Cannot serve.")
-
+                    async def serve_html(): 
+                        return FileResponse(str(ui_file.resolve()))
+                else: 
+                    log.warning(f"UI file {ui_file} not found. Cannot serve.")
+            
             log.info("Starting Uvicorn server...")
-            # --- Run Uvicorn Programmatically ---
             config = uvicorn.Config(app, host=webui_host, port=webui_port, log_level="info")
             server_instance = uvicorn.Server(config)
             await server_instance.serve()
-            # Server runs here until interrupted
-
             log.info("Web UI server shut down.")
-            # Cleanup is handled by the lifespan manager
-
-        # --- Original CLI/Dashboard/Interactive Logic ---
-        # (Connect to specific server block remains the same)
-        # ... (Connect to specific server logic - Keep this) ...
-
+            # NOTE: Cleanup for webui is handled by lifespan, so return here
         elif dashboard:
-            # (Dashboard logic remains the same)
-            # ...
+            # --- Run Dashboard ---
             if not client.server_monitor.monitoring:
-                await client.server_monitor.start_monitoring()
+                 await client.server_monitor.start_monitoring()
             await client.cmd_dashboard("")
-            await client.close() # Ensure cleanup after dashboard closes
-            return
-
+            # No explicit return needed, finally block handles cleanup
         elif query:
-            # (Single query logic remains the same)
-            pass
+            # --- Run Single Query ---
+            # ... (Single query logic as before) ...
+            query_text = query
+            model_to_use = model or client.current_model
+            provider_name = client.get_provider_from_model(model_to_use)
+            provider_title = provider_name.capitalize() if provider_name else "Unknown Provider"
 
-        elif interactive or not query:
-            # (Interactive loop logic remains the same)
-            # ...
-            if not client.config.api_key and interactive:
-                # ... (API key prompt logic) ...
-                pass # Keep the logic
-            await client.interactive_loop()
+            safe_console.print(f"[cyan]Processing single query with {provider_title} ({model_to_use})...[/]")
+            final_result_text = ""
+            query_error: Optional[Exception] = None
+            query_cancelled = False
+            status_updates_internal: List[str] = []
+            client.session_input_tokens = 0; client.session_output_tokens = 0; client.session_total_cost = 0.0; client.cache_hit_count = 0; client.tokens_saved_by_cache = 0 # Reset stats
 
+            with Status(f"{EMOJI_MAP['processing']} Processing query with {model_to_use}...", console=safe_console, spinner="dots") as status:
+                try:
+                    query_task = asyncio.create_task(client.process_streaming_query(query_text, model=model_to_use), name=f"single_query-{query_text[:20].replace(' ','_')}")
+                    client.current_query_task = query_task
+                    async for chunk in query_task:
+                        if chunk.startswith("@@STATUS@@"):
+                            status_updates_internal.append(chunk[len("@@STATUS@@"):].strip())
+                        else: final_result_text += chunk
+                    await query_task # Ensure completion/catch errors
+                except asyncio.CancelledError: query_cancelled = True; log.info("Single query processing cancelled.")
+                except Exception as e: query_error = e; log.error(f"Error processing single query: {e}", exc_info=True)
+                finally: status.stop(); client.current_query_task = None
+
+            safe_console.print() # Blank line
+            if query_cancelled:
+                if final_result_text: safe_console.print(Panel.fit(Markdown(final_result_text), title=f"Partial Result ({model_to_use}) - Cancelled", border_style="yellow"))
+                else: safe_console.print("[yellow]Query cancelled, no result generated.[/yellow]")
+            elif query_error:
+                safe_console.print(f"[bold red]Error processing query:[/] {str(query_error)}")
+                if status_updates_internal:
+                    safe_console.print("\n[dim]Status updates during failed query:[/dim]")
+                    for line in status_updates_internal: safe_console.print(f"[dim]- {line}[/dim]")
+            elif not final_result_text: safe_console.print(Panel.fit("[dim]Model returned no text content.[/dim]", title=f"Result ({model_to_use}) - Empty", border_style="yellow"))
+            else: safe_console.print(Panel.fit(Markdown(final_result_text), title=f"Result ({model_to_use})", border_style="green"))
+
+            if not query_error: client._print_final_query_stats(safe_console)
+            # No explicit return needed, finally block handles cleanup
+
+        elif interactive: # Check interactive explicitly last
+             # --- Run Interactive Mode ---
+             await client.interactive_loop()
+             # No explicit return needed, finally block handles cleanup
+
+        # --- Specific Server Connection (if requested via --server) ---
+        # This should run REGARDLESS of the mode, as it's a startup connection request
+        if server: # Check if the --server argument was provided
+            log.info(f"Attempting specific connection to server '{server}' due to --server flag.")
+            if server in client.config.servers:
+                if server not in client.server_manager.active_sessions:
+                    safe_console.print(f"[cyan]Attempting to connect to specific server: {server}...[/]")
+                    connected = await client.connect_server(server) # Use existing method
+                    if not connected:
+                        safe_console.print(f"[yellow]Warning: Failed to connect to specified server '{server}'.[/]")
+                else:
+                    log.info(f"Specified server '{server}' is already connected.")
+            else:
+                safe_console.print(f"[red]Error: Specified server '{server}' not found in configuration.[/]")
     except KeyboardInterrupt:
         safe_console.print("\n[yellow]Interrupted, shutting down...[/]")
-        # Cleanup is handled in finally block
     except Exception as main_async_error:
-        # (Main error handling remains mostly the same)
         safe_console.print(f"[bold red]An unexpected error occurred in the main process: {main_async_error}[/]")
         print(f"\n--- Traceback for Main Process Error ({type(main_async_error).__name__}) ---", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         print("--- End Traceback ---", file=sys.stderr)
-        if not interactive and not webui_flag: # Exit only for non-interactive CLI modes
+        # Exit only for non-interactive, non-webui modes on error
+        if not interactive and not webui_flag:
              if client and hasattr(client, 'close'):
                  try: await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout / 2)
                  except Exception: pass
-             sys.exit(1)
+             sys.exit(1) # Exit with error code
     finally:
-        # Cleanup: Ensure client.close is called if client was initialized
-        # Note: If FastAPI is running, its lifespan manager handles client.close()
+        # Cleanup logic (Handles closing client *unless* webui is running, as lifespan handles it)
         if not webui_flag and client and hasattr(client, 'close'):
             log.info("Performing final cleanup...")
             try:
                 await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout)
             except asyncio.TimeoutError:
                 safe_console.print("[red]Shutdown timed out. Some processes may still be running.[/]")
-                # (Force kill logic remains the same)
+                # ... force kill logic ...
                 if hasattr(client, 'server_manager') and hasattr(client.server_manager, 'processes'):
                      for name, process in client.server_manager.processes.items():
                          if process and process.returncode is None:
@@ -10211,7 +10744,6 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
             except Exception as close_error:
                 log.error(f"Error during final cleanup: {close_error}", exc_info=True)
         log.info("Application shutdown complete.")
-
 
 async def servers_async(search, list_all, json_output):
     """Server management async function"""
@@ -10276,34 +10808,179 @@ async def config_async(show, edit, reset):
              # but in this design, it mostly reads/writes config files.
              pass
 
-# --- main function ---
-async def main():
-    is_webui_mode = "--webui" in sys.argv
-    if not is_webui_mode:
-        try: app()
-        except McpError as e: 
-            get_safe_console().print(f"[bold red]MCP Error:[/] {str(e)}")
-            sys.exit(1)
-        except httpx.RequestError as e: 
-            get_safe_console().print(f"[bold red]Network Error:[/] {str(e)}")
-            sys.exit(1)
-        except anthropic.APIError as e: 
-            get_safe_console().print(f"[bold red]Anthropic API Error:[/] {str(e)}")
-            sys.exit(1)
-        except openai.APIError as e: 
-            get_safe_console().print(f"[bold red]OpenAI Compatible API Error:[/] {str(e)}")
-            sys.exit(1)
-        except (OSError, yaml.YAMLError, json.JSONDecodeError) as e: 
-            get_safe_console().print(f"[bold red]File/Config Error:[/] {str(e)}")
-            sys.exit(1)
-        except Exception as e:
-            get_safe_console().print(f"[bold red]Unexpected Error:[/] {str(e)}")
-            if os.environ.get("MCP_CLIENT_DEBUG"): get_safe_console().print_exception(show_locals=True)
-            sys.exit(1)
+async def _export_conv_async(conversation_id: Optional[str], output_path: Optional[str]):
+    """Async implementation for exporting."""
+    client = None
+    safe_console = get_safe_console() # Get safe console here
+    try:
+        client = MCPClient()
+        # Minimal setup needed? Just loading graph might be enough.
+        # Load graph if not loaded by constructor
+        if not client.conversation_graph.nodes:
+             client.conversation_graph = await ConversationGraph.load(str(client.conversation_graph_file))
 
-# --- if __name__ == "__main__": ---
+        target_id = conversation_id or client.conversation_graph.current_node.id
+        final_output_path = output_path # Need default logic here if None
+
+        if not final_output_path:
+            final_output_path = f"conversation_{target_id[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            safe_console.print(f"[dim]Output path not specified, using default: {final_output_path}[/dim]")
+
+        success = await client.export_conversation(target_id, final_output_path)
+        if not success:
+            safe_console.print(f"[red]Export failed for conversation '{target_id}'.[/]")
+            # Raising typer.Exit here might be cleaner than returning bool
+            raise typer.Exit(code=1)
+        # Success message printed by export_conversation internally
+
+    except Exception as e:
+        safe_console.print(f"[bold red]Error during export: {e}[/bold red]")
+        log.error("Export error", exc_info=True)
+        raise typer.Exit(code=1) from e
+    finally:
+        if client and hasattr(client, 'close'): # Check if close method exists
+             await client.close() # Close client if setup was performed
+
+async def _import_conv_async(file_path_str: str):
+     """Async implementation for importing."""
+     client = None
+     safe_console = get_safe_console() # Get safe console here
+     try:
+         client = MCPClient()
+         # Load graph if not loaded by constructor
+         if not client.conversation_graph.nodes:
+             client.conversation_graph = await ConversationGraph.load(str(client.conversation_graph_file))
+
+         success = await client.import_conversation(file_path_str)
+         if not success:
+             # Message printed by import_conversation
+             raise typer.Exit(code=1)
+         # Success message printed by import_conversation
+
+     except Exception as e:
+         safe_console.print(f"[bold red]Error during import: {e}[/bold red]")
+         log.error("Import error", exc_info=True)
+         raise typer.Exit(code=1) from e
+     finally:
+        if client and hasattr(client, 'close'): # Check if close method exists
+             await client.close() # Close client if setup was performed
+
+
+# =============================================================================
+# Typer Commands 
+# =============================================================================
+
+@app.command()
+def run(
+    query: Annotated[Optional[str], typer.Option("--query", "-q", help="Execute a single query and exit.")] = None,
+    model: Annotated[Optional[str], typer.Option("--model", "-m", help="Specify the AI model to use for the query.")] = None,
+    server: Annotated[Optional[str], typer.Option("--server", help="Connect to a specific server (by name) on startup.")] = None,
+    dashboard: Annotated[bool, typer.Option("--dashboard", "-d", help="Show the live monitoring dashboard instead of running a query.")] = False,
+    interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Run in interactive CLI mode.")] = False,
+    verbose_logging: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose session logging.")] = False,
+    webui_flag: Annotated[bool, typer.Option("--webui", help="Launch the Web UI instead of CLI.")] = False,
+    webui_host: Annotated[str, typer.Option("--host", help="Host for the Web UI server.")] = "127.0.0.1",
+    webui_port: Annotated[int, typer.Option("--port", help="Port for the Web UI server.")] = 8000,
+    serve_ui_file: Annotated[bool, typer.Option("--serve-ui", help="Serve the default HTML UI file from the current directory.")] = True,
+    cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers on startup.")] = False,
+):
+    """
+    Run the MCP client (Interactive, Single Query, Web UI, or Dashboard).
+
+    If no mode flag (--interactive, --query, --dashboard, --webui) is provided, defaults to interactive mode.
+    """
+    global USE_VERBOSE_SESSION_LOGGING
+    if verbose_logging:
+        USE_VERBOSE_SESSION_LOGGING = True
+        log.setLevel(logging.DEBUG)
+        stderr_console.print("[dim]Verbose logging enabled.[/dim]")
+
+    modes_selected = sum([dashboard, interactive, webui_flag, query is not None])
+    actual_interactive = interactive
+
+    if modes_selected > 1:
+        stderr_console.print("[bold red]Error: Please specify only one mode: --interactive, --query, --dashboard, or --webui.[/bold red]")
+        raise typer.Exit(code=1)
+    elif modes_selected == 0:
+        stderr_console.print("[dim]No mode specified, defaulting to interactive mode.[/dim]")
+        actual_interactive = True
+
+    # Always call main_async, it will handle the mode internally
+    asyncio.run(main_async(
+        query=query, 
+        model=model, 
+        server=server, 
+        dashboard=dashboard,
+        interactive=actual_interactive,
+        webui_flag=webui_flag,
+        webui_host=webui_host, 
+        webui_port=webui_port,
+        serve_ui_file=serve_ui_file, 
+        cleanup_servers=cleanup_servers,
+    ))
+
+@app.command()
+def config(
+    show: Annotated[bool, typer.Option("--show", "-s", help="Show current configuration.")] = False,
+    edit: Annotated[bool, typer.Option("--edit", "-e", help="Edit configuration YAML file in editor.")] = False,
+    reset: Annotated[bool, typer.Option("--reset", "-r", help="Reset configuration YAML to defaults (use with caution!).")] = False,
+):
+    """Manage client configuration (view, edit YAML, reset to defaults)."""
+    # Determine default action
+    actual_show = show
+    if not show and not edit and not reset:
+        actual_show = True # Default to showing if no other action specified
+
+    # Execute the async config logic
+    asyncio.run(config_async(
+        show=actual_show,
+        edit=edit,
+        reset=reset
+    ))
+
+@app.command()
+def servers(
+    search: Annotated[bool, typer.Option("--search", "-s", help="Search for discoverable servers.")] = False,
+    list_all: Annotated[bool, typer.Option("--list", "-l", help="List configured servers.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Output server list in JSON format.")] = False,
+):
+    """List or discover MCP servers."""
+    # Determine default action if no flags given
+    actual_list_all = list_all
+    if not search and not list_all and not json_output:
+        actual_list_all = True # Default to listing if no other action
+
+    # Execute the async server logic
+    asyncio.run(servers_async(
+        search=search,
+        list_all=actual_list_all,
+        json_output=json_output
+    ))
+
+@app.command("export")
+def export_conv_command(
+    conversation_id: Annotated[Optional[str], typer.Option("--id", "-i", help="ID of the conversation branch to export (default: current).")] = None,
+    output_path: Annotated[Optional[str], typer.Option("--output", "-o", help="Path to save the exported JSON file.")] = None,
+):
+    """Export a conversation branch to a JSON file."""
+    asyncio.run(_export_conv_async(conversation_id, output_path))
+
+@app.command("import-conv")
+def import_conv_command(
+    file_path: Annotated[Path, typer.Argument(exists=True, file_okay=True, dir_okay=False, readable=True, help="Path to the JSON conversation file to import.")],
+):
+    """Import a conversation from a JSON file as a new branch."""
+    asyncio.run(_import_conv_async(str(file_path)))
+
+
+# =============================================================================
+# Main execution block
+# =============================================================================
+
 if __name__ == "__main__":
-    if platform.system() == "Windows": colorama.init(convert=True)
-    # Call main which handles the Typer app logic for non-webui modes
-    asyncio.run(main()) # Run the main async function
+    if platform.system() == "Windows":
+        colorama.init(convert=True) # Initialize colorama for Windows
 
+    # Directly call the Typer app instance. Typer handles argument parsing
+    # and calling the appropriate command function.
+    app()

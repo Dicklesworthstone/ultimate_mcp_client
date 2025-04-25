@@ -1,0 +1,61 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Observability & Monitoring
+
+The MCP Client implements comprehensive observability and monitoring features in [mcp_client.py](mdc:mcp_client.py) to provide insights into operations and performance.
+
+## Telemetry
+
+### OpenTelemetry Integration
+- Metrics (counters, histograms) for monitoring client operations
+- Tracing with spans for server requests and tool execution
+- Console exporters (can be enabled for debugging)
+- Configurable export targets
+
+### Metrics Collected
+- Tool execution counts and latency
+- Server connection success/failure rates
+- Query processing times
+- Cache hit/miss ratios
+
+## Live Dashboards
+
+### CLI Dashboard
+- Real-time TUI dashboard via `/dashboard` command
+- Built with Rich library
+- Shows server health, tool usage stats, and client info
+- Refreshes periodically with the latest data
+
+### Web UI Status
+- Dynamic server status indicators
+- Health indicators for connected services
+- Capability counts (tools, resources, prompts)
+- Connection state visualization
+
+## Logging
+
+### Rich Console Output
+- Uses Python's logging with RichHandler
+- Pretty console output with color coding
+- Tracebacks with syntax highlighting
+- Configurable verbosity levels
+
+### STDIO Server Logs
+- Captured stderr output from stdio servers
+- Written to log files in config directory
+- Critical for diagnosing server-side problems
+
+## Debug Features
+
+### Verbose Mode
+- `--verbose` flag for detailed logging
+- Enables detailed JSON-RPC message logging
+- Shows internal state transitions
+
+### Error Handling
+- MCP_CLIENT_DEBUG environment variable for full tracebacks
+- Structured error reporting
+- Retry metrics and circuit breaker status
