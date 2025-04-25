@@ -11508,7 +11508,25 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
             log.info("Starting Uvicorn server...")
             config = uvicorn.Config(app, host=webui_host, port=webui_port, log_level="info")
             server_instance = uvicorn.Server(config)
-            await server_instance.serve()
+            try:
+                await server_instance.serve()
+                log.info("Web UI server shut down.")
+            except OSError as e:
+                if e.errno == 98: # Address already in use
+                    safe_console.print(f"[bold red]ERROR: Could not start Web UI. Port {webui_port} is already in use.[/]")
+                    safe_console.print(f"[yellow]Please stop the other process using port {webui_port} or choose a different port using --port.[/]")
+                    # No need to explicitly close client here, lifespan shutdown *should* handle it if started
+                    # Exit gracefully
+                    sys.exit(1)
+                else:
+                    # Re-raise other OS errors if needed, or handle generally
+                    log.error(f"Uvicorn server failed with OS error: {e}", exc_info=True)
+                    safe_console.print(f"[bold red]Web UI server failed to start (OS Error): {e}[/]")
+                    sys.exit(1)
+            except Exception as e: # Catch other potential server errors during serve()
+                log.error(f"Uvicorn server failed: {e}", exc_info=True)
+                safe_console.print(f"[bold red]Web UI server failed to start: {e}[/]")
+                sys.exit(1)
             log.info("Web UI server shut down.")
             # NOTE: Cleanup for webui is handled by lifespan, so return here
         elif dashboard:
@@ -11618,14 +11636,32 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     pass
             sys.exit(1)  # Exit with error code
     finally:
-        # Cleanup logic (Handles closing client *unless* webui is running, as lifespan handles it)
-        if not webui_flag and client and hasattr(client, "close"):
+        # Ensure cleanup doesn't run if webui failed early OR if lifespan is handling it
+        should_cleanup_main = not webui_flag # Default: cleanup if not webui
+        if webui_flag:
+            # Don't cleanup if webui failed *before* lifespan could properly start/finish
+            # We check if the OSError occurred, implying lifespan might not run fully.
+            # This is slightly heuristic. A more robust way might involve a state flag.
+             if 'server_instance' in locals() and server_instance.should_exit:
+                 # If uvicorn signals exit due to startup failure (like port conflict)
+                 # Then lifespan might not have run its shutdown part.
+                 # However, closing the client *here* might still cause issues if lifespan
+                 # partially ran. It's safer to rely on lifespan and accept that if it
+                 # fails early, resources might not be fully cleaned.
+                 # Let's stick to the original plan: lifespan handles webui cleanup.
+                 should_cleanup_main = False
+                 log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan).")
+             else:
+                 # If serve() completed normally or lifespan shutdown ran
+                  should_cleanup_main = False
+                  log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan).")
+
+        if should_cleanup_main and client and hasattr(client, "close"):
             log.info("Performing final cleanup...")
             try:
                 await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout)
             except asyncio.TimeoutError:
                 safe_console.print("[red]Shutdown timed out. Some processes may still be running.[/]")
-                # ... force kill logic ...
                 if hasattr(client, "server_manager") and hasattr(client.server_manager, "processes"):
                     for name, process in client.server_manager.processes.items():
                         if process and process.returncode is None:
@@ -11780,9 +11816,9 @@ def run(
     dashboard: Annotated[bool, typer.Option("--dashboard", "-d", help="Show the live monitoring dashboard instead of running a query.")] = False,
     interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Run in interactive CLI mode.")] = False,
     verbose_logging: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose session logging.")] = False,
-    webui_flag: Annotated[bool, typer.Option("--webui", help="Launch the Web UI instead of CLI.")] = False,
-    webui_host: Annotated[str, typer.Option("--host", help="Host for the Web UI server.")] = "127.0.0.1",
-    webui_port: Annotated[int, typer.Option("--port", help="Port for the Web UI server.")] = 8000,
+    webui_flag: Annotated[bool, typer.Option("--webui", "-w", help="Launch the Web UI instead of CLI.")] = False,
+    webui_host: Annotated[str, typer.Option("--host", "-h", help="Host for the Web UI server.")] = "127.0.0.1",
+    webui_port: Annotated[int, typer.Option("--port", "-p", help="Port for the Web UI server.")] = 8880,
     serve_ui_file: Annotated[bool, typer.Option("--serve-ui", help="Serve the default HTML UI file from the current directory.")] = True,
     cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers on startup.")] = False,
 ):
