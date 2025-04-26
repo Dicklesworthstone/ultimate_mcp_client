@@ -56,6 +56,68 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.13.3/cdn.min.js"></script>
+    <script>
+        // Marked configuration (restore from old code)
+        const markedRenderer = new marked.Renderer(); // Use 'const' or 'let'
+
+        // --- START: Copy the exact .code override from the OLD CODE ---
+        markedRenderer.code = (code, language, isEscaped) => {
+            const lang = hljs.getLanguage(language) ? language : 'plaintext';
+            let codeToHighlight = ''; // Initialize
+            let originalCodeForCopy = code; // Preserve original for copy button if possible
+
+            if (typeof code === 'string') {
+                codeToHighlight = code;
+                originalCodeForCopy = code; // It's already a string
+            } else if (code && typeof code === 'object' && typeof code.text === 'string') {
+                // If it's an object with a text property (like from the log)
+                codeToHighlight = code.text;
+                originalCodeForCopy = code.text; // Use the extracted text for copy too
+            } else {
+                // Fallback: attempt stringification if it's not a string or the expected object structure
+                console.warn("Marked 'code' received unexpected type, attempting stringification:", code);
+                codeToHighlight = String(code); // This might result in [object Object]
+                originalCodeForCopy = codeToHighlight; // Copy the stringified version
+            }
+
+            try {
+                const highlightedCode = hljs.highlight(codeToHighlight, { language: lang, ignoreIllegals: true }).value;
+                // Use originalCodeForCopy for the copy button to get the best representation
+                // Assuming createCopyButton is globally available or defined here.
+                const copyButtonHtml = createCopyButton(originalCodeForCopy);
+                // Wrap in a div for positioning context and add hljs class for styling
+                return `<div class="relative group"><pre><code class="hljs language-${lang}">${highlightedCode}</code></pre>${copyButtonHtml}</div>`;
+            } catch (e) {
+                console.error("Highlighting error:", e);
+                // Fallback: Ensure code is stringified before sanitizing if error occurred
+                const safeCode = DOMPurify.sanitize(codeToHighlight); // Sanitize the extracted/stringified code
+                return `<div class="relative group"><pre><code class="hljs language-${lang}">${safeCode}</code></pre>${createCopyButton(safeCode)}</div>`;
+            }
+        };
+
+        // Set Marked options using the custom renderer
+        marked.setOptions({
+            renderer: markedRenderer, // Make sure this uses the renderer defined above
+            breaks: true, // Convert single newlines to <br>
+            gfm: true, // Enable GitHub Flavored Markdown
+        });
+        console.log("Global Marked options set with custom renderer."); // Updated log
+
+        const createCopyButton = (codeToCopy, type = 'code') => {
+            try {
+                // Use a different event dispatch mechanism compatible with Alpine listening globally
+                const encodedCode = btoa(encodeURIComponent(JSON.stringify(codeToCopy)));
+                const buttonText = type === 'result' ? 'Copy Result' : 'Copy';
+                return `<button class="copy-code-btn" x-data="{ copied: false }" @click.stop="document.body.dispatchEvent(new CustomEvent('copy-clipboard', { detail: '${encodedCode}' })); copied = true; setTimeout(() => copied = false, 1500)">
+                             <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i> <span x-text="copied ? 'Copied!' : '${buttonText}'"></span>
+                         </button>`;
+            } catch (e) {
+                console.error("Error creating copy button data:", e);
+                return '<!-- copy error -->';
+            }
+        };
+
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,100..900;1,100..900&display=swap"
@@ -3736,41 +3798,9 @@
         class="loading-overlay animate__animated animate__fadeIn animate__faster">
         <span class="loading loading-ring loading-lg text-primary"></span>
     </div>
-    <!-- Container for the teleported template -->
-    <div id="branch-node-template-container" class="hidden"></div>
-    <!-- System Status Bar -->
-    <div class="system-status-bar" :class="{'hidden': !uiSettings.showStatusBar}">
-        <!-- Left section -->
-        <div class="flex items-center gap-3">
-            <div class="status-item"> <i class="fas fa-server fa-fw text-info"></i> <span
-                    x-text="`Servers: ${connectedServersCount}/${servers.length}`"></span> </div>
-            <div class="status-item"> <i class="fas" :class="getProviderIcon(currentModel)"></i> <span
-                    x-text="currentModelShort"></span> </div>
-            <div class="status-item"> <i class="fas fa-network-wired fa-fw text-success"></i> <span
-                    x-text="`Branch: ${getNodeById(currentNodeId)?.name || 'root'}`"></span></div>
-        </div>
-        <!-- Right section -->
-        <div class="flex items-center gap-3">
-            <div class="status-item" title="Session Token Usage"> <i class="fas fa-arrow-right text-cyan-500 fa-fw"></i>
-                <span x-text="`In: ${tokenUsage.input_tokens?.toLocaleString() || 0}`"></span>
-            </div>
-            <div class="status-item" title="Session Token Output"> <i
-                    class="fas fa-arrow-left text-purple-500 fa-fw"></i> <span
-                    x-text="`Out: ${tokenUsage.output_tokens?.toLocaleString() || 0}`"></span> </div>
-            <div class="status-item" title="Session Cost"> <i class="fas fa-dollar-sign text-amber-500 fa-fw"></i> <span
-                    x-text="`$${(tokenUsage.total_cost || 0).toFixed(4)}`"></span> </div>
-            <div class="status-item cursor-pointer" @click="toggleSystemStats"> <i class="fas fa-chart-line fa-fw"></i>
-                <span>Stats</span>
-            </div>
-            <div class="status-item" x-show="showSystemStats"> <i class="fas fa-memory fa-fw"></i> <span
-                    x-text="`Mem: ${systemStats.memory}MB`"></span> </div>
-            <div class="status-item" x-show="showSystemStats"> <i class="fas fa-clock fa-fw"></i> <span
-                    x-text="`Uptime: ${systemStats.uptime}`"></span> </div>
-        </div>
-    </div>
     <script>
-        const API_BASE_URL = '/api'; // Use relative path
-        const WS_URL = `ws://${window.location.host}/ws/chat`; // Use relative path
+        const API_BASE_URL = 'http://localhost:8880/api'; // Adjust port as needed
+        const WS_URL = 'ws://localhost:8880/ws/chat'; // Adjust hostname/port to match backend
 
         // ContrastOptimizer Class (as provided previously)
         class ContrastOptimizer {
@@ -3968,52 +3998,6 @@
                 }
             }
         }
-
-        // createCopyButton and markedRenderer setup (as provided previously)
-        const createCopyButton = (codeToCopy, type = 'code') => {
-            try {
-                const encodedCode = btoa(encodeURIComponent(JSON.stringify(codeToCopy)));
-                const buttonText = type === 'result' ? 'Copy Result' : 'Copy';
-                return `<button class="copy-code-btn" x-data="{ copied: false }" @click.stop="copyToClipboard('${encodedCode}'); copied = true; setTimeout(() => copied = false, 1500)"> <i class="fas mr-1" :class="copied ? 'fa-check text-success' : 'fa-copy'"></i> <span x-text="copied ? 'Copied!' : '${buttonText}'"></span> </button>`;
-            } catch (e) {
-                console.error("Error creating copy button data:", e);
-                return '<!-- copy error -->';
-            }
-        };
-        const markedRenderer = new marked.Renderer();
-        markedRenderer.code = (code, language, isEscaped) => {
-            const lang = hljs.getLanguage(language) ? language : 'plaintext';
-            let codeToHighlight = '';
-            let originalCodeForCopy = code;
-            if (typeof code === 'string') {
-                codeToHighlight = code;
-                originalCodeForCopy = code;
-            } else if (code && typeof code === 'object' && typeof code.text === 'string') {
-                codeToHighlight = code.text;
-                originalCodeForCopy = code.text;
-            } else {
-                console.warn("Marked 'code' received unexpected type, attempting stringification:", code);
-                codeToHighlight = String(code);
-                originalCodeForCopy = codeToHighlight;
-            }
-            try {
-                const highlightedCode = hljs.highlight(codeToHighlight, {
-                    language: lang,
-                    ignoreIllegals: true
-                }).value;
-                const copyButtonHtml = createCopyButton(originalCodeForCopy);
-                return `<div class="relative group"><pre><code class="hljs language-${lang}">${highlightedCode}</code></pre>${copyButtonHtml}</div>`;
-            } catch (e) {
-                console.error("Highlighting error:", e);
-                const safeCode = DOMPurify.sanitize(codeToHighlight);
-                return `<div class="relative group"><pre><code class="hljs language-${lang}">${safeCode}</code></pre>${createCopyButton(safeCode)}</div>`;
-            }
-        };
-        marked.setOptions({
-            renderer: markedRenderer,
-            breaks: true,
-            gfm: true
-        });
 
         // safeDebugStringify (as provided previously)
         window.safeDebugStringify = function (obj, indent = 2) {
@@ -4316,7 +4300,7 @@
                 // --- LIFECYCLE & INITIALIZATION ---
                 init() {
                     console.log('Multi-Provider MCP Client UI Initializing...');
-                    this.contrastOptimizer = new ContrastOptimizer();
+                    this.contrastOptimizer = new ContrastOptimizer(); // Initialize this first
                     this.loadTheme();
                     this.initThemePreviews();
                     this.loadConfig();
@@ -4337,6 +4321,7 @@
                     this.setupColorPickers();
                     this.setupKeyboardShortcuts();
                     this.setupResponsiveHandling();
+                    this.addMessageToConversation('system', 'Welcome! Connecting to backend...');
                     this.$watch('servers', () => this.$nextTick(() => this.initTippy()));
                     this.$watch('activeTab', (newTab) => {
                         this.$nextTick(() => this.initTippy());
@@ -4638,6 +4623,135 @@
                         this.currentModel = this.config.defaultModel || '';
                     }
                 }, // End loadConfigFromLocalStorage
+                saveConfigField(key, value) {
+                    clearTimeout(this.saveConfigTimer);
+                    this.saveConfigTimer = setTimeout(() => {
+                        this.config[key] = value; const updatePayload = { [key]: value };
+                        console.log('Saving config field via API:', updatePayload);
+                        this.apiFetch('/config', { method: 'PUT', body: JSON.stringify(updatePayload), })
+                            .then(() => this.addNotification(`Setting '${key}' saved.`, 'success', 1500))
+                            .catch(() => { this.addNotification(`Failed to save setting '${key}'.`, 'error'); });
+                    }, 750);
+                },
+                async resetConfig() { // Make async
+                    if (confirm('Are you sure you want to reset the configuration TO DEFAULTS? This affects the server and cannot be undone easily.')) {
+                        console.warn("Resetting configuration via API...");
+                        this.isLoading = true; // Use global loading
+                        this.addNotification("Resetting configuration to defaults...", "warning");
+                        try {
+                            // Call the API endpoint
+                            const result = await this.apiFetch('/config/reset', { method: 'POST' });
+                            this.addNotification(result.message || "Configuration reset successfully.", "success");
+                            // Reload UI config state from server (which should now be default)
+                            await this.loadConfig();
+                            // Reload servers and capabilities as config changed drastically
+                            await this.fetchServers();
+                            await this.fetchCapabilities();
+                            // Consider reloading the page or forcing a full state refresh if needed
+                        } catch (e) {
+                            this.addNotification(`Configuration reset failed: ${e.message}`, 'error');
+                        } finally {
+                            this.isLoading = false;
+                        }
+                    }
+                },
+                setModel(modelName) {
+                    if (!modelName || modelName === this.currentModel) return;
+                    this.currentModel = modelName; this.config.defaultModel = modelName;
+                    this.saveConfigField('defaultModel', modelName);
+                    this.addNotification(`Model set to: ${this.currentModelShort}`, 'info', 1500);
+                },
+                setCustomModel(modelName) {
+                    const trimmedName = modelName.trim();
+                    if (trimmedName && trimmedName !== this.currentModel) {
+                        this.currentModel = trimmedName; this.config.defaultModel = this.currentModel;
+                        this.saveConfigField('defaultModel', this.currentModel);
+                        if (!this.availableModels.includes(this.currentModel)) { this.availableModels.push(this.currentModel); }
+                        this.addNotification(`Custom model set: ${this.currentModelShort}`, 'info', 1500);
+                    }
+                },
+
+                // --- SERVER MGMT ---
+                serverStatusIcon(server) {
+                    const baseClasses = 'text-lg ';
+                    if (!server || typeof server.enabled === 'undefined') return baseClasses + 'fas fa-question-circle text-gray-400';
+                    if (!server.enabled) return baseClasses + 'fas fa-ban text-base-content/30';
+                    if (server.isLoading) return baseClasses + 'fas fa-spinner fa-spin text-info';
+                    if (server.isConnected) return baseClasses + 'fas fa-check-circle text-success';
+                    return baseClasses + 'fas fa-times-circle text-error';
+                },
+                async toggleServerConnection(server) {
+                    if (!server || !server.name) return; const action = server.isConnected ? 'disconnect' : 'connect';
+                    const endpoint = `/servers/${encodeURIComponent(server.name)}/${action}`;
+                    const serverIndex = this.servers.findIndex(s => s.name === server.name); if (serverIndex === -1) return;
+                    this.servers[serverIndex].isLoading = true; this.servers[serverIndex].statusText = action === 'connect' ? 'Connecting...' : 'Disconnecting...';
+                    this.servers = [...this.servers];
+                    try {
+                        await this.apiFetch(endpoint, { method: 'POST' });
+                        this.addNotification(`Server ${server.name} ${action} requested.`, 'info');
+                        setTimeout(() => this.fetchServers(), 1500); await this.fetchCapabilities();
+                    } catch (e) { this.addNotification(`Failed to ${action} server ${server.name}.`, 'error'); await this.fetchServers(); }
+                    finally { const finalServerState = this.servers.find(s => s.name === server.name); if (finalServerState) { finalServerState.isLoading = false; } else if (this.servers[serverIndex]) { this.servers[serverIndex].isLoading = false; } this.servers = [...this.servers]; }
+                },
+                async toggleServerEnabled(server) {
+                    if (!server || !server.name) return; const wasEnabled = server.enabled;
+                    const serverIndex = this.servers.findIndex(s => s.name === server.name); if (serverIndex === -1) return;
+                    this.servers[serverIndex].enabled = !wasEnabled; this.servers = [...this.servers];
+                    if (!this.servers[serverIndex].enabled && this.servers[serverIndex].isConnected && !this.servers[serverIndex].isLoading) { console.log(`Disabling server ${server.name}, requesting disconnect.`); this.toggleServerConnection(this.servers[serverIndex]).catch(e => console.warn(`Disconnect during disable failed: ${e}`)); }
+                    try {
+                        await this.apiFetch(`/servers/${encodeURIComponent(server.name)}/enable?enabled=${!wasEnabled}`, { method: 'PUT' });
+                        this.addNotification(`Server ${server.name} ${!wasEnabled ? 'enabled' : 'disabled'}.`, 'success');
+                        await this.fetchServers(); await this.fetchCapabilities();
+                    } catch (e) { this.addNotification(`Failed to update enable status for ${server.name}.`, 'error'); if (this.servers[serverIndex]) { this.servers[serverIndex].enabled = wasEnabled; this.servers = [...this.servers]; } await this.fetchServers(); }
+                },
+                async removeServer(serverName) {
+                    if (confirm(`Are you sure you want to remove server "${serverName}"? This cannot be undone.`)) {
+                        try {
+                            await this.apiFetch(`/servers/${encodeURIComponent(serverName)}`, { method: 'DELETE' });
+                            this.addNotification(`Server ${serverName} removed.`, 'warning');
+                            await this.fetchServers(); await this.fetchCapabilities();
+                        } catch (e) { this.addNotification(`Failed to remove server ${serverName}.`, 'error'); }
+                    }
+                },
+                async addServer() {
+                    const trimmedName = this.newServer.name.trim(); const trimmedPath = this.newServer.path.trim();
+                    if (!trimmedName || !this.newServer.type || !trimmedPath) { this.addNotification('Server name, type, and path/URL are required.', 'error'); return; }
+                    if (this.servers.some(s => s.name === trimmedName)) { this.addNotification(`Server name "${trimmedName}" already exists.`, 'error'); return; }
+                    if (this.newServer.type === 'sse' && !trimmedPath.match(/^https?:\/\//)) { this.addNotification('SSE server requires a valid HTTP(S) URL.', 'error'); return; }
+                    this.isLoading = true;
+                    try {
+                        const payload = { name: trimmedName, type: this.newServer.type, path: trimmedPath, argsString: this.newServer.argsString.trim() || "" };
+                        await this.apiFetch('/servers', { method: 'POST', body: JSON.stringify(payload) });
+                        this.addNotification(`Server ${payload.name} added.`, 'success');
+                        this.showAddServerModal = false; this.newServer = { name: '', type: 'stdio', path: '', argsString: '' };
+                        await this.fetchServers();
+                    } catch (e) { this.addNotification(`Failed to add server ${trimmedName}.`, 'error'); }
+                    finally { this.isLoading = false; }
+                },
+
+
+                // --- DISCOVERY ---
+                async discoverServers(type) {
+                    if (type === 'mdns' && !this.config.enableLocalDiscovery) { this.addNotification('mDNS discovery is disabled in settings.', 'warning'); return; }
+                    console.log(`Discovering servers (${type}) via API...`); this.isLoadingDiscovery = true; this.discoveredServers = [];
+                    try {
+                        const results = await this.apiFetch(`/discover?type=${type}`, { method: 'POST' });
+                        this.discoveredServers = results || [];
+                        this.addNotification(`${type} discovery finished. Found ${this.discoveredServers.length}.`, this.discoveredServers.length > 0 ? 'success' : 'info', 2500);
+                    } catch (e) { this.addNotification(`Discovery (${type}) failed.`, 'error'); }
+                    finally { this.isLoadingDiscovery = false; }
+                },
+                serverExists(discoveredServer) {
+                    if (!discoveredServer) return false; const pathOrUrl = discoveredServer.path || discoveredServer.url;
+                    return this.servers.some(s => s.name === discoveredServer.name || s.path === pathOrUrl);
+                },
+                addDiscoveredServer(discoveredServer) {
+                    if (!discoveredServer) return;
+                    this.newServer = { name: discoveredServer.name || `discovered-${discoveredServer.type || 'server'}`, type: discoveredServer.type || 'sse', path: discoveredServer.path || discoveredServer.url || '', argsString: discoveredServer.args ? discoveredServer.args.join(' ') : '' };
+                    this.addServer();
+                },
+
+
                 reconcileFavoriteTools() {
                     if (!this.tools || this.tools.length === 0) {
                         console.warn("Tools not loaded, cannot reconcile favorites yet.");
@@ -5740,34 +5854,34 @@
                         }
                     });
                 },
+
                 initHighlighting(container = document) {
                     this.$nextTick(() => {
                         if (typeof hljs === 'undefined') {
                             console.warn("highlight.js not loaded.");
                             return;
                         }
+                        // --- ADD CHECK ---
+                        if (!this.contrastOptimizer) {
+                            console.warn("ContrastOptimizer not ready in initHighlighting.");
+                            // return; // Optionally return if critical, or proceed without contrast fix
+                        }
+                        // --- END CHECK ---
                         try {
                             const blocks = container.querySelectorAll('pre code:not(.hljs)');
                             blocks.forEach((block) => {
                                 const bubble = block.closest('.chat-bubble');
                                 hljs.highlightElement(block);
-                                if (bubble) {
-                                    if (this.contrastOptimizer) this.contrastOptimizer.checkAndFixElementContrast(block, bubble);
+                                if (bubble && this.contrastOptimizer) { // Check again before using
+                                    this.contrastOptimizer.checkAndFixElementContrast(block, bubble);
                                 }
-                                const preElement = block.closest('pre');
-                                if (preElement && !preElement.querySelector('.copy-code-btn')) {
-                                    const codeContent = block.textContent || "";
-                                    const copyBtnHtml = createCopyButton(codeContent);
-                                    if (copyBtnHtml !== '<!-- copy error -->') {
-                                        preElement.insertAdjacentHTML('beforeend', copyBtnHtml);
-                                    }
-                                }
+                                // ... rest of highlighting logic ...
                             });
                             const alreadyHighlighted = container.querySelectorAll('pre code.hljs');
                             alreadyHighlighted.forEach((block) => {
                                 const bubble = block.closest('.chat-bubble');
-                                if (bubble) {
-                                    if (this.contrastOptimizer) this.contrastOptimizer.checkAndFixElementContrast(block, bubble);
+                                if (bubble && this.contrastOptimizer) { // Check again before using
+                                    this.contrastOptimizer.checkAndFixElementContrast(block, bubble);
                                 }
                             });
                         } catch (e) {
@@ -5784,24 +5898,32 @@
                     document.documentElement.setAttribute('data-theme', themeName);
                     if (save) localStorage.setItem('mcp_client_theme', themeName);
                     this.setupHljsThemeSwitcher();
+                    // --- ADD CHECK ---
                     if (this.contrastOptimizer) {
                         this.contrastOptimizer.clearCaches();
+                    } else {
+                        console.warn("ContrastOptimizer not ready during setTheme.");
                     }
-                    this.$nextTick(() => this.initTippy());
+                    // --- END CHECK ---
+                    this.$nextTick(() => this.initTippy()); // initTippy also uses theme, ensure contrastOptimizer ran
                 },
                 async apiFetch(endpoint, options = {}) {
                     this.isLoading = true;
-                    const controller = this.stopController || new AbortController();
-                    const signal = controller.signal;
                     try {
+                        // Add a timeout to prevent long-hanging requests
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 15000);
+
                         const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-                            signal: signal,
+                            signal: controller.signal,
                             headers: {
                                 'Content-Type': 'application/json',
                                 ...options.headers
                             },
                             ...options,
                         });
+
+                        clearTimeout(timeoutId);
                         if (response.status === 499) {
                             throw new Error('Request cancelled by client.');
                         }
@@ -5812,7 +5934,7 @@
                                 errorDetail = errJson.detail || JSON.stringify(errJson);
                             } catch (e) {
                                 /* ignore */
-}
+                            }
                             throw new Error(errorDetail);
                         }
                         if (response.status === 204 || response.headers.get('content-length') === '0') {
@@ -5821,11 +5943,11 @@
                         return await response.json();
                     } catch (error) {
                         if (error.name === 'AbortError') {
-                            console.log(`API Fetch Aborted (${endpoint})`);
-                            this.addNotification('Request cancelled.', 'warning');
+                            console.log(`Request timeout: ${endpoint}`);
+                            this.addNotification('Request timed out. Server may be unavailable.', 'warning');
                         } else {
                             console.error(`API Fetch Error (${endpoint}):`, error);
-                            this.addNotification(`API Error: ${error.message}`, 'error');
+                            this.addNotification(`Connection error: ${error.message}`, 'error');
                         }
                         throw error;
                     } finally {
@@ -5865,8 +5987,8 @@
                     };
                     this.ws.onerror = (error) => {
                         console.error('WebSocket Error:', error);
-                        this.wsStatus = 'Error';
-                        this.addNotification('Chat connection error.', 'error');
+                        this.wsStatus = `Error: ${error.type || 'Connection failed'}`;
+                        this.addNotification('Chat connection error. Backend server may be unavailable.', 'error');
                         this.wsConnected = false;
                         this.wsConnecting = false;
                     };
@@ -5917,67 +6039,84 @@
                     }
                 },
                 handleWebSocketMessage(message) {
-                    let assistantMsg = this.currentConversation.find(m => m.id === this.currentAssistantMessageId);
-                    const backendMessageId = message.message_id;
-                    if (backendMessageId && (!assistantMsg || assistantMsg.id !== backendMessageId)) {
-                        const existingMsg = this.currentConversation.find(m => m.id === backendMessageId);
-                        if (existingMsg) {
-                            assistantMsg = existingMsg;
+                    // --- MODIFIED START ---
+                    let assistantMsg = null;
+                    const backendMessageId = message.message_id; // Check if backend provides an ID
+
+                    // 1. Try finding by backend ID first
+                    if (backendMessageId) {
+                        assistantMsg = this.currentConversation.find(m => m.id === backendMessageId);
+                        if (assistantMsg && this.currentAssistantMessageId !== backendMessageId) {
+                            // If found by backend ID, update the component's current ID tracker
+                            console.log(`WS: Switched processing to assistant message ID: ${backendMessageId} (found via backend ID)`);
                             this.currentAssistantMessageId = backendMessageId;
-                            console.log(`WS: Switched to existing assistant message ID: ${backendMessageId}`);
-                        } else if (['stream_start', 'text_chunk', 'status', 'tool_call'].includes(message.type)) {
-                            const timestamp = new Date().toISOString();
-                            assistantMsg = {
-                                role: 'assistant',
-                                content: '',
-                                id: backendMessageId,
-                                timestamp: timestamp,
-                                current_status: message.type === 'status' ? message.payload : null,
-                                model: this.currentModelShort
-                            };
-                            this.currentConversation.push(assistantMsg);
-                            this.currentAssistantMessageId = backendMessageId;
-                            console.log(`WS: Started new assistant message ID: ${backendMessageId}`);
                         }
-                    } else if (!assistantMsg && message.type !== 'state_update' && message.type !== 'command_response' && message.type !== 'error') {
+                    }
+
+                    // 2. If not found by backend ID, try the component's tracked ID (less reliable)
+                    if (!assistantMsg && this.currentAssistantMessageId) {
+                        assistantMsg = this.currentConversation.find(m => m.id === this.currentAssistantMessageId);
+                        if (assistantMsg) {
+                            console.log(`WS: Found assistant message using component's tracked ID: ${this.currentAssistantMessageId}`);
+                        }
+                    }
+
+                    // 3. Create a new message if it's a starting event AND no message was found yet
+                    const isStartingEvent = ['stream_start', 'text_chunk', 'status', 'tool_call'].includes(message.type); // Define what starts a message
+                    if (!assistantMsg && isStartingEvent) {
                         const timestamp = new Date().toISOString();
-                        const tempId = `assistant_${timestamp}_${Math.random().toString(16).slice(2)}`;
+                        // Use backend ID if available, otherwise generate temporary ID
+                        const newMsgId = backendMessageId || `client_assistant_${timestamp}_${Math.random().toString(16).slice(2)}`;
                         assistantMsg = {
                             role: 'assistant',
-                            content: '',
-                            id: tempId,
+                            content: '', // Initialize content
+                            id: newMsgId,
                             timestamp: timestamp,
                             current_status: message.type === 'status' ? message.payload : null,
-                            model: this.currentModelShort
+                            model: this.currentModelShort // Use computed property
                         };
                         this.currentConversation.push(assistantMsg);
-                        this.currentAssistantMessageId = tempId;
-                        console.warn(`WS: Started assistant message with temporary ID: ${tempId}`);
+                        this.currentAssistantMessageId = newMsgId; // Track the ID of the newly created message
+                        if (backendMessageId) {
+                            console.log(`WS: Started NEW assistant message using backend ID: ${newMsgId}`);
+                        } else {
+                            console.warn(`WS: Started assistant message with temporary CLIENT ID: ${newMsgId}`);
+                        }
                     }
                     switch (message.type) {
                         case 'text_chunk':
+                            // --- ADDED CHECK ---
                             if (assistantMsg) {
                                 let chunkText = message.payload;
-                                if (typeof chunkText !== 'string') {
-                                    chunkText = JSON.stringify(chunkText, null, 2);
-                                }
+                                // Ensure content is a string before appending
                                 if (typeof assistantMsg.content !== 'string') {
+                                    console.warn(`WS: Assistant message ${assistantMsg.id} content was not a string, resetting before appending chunk.`);
                                     assistantMsg.content = '';
                                 }
+                                // Ensure chunk is a string
+                                if (typeof chunkText !== 'string') {
+                                    console.warn(`WS: Received non-string text_chunk payload, stringifying.`);
+                                    chunkText = JSON.stringify(chunkText); // Or handle differently
+                                }
                                 assistantMsg.content += chunkText;
-                                assistantMsg.current_status = null;
-                                this.currentConversation = [...this.currentConversation];
+                                assistantMsg.current_status = null; // Clear status on text
+                                this.currentConversation = [...this.currentConversation]; // Trigger reactivity
                             } else {
-                                console.warn("WS: Received text_chunk but no assistant message found/created.");
+                                console.warn("WS: Received text_chunk but no corresponding assistant message was found or created.");
+                                // Optionally buffer or discard? For now, just warn.
                             }
                             this.scrollToBottom();
                             break;
                         case 'status':
+                            // --- ADDED CHECK ---
                             if (assistantMsg) {
                                 assistantMsg.current_status = message.payload;
-                                this.currentConversation = [...this.currentConversation];
+                                this.currentConversation = [...this.currentConversation]; // Trigger reactivity
                             } else {
+                                // If no active assistant message, show as a general status update
+                                console.warn("WS: Received status but no corresponding assistant message, showing globally.");
                                 this.currentStatusMessage = message.payload;
+                                // Set a timer to clear the global status if needed
                                 setTimeout(() => {
                                     if (this.currentStatusMessage === message.payload) this.currentStatusMessage = null;
                                 }, 4000);
@@ -6313,7 +6452,7 @@
                                     resultData = JSON.parse(resultData);
                                 } catch (e) {
                                     /* Leave as string */
-}
+                                }
                             }
                             return this.visualRenderer.init(this).renderModelResult(resultData, {
                                 ...message,
@@ -6325,10 +6464,10 @@
                         }
                         if (Array.isArray(message.content) && message.content.every(b => b?.type === 'text')) {
                             const combinedText = message.content.map(b => b?.text || '').join('\n\n');
-                            return this.renderMarkdown(combinedText);
+                            return this.visualRenderer.renderMarkdown(combinedText);
                         }
                         if (typeof message.content === 'string') {
-                            return this.renderMarkdown(message.content);
+                            return this.visualRenderer.renderMarkdown(message.content);
                         }
                         if (typeof message.content === 'object' && message.content !== null && !Array.isArray(message.content)) {
                             return this.renderJson(message.content);
@@ -6377,7 +6516,7 @@
                                 rawText = JSON.parse(JSON.stringify(textContent));
                             }
                             const stringToParse = String(rawText);
-                            html += this.renderMarkdown(block);
+                            html += this.visualRenderer.renderMarkdown(block);
                         } else if (block.type === 'tool_use') {
                             const toolName = block.name || "Unknown Tool";
                             const inputData = block.input || {};
@@ -6455,9 +6594,539 @@
                     });
                     return html;
                 },
+                // ===== CONTENT ANALYSIS & EXTRACTION ENGINE (Component Property) =====
+                contentInspector: {
+                    // Core Analysis Functions
+                    inspectContent(content) {
+                        const result = { markdown: [], json: [], models: [], stats: null, rawText: [], detectedType: 'unknown' };
+                        try {
+                            this._analyzeDeep(content, result);
+                            result.detectedType = this._determineContentType(result);
+                        } catch (err) { console.error("Content inspection error:", err); }
+                        return result;
+                    },
+
+                    // Recursive analysis engine
+                    _analyzeDeep(content, result, path = '') {
+                        if (content === null || content === undefined) return;
+
+                        // --- CORRECTED STRING HANDLING ---
+                        if (typeof content === 'string') {
+                            // 1. Clean TextContent wrapper first
+                            const cleanedContent = this._cleanTextContentWrappers(content);
+                            let potentialJsonString = cleanedContent;
+
+                            // If cleaning occurred, log it
+                            if (cleanedContent !== content) {
+                                console.log("_analyzeDeep: TextContent cleaned, potential JSON:", potentialJsonString);
+                            } else {
+                                //console.log("_analyzeDeep: Processing raw string:", content); // Less verbose log
+                            }
+
+                            // 2. Attempt to parse the *result* of cleaning as JSON
+                            let parsedJson = null;
+                            try {
+                                const trimmed = potentialJsonString.trim();
+                                if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                                    parsedJson = JSON.parse(potentialJsonString);
+                                    //console.log("_analyzeDeep: Successfully parsed cleaned content as JSON.");
+                                } else {
+                                    //console.log("_analyzeDeep: Cleaned content doesn't look like JSON, skipping parse.");
+                                }
+                            } catch (e) {
+                                //console.log("_analyzeDeep: Failed to parse cleaned content as JSON, treating as text/markdown.", e.message);
+                            }
+
+                            // 3. If JSON parsed, analyze recursively
+                            if (parsedJson !== null) {
+                                this._analyzeDeep(parsedJson, result, path + '.parsed');
+                                return;
+                            }
+
+                            // 4. If no JSON, treat *cleaned* content as markdown or raw text
+                            const contentToRender = cleanedContent; // Always use the cleaned result
+                            if (this._isMarkdown(contentToRender)) {
+                                //console.log("_analyzeDeep: Treating cleaned content as Markdown.");
+                                result.markdown.push({ content: contentToRender, path: path });
+                            } else {
+                                //console.log("_analyzeDeep: Treating cleaned content as Raw Text.");
+                                result.rawText.push({ content: contentToRender, path: path });
+                            }
+                            return;
+                        }
+                        // --- END CORRECTED STRING HANDLING ---
+
+
+                        // Handle arrays
+                        if (Array.isArray(content)) {
+                            if (this._isModelResultsArray(content)) {
+                                content.forEach((model, index) => {
+                                    if (model && typeof model === 'object') result.models.push({ ...model, _index: index, _path: `${path}[${index}]` });
+                                });
+                                return;
+                            }
+                            content.forEach((item, index) => this._analyzeDeep(item, result, `${path}[${index}]`));
+                            return;
+                        }
+
+                        // Handle objects
+                        if (typeof content === 'object') {
+                            if (this._isModelResultObject(content)) {
+                                result.models.push({ ...content, _path: path });
+                                return;
+                            }
+                            if (this._isStatsObject(content)) {
+                                result.stats = result.stats ? { ...result.stats, ...content } : content;
+                                // Don't return here, still analyze deeper if necessary
+                            }
+
+                            // Store full object as JSON *unless* it was already identified as stats/model
+                            if (!this._isStatsObject(content) && !this._isModelResultObject(content)) {
+                                result.json.push({ content: content, path: path });
+                            }
+
+
+                            // Look deeper into object properties
+                            for (const key in content) {
+                                if (key.startsWith('_')) continue; // Skip internal keys
+
+                                // Special handling for common keys if they weren't part of a detected object type
+                                if (!this._isModelResultObject(content)) {
+                                    if ((key === 'text' || key === 'content' || key === 'message') && typeof content[key] === 'string') {
+                                        if (this._isMarkdown(content[key])) {
+                                            result.markdown.push({ content: content[key], path: `${path}.${key}` });
+                                            continue; // Don't recurse further into this specific key if handled as markdown
+                                        }
+                                    }
+                                    if (key === 'results' && typeof content[key] === 'object') {
+                                        for (const modelName in content[key]) {
+                                            const modelData = content[key][modelName];
+                                            if (typeof modelData === 'object') {
+                                                result.models.push({ ...modelData, provider: modelName.split('/')[0], model: modelName.split('/')[1] || modelName, _path: `${path}.${key}.${modelName}` });
+                                            }
+                                        }
+                                        // Recurse *into* the results object to find potential nested stats/markdown/etc.
+                                        // This was missing before.
+                                        this._analyzeDeep(content[key], result, `${path}.${key}`);
+                                        continue; // Already handled the 'results' structure
+                                    }
+                                }
+
+                                // Always recurse into other properties
+                                this._analyzeDeep(content[key], result, `${path}.${key}`);
+                            }
+                            return;
+                        }
+                    }, // End _analyzeDeep
+
+                    // Extract embedded JSON from strings
+                    _extractJsonFromString(str) {
+                        if (typeof str !== 'string') return null;
+                        const jsonRegexPatterns = [/\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}/g, /\[(?:[^\[\]]|(?:\[(?:[^\[\]]|(?:\[[^\[\]]*\]))*\]))*\]/g];
+                        for (const pattern of jsonRegexPatterns) {
+                            const matches = str.match(pattern);
+                            if (!matches) continue;
+                            for (const match of matches) {
+                                try { if (match.length < 10) continue; const parsed = JSON.parse(match); return parsed; } catch (e) { }
+                            }
+                        }
+                        // Removed TextContent matching here, handled by _cleanTextContentWrappers
+                        return null;
+                    }, // End _extractJsonFromString
+
+                    // Clean TextContent wrappers - Using Robust Version
+                    _cleanTextContentWrappers(str) {
+                        if (typeof str !== 'string') return str;
+                        let contentToProcess = str.trim();
+                        // 1. Strip surrounding brackets first
+                        if (contentToProcess.startsWith('[') && contentToProcess.endsWith(']')) {
+                            contentToProcess = contentToProcess.slice(1, -1).trim();
+                        }
+                        // 2. Apply the more robust TextContent regex
+                        const pattern = /^TextContent\(\s*(?:type\s*=\s*(['"])text\1(?:,\s*)?)?text\s*=\s*(['"])((?:\\.|(?!\2).)*?)\2(?:,\s*annotations\s*=\s*(?:None|\[\]))?\s*\)$/;
+                        const match = contentToProcess.match(pattern);
+
+                        if (match && match[3]) {
+                            try {
+                                let unescaped = match[3]
+                                    .replace(/\\"/g, '"')
+                                    .replace(/\\'/g, "'")
+                                    .replace(/\\n/g, '\n')
+                                    .replace(/\\\\/g, '\\');
+                                unescaped = unescaped.replace(/\\u([\da-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+                                unescaped = unescaped.replace(/\\U([\da-fA-F]{8})/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)));
+                                return unescaped;
+                            } catch (e) {
+                                console.error("Error unescaping TextContent text:", e);
+                                return match[3]; // Return raw matched text on error
+                            }
+                        }
+                        // If pattern didn't match, return the (potentially bracket-stripped) string
+                        return contentToProcess;
+                    }, // End _cleanTextContentWrappers
+
+                    // Check if string contains markdown
+                    _isMarkdown(str) {
+                        if (typeof str !== 'string' || str.length <= 20) return false;
+                        const markdownPatterns = [/^#{1,6}\s+.+$/m, /^[-*+]\s+.+$/m, /^>\s+.+$/m, /^```[\s\S]*?```$/m, /^(?:\d+\.)\s+.+$/m, /\*\*.*?\*\*/, /_.*?_/, /`.*?`/, /\[.*?\]\(.*?\)/, /!\[.*?\]\(.*?\)/, /\|[^|]+\|[^|]+\|/, /^---+$/m, /^===+$/m];
+                        return markdownPatterns.some(pattern => pattern.test(str));
+                    }, // End _isMarkdown
+
+                    // Check if object is a model result
+                    _isModelResultObject(obj) {
+                        if (!obj || typeof obj !== 'object') return false;
+                        const modelProperties = ['model', 'provider', 'text', 'tokens', 'cost', 'processing_time', 'success'];
+                        return ('text' in obj || 'content' in obj) && modelProperties.filter(prop => prop in obj).length >= 2;
+                    }, // End _isModelResultObject
+
+                    // Check if an array contains model results
+                    _isModelResultsArray(arr) {
+                        return Array.isArray(arr) && arr.length > 0 && arr.some(item => this._isModelResultObject(item));
+                    }, // End _isModelResultsArray
+
+                    // Check if object contains statistics
+                    _isStatsObject(obj) {
+                        if (!obj || typeof obj !== 'object') return false;
+                        const statsProps = ['tokens', 'cost', 'processing_time', 'total_requests', 'successful_requests', 'failed_requests', 'total_cost', 'average_processing_time'];
+                        return statsProps.filter(prop => prop in obj).length >= 2;
+                    }, // End _isStatsObject
+
+                    // Determine the primary content type based on the analysis - Using IMPROVED VERSION
+                    _determineContentType(result) {
+                        // Give priority to complex structures detected directly in the first JSON block
+                        if (result.json && result.json.length > 0) {
+                            const jsonData = result.json[0].content; // Analyze the primary JSON data found
+
+                            if (jsonData) { // Check if jsonData is valid
+                                // Check for multi-provider results with aggregate stats (highest priority)
+                                if (jsonData.results && typeof jsonData.results === 'object' &&
+                                    Object.keys(jsonData.results).length > 0 &&
+                                    jsonData.aggregate_stats && typeof jsonData.aggregate_stats === 'object') {
+                                    return 'multi_provider';
+                                }
+
+                                // Standard model comparison (multiple models without aggregate stats)
+                                if (jsonData.results && typeof jsonData.results === 'object' &&
+                                    Object.keys(jsonData.results).length > 1) {
+                                    return 'model_comparison';
+                                }
+
+                                // Check for providers status information
+                                if (jsonData.providers && typeof jsonData.providers === 'object') {
+                                    return 'providers_status';
+                                }
+
+                                // Check for models list
+                                if (jsonData.models && typeof jsonData.models === 'object') {
+                                    return 'models_list';
+                                }
+
+                                // Check if it's a single model result *within* the JSON
+                                if ((jsonData.text || jsonData.content) && jsonData.model && jsonData.provider) {
+                                    return 'single_model';
+                                }
+
+                                // Check for simple message object
+                                if (jsonData.message && typeof jsonData.message === 'string' &&
+                                    Object.keys(jsonData).length === 1) {
+                                    return 'simple_message';
+                                }
+                            }
+                        }
+
+                        // Fallback to checking collected arrays/types
+                        if (result.models.length > 1) {
+                            return 'models'; // Multiple models implies comparison or list
+                        }
+
+                        if (result.models.length === 1) {
+                            return 'single_model'; // Only one model found
+                        }
+
+                        if (result.markdown.length > 0) {
+                            return 'markdown';
+                        }
+
+                        if (result.json.length > 0) {
+                            return 'json'; // Generic JSON if no specific structure matched
+                        }
+
+                        if (result.rawText.length > 0) {
+                            return 'text'; // Plain text
+                        }
+
+                        return 'unknown'; // Default if nothing substantial was found
+                    } // End _determineContentType
+                }, // End contentInspector
+
+                                // ===== VISUAL RENDERING ENGINE (REVISED & COMPLETE) =====
+                                visualRenderer: {
+
+// Highlight code with proper language detection
+highlight(code, forcedLanguage = null) {
+    // Use global hljs and DOMPurify directly
+    if (typeof hljs === 'undefined' || typeof DOMPurify === 'undefined') {
+        console.error("highlight error: hljs or DOMPurify not loaded");
+        return String(code || '');
+    }
+    if (!code) return DOMPurify.sanitize(String(code || ''));
+
+    const codeStr = typeof code === 'object' ? JSON.stringify(code, null, 2) : String(code);
+    let language = forcedLanguage;
+    if (!language) {
+        // Basic language detection
+        if (codeStr.trim().startsWith('{') || codeStr.trim().startsWith('[')) language = 'json';
+        else if (/^(function|const|let|var|import|class)\s/.test(codeStr)) language = 'javascript';
+        else if (/^(def|class|import|from|print)\s/.test(codeStr)) language = 'python';
+        else if (/^<\?xml/.test(codeStr.trim()) || /^<[a-zA-Z]/.test(codeStr.trim())) language = 'xml'; // Basic XML/HTML check
+        else language = 'plaintext';
+    }
+    try {
+        // Check if language is supported before highlighting
+        if (hljs.getLanguage(language)) {
+            return hljs.highlight(codeStr, { language, ignoreIllegals: true }).value;
+        } else {
+            console.warn(`Highlight.js language "${language}" not supported, using plaintext.`);
+            return hljs.highlight(codeStr, { language: 'plaintext', ignoreIllegals: true }).value;
+        }
+    } catch (e) {
+        console.error("Highlighting error:", e, "Lang:", language, "Code:", codeStr.substring(0, 50) + "...");
+        // Fallback: Sanitize and wrap in plain code tags
+        return DOMPurify.sanitize(codeStr);
+    }
+},
+
+// createCopyButton method removed - uses the global one now
+
+// Render markdown content
+renderMarkdown(markdownInput) {
+    // Use global marked and DOMPurify directly
+    const inputType = typeof markdownInput;
+    const mdSample = String(markdownInput || '').substring(0, 70).replace(/\n/g, '\\n'); // Log with visible newlines
+    // console.log(`[visualRenderer.renderMarkdown] Input Type: ${inputType}, Sample: "${mdSample}"`); // Keep for debugging if needed
+
+    if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+        console.error("[visualRenderer.renderMarkdown] Missing marked or DOMPurify!");
+        return `<div>${DOMPurify.sanitize(String(markdownInput || ''))}</div>`;
+    }
+
+    if (markdownInput === null || typeof markdownInput === 'undefined') {
+        // console.warn("[visualRenderer.renderMarkdown] Input is null/undefined.");
+        return '';
+    }
+
+    try {
+        // Extract text content if it's a standard block structure
+        let contentToParse = markdownInput;
+        if (typeof markdownInput === 'object' && markdownInput !== null && markdownInput.type === 'text' && typeof markdownInput.text === 'string') {
+            contentToParse = markdownInput.text;
+        } else if (Array.isArray(markdownInput) && markdownInput.length === 1 && markdownInput[0]?.type === 'text' && typeof markdownInput[0].text === 'string') {
+            // Handle cases where a single text block is passed in an array
+            contentToParse = markdownInput[0].text;
+        }
+
+        // Ensure we are parsing a string
+        const stringContent = String(contentToParse);
+
+        const html = marked.parse(stringContent); // Use global marked
+
+        if (typeof html !== 'string') {
+            console.error("[visualRenderer.renderMarkdown] marked.parse returned non-string:", html);
+            return `<div>${DOMPurify.sanitize(stringContent)}</div>`; // Sanitize original string
+        }
+
+        const sanitizedHtml = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } }); // Use global DOMPurify
+        // console.log(`[visualRenderer.renderMarkdown] Output Sample:`, sanitizedHtml.substring(0, 100)); // Keep for debugging if needed
+        return sanitizedHtml; // Return raw sanitized HTML
+    } catch (e) {
+        console.error("[visualRenderer.renderMarkdown] FAILED:", e, "Input was:", markdownInput);
+        return `<div class="text-error p-1">Markdown Render Error</div><div>${DOMPurify.sanitize(String(markdownInput))}</div>`; // Use global DOMPurify
+    }
+},
+
+// Helper function to render a code block with syntax highlighting
+renderCodeBlock(code, language, title = null) {
+    // Use global hljs and DOMPurify and global createCopyButton
+    if (typeof hljs === 'undefined' || typeof DOMPurify === 'undefined') {
+        console.error("renderCodeBlock error: hljs or DOMPurify not loaded");
+        return String(code || '');
+    }
+
+    try {
+        const codeString = (typeof code === 'object' ? JSON.stringify(code, null, 2) : String(code)) || '';
+        let highlightedCode = '';
+
+        // Check if language is supported before highlighting
+        if (language && hljs.getLanguage(language)) {
+            highlightedCode = hljs.highlight(codeString.trim(), { language, ignoreIllegals: true }).value;
+        } else {
+            // Fallback to plaintext if language is not supported or not provided
+            language = 'plaintext';
+            highlightedCode = hljs.highlight(codeString.trim(), { language: 'plaintext', ignoreIllegals: true }).value;
+        }
+
+        const titleHtml = title ? `<div class="tool-code-title">${DOMPurify.sanitize(title)}</div>` : '';
+        // Use global createCopyButton function
+        const copyButton = createCopyButton(codeString.trim()); // Defined globally
+
+        return `
+<div class="tool-code-container my-2">
+${titleHtml}
+<div class="tool-code-block-wrapper relative group">
+<pre class="tool-code-block"><code class="language-${language} hljs">${highlightedCode}</code></pre>
+${copyButton}
+</div>
+</div>`;
+    } catch (e) {
+        console.error("Code highlighting/rendering error:", e);
+        const safeCode = DOMPurify.sanitize(typeof code === 'object' ? JSON.stringify(code) : String(code));
+        const copyButtonFallback = createCopyButton(safeCode); // Use global function
+        return `<div class="tool-code-container my-2"><div class="tool-code-block-wrapper relative group"><pre class="tool-code-block"><code>${safeCode}</code></pre>${copyButtonFallback}</div></div>`;
+    }
+},
+
+// Helper method to render formatted text with parameter highlighting
+renderFormattedText(text) {
+     // Use global DOMPurify
+    if (typeof DOMPurify === 'undefined') {
+        console.error("renderFormattedText error: DOMPurify not loaded");
+        return String(text || '');
+    }
+    if (!text) return '';
+    text = text.trim();
+    const backtickParamRegex = /`([a-zA-Z_][a-zA-Z0-9_]*)`/g;
+    text = text.replace(backtickParamRegex, '<span class="font-mono text-info">$1</span>');
+    const paramRegex = /^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)/gm;
+    text = text.replace(paramRegex, '<span class="font-mono text-info">$1</span>: $2');
+    const lines = text.split('\n');
+    const paragraphs = [];
+    let currentParagraph = [];
+    let inCodeBlock = false;
+    let codeContent = '';
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const isIndented = line.startsWith('    ');
+        if (!inCodeBlock && isIndented) {
+            if (currentParagraph.length > 0) { paragraphs.push({ type: 'paragraph', content: currentParagraph.join('\n') }); currentParagraph = []; }
+            inCodeBlock = true; codeContent = line.substring(4);
+        } else if (inCodeBlock && !isIndented) {
+            if (codeContent.trim()) { paragraphs.push({ type: 'code', content: codeContent }); }
+            inCodeBlock = false; if (line.trim()) { currentParagraph.push(line); }
+        } else if (inCodeBlock) { codeContent += '\n' + (isIndented ? line.substring(4) : line);
+        } else {
+            if (!line.trim() && currentParagraph.length > 0) { paragraphs.push({ type: 'paragraph', content: currentParagraph.join('\n') }); currentParagraph = [];
+            } else if (line.trim()) { currentParagraph.push(line); }
+        }
+    }
+    if (inCodeBlock && codeContent.trim()) { paragraphs.push({ type: 'code', content: codeContent }); }
+    else if (currentParagraph.length > 0) { paragraphs.push({ type: 'paragraph', content: currentParagraph.join('\n') }); }
+    let html = '';
+    paragraphs.forEach(item => {
+        if (item.type === 'paragraph') { html += `<p>${DOMPurify.sanitize(item.content)}</p>`; // Use global DOMPurify
+        } else if (item.type === 'code') {
+            let language = 'python';
+            if (item.content.includes('function') && (item.content.includes('{') || item.content.includes('=>'))) { language = 'javascript'; }
+            else if (item.content.includes('class ') || item.content.includes('def ')) { language = 'python'; }
+            // Call the corrected renderCodeBlock within this object
+            html += this.renderCodeBlock(item.content, language);
+        }
+    });
+    return html;
+},
+
+// Format values with appropriate units
+formatValue(value, type) {
+    // This function was self-contained and likely correct already
+    if (value === undefined || value === null) return 'N/A';
+    try {
+        switch (type) {
+            case 'cost': const cost = parseFloat(value); if (isNaN(cost)) return 'N/A'; if (cost < 0.0001 && cost !== 0) return `${(cost * 1000000).toFixed(2)}µ$`; if (cost < 0.01 && cost !== 0) return `${(cost * 1000).toFixed(2)}m$`; return `$${cost.toFixed(6)}`;
+            case 'time': const time = parseFloat(value); if (isNaN(time)) return 'N/A'; if (time < 0.1) return `${(time * 1000).toFixed(0)}ms`; if (time < 60) return `${time.toFixed(2)}s`; const mins = Math.floor(time / 60); const secs = Math.round(time % 60); return `${mins}m ${secs}s`;
+            case 'number': const num = parseInt(value); return isNaN(num) ? 'N/A' : num.toLocaleString();
+            default: return String(value);
+        }
+    } catch (e) { console.error("Error formatting value:", value, type, e); return 'N/A'; }
+},
+
+// Create a badge with appropriate styling
+createBadge(text, type = 'default') {
+    // Use global DOMPurify
+    if (typeof DOMPurify === 'undefined') {
+         console.error("createBadge error: DOMPurify not loaded");
+         return String(text || '');
+    }
+    const classMap = { 'success': 'tool-badge-success', 'error': 'tool-badge-error', 'warning': 'tool-badge-warning', 'info': 'tool-badge-info', 'default': 'tool-badge-default' };
+    const className = classMap[type] || classMap['default'];
+    return `<span class="tool-badge ${className}">${DOMPurify.sanitize(String(text))}</span>`;
+},
+
+// Check if string contains markdown (Helper needed internally)
+ _isMarkdown(str) {
+   // This function was self-contained and likely correct already
+   if (typeof str !== 'string' || str.length <= 20) return false;
+   // More robust checks, including lists, blockquotes, etc.
+   const markdownPatterns = [
+       /^#{1,6}\s+.+$/m,         // Headers
+       /^\s*[-*+]\s+.+$/m,       // Unordered lists
+       /^\s*\d+\.\s+.+$/m,      // Ordered lists
+       /^>\s*.+$/m,            // Blockquotes
+       /^```[\s\S]*?^```$/m,   // Fenced code blocks
+       /^(?:-{3,}|_{3,}|\*{3,})$/m, // Horizontal rules
+       /!\[.*?\]\(.*?\)/,     // Images
+       /\[.*?\]\(.*?\)/,       // Links
+       /`[^`]+`/,            // Inline code
+       /(?<!\\)\*\*[\s\S]+?\*\*(?!\\)|(?<!\\)__[\s\S]+?__(?!\\)/, // Bold
+       /(?<!\\)\*[\s\S]+?\*(?!\\)|(?<!\\)_[\s\S]+?_(?!\\)/,   // Italic
+       /\|.*\|.*\|/            // Basic table structure indicator
+   ];
+   return markdownPatterns.some(pattern => pattern.test(str));
+},
+
+// Render a model result card
+renderModelResult(model, indexOrName = null) {
+    // Use global DOMPurify
+     if (typeof DOMPurify === 'undefined') {
+         console.error("renderModelResult error: DOMPurify not loaded");
+         return '<div class="text-error">Render Error</div>';
+    }
+    if (!model || typeof model !== 'object') {
+        return '<div class="text-error">Invalid model data</div>';
+    }
+
+    const { provider = 'unknown', model: modelName = 'unknown', text, content, message, tokens, cost, processing_time, success = true, error = null } = model;
+    const modelContent = text || content || message || (error ? `Error: ${error}` : '');
+    const badgeProvider = this.createBadge(DOMPurify.sanitize(provider), 'info');
+    const badgeStatus = success ? this.createBadge('Success', 'success') : this.createBadge(DOMPurify.sanitize(error || 'Error'), 'error');
+    // Use this.renderMarkdown to call corrected version
+    const renderedContent = this._isMarkdown(modelContent) ? this.renderMarkdown(modelContent) : `<pre class="tool-model-text whitespace-pre-wrap">${DOMPurify.sanitize(modelContent)}</pre>`;
+    const metricTokens = tokens ? `<div class="tool-metric"><i class="fas fa-hashtag tool-metric-icon"></i> <span class="tool-metric-value">${typeof tokens === 'object' ? this.formatValue(tokens.total || tokens.output || tokens.input || 0, 'number') : this.formatValue(tokens, 'number')}</span><span class="tool-metric-label">tokens</span></div>` : '';
+    const metricCost = cost !== undefined ? `<div class="tool-metric"><i class="fas fa-dollar-sign tool-metric-icon"></i> <span class="tool-metric-value">${this.formatValue(cost, 'cost')}</span><span class="tool-metric-label">cost</span></div>` : '';
+    const metricTime = processing_time !== undefined ? `<div class="tool-metric"><i class="fas fa-clock tool-metric-icon"></i> <span class="tool-metric-value">${this.formatValue(processing_time, 'time')}</span><span class="tool-metric-label">time</span></div>` : '';
+    const indexHtml = indexOrName !== null ? `<div class="tool-model-index">#${indexOrName}</div>` : '';
+
+    // Main card structure
+    return `
+<div class="tool-model-card" data-provider="${DOMPurify.sanitize(provider.toLowerCase())}">
+<div class="tool-model-header">
+<div class="tool-model-info">
+${badgeProvider}
+<div class="tool-model-name">${DOMPurify.sanitize(modelName)}</div>
+${indexHtml}
+</div>
+<div class="tool-model-status">
+${badgeStatus}
+</div>
+</div>
+<div class="tool-model-content">
+${renderedContent}
+</div>
+${ (metricTokens || metricCost || metricTime) ? `<div class="tool-model-metrics"> ${metricTokens} ${metricCost} ${metricTime} </div>` : '' }
+</div>`;
+}
+}, // End visualRenderer
                 renderUserProvidedToolResult(block, message) {
                     if (!this.uiSettings.showToolDataMessages) return '<!-- tool message hidden -->';
-                    const renderer = this.visualRenderer.init(this);
                     const inspector = this.contentInspector;
                     try {
                         const rawBlockContent = block?.content;
@@ -6469,13 +7138,13 @@
                         let isStringPayload = typeof payload === 'string';
                         if (isStringPayload) {
                             const markdownInputString = payload.replace(/\\n/g, '\n');
-                            const markdownOutputHTML = renderer.renderMarkdown(markdownInputString);
+                            const markdownOutputHTML = this.visualRenderer.renderMarkdown(markdownInputString);
                             contentHTML = `<div class="tool-markdown prose prose-sm max-w-none prose-invert">${markdownOutputHTML}</div>`;
                         } else {
                             const analysisResult = inspector.inspectContent(payload);
                             switch (analysisResult.detectedType) {
                                 case 'multi_provider':
-                                    contentHTML = (payload && typeof payload === 'object' && payload.results) ? renderer.renderMultiProviderResults(payload.results, payload.aggregate_stats) : renderer.renderCodeBlock(payload, 'json', 'Multi-Provider Results');
+                                    contentHTML = (payload && typeof payload === 'object' && payload.results) ? this.visualRenderer.renderMultiProviderResults(payload.results, payload.aggregate_stats) : this.visualRenderer.renderCodeBlock(payload, 'json', 'Multi-Provider Results');
                                     break;
                                 case 'model_comparison':
                                     if (payload && typeof payload === 'object' && payload.results) {
@@ -6492,16 +7161,16 @@
                                             };
                                         }).filter(Boolean);
                                         if (modelsList.length > 1) {
-                                            contentHTML += renderer.renderComparisonTable(modelsList, 'Model Comparison Results');
+                                            contentHTML += this.visualRenderer.renderComparisonTable(modelsList, 'Model Comparison Results');
                                         }
                                         modelsList.forEach((model, index) => {
-                                            contentHTML += renderer.renderModelResult(model, index + 1);
+                                            contentHTML += this.visualRenderer.renderModelResult(model, index + 1);
                                         });
                                         if (payload.aggregate_stats && typeof payload.aggregate_stats === 'object') {
-                                            contentHTML += renderer.renderStatsDashboard(payload.aggregate_stats, 'Aggregate Performance');
+                                            contentHTML += this.visualRenderer.renderStatsDashboard(payload.aggregate_stats, 'Aggregate Performance');
                                         }
                                     } else {
-                                        contentHTML = renderer.renderCodeBlock(payload, 'json', 'Comparison Data');
+                                        contentHTML = this.visualRenderer.renderCodeBlock(payload, 'json', 'Comparison Data');
                                     }
                                     break;
                                 case 'single_model':
@@ -6509,33 +7178,33 @@
                                     const modelsToRender = analysisResult.models?.length > 0 ? analysisResult.models : (typeof payload === 'object' && ((payload.text && payload.model) || (payload.content && payload.model)) ? [payload] : []);
                                     modelsToRender.forEach((modelData, index) => {
                                         if (modelData) {
-                                            contentHTML += renderer.renderModelResult(modelData, modelsToRender.length > 1 ? index + 1 : null);
+                                            contentHTML += this.visualRenderer.renderModelResult(modelData, modelsToRender.length > 1 ? index + 1 : null);
                                         }
                                     });
                                     if (analysisResult.stats) {
-                                        contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
+                                        contentHTML += this.visualRenderer.renderStatsDashboard(analysisResult.stats);
                                     }
                                     break;
                                 case 'providers_status':
-                                    contentHTML = (payload && typeof payload === 'object' && payload.providers) ? renderer.renderProvidersStatus(payload.providers) : renderer.renderCodeBlock(payload, 'json', 'Provider Status Data');
+                                    contentHTML = (payload && typeof payload === 'object' && payload.providers) ? this.visualRenderer.renderProvidersStatus(payload.providers) : this.visualRenderer.renderCodeBlock(payload, 'json', 'Provider Status Data');
                                     break;
                                 case 'models_list':
-                                    contentHTML = (payload && typeof payload === 'object' && payload.models) ? renderer.renderModelsList(payload.models) : renderer.renderCodeBlock(payload, 'json', 'Models List Data');
+                                    contentHTML = (payload && typeof payload === 'object' && payload.models) ? this.visualRenderer.renderModelsList(payload.models) : this.visualRenderer.renderCodeBlock(payload, 'json', 'Models List Data');
                                     break;
                                 case 'simple_message':
-                                    contentHTML = (typeof payload === 'object' && payload.message) ? renderer.renderSimpleMessage(payload) : renderer.renderCodeBlock(payload, 'json', 'Message Data');
+                                    contentHTML = (typeof payload === 'object' && payload.message) ? this.visualRenderer.renderSimpleMessage(payload) : this.visualRenderer.renderCodeBlock(payload, 'json', 'Message Data');
                                     break;
                                 case 'json':
-                                    contentHTML = (analysisResult.json?.length > 0) ? renderer.renderCodeBlock(analysisResult.json[0].content, 'json', 'JSON Data') : renderer.renderCodeBlock(payload, 'json', 'JSON Data');
-                                    if (analysisResult.stats) contentHTML += renderer.renderStatsDashboard(analysisResult.stats);
+                                    contentHTML = (analysisResult.json?.length > 0) ? this.visualRenderer.renderCodeBlock(analysisResult.json[0].content, 'json', 'JSON Data') : this.visualRenderer.renderCodeBlock(payload, 'json', 'JSON Data');
+                                    if (analysisResult.stats) contentHTML += this.visualRenderer.renderStatsDashboard(analysisResult.stats);
                                     break;
                                 default:
                                     console.warn(`renderUserProvidedToolResult: Unknown/unhandled object type: ${analysisResult.detectedType}. Rendering as JSON.`);
-                                    contentHTML += renderer.renderCodeBlock(payload, 'json', 'Raw Data');
+                                    contentHTML += this.visualRenderer.renderCodeBlock(payload, 'json', 'Raw Data');
                                     break;
                             }
                         }
-                        return `<div class="tool-result-container"><div class="tool-result-header"><div class="tool-result-title"><svg xmlns="http://www.w3.org/2000/svg" class="tool-result-icon" viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 17a2.4 2.4 0 0 1 0-4.8V7a2.4 2.4 0 0 1 4.8 0v5.2a2.4 2.4 0 0 1 0 4.8z"/><path d="M16.5 17a2.4 2.4 0 0 1 0-4.8V7a2.4 2.4 0 0 1 4.8 0v5.2a2.4 2.4 0 0 1 0 4.8zM5 12h14"/></svg><span>Tool Data (User Provided)</span> ${message?.tool_name ? `<span class="text-xs opacity-70 ml-2">(${DOMPurify.sanitize(message.tool_name)})</span>` : ''}</div><div class="tool-result-actions">${renderer.createCopyButton(rawBlockContent || '', 'Copy Raw')}</div></div><div class="tool-result-content p-4 bg-gray-800 text-gray-200">${contentHTML}</div></div>`;
+                        return `<div class="tool-result-container"><div class="tool-result-header"><div class="tool-result-title"><svg xmlns="http://www.w3.org/2000/svg" class="tool-result-icon" viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 17a2.4 2.4 0 0 1 0-4.8V7a2.4 2.4 0 0 1 4.8 0v5.2a2.4 2.4 0 0 1 0 4.8z"/><path d="M16.5 17a2.4 2.4 0 0 1 0-4.8V7a2.4 2.4 0 0 1 4.8 0v5.2a2.4 2.4 0 0 1 0 4.8zM5 12h14"/></svg><span>Tool Data (User Provided)</span> ${message?.tool_name ? `<span class="text-xs opacity-70 ml-2">(${DOMPurify.sanitize(message.tool_name)})</span>` : ''}</div><div class="tool-result-actions">${this.visualRenderer.createCopyButton(rawBlockContent || '', 'Copy Raw')}</div></div><div class="tool-result-content p-4 bg-gray-800 text-gray-200">${contentHTML}</div></div>`;
                     } catch (error) {
                         console.error("Tool result rendering failed:", error, block);
                         return `<div class="bg-error/10 p-4 rounded border border-error/30 text-error"><h3 class="font-medium mb-2">Tool Data Rendering Error</h3><p>Failed to render tool result: ${error.message}</p></div>`;
@@ -6549,12 +7218,12 @@
                         }
                         return this.renderJsonWithToggle(parsedJson, message.id);
                     }
-                    return this.renderMarkdown(content);
+                    return this.visualRenderer.renderMarkdown(content);
                 },
                 renderArrayContent(content, message) {
                     if (Array.isArray(content) && content.length === 1 && content[0] && typeof content[0] === 'object' && content[0].type === 'text' && typeof content[0].text === 'string') {
                         console.log("Found single text block, rendering text directly");
-                        return this.renderMarkdown(content[0].text);
+                        return this.visualRenderer.renderMarkdown(content[0].text);
                     }
                     const hasMixedContent = content.some(item => item && typeof item === 'object' && (item.type === 'tool_use' || item.type === 'tool_result'));
                     if (hasMixedContent) {
@@ -6572,7 +7241,7 @@
                     }
                     if (Object.prototype.toString.call(content) === '[object Object]') {
                         if (content.title || content.heading) {
-                            return `<div class="prose prose-sm max-w-none"><h3 class="font-medium text-base">${DOMPurify.sanitize(content.title || content.heading)}</h3>${content.content ? this.renderMarkdown(content.content) : ''}${content.sections ? this.renderSections(content.sections) : ''}</div>`;
+                            return `<div class="prose prose-sm max-w-none"><h3 class="font-medium text-base">${DOMPurify.sanitize(content.title || content.heading)}</h3>${content.content ? this.visualRenderer.renderMarkdown(content.content) : ''}${content.sections ? this.renderSections(content.sections) : ''}</div>`;
                         }
                         return this.renderJsonWithToggle(content, message.id);
                     }
@@ -6589,49 +7258,19 @@
                                 html += `<h4 class="font-medium mt-2">${DOMPurify.sanitize(section.title || section.heading)}</h4>`;
                             }
                             if (section.content) {
-                                html += this.renderMarkdown(section.content);
+                                html += visualRenderer.renderMarkdown(section.content);
                             } else if (Object.keys(section).length > 0) {
                                 const content = Object.entries(section).filter(([k]) => k !== 'title' && k !== 'heading').map(([k, v]) => {
                                     if (typeof v === 'string') return v;
                                     if (typeof v === 'object') return JSON.stringify(v);
                                     return String(v);
                                 }).join('\n\n');
-                                html += this.renderMarkdown(content);
+                                html += visualRenderer.renderMarkdown(content);
                             }
                         }
                     });
                     html += '</div>';
                     return html;
-                },
-                renderMarkdown(markdownInput) {
-                    const inputType = typeof markdownInput;
-                    const mdSample = String(markdownInput || '').substring(0, 70).replace(/\n/g, '\\n');
-                    console.log(`[visualRenderer.renderMarkdown] Input Type: ${inputType}, Sample: "${mdSample}"`);
-                    if (!this._marked || !this._DOMPurify) {
-                        console.error("[visualRenderer.renderMarkdown] Missing marked or DOMPurify!");
-                        return `<div>${this._DOMPurify.sanitize(String(markdownInput || ''))}</div>`;
-                    }
-                    if (markdownInput === null || typeof markdownInput === 'undefined') {
-                        console.warn("[visualRenderer.renderMarkdown] Input is null/undefined.");
-                        return '';
-                    }
-                    try {
-                        const html = this._marked.parse(String(markdownInput));
-                        if (typeof html !== 'string') {
-                            console.error("[visualRenderer.renderMarkdown] marked.parse returned non-string:", html);
-                            return `<div>${this._DOMPurify.sanitize(String(markdownInput))}</div>`;
-                        }
-                        const sanitizedHtml = this._DOMPurify.sanitize(html, {
-                            USE_PROFILES: {
-                                html: true
-                            }
-                        });
-                        console.log(`[visualRenderer.renderMarkdown] Output Sample:`, sanitizedHtml.substring(0, 100));
-                        return sanitizedHtml;
-                    } catch (e) {
-                        console.error("[visualRenderer.renderMarkdown] FAILED:", e);
-                        return `<div>${this._DOMPurify.sanitize(String(markdownInput))}</div>`;
-                    }
                 },
                 renderToolResult(content, message) {
                     const isError = message.is_error || content?.error || false;
@@ -7135,7 +7774,7 @@
                                 errorDetail = errJson.detail || errorDetail;
                             } catch (e) {
                                 /* Ignore */
-}
+                            }
                             throw new Error(errorDetail);
                         }
                         const data = await response.json();
@@ -7210,12 +7849,11 @@
                         default:
                             return 'fas fa-info-circle';
                     }
-                },
+                }
             })); // End Alpine.data
         }); // End alpine:init listener
     </script>
-    <!-- Container for the teleported template -->
-    <div id="branch-node-template-container" class="hidden"></div>
+
     <!-- System Status Bar -->
     <div class="system-status-bar" :class="{'hidden': !uiSettings.showStatusBar}">
         <!-- Left section -->
@@ -7246,6 +7884,9 @@
                     x-text="`Uptime: ${systemStats.uptime}`"></span> </div>
         </div>
     </div>
+
+    <!-- Container for the teleported template -->
+    <div id="branch-node-template-container" class="hidden"></div>
 </body>
 
 </html>
