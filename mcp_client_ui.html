@@ -59,7 +59,7 @@
     <!-- Mousetrap for keyboard shortcuts -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/mousetrap/1.6.5/mousetrap.min.js"></script>
     <!-- PDF export  -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/3.0.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <!-- highlight.js -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -3667,7 +3667,6 @@
         </form>
     </dialog>
 
-    <!-- Replace your existing toolDetailsModal with this improved version -->
     <dialog id="toolDetailsModal" class="modal" :class="{ 'modal-open': showToolDetailsModal }"
         @keydown.escape.window="showToolDetailsModal = false">
         <div class="modal-box w-11/12 max-w-4xl bg-base-100"> <!-- Increased from max-w-2xl to max-w-4xl -->

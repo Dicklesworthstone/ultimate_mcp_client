@@ -11305,7 +11305,9 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     mcp_client: MCPClient = websocket.app.state.mcp_client
                 except AttributeError:
                     log.error("app.state.mcp_client not available during WebSocket connection!")
-                    await websocket.close(code=1011)
+                    # Use suppress for closing on error
+                    with suppress(Exception):
+                        await websocket.close(code=1011)
                     return
 
                 await websocket.accept()
@@ -11314,184 +11316,235 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                 active_query_task: Optional[asyncio.Task] = None  # Track task specific to this WS connection
 
                 async def send_ws_message(msg_type: str, payload: Any):
+                    """Safely send a JSON message over the WebSocket."""
                     try:
+                        # Use model_dump() for Pydantic v2 compatibility
                         await websocket.send_json(WebSocketMessage(type=msg_type, payload=payload).model_dump())
+                    except (WebSocketDisconnect, RuntimeError) as send_err: # More specific exceptions
+                        # Ignore errors if the socket is already closing/closed
+                        log.debug(f"WS-{connection_id}: Failed send (Type: {msg_type}) - likely disconnected: {send_err}")
                     except Exception as send_err:
-                        log.warning(f"WS-{connection_id}: Failed send (Type: {msg_type}): {send_err}")
+                        # Log other unexpected send errors
+                        log.warning(f"WS-{connection_id}: Unexpected error sending WS message (Type: {msg_type}): {send_err}")
 
                 async def send_command_response(success: bool, message: str, data: Optional[Dict] = None):
+                    """Sends a standardized response to a command."""
                     payload = {"success": success, "message": message}
                     payload.update(data or {})
                     await send_ws_message("command_response", payload)
 
                 async def send_error_response(message: str, cmd: Optional[str] = None):
+                    """Logs an error and sends an error message to the client."""
                     log_msg = f"WS-{connection_id} Error: {message}" + (f" (Cmd: /{cmd})" if cmd else "")
                     log.warning(log_msg)
                     await send_ws_message("error", {"message": message})
+                    # Also send a command_response failure if it was triggered by a command
                     if cmd is not None:
                         await send_command_response(False, message)
 
+                # --- Consumer coroutine for processing the query stream ---
+                async def _consume_query_stream(query_text: str):
+                    """Consumes the query stream and sends updates over WebSocket."""
+                    nonlocal active_query_task # Allow modification of outer scope variable
+                    try:
+                        # Iterate over the standardized events yielded by the stream wrapper
+                        async for chunk_type, chunk_data in mcp_client._stream_wrapper(mcp_client.process_streaming_query(query_text)):
+                            # Forward relevant events to the WebSocket client
+                            if chunk_type == "text":
+                                await send_ws_message("text_chunk", chunk_data)
+                            elif chunk_type == "status":
+                                await send_ws_message("status", chunk_data)
+                            elif chunk_type == "error":
+                                await send_ws_message("error", {"message": str(chunk_data)})
+                            elif chunk_type == "final_stats":
+                                # Send final usage and completion status after stream completes
+                                usage_data = await get_token_usage(mcp_client) # Recalculate based on final client state
+                                await send_ws_message("token_usage", usage_data)
+                                await send_ws_message("query_complete", {"stop_reason": chunk_data.get("stop_reason", "unknown")})
+                            # Add handlers for other event types if needed (e.g., tool calls for UI)
+
+                    except asyncio.CancelledError:
+                        log.info(f"WS-{connection_id}: Query task cancelled.")
+                        # Send status update indicating cancellation
+                        await send_ws_message("status", "[yellow]Request Aborted by User.[/]")
+                    except Exception as e:
+                        error_msg = f"Error processing query stream: {str(e)}"
+                        log.error(f"WS-{connection_id}: {error_msg}", exc_info=True)
+                        # Send error message to the client
+                        await send_ws_message("error", {"message": error_msg})
+                    finally:
+                        # --- Cleanup specific to this query task ---
+                        task_being_cleaned = active_query_task # Capture current task locally
+                        active_query_task = None # Clear task reference for this WS connection
+
+                        # Clear global task reference ONLY if it was THIS task
+                        # Check the task object itself for safety before clearing
+                        if mcp_client.current_query_task and mcp_client.current_query_task is task_being_cleaned:
+                            mcp_client.current_query_task = None
+                        log.debug(f"WS-{connection_id}: Query consuming task finished.")
+                        # query_complete is now sent with final_stats
+
+                # --- Main WebSocket Receive Loop ---
                 try:
                     while True:
                         raw_data = await websocket.receive_text()
                         try:
                             data = json.loads(raw_data)
-                            message = WebSocketMessage(**data)
+                            # Use model_validate for Pydantic v2
+                            message = WebSocketMessage.model_validate(data)
                             log.debug(f"WS-{connection_id} Received: Type={message.type}, Payload={str(message.payload)[:100]}...")
 
                             # --- Handle Query ---
                             if message.type == "query":
                                 query_text = str(message.payload or "").strip()
                                 if not query_text:
-                                    continue
+                                    continue # Ignore empty queries
                                 if active_query_task and not active_query_task.done():
                                     await send_error_response("Previous query still running.")
                                     continue
 
+                                # Reset session stats before starting the new query task
                                 mcp_client.session_input_tokens = 0
                                 mcp_client.session_output_tokens = 0
                                 mcp_client.session_total_cost = 0.0
                                 mcp_client.cache_hit_count = 0
                                 mcp_client.tokens_saved_by_cache = 0
 
-                                # Create and track the task
-                                query_task = asyncio.create_task(mcp_client.process_streaming_query(query_text))
+                                # Create the task using the consumer coroutine
+                                query_task = asyncio.create_task(_consume_query_stream(query_text), name=f"ws_query_{connection_id}")
                                 active_query_task = query_task
+
                                 # Link to client instance ONLY if no other task is running (for global abort)
                                 if not mcp_client.current_query_task or mcp_client.current_query_task.done():
                                     mcp_client.current_query_task = query_task
                                 else:
                                     log.warning("Another query task is already running globally, global abort might affect wrong task.")
 
-                                try:
-                                    async for chunk in query_task:
-                                        if chunk.startswith("@@STATUS@@"):
-                                            status_payload = chunk[len("@@STATUS@@") :].strip()
-                                            # Optionally log status to console: mcp_client.safe_print(status_payload)
-                                            await send_ws_message("status", status_payload)
-                                        else:
-                                            await send_ws_message("text_chunk", chunk)
-                                    await send_ws_message("query_complete", None)
-                                    usage_data = await get_token_usage(mcp_client)
-                                    await send_ws_message("token_usage", usage_data)
-
-                                except asyncio.CancelledError:
-                                    log.info(f"WS-{connection_id}: Query cancelled.")
-                                    await send_ws_message("status", "[yellow]Request Aborted by User.[/]")
-                                except Exception as e:
-                                    error_msg = f"Error processing query: {str(e)}"
-                                    log.error(f"WS-{connection_id}: Error processing query: {e}", exc_info=True)
-                                    await send_ws_message("error", {"message": error_msg})
-                                finally:
-                                    active_query_task = None  # Clear task for this WS connection
-                                    # Clear global task reference ONLY if it was THIS task
-                                    if mcp_client.current_query_task == query_task:
-                                        mcp_client.current_query_task = None
+                                # Task runs in background, loop continues to listen for more messages/commands
 
                             # --- Handle Command ---
                             elif message.type == "command":
                                 command_str = str(message.payload).strip()
                                 if command_str.startswith("/"):
-                                    parts = command_str[1:].split(maxsplit=1)
-                                    cmd = parts[0].lower()
-                                    args = parts[1] if len(parts) > 1 else ""
+                                    try:
+                                        # Use shlex to handle potential quoting in args
+                                        parts = shlex.split(command_str[1:])
+                                        if not parts: continue # Ignore empty command
+                                        cmd = parts[0].lower()
+                                        args = shlex.join(parts[1:]) if len(parts) > 1 else ""
+                                    except ValueError as e:
+                                        await send_error_response(f"Error parsing command: {e}", cmd=command_str[:10]) # Pass partial command
+                                        continue
+
                                     log.info(f"WS-{connection_id} processing command: /{cmd} {args}")
                                     try:
+                                        # --- Implement Command Logic ---
                                         if cmd == "clear":
                                             mcp_client.conversation_graph.current_node.messages = []
-                                            mcp_client.conversation_graph.set_current_node("root")
+                                            # Optionally switch back to root, or stay on cleared node
+                                            # mcp_client.conversation_graph.set_current_node("root")
                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                            await send_command_response(True, "Conversation cleared.", {"messages": []})  # Send cleared messages
+                                            await send_command_response(True, "Conversation branch cleared.", {"messages": []}) # Send cleared messages
                                         elif cmd == "model":
                                             if args:
+                                                # Optional: Add validation if model is known
                                                 mcp_client.current_model = args
                                                 mcp_client.config.default_model = args
-                                                asyncio.create_task(mcp_client.config.save_async())  # Persist default model change
+                                                # Save config in background, don't wait
+                                                asyncio.create_task(mcp_client.config.save_async())
                                                 await send_command_response(True, f"Model set to: {args}", {"currentModel": args})
                                             else:
-                                                await send_command_response(
-                                                    True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model}
-                                                )
+                                                await send_command_response(True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model})
                                         elif cmd == "fork":
                                             new_node = mcp_client.conversation_graph.create_fork(name=args if args else None)
                                             mcp_client.conversation_graph.set_current_node(new_node.id)
                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                            await send_command_response(
-                                                True, f"Created branch: {new_node.name}", {"newNodeId": new_node.id, "newNodeName": new_node.name}
-                                            )
+                                            await send_command_response(True, f"Created and switched to branch: {new_node.name}", {"newNodeId": new_node.id, "newNodeName": new_node.name, "messages": new_node.messages})
                                         elif cmd == "checkout":
                                             if not args:
                                                 await send_error_response("Usage: /checkout NODE_ID_or_Prefix", cmd)
                                                 continue
-                                            node_id = args
-                                            node = mcp_client.conversation_graph.get_node(node_id)
-                                            if not node:
-                                                matched_node = None
-                                                [
-                                                    matched_node := n
-                                                    for n_id, n in mcp_client.conversation_graph.nodes.items()
-                                                    if n_id.startswith(node_id)
-                                                    if not matched_node
-                                                ]
-                                                node = matched_node
-                                            if node and mcp_client.conversation_graph.set_current_node(node.id):
-                                                await send_command_response(
-                                                    True, f"Switched to branch: {node.name}", {"currentNodeId": node.id, "messages": node.messages}
-                                                )  # Send messages of new node
+                                            node_id_prefix = args
+                                            node_to_checkout = None
+                                            matches = [n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id_prefix)]
+                                            if len(matches) == 1:
+                                                node_to_checkout = matches[0]
+                                            elif len(matches) > 1:
+                                                 await send_error_response(f"Ambiguous node ID prefix '{node_id_prefix}'", cmd)
+                                                 continue
+
+                                            if node_to_checkout and mcp_client.conversation_graph.set_current_node(node_to_checkout.id):
+                                                await send_command_response(True, f"Switched to branch: {node_to_checkout.name}", {"currentNodeId": node_to_checkout.id, "messages": node_to_checkout.messages})
                                             else:
-                                                await send_error_response(f"Node ID '{node_id}' not found.", cmd)
-                                        elif cmd == "apply_prompt":  # Renamed from 'prompt' for clarity
+                                                await send_error_response(f"Node ID prefix '{node_id_prefix}' not found.", cmd)
+                                        elif cmd == "apply_prompt":
                                             if not args:
                                                 await send_error_response("Usage: /apply_prompt <prompt_name>", cmd)
                                                 continue
                                             success = await mcp_client.apply_prompt_to_conversation(args)
                                             if success:
-                                                await send_command_response(
-                                                    True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages}
-                                                )
+                                                await send_command_response(True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages})
                                             else:
                                                 await send_error_response(f"Prompt not found: {args}", cmd)
-                                        # --- Add Abort Command Handler ---
                                         elif cmd == "abort":
                                             log.info(f"WS-{connection_id} received abort command.")
-                                            if active_query_task and not active_query_task.done():
-                                                active_query_task.cancel()
-                                                await send_command_response(True, "Abort signal sent to running query.")
-                                                # Status update will be sent when CancelledError is caught
+                                            task_to_cancel = active_query_task # Target the task specific to this connection
+                                            if task_to_cancel and not task_to_cancel.done():
+                                                was_cancelled = task_to_cancel.cancel() # Request cancellation
+                                                if was_cancelled:
+                                                    await send_command_response(True, "Abort signal sent to running query.")
+                                                else:
+                                                    # This is unlikely but possible if task finished between check and cancel
+                                                    await send_command_response(False, "Query finished before abort signal could be sent.")
                                             else:
                                                 await send_command_response(False, "No active query running for this connection.")
+                                        # Add other command handlers here if needed
                                         else:
                                             await send_command_response(False, f"Command '/{cmd}' not supported via WebSocket.")
                                     except Exception as cmd_err:
+                                        # Catch errors during command execution
                                         await send_error_response(f"Error executing '/{cmd}': {cmd_err}", cmd)
                                         log.error(f"WS-{connection_id} Cmd Error /{cmd}: {cmd_err}", exc_info=True)
                                 else:
-                                    await send_error_response("Invalid command format.", None)
+                                    await send_error_response("Invalid command format (must start with '/').", None)
 
                             # Ignore other message types for now
-                            # elif message.type == "other_type": ...
 
                         except (json.JSONDecodeError, ValidationError) as e:
                             log.warning(f"WS-{connection_id} invalid message: {raw_data[:100]}... Error: {e}")
                             await send_ws_message("error", {"message": "Invalid message format."})
                         except WebSocketDisconnect:
-                            raise
+                            raise # Re-raise to be caught by the outer handler
                         except Exception as e:
                             log.error(f"WS-{connection_id} error processing message: {e}", exc_info=True)
-                            await suppress(Exception)(send_ws_message("error", {"message": f"Internal error: {str(e)}"}))
+                            # Use suppress correctly when sending error back
+                            with suppress(Exception):
+                                await send_ws_message("error", {"message": f"Internal error: {str(e)}"})
 
+                # --- Outer Exception Handling for the WebSocket Connection ---
                 except WebSocketDisconnect:
                     log.info(f"WebSocket connection closed (ID: {connection_id}).")
                 except Exception as e:
                     log.error(f"WS-{connection_id} unexpected handler error: {e}", exc_info=True)
-                    await suppress(Exception)(websocket.close(code=1011))
-                finally:  # Ensure task is cancelled if WS connection closes unexpectedly
+                    # Use suppress correctly when trying to close the socket on error
+                    with suppress(Exception):
+                       await websocket.close(code=1011)
+                finally:
+                    # --- Final Cleanup for this WebSocket Connection ---
+                    log.debug(f"WS-{connection_id}: Cleaning up WebSocket handler resources.")
+                    # Ensure any active query task *for this specific connection* is cancelled
                     if active_query_task and not active_query_task.done():
-                        log.warning(f"WS-{connection_id} closing, cancelling active query task.")
+                        log.warning(f"WS-{connection_id} closing, cancelling associated active query task.")
                         active_query_task.cancel()
-                    # Clear global reference if this was the task
-                    if mcp_client.current_query_task == active_query_task:
+                        # Optionally await cancellation with timeout, or just signal and move on
+                        with suppress(asyncio.TimeoutError, Exception):
+                            await asyncio.wait_for(active_query_task, timeout=0.5)
+
+                    # Clear global task reference ONLY if it was the task associated with this connection
+                    if mcp_client.current_query_task and mcp_client.current_query_task is active_query_task:
+                        log.debug(f"WS-{connection_id}: Clearing global query task reference.")
                         mcp_client.current_query_task = None
+                    log.debug(f"WS-{connection_id}: WebSocket cleanup complete.")
 
             # --- Static File Serving ---
             if serve_ui_file:
@@ -11501,7 +11554,13 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
 
                     @app.get("/", response_class=FileResponse, include_in_schema=False)
                     async def serve_html():
-                        return FileResponse(str(ui_file.resolve()))
+                        # Added cache control headers to encourage browser reloading for development
+                        headers = {
+                            "Cache-Control": "no-cache, no-store, must-revalidate",
+                            "Pragma": "no-cache",
+                            "Expires": "0"
+                        }
+                        return FileResponse(str(ui_file.resolve()), headers=headers)
                 else:
                     log.warning(f"UI file {ui_file} not found. Cannot serve.")
 
@@ -11509,24 +11568,23 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
             config = uvicorn.Config(app, host=webui_host, port=webui_port, log_level="info")
             server_instance = uvicorn.Server(config)
             try:
+                # This blocks until the server is stopped
                 await server_instance.serve()
-                log.info("Web UI server shut down.")
+                log.info("Web UI server shut down normally.")
             except OSError as e:
                 if e.errno == 98: # Address already in use
                     safe_console.print(f"[bold red]ERROR: Could not start Web UI. Port {webui_port} is already in use.[/]")
                     safe_console.print(f"[yellow]Please stop the other process using port {webui_port} or choose a different port using --port.[/]")
-                    # No need to explicitly close client here, lifespan shutdown *should* handle it if started
-                    # Exit gracefully
-                    sys.exit(1)
+                    sys.exit(1) # Exit directly
                 else:
-                    # Re-raise other OS errors if needed, or handle generally
                     log.error(f"Uvicorn server failed with OS error: {e}", exc_info=True)
                     safe_console.print(f"[bold red]Web UI server failed to start (OS Error): {e}[/]")
-                    sys.exit(1)
+                    sys.exit(1) # Exit on other OS errors too
             except Exception as e: # Catch other potential server errors during serve()
                 log.error(f"Uvicorn server failed: {e}", exc_info=True)
                 safe_console.print(f"[bold red]Web UI server failed to start: {e}[/]")
-                sys.exit(1)
+                sys.exit(1) # Exit on other startup errors
+                
             log.info("Web UI server shut down.")
             # NOTE: Cleanup for webui is handled by lifespan, so return here
         elif dashboard:
@@ -11638,28 +11696,19 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
     finally:
         # Ensure cleanup doesn't run if webui failed early OR if lifespan is handling it
         should_cleanup_main = not webui_flag # Default: cleanup if not webui
+        # If webui mode, assume lifespan handles cleanup *unless* we explicitly
+        # exited early (e.g., due to OSError above, which calls sys.exit).
+        # If sys.exit was called, this finally block might not execute fully anyway.
+        # The goal is to avoid double cleanup if lifespan is responsible.
         if webui_flag:
-            # Don't cleanup if webui failed *before* lifespan could properly start/finish
-            # We check if the OSError occurred, implying lifespan might not run fully.
-            # This is slightly heuristic. A more robust way might involve a state flag.
-             if 'server_instance' in locals() and server_instance.should_exit:
-                 # If uvicorn signals exit due to startup failure (like port conflict)
-                 # Then lifespan might not have run its shutdown part.
-                 # However, closing the client *here* might still cause issues if lifespan
-                 # partially ran. It's safer to rely on lifespan and accept that if it
-                 # fails early, resources might not be fully cleaned.
-                 # Let's stick to the original plan: lifespan handles webui cleanup.
-                 should_cleanup_main = False
-                 log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan).")
-             else:
-                 # If serve() completed normally or lifespan shutdown ran
-                  should_cleanup_main = False
-                  log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan).")
+             should_cleanup_main = False # Lifespan is responsible in normal webui operation/shutdown
+             log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan or exited early).")
 
         if should_cleanup_main and client and hasattr(client, "close"):
             log.info("Performing final cleanup...")
             try:
-                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout)
+                # Shorten timeout slightly to avoid long waits on hang
+                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout - 1)
             except asyncio.TimeoutError:
                 safe_console.print("[red]Shutdown timed out. Some processes may still be running.[/]")
                 if hasattr(client, "server_manager") and hasattr(client.server_manager, "processes"):
@@ -11922,3 +11971,4 @@ if __name__ == "__main__":
     # Directly call the Typer app instance. Typer handles argument parsing
     # and calling the appropriate command function.
     app()
+
