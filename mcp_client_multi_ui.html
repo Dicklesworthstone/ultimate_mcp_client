@@ -57,6 +57,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/3.0.1/jspdf.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/@alpinejs/collapse@3.x.x/dist/cdn.min.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
     <script>
         // Marked configuration (restore from old code)
@@ -1873,73 +1874,110 @@
             <div class="tooltip tooltip-bottom" data-tip="Tools">
                 <i class="fas fa-tools fa-fw"></i> <span x-text="tools.length"></span>
             </div>
-            <!-- Model Dropdown -->
-            <div class="dropdown dropdown-end">
-                <!-- Trigger Button -->
-                <label tabindex="0" class="btn btn-ghost btn-xs flex items-center gap-1.5 px-2 h-7" data-tippy-content="Select Model">
-                    <i class="fas fa-fw text-primary" :class="getProviderIcon(currentModel) || 'fa-cogs'"></i>
-                    <span class="font-medium text-xs" x-text="getFormattedModelName(currentModel)"></span> <!-- Use new formatter here too -->
-                    <i class="fas fa-chevron-down text-xs opacity-50"></i>
-                </label>
+            ### Refined, fully-ready markup
 
-                <!-- Dropdown Content -->
-                <ul tabindex="0" class="dropdown-content z-[20] menu p-2 shadow bg-base-200 rounded-box w-72 max-h-96 overflow-y-auto text-xs mt-1 border border-base-300/30">
-                    <!-- Iterate Providers -->
-                    <template x-for="(providerData, providerName) in modelsByProvider" :key="providerName">
-                            <!-- Provider Header -->
-                            <li class="menu-title px-2 pt-2 pb-1">
-                            <span class="text-xs font-bold uppercase opacity-60 flex items-center gap-1.5">
-                                <!-- Get icon from first model in provider or provider name -->
-                                <i class="fas fa-fw" :class="getProviderIcon(providerData[0]?.name || providerName) || 'fa-server'"></i>
-                                <span x-text="providerName"></span>
-                            </span>
-                            </li>
-
-                            <!-- Iterate Models within Provider -->
-                            <template x-if="providerData && Array.isArray(providerData) && providerData.length > 0" x-for="modelInfo in providerData" :key="modelInfo.name">
-                            <li>
-                                <!-- Use @click.prevent to stop default link behavior -->
-                                <a @click.prevent="setModel(modelInfo.name)"
-                                    href="#" <!-- Add href for better semantics/accessibility -->
-                                    class="flex items-center justify-between px-2 py-1.5 rounded-md"
-                                    :class="{
-                                        'bg-primary/80 text-primary-content font-semibold': modelInfo.name === currentModel, /* Active */
-                                        'hover:bg-base-content/10': modelInfo.name !== currentModel && modelInfo.is_active, /* Normal Hover */
-                                        'opacity-60 !bg-transparent cursor-not-allowed hover:!bg-base-content/5': !modelInfo.is_active, /* Inactive */
-                                        'pointer-events-none': !modelInfo.is_active && modelInfo.name === currentModel /* Prevent clicking active but inactive model */
-                                    }"
-                                    :aria-disabled="!modelInfo.is_active ? 'true' : 'false'">
-                                        <!-- Left Side: Icon + Name -->
-                                    <span class="flex items-center gap-1.5 truncate flex-1 min-w-0"> <!-- Added flex-1 min-w-0 for better truncation -->
-                                        <!-- Use specific provider icon if available, else generic -->
-                                        <i class="fas fa-fw w-3 text-center" :class="getProviderIcon(modelInfo.name) || 'fa-robot'"></i>
-                                        <!-- Use formatted name for display, title for full ID -->
-                                        <span x-text="getFormattedModelName(modelInfo.name)" class="truncate" :title="modelInfo.name"></span>
-                                    </span>
-                                    <!-- Right Side: Status Badge -->
-                                    <span x-show="!modelInfo.is_active" class="badge badge-xs badge-outline badge-warning ml-2 flex-shrink-0">Inactive</span>
-                                </a>
-                            </li>
-                            </template>
-                            <div class="divider my-1 mx-2 opacity-50" x-show="providerName !== Object.keys(modelsByProvider)[Object.keys(modelsByProvider).length - 1]"></div>
-                           
-                    </template>
-
-                    <!-- Divider before custom input -->
-                        <div class="divider my-1 mx-2"></div>
-
-                    <!-- Custom Model Input -->
-                    <li class="px-2 py-1">
-                        <input type="text"
-                                placeholder="Enter custom model ID..."
-                                class="input input-xs input-bordered w-full"
-                                @change="setCustomModel($event.target.value)"
-                                @keyup.enter="setCustomModel($event.target.value); $event.target.blur()"
-                                :value="currentModel"
-                                data-tippy-content="Enter a custom model ID if not listed (e.g., from OpenRouter)">
-                    </li>
-                </ul>
+<!-- MODEL PICKER ----------------------------------------------------------->
+<div x-data="{search:''}" class="dropdown dropdown-end">
+    <!-- Trigger -->
+    <label tabindex="0"
+           class="btn btn-ghost btn-xs h-7 px-2 gap-1.5"
+           data-tippy-content="Select Model">
+      <i :class="getProviderIcon(currentModel) || 'fas fa-cogs'"
+         class="fas fa-fw text-primary"></i>
+      <span x-text="getFormattedModelName(currentModel)"
+            class="text-xs font-medium text-base-content"></span>
+      <i class="fas fa-chevron-down text-xs opacity-50"></i>
+    </label>
+  
+    <!-- Sheet -->
+    <div tabindex="0"
+         class="dropdown-content w-[500px] mt-1 rounded-lg overflow-hidden
+                bg-base-100 border border-base-300/30 shadow-lg z-[20] p-0">
+  
+      <!-- Search bar -->
+      <div class="sticky top-0 z-20 bg-base-200 p-3 border-b border-base-300/50">
+        <div class="relative">
+          <input x-model="search" type="text" placeholder="Search models…"
+                 class="input input-sm input-bordered w-full pr-8"
+                 @keydown.stop>
+          <button x-show="search"
+                  @click="search=''"
+                  class="absolute right-2 top-1/2 -translate-y-1/2
+                         text-base-content/60 hover:text-error">
+            <i class="fas fa-times"></i>
+          </button>
+        </div>
+      </div>
+  
+      <!-- Providers / models -->
+      <div class="max-h-[400px] overflow-y-auto">
+        <template x-for="providerName in Object.keys(modelsByProvider).sort()" :key="providerName">
+          <div x-data="{open:true}">
+            <!-- Provider header -->
+            <button @click="open=!open"
+                    class="w-full flex items-center gap-2 px-4 py-2.5
+                           bg-base-200 sticky top-0 z-10 border-b border-base-300/50
+                           text-base-content">
+              <i :class="getProviderIcon(providerName) || 'fas fa-server'"
+                 class="fas text-lg"></i>
+              <span class="flex-1 text-sm font-bold tracking-wide"
+                    x-text="providerName.toUpperCase()"></span>
+              <i :class="open ? 'fas fa-minus' : 'fas fa-plus'"
+                 class="fas text-xs opacity-60"></i>
+            </button>
+  
+            <!-- Model grid -->
+            <div x-show="open" x-collapse class="grid grid-cols-2 gap-2 p-2">
+              <template x-for="modelInfo in modelsByProvider[providerName]" :key="modelInfo.name">
+                <button
+                  x-show="!search
+                          || modelInfo.name.toLowerCase().includes(search.toLowerCase())
+                          || getFormattedModelName(modelInfo.name).toLowerCase().includes(search.toLowerCase())"
+                  @click="setModel(modelInfo.name);
+                          $root.querySelector('[tabindex]').click()"
+                  :class="{
+                    'bg-primary/10 text-primary shadow-sm font-medium':
+                        modelInfo.name===currentModel,
+                    'hover:bg-base-200 hover:shadow-sm':
+                        modelInfo.name!==currentModel && modelInfo.is_active,
+                    'opacity-50 cursor-not-allowed': !modelInfo.is_active
+                  }"
+                  class="flex items-center gap-2 py-2 px-3 rounded-md
+                         transition-all text-base-content">
+                  <span class="truncate text-sm flex-1"
+                        x-text="getFormattedModelName(modelInfo.name)"></span>
+                  <i x-show="modelInfo.name===currentModel"
+                     class="fas fa-check text-primary text-xs"></i>
+                  <span x-show="!modelInfo.is_active"
+                        class="badge badge-xs badge-outline badge-warning">Inactive</span>
+                </button>
+              </template>
             </div>
+          </div>
+        </template>
+      </div>
+  
+      <!-- Custom model -->
+      <div class="bg-base-200 p-3 border-t border-base-300">
+        <div class="relative">
+          <input x-ref="custom"
+                 :value="currentModel"
+                 type="text"
+                 placeholder="Enter custom model ID…"
+                 class="input input-sm input-bordered w-full pr-8 text-base-content"
+                 @keyup.enter="setCustomModel($refs.custom.value);
+                               $root.querySelector('[tabindex]').click()">
+          <button @click="setCustomModel($refs.custom.value);
+                          $root.querySelector('[tabindex]').click()"
+                  class="absolute right-2 top-1/2 -translate-y-1/2
+                         text-base-content/50 hover:text-primary">
+            <i class="fas fa-check text-xs"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+  
             <!-- WS Status & Settings Icons -->
             <div class="tooltip tooltip-bottom" :data-tip="wsStatus">
                 <i class="fas fa-circle text-xs transition-colors duration-500"
@@ -4379,26 +4417,36 @@
                     // Indicate specific loading states (can overlap with global)
                     this.isLoadingServers = true;
                     this.isLoadingTools = true; // Using this for all capabilities
-
+                    console.log(">>> fetchInitialData: START"); // <-- Log Start
                     try {
-                        console.log("Fetching initial data (Servers, Models, Capabilities, Conversation)...");
+                        console.log(">>> fetchInitialData: Preparing promises..."); // <-- Log before Promise.allSettled
 
-                        // Use Promise.allSettled to fetch core data concurrently and allow partial success
-                        const results = await Promise.allSettled([
-                            this.fetchServers(), // Fetches server list
-                            this.fetchAvailableModels(), // Fetches models grouped by provider
-                            this.fetchCapabilities(), // Fetches tools, resources, prompts
-                            this.fetchConversation() // Fetches current conversation state
-                            // Config is loaded separately in init() before this, usually
-                        ]);
+                        // --- Log each function call BEFORE adding to the array ---
+                        console.log(">>> fetchInitialData: Adding fetchServers() to promises");
+                        const p1 = this.fetchServers();
+                        console.log(">>> fetchInitialData: Adding fetchAvailableModels() to promises");
+                        const p2 = this.fetchAvailableModels(); // <-- Make sure this line exists!
+                        console.log(">>> fetchInitialData: Adding fetchCapabilities() to promises");
+                        const p3 = this.fetchCapabilities();
+                        console.log(">>> fetchInitialData: Adding fetchConversation() to promises");
+                        const p4 = this.fetchConversation();
+                        // --------------------------------------------------------
+
+                        const promises = [p1, p2, p3, p4];
+                        console.log(">>> fetchInitialData: Awaiting Promise.allSettled..."); // <-- Log before await
+
+                        const results = await Promise.allSettled(promises);
+
+                        console.log(">>> fetchInitialData: Promise.allSettled finished. Results:", results); // <-- Log results
 
                         console.log("Initial data fetch results:", results);
 
-                        // Process results and report errors for each fetch attempt
+                        // Process results (keep existing logic)
                         const endpoints = ['servers', 'models', 'capabilities', 'conversation'];
                         results.forEach((result, index) => {
+                            console.log(`>>> fetchInitialData: Processing result for ${endpoints[index]} - Status: ${result.status}`); // <-- Log each result status
                             if (result.status === 'rejected') {
-                                console.error(`Initial fetch failed for ${endpoints[index]}:`, result.reason);
+                                console.error(`>>> fetchInitialData: Initial fetch failed for ${endpoints[index]}:`, result.reason);
                                 this.addNotification(`Failed to fetch initial ${endpoints[index]}. Check backend connection/logs.`, 'error', 5000);
                             }
                         });
@@ -4450,33 +4498,42 @@
                     }
                 }, // End fetchInitialData
                 async fetchAvailableModels() {
-                    console.log("Fetching available models...");
+                    console.log(">>> fetchAvailableModels: Starting fetch...");
+                    let rawData = null; // Variable to hold raw response
                     try {
-                        // Fetch model data from the backend API endpoint
-                        const data = await this.apiFetch('/models'); // Uses the existing apiFetch helper
+                        rawData = await this.apiFetch('/models');
+                        console.log(">>> fetchAvailableModels: Received RAW data from API:", rawData); // Log raw data
 
-                        // Ensure data is an object before proceeding
-                        if (data && typeof data === 'object') {
-                            this.modelsByProvider = data; // Update the component's state
-                            console.log("Fetched and updated Models By Provider:", this.modelsByProvider);
+                        // Perform validation *before* assignment
+                        if (rawData && typeof rawData === 'object' && !Array.isArray(rawData) && Object.keys(rawData).length > 0) {
+                            // Basic check: Does it have expected provider keys? Are their values arrays?
+                            const looksValid = Object.values(rawData).every(value => Array.isArray(value));
+                            if (looksValid) {
+                                this.modelsByProvider = {...rawData};
 
-                            // Optionally, update the simple 'availableModels' list if needed elsewhere,
-                            // though iterating modelsByProvider is preferred now.
-                            // this.availableModels = Object.values(data).flat().map(m => m.name).sort();
-
+                                // Then add this line after assignment to ensure the UI updates:
+                                this.$nextTick(() => {
+                                console.log("Triggering UI refresh for model dropdown");
+                                // Force a UI refresh on the dropdown
+                                const dropdownEl = document.querySelector('.dropdown-end [tabindex="0"]');
+                                if (dropdownEl) dropdownEl.click(); // Optional: force open the dropdown
+                                });
+                                console.log(">>> fetchAvailableModels: ASSIGNED VALID data to this.modelsByProvider.");
+                                // Log the assigned data AFTER assignment for comparison
+                                console.log(">>> fetchAvailableModels: State AFTER assignment:", JSON.stringify(this.modelsByProvider, null, 2));
+                            } else {
+                                console.warn(">>> fetchAvailableModels: Received data object has invalid structure (values are not all arrays). Resetting. Data:", rawData);
+                                this.modelsByProvider = {}; // Reset
+                            }
                         } else {
-                            console.warn("Received invalid or empty data from /api/models endpoint.");
-                            this.modelsByProvider = {}; // Reset to empty object on invalid data
-                            this.addNotification('Received invalid model data from server.', 'warning');
+                            console.warn(">>> fetchAvailableModels: Received invalid data format (not a non-empty object). Resetting. Received:", rawData);
+                            this.modelsByProvider = {}; // Reset
                         }
                     } catch (e) {
-                        // Error notification is handled by apiFetch, but log here too
-                        console.error("Error fetching available models:", e);
-                        this.addNotification('Failed to load available models from server.', 'error');
+                        console.error(">>> fetchAvailableModels: Error during fetch:", e);
                         this.modelsByProvider = {}; // Reset on error
                     }
-                    // No finally block needed here as isLoading is handled by fetchInitialData
-                }, // End fetchAvailableModels
+                },
                 loadConfig() {
                     // Define default config structure matching Alpine state and Pydantic model (camelCase)
                     // Ensure this covers all expected keys with sensible defaults.
@@ -4700,20 +4757,42 @@
                 },
                 setModel(modelName) {
                     if (!modelName || modelName === this.currentModel) return;
-                    this.currentModel = modelName; this.config.defaultModel = modelName;
-                    this.saveConfigField('defaultModel', modelName);
-                    this.addNotification(`Model set to: ${this.currentModelShort}`, 'info', 1500);
-                },
-                setCustomModel(modelName) {
-                    const trimmedName = modelName.trim();
-                    if (trimmedName && trimmedName !== this.currentModel) {
-                        this.currentModel = trimmedName; this.config.defaultModel = this.currentModel;
-                        this.saveConfigField('defaultModel', this.currentModel);
-                        if (!this.availableModels.includes(this.currentModel)) { this.availableModels.push(this.currentModel); }
-                        this.addNotification(`Custom model set: ${this.currentModelShort}`, 'info', 1500);
-                    }
+                    const oldModel = this.currentModel;
+                    this.currentModel = modelName; // Update UI immediately
+
+                    console.log(`UI attempting to set model to: ${modelName}`);
+                    this.addNotification(`Switching model to ${this.getFormattedModelName(modelName)}...`, 'info', 1500);
+
+                    // Call the new backend API endpoint
+                    this.apiFetch('/model', {
+                        method: 'PUT',
+                        body: JSON.stringify({ model: modelName })
+                    })
+                    .then(response => {
+                        // Backend confirms the model is set (might be the same or updated)
+                        this.currentModel = response.currentModel; // Ensure UI matches backend state
+                        this.config.defaultModel = response.currentModel; // Update local config state too
+                        this.addNotification(response.message || `Model successfully set to ${this.getFormattedModelName(this.currentModel)}.`, 'success', 2000);
+                        console.log("Backend confirmed model set:", this.currentModel);
+                        // Optionally trigger a config save on the UI side if needed,
+                        // but the backend's set_active_model should handle saving the default.
+                        // this.saveConfigToLocalStorage(); // Maybe save local fallback
+                    })
+                    .catch(error => {
+                        // Revert UI on error
+                        this.currentModel = oldModel;
+                        this.addNotification(`Failed to set model: ${error.message}`, 'error');
+                        console.error("Error setting model via API:", error);
+                    });
                 },
 
+                setCustomModel(modelName) {
+                    const trimmedName = modelName.trim();
+                    // Call the main setModel function, which now handles API call and updates
+                    if (trimmedName) {
+                        this.setModel(trimmedName);
+                    }
+                },
 
                 async fetchServers() {
                     this.isLoadingServers = true; // Indicate loading specifically for servers
@@ -6505,6 +6584,7 @@
                     this.$nextTick(() => this.initTippy());
                 },
                 async apiFetch(endpoint, options = {}) {
+                    console.log(`>>> apiFetch: Called for endpoint: '${endpoint}' with options:`, options.method || 'GET');
                     this.isLoading = true;
                     try {
                         // Add a timeout to prevent long-hanging requests
@@ -6548,7 +6628,9 @@
                         }
                         throw error;
                     } finally {
-                        this.isLoading = false;
+                        if (!this.isLoadingServers && !this.isLoadingTools && !this.isLoadingDiscovery /* add other flags if needed */) {
+                           this.isLoading = false;
+                       }
                     }
                 },
                 connectWebSocket() {
@@ -6653,9 +6735,7 @@
                     // 2. If not found by backend ID, try the component's tracked ID (less reliable)
                     if (!assistantMsg && this.currentAssistantMessageId) {
                         assistantMsg = this.currentConversation.find(m => m.id === this.currentAssistantMessageId);
-                        if (assistantMsg) {
-                            console.log(`WS: Found assistant message using component's tracked ID: ${this.currentAssistantMessageId}`);
-                        }
+                    
                     }
 
                     // 3. Create a new message if it's a starting event AND no message was found yet
@@ -8085,89 +8165,196 @@
                     } catch {
                         return '';
                     }
-                },
-                // --- FORMATTING HELPER ---
+                },                
                 getFormattedModelName(modelId) {
-                    if (!modelId || typeof modelId !== 'string') {
-                        return 'Selected Model'; // Default fallback
+                    const originalModelId = modelId; // Keep original for fallback on error
+                    try {
+                        if (!modelId || typeof modelId !== 'string' || modelId.trim() === '') {
+                            return 'Select Model'; // Fallback display text
+                        }
+
+                        let name = modelId.trim();
+
+                        // 1. Preserve the full original model ID for special case handling later
+                        const fullModelId = name;
+
+                        // 2. Remove known provider prefixes (case-insensitive)
+                        const prefixesToRemove = ['openai/', 'anthropic/', 'google/', 'gemini/', 'grok/', 'deepseek/', 'mistralai/', 'groq/', 'cerebras/', 'openrouter/'];
+                        for (const prefix of prefixesToRemove) {
+                            if (name.toLowerCase().startsWith(prefix)) {
+                                name = name.substring(prefix.length);
+                                break; // Assume only one prefix
+                            }
+                        }
+
+                        // 3. Capture suffixes and dates before removing them for special handling
+                        const dateSuffixMatch = name.match(/[-_](\d{8})$/);
+                        const dateSuffix = dateSuffixMatch ? dateSuffixMatch[1] : null;
+                        
+                        // Special handling for experimental versions that should be preserved
+                        const expVersionMatch = name.match(/(exp[-_]\d{2}[-_]\d{2})$/i);
+                        const expVersion = expVersionMatch ? expVersionMatch[1] : null;
+                        
+                        // 4. Remove common suffixes but with better pattern matching to avoid removing important parts
+                        name = name.replace(/[-_](?:(\d{8})|(v\d+(\.\d+)?)|(latest)|(preview)|(alpha)|(beta)|(instruct)|(chat)|(versatile)|(scout)|(16e))$/i, '');
+                        
+                        // KEEP certain meaningful suffixes like "reasoner" for Deepseek models
+                        const preserveSuffixes = ["reasoner", "thinking", "chat"];
+                        const hasPreserveSuffix = preserveSuffixes.some(suffix => 
+                            name.toLowerCase().includes(suffix)
+                        );
+
+                        // 5. Replace separators with spaces, but preserve decimals in version numbers
+                        name = name.replace(/(?<!\.)-|(?<!\.|\d)_(?!\d)/g, ' ');
+
+                        // 6. Special handling for specific model families BEFORE general formatting
+                        
+                        // Handle Claude models - preserve decimal point in version
+                        if (name.toLowerCase().includes('claude')) {
+                            // Fix the Claude 3.7 becoming "Claude 3 7" issue
+                            name = name.replace(/claude[\s-_]*(\d+)[\s-_]*(\d+)/i, 'Claude $1.$2');
+                        }
+                        
+                        // Handle DeepSeek models - make sure the suffixes are preserved
+                        if (name.toLowerCase().includes('deepseek')) {
+                            // If it ends with "chat", preserve it
+                            if (name.toLowerCase().endsWith('chat')) {
+                                name = 'Deepseek Chat';
+                            } 
+                            // If it contains "reasoner", make it explicit
+                            else if (name.toLowerCase().includes('reasoner')) {
+                                name = 'Deepseek Reasoner';
+                            }
+                            // Generic Deepseek model
+                            else {
+                                name = 'Deepseek';
+                            }
+                        }
+                        
+                        // Handle Gemini models - ensure proper spacing and version formatting
+                        if (name.toLowerCase().includes('gemini')) {
+                            // Preserve "thinking" in Gemini models
+                            if (name.toLowerCase().includes('thinking')) {
+                                // Check if we have the exp version to add
+                                if (expVersion) {
+                                    name = name.replace(/gemini[\s-_]*(\d+\.\d+)[\s-_]*flash[\s-_]*thinking/i, 
+                                                    'Gemini $1 Flash Thinking ' + expVersion.replace(/-/g, ' ').toUpperCase());
+                                } else {
+                                    name = name.replace(/gemini[\s-_]*(\d+\.\d+)[\s-_]*flash[\s-_]*thinking/i, 
+                                                    'Gemini $1 Flash Thinking');
+                                }
+                            }
+                            // Handle Gemini Pro models with experimental versions
+                            else if (name.toLowerCase().includes('pro') && expVersion) {
+                                name = name.replace(/gemini[\s-_]*(\d+\.\d+)[\s-_]*pro/i, 
+                                                'Gemini $1 Pro ' + expVersion.replace(/-/g, ' ').toUpperCase());
+                            }
+                            // Standard Gemini model with version number
+                            else {
+                                name = name.replace(/gemini[\s-_]*(\d+\.\d+)/i, 'Gemini $1');
+                                
+                                // Handle Flash suffix
+                                if (name.toLowerCase().includes('flash')) {
+                                    name = name.replace(/(gemini\s\d+\.\d+)[\s-_]*flash[\s-_]*lite/i, '$1 Flash Lite');
+                                    name = name.replace(/(gemini\s\d+\.\d+)[\s-_]*flash/i, '$1 Flash');
+                                }
+                            }
+                        }
+                        
+                        // Handle GPT models
+                        if (name.toLowerCase().includes('gpt')) {
+                            // O1/O3 models
+                            if (name.match(/^o[13]/i)) {
+                                name = name.replace(/^o(\d+)[-_]?(.+)/i, 'O$1 $2');
+                                name = name.replace(/o(\d+)[\s-_]*(.+)/i, 'O$1 $2');
+                                // Capitalize first letter of each word after O1/O3
+                                name = name.replace(/\b\w+\b/g, (word) => {
+                                    return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+                                });
+                            } 
+                            // Standard GPT models
+                            else {
+                                name = name.replace(/gpt[\s-_]*(\d+)\.(\d+)/i, 'GPT-$1.$2');
+                                name = name.replace(/gpt[\s-_]*(\d+)o/i, 'GPT-$1O');
+                                name = name.replace(/gpt[\s-_]*(\d+)/i, 'GPT-$1');
+                                
+                                // Handle Mini/Nano suffixes
+                                name = name.replace(/(gpt-\d+\.?\d*o?)[\s-_]*mini/i, '$1 Mini');
+                                name = name.replace(/(gpt-\d+\.?\d*)[\s-_]*nano/i, '$1 Nano');
+                            }
+                        }
+                        
+                        // Handle Grok models
+                        if (name.toLowerCase().includes('grok')) {
+                            name = name.replace(/grok[\s-_]*(\d+)/i, 'Grok $1');
+                            
+                            // Handle Mini/Fast suffixes
+                            if (name.toLowerCase().includes('mini') && name.toLowerCase().includes('fast')) {
+                                name = name.replace(/(grok\s\d+)[\s-_]*mini[\s-_]*fast/i, '$1 Mini Fast');
+                            } else if (name.toLowerCase().includes('mini')) {
+                                name = name.replace(/(grok\s\d+)[\s-_]*mini/i, '$1 Mini');
+                            } else if (name.toLowerCase().includes('fast')) {
+                                name = name.replace(/(grok\s\d+)[\s-_]*fast/i, '$1 Fast');
+                            }
+                        }
+                        
+                        // Handle Mistral models
+                        if (name.toLowerCase().includes('mistral')) {
+                            if (name.toLowerCase().includes('nemo')) {
+                                name = 'Mistral Nemo';
+                            } else if (name.toLowerCase().includes('large')) {
+                                name = 'Mistral Large';
+                            } else {
+                                name = name.replace(/mistral[\s-_]*(\w+)/i, 'Mistral $1');
+                            }
+                        }
+                        
+                        // 7. If we haven't handled this as a special case, do generic formatting
+                        if (name === fullModelId || (
+                            !name.includes('Claude') && 
+                            !name.includes('Deepseek') && 
+                            !name.includes('Gemini') && 
+                            !name.includes('GPT') && 
+                            !name.includes('Grok') && 
+                            !name.includes('Mistral') &&
+                            !name.includes('O1') &&
+                            !name.includes('O3'))) {
+                            
+                            // Split and remove empty parts
+                            const parts = name.split(' ').filter(p => p);
+                            
+                            const formattedParts = parts.map(part => {
+                                const lowerPart = part.toLowerCase();
+                                
+                                // Keep numbers/sizes like 70b, 1.5, 8x7b
+                                if (/^\d+(\.\d+)?(x\d+)?[bmk]?$/.test(lowerPart)) {
+                                    return part; // Return original to keep 'b' etc.
+                                }
+                                
+                                // Default: Capitalize first letter
+                                // Avoid capitalizing already fully uppercase parts
+                                if (part === part.toUpperCase() && part.length > 1) {
+                                    return part;
+                                }
+                                
+                                return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+                            });
+                            
+                            name = formattedParts.join(' ');
+                        }
+                        
+                        // 8. Final cleanup and polish
+                        // Remove any double spaces
+                        name = name.replace(/\s{2,}/g, ' ').trim();
+                        
+                        // 9. Truncate if necessary
+                        const maxLength = 35;
+                        return name.length > maxLength ? name.substring(0, maxLength - 3) + '...' : name;
+                        
+                    } catch (e) {
+                        console.error(`Error in getFormattedModelName for ID: '${originalModelId}'`, e);
+                        return originalModelId; // Return the original model ID so at least something is displayed
                     }
-
-                    let name = modelId;
-
-                    // 1. Remove potential provider prefix (e.g., "anthropic/", "google/")
-                    name = name.split('/').pop();
-
-                    // 2. Remove common suffixes (dates, versions, previews) - case-insensitive for preview
-                    name = name.replace(/-\d{8}$/, ''); // YYYYMMDD date
-                    name = name.replace(/[-_]v\d+(\.\d+)?$/, ''); // -v1, _v0.1 etc.
-                    name = name.replace(/-preview$/i, ''); // -preview (case-insensitive)
-                    name = name.replace(/-latest$/i, ''); // -latest (case-insensitive)
-
-                    // 3. Handle specific known model prefixes and ensure correct casing
-                    if (name.toLowerCase().startsWith('gpt-')) {
-                        name = 'GPT-' + name.substring(4);
-                    } else if (name.toLowerCase().startsWith('claude-')) {
-                        name = 'Claude-' + name.substring(7);
-                    } else if (name.toLowerCase().startsWith('gemini-')) {
-                        name = 'Gemini-' + name.substring(7);
-                    }
-                    // Add more specific prefixes if needed (e.g., 'Mistral-', 'Llama-')
-
-                    // 4. Split by hyphen or underscore, process each part
-                    const parts = name.split(/[-_]/);
-                    const formattedParts = parts.map(part => {
-                        if (!part) return ''; // Handle empty strings from double separators
-                        const lowerPart = part.toLowerCase();
-
-                        // Known Keywords - Prioritize exact match and casing
-                        const knownKeywords = {
-                            'o': 'O', // For GPT-4o
-                            'sonnet': 'Sonnet',
-                            'haiku': 'Haiku',
-                            'opus': 'Opus',
-                            'pro': 'Pro',
-                            'mini': 'Mini',
-                            'turbo': 'Turbo',
-                            'flash': 'Flash',
-                            'instruct': 'Instruct',
-                            'code': 'Code', // Example
-                            'coder': 'Coder' // Example
-                            // Add more known keywords as needed
-                        };
-                        if (knownKeywords.hasOwnProperty(lowerPart)) {
-                            return knownKeywords[lowerPart];
-                        }
-
-                        // Handle numbers (like '3', '70b', '1.5') - keep them as is
-                        if (/^\d+(\.\d+)?([mkb])?$/.test(lowerPart)) { // Allows 7B, 1.5, 8x7b etc.
-                            return part; // Return original part to preserve 'b' etc.
-                        }
-
-                        // General Capitalization (handle already uppercase like GPT)
-                        if (part === part.toUpperCase() && part.length > 1) {
-                            return part; // Assume acronym like GPT
-                        }
-                        if (part.length > 0) {
-                            // Capitalize first letter, lowercase rest for general words
-                            return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
-                        }
-                        return ''; // Should be caught by !part check
-                    });
-
-                    // 5. Join parts back together, filter empty parts
-                    let finalName = formattedParts.filter(p => p).join(' ');
-
-                    // 6. Final Refinements - Fix common spacing/joining issues
-                    finalName = finalName.replace(/GPT (\d)/g, 'GPT-$1');    // GPT-4
-                    finalName = finalName.replace(/(\d) O/g, '$1O');        // GPT-4O (remove space)
-                    finalName = finalName.replace(/(\d)\s+(\d)/g, '$1.$2');  // Rejoin version numbers like 1.5
-                    finalName = finalName.replace(/(\d)\s?([BbMmKk])\b/g, '$1$2'); // Rejoin size suffixes like 7B, 13B
-                    finalName = finalName.replace(/Claude (\d)/, 'Claude $1'); // Ensure space like Claude 3
-                    finalName = finalName.replace(/Gemini (\d\.\d)/, 'Gemini $1'); // Ensure space like Gemini 1.5
-
-                    // Limit length if it becomes excessively long
-                    const maxLength = 35; // Adjust as needed
-                    return finalName.length > maxLength ? finalName.substring(0, maxLength - 3) + '...' : finalName;
                 },
                 currentStatusIcon() {
                     const msg = this.currentStatusMessage?.toLowerCase() || "";
@@ -8198,6 +8385,7 @@
                     el.style.height = Math.min(el.scrollHeight, maxHeight) + 'px';
                 },
                 getProviderIcon(modelName) {
+                    try {
                     if (!modelName) return 'fa-question-circle';
                     const lowerModel = modelName.toLowerCase();
                     // Order matters slightly - check for full provider names first
@@ -8211,6 +8399,10 @@
                     if (lowerModel.includes('cerebras')) return 'fa-microchip text-gray-500'; // Cerebras
                     if (lowerModel.includes('openrouter')) return 'fa-route text-purple-500'; // OpenRouter
                     return 'fa-robot'; // Default
+                    } catch (e) {
+                        console.error(`!!! Error in getProviderIcon for modelName: '${modelName}'`, e); // Log the specific ID
+                        return 'fa-question-circle';
+                    }
                 },
                 renderDocstring(docstring) { // Implementation for docstring rendering
                     if (!docstring) return '<div class="text-base-content/50 italic">No documentation available</div>';

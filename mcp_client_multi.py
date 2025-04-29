@@ -162,7 +162,7 @@ import uuid
 from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import (
@@ -709,6 +709,8 @@ class WebSocketMessage(BaseModel):
     type: str
     payload: Any = None
 
+class SetModelRequest(BaseModel):
+    model: str = Field(..., min_length=1)
 
 class ServerType(Enum):
     STDIO = "stdio"
@@ -1238,7 +1240,6 @@ class MCPResource:
     call_count: int = 0
     last_used: datetime = field(default_factory=datetime.now)
 
-
 @dataclass
 class MCPPrompt:
     name: str
@@ -1270,10 +1271,14 @@ class ConversationNode:
         self.children.append(child)
 
     def to_dict(self) -> Dict[str, Any]:
+        """Converts the node to a dictionary suitable for JSON serialization."""
+        # Directly return the messages list. We'll handle potential non-serializable
+        # content within this list using json.dumps(default=...) later.
+        # The TypedDicts within the list behave like dicts at runtime.
         return {
             "id": self.id,
             "name": self.name,
-            "messages": self.messages,  # Assumes messages are dicts
+            "messages": self.messages, # Pass the list directly
             "parent_id": self.parent.id if self.parent else None,
             "children_ids": [child.id for child in self.children],
             "created_at": self.created_at.isoformat(),
@@ -1889,13 +1894,43 @@ class ConversationGraph:
             current = current.parent
         return list(reversed(path))
 
+    @staticmethod
+    def _json_serializer_default(obj):
+        """Custom serializer for objects json.dumps doesn't handle by default."""
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        # Add handling for other specific types if needed
+        # ...
+        # Fallback: Convert any other unknown object to its string representation
+        # This prevents TypeErrors for most custom objects or complex types.
+        log.debug(f"Using string fallback for non-serializable type: {type(obj)}")
+        return str(obj)
+
     async def save(self, file_path: str):
-        data = {"current_node_id": self.current_node.id, "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()}}
+        """Saves the conversation graph to a JSON file."""
+        # Prepare the main data structure
+        data_to_save = {
+            "current_node_id": self.current_node.id,
+            # Call the node's to_dict method, which now returns the messages list directly
+            "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()}
+        }
+
         try:
-            async with aiofiles.open(file_path, "w") as f:
-                await f.write(json.dumps(data, indent=2))
+            async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+                # Use the custom default handler for non-serializable objects
+                json_string = json.dumps(
+                    data_to_save,
+                    indent=2,
+                    ensure_ascii=False,
+                    default=self._json_serializer_default # Use the custom handler
+                )
+                await f.write(json_string)
+            log.debug(f"Saved graph to {file_path} using simplified serialization.")
         except (IOError, TypeError) as e:
-            log.error(f"Could not save graph {file_path}: {e}")
+            # TypeError might still occur if the default handler fails unexpectedly
+            log.error(f"Could not save graph {file_path} (Serialization Error?): {e}", exc_info=True)
+        except Exception as e:
+            log.error(f"Unexpected error saving graph {file_path}: {e}", exc_info=True)
 
     @classmethod
     async def load(cls, file_path: str) -> "ConversationGraph":
@@ -6219,32 +6254,63 @@ class MCPClient:
                 safe_console.print(f"[red]Unexpected error: {e}[/]")
 
     # --- Model Selection ---
+
+    async def set_active_model(self, model_name: str, source: str = "CLI") -> bool:
+        """
+        Sets the active model, updates the default config, and saves.
+
+        Args:
+            model_name: The name of the model to set.
+            source: Where the request originated from (e.g., "CLI", "API").
+
+        Returns:
+            True if the model was potentially changed, False otherwise.
+        """
+        safe_console = get_safe_console() # Get console instance
+        new_model = model_name.strip()
+        if not new_model:
+            safe_console.print(f"[{source}] [yellow]Cannot set empty model name.[/]")
+            return False
+
+        # Optional: Add validation (can be expanded)
+        if new_model not in COST_PER_MILLION_TOKENS:
+            log.warning(f"Model '{new_model}' not found in known cost list. Setting anyway.")
+            # You could add a stricter check here if desired
+
+        if self.current_model == new_model and self.config.default_model == new_model:
+            log.debug(f"Model already set to '{new_model}', no change needed.")
+            # Optionally notify user even if no change
+            # self.safe_print(f"[{source}] Model is already set to: [cyan]{new_model}[/]")
+            return False # Indicate no change was made
+
+        log.info(f"Setting active model to '{new_model}' (requested via {source})")
+        self.current_model = new_model
+        self.config.default_model = new_model # Update persistent default
+        await self.config.save_async() # Save the updated default
+        self.safe_print(f"[{source}] {EMOJI_MAP['model']} Default model set to: [cyan]{new_model}[/]")
+        return True # Indicate a change occurred
+    
     async def cmd_model(self, args: str):
-        """Change the current AI model."""
+        """Change the current AI model (CLI command)."""
         safe_console = get_safe_console()
         new_model = args.strip()
         if not new_model:
             safe_console.print(f"Current default model: [cyan]{self.current_model}[/]")
-            # List available models by provider
+            # List available models by provider (existing logic is fine)
             models_by_provider = {}
             for model_name, provider_value in MODEL_PROVIDER_MAP.items():
+                # Optionally filter by initialized providers if desired
+                # if provider_value in initialized_providers: # Get initialized_providers set
                 models_by_provider.setdefault(provider_value.capitalize(), []).append(model_name)
+
             safe_console.print("\n[bold]Available Models (based on cost data):[/]")
             for provider, models in sorted(models_by_provider.items()):
                 safe_console.print(f" [blue]{provider}:[/] {', '.join(sorted(models))}")
             safe_console.print("\nUsage: /model MODEL_NAME")
             return
 
-        # Optional: Validate if the model name is known or seems valid
-        if new_model not in COST_PER_MILLION_TOKENS:
-            if not Confirm.ask(f"Model '{new_model}' not found in cost list. Use anyway?", default=False, console=safe_console):
-                safe_console.print("[yellow]Model change cancelled.[/]")
-                return
-
-        self.current_model = new_model
-        self.config.default_model = new_model  # Also update the config default
-        await self.config.save_async()  # Persist the default model change
-        safe_console.print(f"[green]{EMOJI_MAP['model']} Default model changed to: {new_model}[/]")
+        # Call the shared method
+        await self.set_active_model(new_model, source="CLI")
 
     # --- Cache Management ---
     async def cmd_cache(self, args: str):
@@ -8142,21 +8208,24 @@ class MCPClient:
                             if isinstance(block, dict) and block.get("type") == "text":
                                 text_parts.append(block.get("text", ""))
                             elif isinstance(block, dict) and block.get("type") == "tool_use":
-                                original_tool_name = block.get("name", "unknown_tool")
+                                original_tool_name_from_history = block.get("name", "unknown_tool")
                                 tool_call_id = block.get("id", "")
                                 tool_input = block.get("input", {})
-                                # Need sanitized name used for OpenAI tool definition
-                                sanitized_name = next(
-                                    (s_name for s_name, o_name in self.server_manager.sanitized_to_original.items() if o_name == original_tool_name),
-                                    original_tool_name, # Fallback
-                                )
+                                # Use the same regex pattern as in _format_tools_for_provider
+                                name_for_api = re.sub(r"[^a-zA-Z0-9_-]", "_", original_tool_name_from_history)[:64]
+                                if not name_for_api: # Handle case where sanitization results in empty string
+                                     log.warning(f"Tool name '{original_tool_name_from_history}' resulted in empty sanitized name. Skipping tool call in history.")
+                                     continue # Skip this tool call block
                                 try:
                                     arguments_str = json.dumps(tool_input)
                                 except TypeError:
-                                    log.error(f"Could not JSON-stringify tool input for '{sanitized_name}'. Sending empty args.")
+                                    # Log using the name being sent to API for clarity
+                                    log.error(f"Could not JSON-stringify tool input for '{name_for_api}'. Sending empty args.")
                                     arguments_str = "{}"
+
+                                # --- Use the correctly sanitized name_for_api ---
                                 tool_calls_for_api.append(
-                                    {"id": tool_call_id, "type": "function", "function": {"name": sanitized_name, "arguments": arguments_str}}
+                                    {"id": tool_call_id, "type": "function", "function": {"name": name_for_api, "arguments": arguments_str}}
                                 )
                         assistant_text_content = "\n".join(text_parts).strip() or None
 
@@ -8963,124 +9032,130 @@ class MCPClient:
             yield ("stop_reason", stop_reason)
 
     async def _handle_openai_compatible_stream(
-            self, stream: AsyncStream[ChatCompletionChunk], provider_name: str
-        ) -> AsyncGenerator[Tuple[str, Any], None]:
-            """Process OpenAI/Grok/DeepSeek/etc. stream and emit standardized events."""
-            current_tool_calls: Dict[int, Dict] = {}  # {index: {'id':..., 'name':..., 'args_acc':...}}
-            input_tokens = 0  # Often not available until the end
-            output_tokens = 0 # Often not available until the end
-            stop_reason = "stop"  # Default
-            finish_reason = None
-            final_usage_obj = None # To store usage from get_final_usage()
+        self, stream: AsyncStream[ChatCompletionChunk], provider_name: str
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
+        """Process OpenAI/Grok/DeepSeek/etc. stream and emit standardized events."""
+        current_tool_calls: Dict[int, Dict] = {} # {index: {'id':..., 'name':..., 'args_acc':...}}
+        # --- Initialize usage tokens to None to clearly indicate if they were received ---
+        input_tokens: Optional[int] = None
+        output_tokens: Optional[int] = None
+        # -----------------------------------------------------------------------------
+        stop_reason = "stop"  # Default
+        finish_reason = None
+        final_chunk_usage: Optional[Any] = None # Variable to store usage from the final chunk
 
-            try:
-                async for chunk in stream:
-                    # --- Process Chunk Data (Text, Tools) ---
-                    choice = chunk.choices[0] if chunk.choices else None
-                    if not choice:
-                        continue
+        try:
+            async for chunk in stream:
+                # --- Process Chunk Data (Text, Tools) ---
+                choice = chunk.choices[0] if chunk.choices else None
 
-                    delta = choice.delta
-                    finish_reason = choice.finish_reason # Store the latest finish_reason
+                # --- Capture Usage if present in ANY chunk (especially the last one) ---
+                if chunk.usage:
+                    # The final chunk contains the total usage
+                    final_chunk_usage = chunk.usage
+                    log.debug(f"Received usage data in stream chunk for {provider_name}: {final_chunk_usage}")
+                    # We capture it here but yield it in the finally block
 
-                    # 1. Text Chunks
-                    if delta and delta.content:
-                        yield ("text_chunk", delta.content)
+                # --- If it's the usage chunk, it might have empty choices, so skip choice processing ---
+                if not choice and chunk.usage:
+                    continue
+                elif not choice: # Skip if no choices and no usage (e.g., empty initial chunk)
+                    continue
+                # ----------------------------------------------------------------------------------
 
-                    # 2. Tool Calls (Parsing logic remains the same)
-                    if delta and delta.tool_calls:
-                        for tc_chunk in delta.tool_calls:
-                            idx = tc_chunk.index
-                            # Start of a new tool call
-                            if tc_chunk.id and tc_chunk.function and tc_chunk.function.name:
-                                tool_id = tc_chunk.id
-                                sanitized_name = tc_chunk.function.name
-                                # --- Get Original Name ---
-                                original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
-                                # -------------------------
-                                current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
-                                yield ("tool_call_start", {"id": tool_id, "name": original_name})
+                delta = choice.delta
+                finish_reason = choice.finish_reason # Store the latest finish_reason
 
-                            # Argument chunks for an existing tool call
-                            if tc_chunk.function and tc_chunk.function.arguments:
-                                args_chunk = tc_chunk.function.arguments
-                                if idx in current_tool_calls:
-                                    current_tool_calls[idx]["args_acc"] += args_chunk
-                                    # Yield incremental input chunk
-                                    yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
-                                else:
-                                    log.warning(f"Args chunk for unknown tool index {idx} from {provider_name}")
+                # 1. Text Chunks
+                if delta and delta.content:
+                    yield ("text_chunk", delta.content)
 
-                    # --- Provider-Specific Stream Data (e.g., Groq Usage) ---
-                    if provider_name == Provider.GROQ.value and hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
-                        usage = chunk.x_groq.usage
-                        if usage:
-                            # Groq provides usage per-chunk, update totals
-                            input_tokens = getattr(usage, "prompt_tokens", input_tokens) # Prompt tokens usually fixed
-                            current_chunk_output = getattr(usage, "completion_tokens", 0)
-                            # Use max as completion_tokens seems cumulative in Groq's per-chunk usage
-                            output_tokens = max(output_tokens, current_chunk_output)
-                            log.debug(f"Groq chunk usage: In={input_tokens}, Out={output_tokens} (Chunk Out={current_chunk_output})")
+                # 2. Tool Calls (Parsing logic remains the same)
+                if delta and delta.tool_calls:
+                    for tc_chunk in delta.tool_calls:
+                        idx = tc_chunk.index
+                        # Start of a new tool call
+                        if tc_chunk.id and tc_chunk.function and tc_chunk.function.name:
+                            tool_id = tc_chunk.id
+                            sanitized_name = tc_chunk.function.name
+                            original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
+                            current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
+                            yield ("tool_call_start", {"id": tool_id, "name": original_name})
+
+                        # Argument chunks for an existing tool call
+                        if tc_chunk.function and tc_chunk.function.arguments:
+                            args_chunk = tc_chunk.function.arguments
+                            if idx in current_tool_calls:
+                                current_tool_calls[idx]["args_acc"] += args_chunk
+                                yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
+                            else:
+                                log.warning(f"Args chunk for unknown tool index {idx} from {provider_name}")
+
+                # --- Handle Groq per-chunk usage (Keep this as Groq might be different) ---
+                if provider_name == Provider.GROQ.value and hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
+                    usage = chunk.x_groq.usage
+                    if usage:
+                        # Only update if input_tokens hasn't been set by the final usage chunk yet
+                        if input_tokens is None:
+                            input_tokens = getattr(usage, "prompt_tokens", None)
+                        current_chunk_output = getattr(usage, "completion_tokens", 0)
+                        output_tokens = max(output_tokens or 0, current_chunk_output) # Accumulate max for Groq
+                        log.debug(f"Groq chunk usage: In={input_tokens}, Out={output_tokens} (Chunk Out={current_chunk_output})")
 
 
-                # --- After Stream Ends: Finalize Tool Calls ---
-                for idx, tool_data in current_tool_calls.items():
-                    accumulated_args = tool_data["args_acc"]
-                    parsed_input = {}
-                    try:
-                        if accumulated_args: # Only parse if not empty
-                            parsed_input = json.loads(accumulated_args)
-                    except json.JSONDecodeError as e:
-                        log.error(f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'")
-                        parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
-                    yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
+            # --- After Stream Ends: Finalize Tool Calls ---
+            for idx, tool_data in current_tool_calls.items():
+                accumulated_args = tool_data["args_acc"]
+                parsed_input = {}
+                try:
+                    if accumulated_args: # Only parse if not empty
+                        parsed_input = json.loads(accumulated_args)
+                except json.JSONDecodeError as e:
+                    log.error(f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'")
+                    parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
+                yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
 
-                # Determine final stop reason
-                stop_reason = finish_reason if finish_reason else "stop"
-                if stop_reason == "tool_calls":
-                    stop_reason = "tool_use" # Standardize
+            # Determine final stop reason
+            stop_reason = finish_reason if finish_reason else "stop"
+            if stop_reason == "tool_calls":
+                stop_reason = "tool_use" # Standardize
 
-            # --- Error Handling ---
-            except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e:
-                log.error(f"{provider_name} stream API error: {e}")
-                yield ("error", f"{provider_name} API Error: {e}")
-                stop_reason = "error"
-            except Exception as e:
-                log.error(f"Unexpected error in {provider_name} stream handler: {e}", exc_info=True)
-                yield ("error", f"Unexpected stream processing error: {e}")
-                stop_reason = "error"
-            # --- End Main Try/Except ---
-            finally:
-                # --- Get Final Usage (Correct Method) ---
-                # Do this *after* the stream loop finishes, but *before* yielding final usage
-                # Skip for Groq, as we accumulated it during the stream
-                if provider_name != Provider.GROQ.value:
-                    try:
-                        # Call get_final_usage() on the stream object AFTER iteration
-                        final_usage_obj = stream.get_final_usage()
-                        if final_usage_obj:
-                            input_tokens = getattr(final_usage_obj, "prompt_tokens", 0)
-                            output_tokens = getattr(final_usage_obj, "completion_tokens", 0)
-                            log.debug(f"Retrieved final usage via get_final_usage() for {provider_name}: In={input_tokens}, Out={output_tokens}")
-                        else:
-                            log.warning(f"stream.get_final_usage() returned None for {provider_name}. Usage may be inaccurate.")
-                    except AttributeError:
-                        # Handle cases where get_final_usage might not exist (though it should for OpenAI v1+)
-                        log.warning(f"Stream object for {provider_name} does not have get_final_usage(). Usage will be 0.")
-                    except Exception as e:
-                        # Catch any other error during the final usage call
-                        log.warning(f"Error calling get_final_usage() for {provider_name}: {e}. Usage may be inaccurate.")
+        # --- Error Handling ---
+        except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e:
+            log.error(f"{provider_name} stream API error: {e}")
+            yield ("error", f"{provider_name} API Error: {e}")
+            stop_reason = "error"
+        except Exception as e:
+            log.error(f"Unexpected error in {provider_name} stream handler: {e}", exc_info=True)
+            yield ("error", f"Unexpected stream processing error: {e}")
+            stop_reason = "error"
+        # --- End Main Try/Except ---
+        finally:
+            # --- Get Final Usage from the captured final chunk ---
+            # Use the final_chunk_usage if captured, otherwise default to 0
+            if final_chunk_usage:
+                input_tokens = final_chunk_usage.prompt_tokens
+                output_tokens = final_chunk_usage.completion_tokens
+                log.debug(f"Using final usage from stream options for {provider_name}: In={input_tokens}, Out={output_tokens}")
+            elif provider_name != Provider.GROQ.value: # Don't warn for Groq if we accumulated
+                log.warning(f"Final usage chunk not received or parsed for {provider_name}. Usage will be 0 or based on Groq accumulation.")
+                # Ensure defaults if not set
+                if input_tokens is None: input_tokens = 0
+                if output_tokens is None: output_tokens = 0
 
-                # --- Log and Yield Final Events ---
-                if input_tokens == 0 or output_tokens == 0:
-                    # Adjust warning based on whether usage was expected vs unavailable
-                    if final_usage_obj or provider_name == Provider.GROQ.value: # If we got an object but values are 0
-                        log.warning(f"{provider_name} usage details reported as zero (Input: {input_tokens}, Output: {output_tokens}).")
-                    else: # If we couldn't get the usage object at all
-                        log.warning(f"{provider_name} usage details unavailable. Cannot calculate cost accurately.")
+            # --- Log and Yield Final Events ---
+            # Default tokens to 0 if they are still None after processing
+            final_input_tokens = input_tokens if input_tokens is not None else 0
+            final_output_tokens = output_tokens if output_tokens is not None else 0
 
-                yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
-                yield ("stop_reason", stop_reason)
+            if final_input_tokens == 0 or final_output_tokens == 0:
+                if final_chunk_usage: # If we got the usage object but values are 0
+                    log.warning(f"{provider_name} usage details reported as zero (Input: {final_input_tokens}, Output: {final_output_tokens}).")
+                elif provider_name != Provider.GROQ.value: # Only warn if not Groq and no usage chunk found
+                    log.warning(f"{provider_name} usage details unavailable. Cannot calculate cost accurately.")
+
+            yield ("final_usage", {"input_tokens": final_input_tokens, "output_tokens": final_output_tokens})
+            yield ("stop_reason", stop_reason)
 
     def _filter_faulty_client_tool_results(self, messages_in: InternalMessageList) -> InternalMessageList:
         """
@@ -9415,6 +9490,7 @@ class MCPClient:
                             "max_tokens": max_tokens,
                             "temperature": self.config.temperature,
                             "stream": True,
+                            "stream_options": {"include_usage": True},
                         }
                         api_stream = await openai_client.chat.completions.create(**completion_params)
                         stream_iterator = self._handle_openai_compatible_stream(api_stream, provider_name)
@@ -9766,7 +9842,21 @@ class MCPClient:
                     final_status_code = trace.StatusCode.ERROR
                     final_desc = "Query cancelled by user"
 
-                span.set_status(final_status_code, description=final_desc)
+                is_error_status = False # Default to not an error
+                if error_occurred or stop_reason == "error":
+                    final_status_code = trace.StatusCode.ERROR
+                    final_desc = f"Query failed or cancelled: {stop_reason or 'unknown error'}"
+                    is_error_status = True # Set flag if error occurred
+                elif stop_reason == "cancelled":  # Handle explicit cancellation case
+                    final_status_code = trace.StatusCode.ERROR # Treat cancellation as error for span status
+                    final_desc = "Query cancelled by user"
+                    is_error_status = True # Set flag if cancelled
+
+                if is_error_status: # Use the flag defined above
+                    span.set_status(final_status_code, description=final_desc)
+                else:
+                    span.set_status(final_status_code) # No description for OK status
+
                 # Record final session totals on the main span
                 span.set_attribute("total_input_tokens", self.session_input_tokens)
                 span.set_attribute("total_output_tokens", self.session_output_tokens)
@@ -10498,6 +10588,26 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                 else:
                     return {"message": "No configuration changes applied."}
 
+            @app.put("/api/model", status_code=200)
+            async def set_model_api(
+                req: SetModelRequest,
+                mcp_client: MCPClient = Depends(get_mcp_client)
+            ):
+                """Sets the active model for subsequent queries."""
+                log.info(f"API request to set model to: {req.model}")
+                try:
+                    # Use the shared method in MCPClient
+                    changed = await mcp_client.set_active_model(req.model, source="API")
+                    if changed:
+                        message = f"Active model set to {req.model}."
+                    else:
+                        message = f"Model was already set to {req.model}."
+
+                    return {"message": message, "currentModel": mcp_client.current_model}
+                except Exception as e:
+                    log.error(f"Error setting model via API: {e}", exc_info=True)
+                    raise HTTPException(status_code=500, detail=f"Failed to set model: {str(e)}") from e
+            
             @app.get("/api/models")
             async def list_models_api(mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Lists available models, grouped by provider, based on cost data and initialized clients."""
@@ -11353,7 +11463,8 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                             if chunk_type == "text":
                                 await send_ws_message("text_chunk", chunk_data)
                             elif chunk_type == "status":
-                                await send_ws_message("status", chunk_data)
+                                plain_status_text = Text.from_markup(str(chunk_data)).plain # Convert potentially marked-up string to plain text
+                                await send_ws_message("status", plain_status_text)
                             elif chunk_type == "error":
                                 await send_ws_message("error", {"message": str(chunk_data)})
                             elif chunk_type == "final_stats":
