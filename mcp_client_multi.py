@@ -206,6 +206,7 @@ from decouple import Config as DecoupleConfig
 from decouple import Csv, RepositoryEnv
 from dotenv import dotenv_values, find_dotenv, load_dotenv, set_key
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -226,11 +227,16 @@ from mcp.types import (
 from mcp.types import Prompt as McpPromptType
 from openai import APIConnectionError as OpenAIAPIConnectionError
 from openai import APIError as OpenAIAPIError
+from openai import APIStatusError as OpenAIAPIStatusError
 from openai import (
     AsyncOpenAI,  # For OpenAI, Grok, DeepSeek, Mistral, Groq, Cerebras, Gemini
     AsyncStream,
 )
 from openai import AuthenticationError as OpenAIAuthenticationError
+from openai import BadRequestError as OpenAIBadRequestError
+from openai import NotFoundError as OpenAINotFoundError
+from openai import PermissionDeniedError as OpenAIPermissionDeniedError
+from openai import RateLimitError as OpenAIRateLimitError
 from openai.types.chat import ChatCompletionChunk
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
@@ -303,7 +309,7 @@ class LogLevel(str, Enum):  # Keep as is
     CRITICAL = "CRITICAL"
 
 
-# Cost estimates (Copied and slightly adjusted for consistency)
+# Cost estimates (Updated with prefixed model names for clarity)
 COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
     # OpenAI models
     "gpt-4o": {"input": 2.5, "output": 10.0},
@@ -313,7 +319,7 @@ COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
     "gpt-4.1-nano": {"input": 0.10, "output": 0.40},
     "o1-preview": {"input": 15.00, "output": 60.00},
     "o3-mini": {"input": 1.10, "output": 4.40},
-    # Claude models
+    # Claude models (Anthropic)
     "claude-3-7-sonnet-20250219": {"input": 3.0, "output": 15.0},
     "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.0},
     "claude-3-opus-20240229": {"input": 15.0, "output": 75.0},
@@ -321,37 +327,48 @@ COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
     # DeepSeek models
     "deepseek-chat": {"input": 0.27, "output": 1.10},
     "deepseek-reasoner": {"input": 0.55, "output": 2.19},
-    # Gemini models
+    # Gemini models (Google)
     "gemini-2.0-flash-lite": {"input": 0.075, "output": 0.30},
     "gemini-2.0-flash": {"input": 0.35, "output": 1.05},
-    "gemini-2.0-flash-thinking-exp-01-21": {"input": 0.0, "output": 0.0},
+    "gemini-2.0-flash-thinking-exp-01-21": {"input": 0.0, "output": 0.0}, # Assuming free tier
     "gemini-2.5-pro-exp-03-25": {"input": 1.25, "output": 10.0},
-    # OpenRouter models
-    "mistralai/mistral-nemo": {"input": 0.035, "output": 0.08},
-    # Grok models (based on the provided documentation)
+    # OpenRouter models (Prefixed)
+    "openrouter/mistralai/mistral-nemo": {"input": 0.035, "output": 0.08},
+    "openrouter/tngtech/deepseek-r1t-chimera:free": {"input": 0.00001, "output": 0.00001},
+    # Grok models
     "grok-3-latest": {"input": 3.0, "output": 15.0},
     "grok-3-fast-latest": {"input": 5.0, "output": 25.0},
     "grok-3-mini-latest": {"input": 0.30, "output": 0.50},
     "grok-3-mini-fast-latest": {"input": 0.60, "output": 4.0},
-    # Mistral models
-    "mistral-large-latest": {"input": 0.035, "output": 0.08},
-    # Groq models
-    "llama-3.3-70b-versatile": {"input": 0.0001, "output": 0.0001},
-    # Cerebras models
-    "llama-4-scout-17b-16e-instruct": {"input": 0.0001, "output": 0.0001},
+    # Mistral models (Native Mistral API)
+    "mistral-large-latest": {"input": 2.0, "output": 6.0}, 
+    "mistral-small-latest": {"input": 0.1, "output": 0.3},
+    # Groq models (Prefixed)
+    "groq/llama-3.3-70b-versatile": {"input": 0.0, "output": 0.0}, # Groq often has very low/free pricing during beta
+    "groq/meta-llama/llama-4-scout-17b-16e-instruct": {"input": 0.0, "output": 0.0}, 
+    "groq/mistral-saba-24b": {"input": 0.0, "output": 0.0}, 
+    "groq/qwen-qwq-32b": {"input": 0.0, "output": 0.0},
+    "groq/gemma2-9b-it": {"input": 0.0, "output": 0.0},
+    "groq/compound-beta": {"input": 0.0, "output": 0.0},
+    "groq/compound-beta-mini": {"input": 0.0, "output": 0.0},
+
+    # Cerebras models (Prefixed)
+    "cerebras/llama-4-scout-17b-16e-instruct": {"input": 0.0001, "output": 0.0001}, # Using placeholder cost
+    "cerebras/llama-3.3-70b": {"input": 0.0001, "output": 0.0001}, # Using placeholder cost
+
 }
 
-# Default models by provider (Using Provider Enum values as keys)
+# Default models by provider (Updated with prefixed names)
 DEFAULT_MODELS = {
-    Provider.OPENAI: "gpt-4.1-mini",
+    Provider.OPENAI: "gpt-4o-mini", # Changed to newer mini model
     Provider.ANTHROPIC: "claude-3-5-haiku-20241022",
     Provider.DEEPSEEK: "deepseek-chat",
-    Provider.GEMINI: "gemini-2.5-pro-exp-03-25",
-    Provider.OPENROUTER: "mistralai/mistral-nemo",
-    Provider.GROK: "grok-3-latest",
+    Provider.GEMINI: "gemini-2.0-flash-lite", # Changed to cheaper flash model
+    Provider.OPENROUTER: "openrouter/tngtech/deepseek-r1t-chimera:free",
+    Provider.GROK: "grok-3-mini-latest", # Changed to cheaper Grok model
     Provider.MISTRAL: "mistral-large-latest",
-    Provider.GROQ: "llama-3.3-70b-versatile",
-    Provider.CEREBRAS: "llama-4-scout-17b-16e-instruct",
+    Provider.GROQ: "groq/compound-beta",
+    Provider.CEREBRAS: "cerebras/llama-4-scout-17b-16e-instruct",
 }
 
 OPENAI_MAX_TOOL_COUNT = 128 # Maximum tools to send to OpenAI-compatible APIs
@@ -444,55 +461,78 @@ EMOJI_MAP["status_unknown"] = EMOJI_MAP["question_mark"]
 # Maps known model identifiers (or prefixes) to their provider's enum value string.
 MODEL_PROVIDER_MAP: Dict[str, str] = {}
 
-
-# Logic to infer provider from model name (simplified version for static generation)
 def _infer_provider(model_name: str) -> Optional[str]:
-    # ... (keep infer provider function) ...
+    """
+    Infers the provider based on the model name string using known prefixes.
+    This is a best-effort guess, especially for models shared across providers.
+    Priority: Explicit prefixes (e.g., 'openrouter/', 'groq/').
+    """
+    if not model_name:
+        return None
     lname = model_name.lower()
-    if lname.startswith("openai/"):
-        return Provider.OPENAI.value
-    if lname.startswith("anthropic/"):
-        return Provider.ANTHROPIC.value
-    if lname.startswith("google/") or lname.startswith("gemini/"):
-        return Provider.GEMINI.value
-    if lname.startswith("grok/"):
-        return Provider.GROK.value
-    if lname.startswith("deepseek/"):
-        return Provider.DEEPSEEK.value
-    if lname.startswith("mistralai/"):
-        return Provider.MISTRAL.value
-    if lname.startswith("groq/"):
-        return Provider.GROQ.value
-    if lname.startswith("cerebras/"):
-        return Provider.CEREBRAS.value
-    if lname.startswith("openrouter/"):
-        return Provider.OPENROUTER.value  # Add openrouter prefix
+
+    # 1. Explicit Provider Prefixes (Highest Priority)
+    prefixes = {
+        "openrouter/": Provider.OPENROUTER.value,
+        "groq/": Provider.GROQ.value,
+        "cerebras/": Provider.CEREBRAS.value,
+        "openai/": Provider.OPENAI.value,
+        "anthropic/": Provider.ANTHROPIC.value,
+        "google/": Provider.GEMINI.value, # Keep google/ for Gemini
+        "gemini/": Provider.GEMINI.value, # Allow gemini/ too
+        "grok/": Provider.GROK.value,
+        "deepseek/": Provider.DEEPSEEK.value,
+        "mistralai/": Provider.MISTRAL.value, # Keep mistralai/ -> Mistral as default
+    }
+    for prefix, provider_val in prefixes.items():
+        if lname.startswith(prefix):
+            # For OpenRouter, Groq, Cerebras, we *want* this prefix match
+            if provider_val in [Provider.OPENROUTER.value, Provider.GROQ.value, Provider.CEREBRAS.value]:
+                return provider_val
+            # For others like mistralai/, it *could* be OpenRouter/Groq, but default to the main provider if no other prefix matches
+            # This logic becomes less critical as the main flow uses the explicit provider.
+            # Let's refine this: If it starts with a known base model provider but ISN'T explicitly openrouter/groq/cerebras, assume base provider.
+            if provider_val not in [Provider.MISTRAL.value]: # Example: Don't return Mistral if it might be OpenRouter/Groq
+                 return provider_val
+
+    # 2. Common Model Name Prefixes (Lower Priority)
     if lname.startswith("gpt-") or lname.startswith("o1-") or lname.startswith("o3-"):
         return Provider.OPENAI.value
     if lname.startswith("claude-"):
         return Provider.ANTHROPIC.value
-    if lname.startswith("gemini-"):
-        return Provider.GEMINI.value
+    # Handle Gemini models that don't start with google/ or gemini/
+    if lname.startswith("gemini-"): # Ensure this check happens
+         return Provider.GEMINI.value
     if lname.startswith("grok-"):
         return Provider.GROK.value
     if lname.startswith("deepseek-"):
         return Provider.DEEPSEEK.value
-    if lname.startswith("mistral-"):
-        return Provider.MISTRAL.value
-    if lname.startswith("groq-"):
-        return Provider.GROQ.value
-    if lname.startswith("cerebras-"):
-        return Provider.CEREBRAS.value
-    return None  # Cannot infer provider for this model
+    # Llama models might be Groq or Cerebras - cannot reliably infer from name alone.
+    # Mistral models might be Mistral, OpenRouter, etc. - cannot reliably infer.
+    # If it starts with mistral- but NOT mistralai/, it's ambiguous.
 
+    # 3. Specific Known Model Names (Can override prefixes if needed)
+    # Example: if 'llama-3.1-...' was ONLY on Groq, you could add:
+    # if "llama-3.1" in lname: return Provider.GROQ.value
+    # Be careful with this, as models move between providers.
 
-# Populate the map
+    # 4. Check if the name *exactly matches* a key in COST_PER_MILLION_TOKENS
+    # This is useful for models like `mistralai/mistral-nemo` if they haven't been prefixed
+    if model_name in COST_PER_MILLION_TOKENS:
+        # Try inferring based *solely* on COST_PER_MILLION_TOKENS keys (less reliable)
+        if model_name.startswith("mistralai/"): return Provider.OPENROUTER.value # Heuristic: Nemo is likely OpenRouter
+        if model_name.startswith("llama-"): # Heuristic: Llama 3.3 is Groq, Llama 4 is Cerebras
+            if "3.3" in model_name: return Provider.GROQ.value
+            if "4-scout" in model_name: return Provider.CEREBRAS.value
+    return None # Cannot reliably infer
+
+# Populate the map (used for informational purposes, e.g., /model list)
+# The runtime logic relies on get_provider_from_model
 for model_key in COST_PER_MILLION_TOKENS.keys():
+    # Attempt inference using the refined logic
     inferred_provider = _infer_provider(model_key)
     if inferred_provider:
         MODEL_PROVIDER_MAP[model_key] = inferred_provider
-    else:
-        pass  # Skip adding models we cannot map
 
 # =============================================================================
 # Type Aliases & Canonical Internal Format
@@ -1089,6 +1129,7 @@ CACHE_DIR = CONFIG_DIR / "cache"
 REGISTRY_DIR = CONFIG_DIR / "registry"
 MAX_HISTORY_ENTRIES = 300
 REGISTRY_URLS = []
+BLACKLIST_FILE = CONFIG_DIR / "tool_blacklist.json"
 
 # Create directories
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1313,7 +1354,57 @@ class ChatHistory:
     cached: bool = False
     streamed: bool = False
 
+class ToolBlacklistManager:
+    def __init__(self, filepath: Path = BLACKLIST_FILE):
+        self.filepath = filepath
+        self.blacklist: Dict[str, List[str]] = {} # provider -> list of blocked tool names
+        self.load()
 
+    def load(self):
+        """Loads the blacklist from the JSON file."""
+        try:
+            if self.filepath.exists():
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    self.blacklist = json.load(f)
+                log.info(f"Loaded tool blacklist from {self.filepath}")
+            else:
+                self.blacklist = {}
+        except (json.JSONDecodeError, IOError, Exception) as e:
+            log.error(f"Error loading tool blacklist {self.filepath}: {e}", exc_info=True)
+            self.blacklist = {} # Start fresh on error
+
+    def save(self):
+        """Saves the current blacklist to the JSON file."""
+        try:
+            self.filepath.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump(self.blacklist, f, indent=2)
+            log.debug(f"Saved tool blacklist to {self.filepath}")
+        except (IOError, Exception) as e:
+            log.error(f"Error saving tool blacklist {self.filepath}: {e}", exc_info=True)
+
+    def add_to_blacklist(self, provider: str, tool_names: List[str]):
+        """Adds tool names to the blacklist for a specific provider."""
+        if not tool_names:
+            return
+        current_list = self.blacklist.setdefault(provider, [])
+        added = False
+        for tool_name in tool_names:
+            if tool_name not in current_list:
+                current_list.append(tool_name)
+                added = True
+        if added:
+            log.info(f"Added tools to {provider} blacklist: {tool_names}")
+            self.save() # Save immediately after adding
+
+    def is_blacklisted(self, provider: str, tool_name: str) -> bool:
+        """Checks if a tool is blacklisted for a specific provider."""
+        return tool_name in self.blacklist.get(provider, [])
+
+    def get_blacklisted_tools(self, provider: str) -> List[str]:
+        """Gets the list of blacklisted tools for a provider."""
+        return self.blacklist.get(provider, []).copy()
+    
 class ServerRegistry:
     """
     Manages discovery and interaction with remote registries and local network servers.
@@ -4674,6 +4765,11 @@ class MCPClient:
         self.cerebras_client: Optional[AsyncOpenAI] = None
 
         self.current_model = self.config.default_model
+        self.current_provider: Optional[str] = self.get_provider_from_model(self.current_model)
+        if not self.current_provider:
+             log.warning(f"Could not determine provider for default model '{self.current_model}'. LLM calls may fail.")
+        else:
+             log.info(f"Initial provider set to: {self.current_provider} for model {self.current_model}")        
         self.server_monitor = ServerMonitor(self.server_manager)
         self.discovered_local_servers = set()
         self.local_discovery_task = None
@@ -4698,7 +4794,7 @@ class MCPClient:
         self._current_query_text: str = ""
         self._current_status_messages: List[str] = []
         self._active_live_display: Optional[Live] = None  # Track the Live instance
-
+        self.tool_blacklist_manager = ToolBlacklistManager() # Initialize blacklist manager
         # Command handler dictionary (populated later)
         self.commands: Dict[str, Callable[[str], Coroutine[Any, Any, None]]] = {}  # Type hint
 
@@ -6257,37 +6353,40 @@ class MCPClient:
 
     async def set_active_model(self, model_name: str, source: str = "CLI") -> bool:
         """
-        Sets the active model, updates the default config, and saves.
+        Sets the active model AND provider, updates the default config, and saves.
 
         Args:
             model_name: The name of the model to set.
             source: Where the request originated from (e.g., "CLI", "API").
 
         Returns:
-            True if the model was potentially changed, False otherwise.
+            True if the model and provider were successfully set, False otherwise.
         """
-        safe_console = get_safe_console() # Get console instance
+        safe_console = get_safe_console()
         new_model = model_name.strip()
         if not new_model:
             safe_console.print(f"[{source}] [yellow]Cannot set empty model name.[/]")
             return False
 
-        # Optional: Add validation (can be expanded)
-        if new_model not in COST_PER_MILLION_TOKENS:
-            log.warning(f"Model '{new_model}' not found in known cost list. Setting anyway.")
-            # You could add a stricter check here if desired
+        # --- Determine Provider ---
+        new_provider = self.get_provider_from_model(new_model)
+        if not new_provider:
+            safe_console.print(f"[{source}] [red]Error: Could not determine provider for model '{new_model}'. Model not set.[/]")
+            return False # Prevent setting if provider is unknown
 
-        if self.current_model == new_model and self.config.default_model == new_model:
-            log.debug(f"Model already set to '{new_model}', no change needed.")
-            # Optionally notify user even if no change
-            # self.safe_print(f"[{source}] Model is already set to: [cyan]{new_model}[/]")
+        # Check if model/provider combo is actually changing
+        if self.current_model == new_model and self.current_provider == new_provider:
+            log.debug(f"Model/Provider already set to '{new_model}'/'{new_provider}', no change needed.")
+            # Optionally notify user
+            # self.safe_print(f"[{source}] Model is already set to: [cyan]{new_model}[/] (Provider: {new_provider})")
             return False # Indicate no change was made
 
-        log.info(f"Setting active model to '{new_model}' (requested via {source})")
+        log.info(f"Setting active model to '{new_model}' (Provider: {new_provider}) (requested via {source})")
         self.current_model = new_model
+        self.current_provider = new_provider # <-- Set the provider attribute
         self.config.default_model = new_model # Update persistent default
         await self.config.save_async() # Save the updated default
-        self.safe_print(f"[{source}] {EMOJI_MAP['model']} Default model set to: [cyan]{new_model}[/]")
+        self.safe_print(f"[{source}] {EMOJI_MAP.get(new_provider, EMOJI_MAP['model'])} Default model set to: [cyan]{new_model}[/] (Provider: {new_provider})")
         return True # Indicate a change occurred
     
     async def cmd_model(self, args: str):
@@ -6306,7 +6405,7 @@ class MCPClient:
             safe_console.print("\n[bold]Available Models (based on cost data):[/]")
             for provider, models in sorted(models_by_provider.items()):
                 safe_console.print(f" [blue]{provider}:[/] {', '.join(sorted(models))}")
-            safe_console.print("\nUsage: /model MODEL_NAME")
+            safe_console.print("\nUsage: /model MODEL_NAME (e.g., /model openrouter/mistralai/mistral-nemo)") # Added example
             return
 
         # Call the shared method
@@ -7909,21 +8008,22 @@ class MCPClient:
 
         Args:
             messages: The list of messages in InternalMessage format to send.
-            model: The specific model name to use.
+            model: The specific model name to use (user-facing, potentially prefixed).
             max_tokens: Maximum tokens for the response.
             temperature: Temperature for the generation.
 
         Returns:
             The generated text content as a string, or None if the call fails.
         """
-        provider_name = self.get_provider_from_model(model)
+        internal_model_name_for_cost_lookup = model # User-facing name for logging/cost
+        provider_name = self.get_provider_from_model(internal_model_name_for_cost_lookup)
         if not provider_name:
-            log.error(f"Cannot execute internal call: Unknown provider for model '{model}'")
+            log.error(f"Cannot execute internal call: Unknown provider for model '{internal_model_name_for_cost_lookup}'")
             return None
 
         provider_client = getattr(self, f"{provider_name}_client", None)
         if provider_name == Provider.ANTHROPIC.value and not provider_client:
-            provider_client = self.anthropic  # Special case for anthropic client attribute name
+            provider_client = self.anthropic
         if not provider_client:
             log.error(f"Cannot execute internal call: Client not initialized for provider '{provider_name}'")
             return None
@@ -7931,79 +8031,88 @@ class MCPClient:
         max_tokens_to_use = max_tokens or self.config.default_max_tokens
         temperature_to_use = temperature if temperature is not None else self.config.temperature
 
-        log.info(f"Executing internal LLM call (no history): Model='{model}', Provider='{provider_name}'")
+        # --- Prepare ACTUAL Model Name String for the API Call ---
+        actual_model_name_string = internal_model_name_for_cost_lookup # Default to user-facing name
+        providers_to_strip = [
+            Provider.OPENROUTER.value,
+            Provider.GROQ.value,
+            Provider.CEREBRAS.value,
+        ]
+        if provider_name in providers_to_strip:
+            prefix_to_strip = f"{provider_name}/"
+            if internal_model_name_for_cost_lookup.lower().startswith(prefix_to_strip):
+                actual_model_name_string = internal_model_name_for_cost_lookup[len(prefix_to_strip):]
+                log.debug(f"Internal Call: Stripped prefix for API. Original: '{internal_model_name_for_cost_lookup}', Sent: '{actual_model_name_string}'")
+            else:
+                log.warning(f"Internal Call: Provider is '{provider_name}', but model '{internal_model_name_for_cost_lookup}' doesn't start with expected prefix '{prefix_to_strip}'. Sending model name as is.")
+        # --- End Prefix Stripping ---
 
-        # Format messages for the specific provider
-        formatted_messages, system_prompt = self._format_messages_for_provider(messages, provider_name, model)
+        log.info(f"Executing internal LLM call (no history): Model='{actual_model_name_string}', Provider='{provider_name}'")
+
+        # Format messages for the specific provider, using the original user-facing model name
+        formatted_messages, system_prompt = self._format_messages_for_provider(messages, provider_name, internal_model_name_for_cost_lookup)
+
+        if not formatted_messages and provider_name != Provider.ANTHROPIC.value:
+             log.error(f"Internal Call Error: Formatted messages are empty for model '{internal_model_name_for_cost_lookup}'. Cannot make API call.")
+             return None
+        elif not formatted_messages and provider_name == Provider.ANTHROPIC.value and not system_prompt:
+             log.error(f"Internal Call Error (Anthropic): Formatted messages and system prompt are both empty for model '{internal_model_name_for_cost_lookup}'.")
+             return None
+
         try:
             response_text: Optional[str] = None
+            api_client: Any = provider_client
 
             # --- Provider-Specific Non-Streaming Call ---
             if provider_name == Provider.ANTHROPIC.value:
-                # Build parameters dictionary dynamically
+                anthropic_client = cast("AsyncAnthropic", api_client)
                 anthropic_params = {
-                    "model": model,
-                    "messages": formatted_messages, # Excludes system message
+                    "model": actual_model_name_string, # Use stripped param
+                    "messages": formatted_messages,
                     "max_tokens": max_tokens_to_use,
                     "temperature": temperature_to_use,
                 }
-                # Only add 'system' parameter if system_prompt has content
-                if system_prompt:
-                    anthropic_params["system"] = system_prompt
-
-                response = await cast("AsyncAnthropic", provider_client).messages.create(**anthropic_params)
-                
-                # Extract text content (Anthropic usually returns content blocks)
+                if system_prompt: anthropic_params["system"] = system_prompt
+                if not formatted_messages: log.warning("Internal Call (Anthropic): Sending API call with only a system prompt.")
+                response = await anthropic_client.messages.create(**anthropic_params)
                 if response.content and isinstance(response.content, list):
-                    text_parts = [block.text for block in response.content if block.type == "text"]
-                    response_text = "\n".join(text_parts).strip()
-                elif isinstance(response.content, str):  # Should not happen based on API, but handle
-                    response_text = response.content
+                    response_text = "\n".join(block.text for block in response.content if block.type == "text").strip()
+                elif isinstance(response.content, str): response_text = response.content
 
             elif provider_name in [
-                Provider.OPENAI.value,
-                Provider.GROK.value,
-                Provider.DEEPSEEK.value,
-                Provider.GROQ.value,
-                Provider.MISTRAL.value,
-                Provider.CEREBRAS.value,
-                Provider.GEMINI.value,
+                Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
+                Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value,
+                Provider.GEMINI.value, Provider.OPENROUTER.value
             ]:
-                response = await cast("AsyncOpenAI", provider_client).chat.completions.create(
-                    model=model,
-                    messages=formatted_messages,  # type: ignore # Pydantic v2 compat
+                openai_client = cast("AsyncOpenAI", api_client)
+                if not formatted_messages:
+                     log.error(f"Internal Call Error ({provider_name}): No messages to send after formatting.")
+                     return None
+                response = await openai_client.chat.completions.create(
+                    model=actual_model_name_string, # Use stripped param
+                    messages=formatted_messages,  # type: ignore
                     max_tokens=max_tokens_to_use,
                     temperature=temperature_to_use,
-                    stream=False,  # Explicitly non-streaming
-                    # tools=None, tool_choice=None # No tools needed for internal call
+                    stream=False,
                 )
                 if response.choices and response.choices[0].message:
                     response_text = response.choices[0].message.content
-
             else:
                 log.error(f"Internal call not implemented for provider: {provider_name}")
                 return None
 
-            # --- Log completion and return ---
             log.info(f"Internal LLM call completed. Response length: {len(response_text or '')} chars.")
             return response_text.strip() if response_text else None
 
         # --- Error Handling ---
-        except (anthropic.APIConnectionError, openai.APIConnectionError) as e:
-            log.error(f"Internal Call Connection Error ({provider_name}): {e}")
-        except (anthropic.AuthenticationError, openai.AuthenticationError):
-            log.error(f"Internal Call Authentication Error ({provider_name}). Check API Key.")
-        except (anthropic.RateLimitError, openai.RateLimitError):
-            log.warning(f"Internal Call Rate Limit Exceeded ({provider_name}).")
-        except (anthropic.APIError, openai.APIError) as e:
-            log.error(f"Internal Call API Error ({provider_name}): {e}", exc_info=True)
-        except Exception as e:
-            log.error(f"Unexpected error during internal LLM call ({provider_name}): {e}", exc_info=True)
+        except (anthropic.APIConnectionError, openai.APIConnectionError) as e: log.error(f"Internal Call Connection Error ({provider_name}): {e}")
+        except (anthropic.AuthenticationError, openai.AuthenticationError): log.error(f"Internal Call Authentication Error ({provider_name}). Check API Key.")
+        except (anthropic.RateLimitError, openai.RateLimitError): log.warning(f"Internal Call Rate Limit Exceeded ({provider_name}).")
+        except (anthropic.APIError, openai.APIError) as e: log.error(f"Internal Call API Error ({provider_name}): {e}", exc_info=True)
+        except Exception as e: log.error(f"Unexpected error during internal LLM call ({provider_name}): {e}", exc_info=True)
 
-        return None  # Return None on any failure
-
-    # Inside class MCPClient:
-
+        return None
+    
     async def summarize_conversation(self, target_tokens: Optional[int] = None, model: Optional[str] = None) -> Optional[str]:
         """
         Generates a summary of the current conversation branch *without* modifying history.
@@ -8122,12 +8231,19 @@ class MCPClient:
                             processed_blocks.append({"type": "text", "text": block.get("text", "")})
                         elif block_type == "tool_use":
                             original_tool_name = block.get("name", "unknown_tool")
-                            # Use sanitized name for Anthropic API call if needed, map maintained elsewhere
-                            # Assuming sanitized_to_original map is up-to-date
-                            sanitized_name = next(
-                                (s_name for s_name, o_name in self.server_manager.sanitized_to_original.items() if o_name == original_tool_name),
-                                original_tool_name, # Fallback needed? Check tool formatting step. Use sanitized here.
-                            )
+                            # --- CORRECTED LOGIC ---
+                            # Apply the same sanitization used when defining tools for the current provider
+                            # Anthropic names: ^[a-zA-Z0-9_-]{1,64}$
+                            sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_tool_name)[:64]
+                            if not sanitized_name: # Handle case where sanitization results in empty string
+                                log.warning(f"Original tool name '{original_tool_name}' resulted in empty sanitized name during Anthropic history formatting. Skipping tool_use block.")
+                                continue # Skip this block if sanitization failed
+
+                            # Log the sanitization happening during history formatting for clarity
+                            if original_tool_name != sanitized_name:
+                                log.debug(f"History Formatting (Anthropic): Sanitized '{original_tool_name}' -> '{sanitized_name}' for historical tool_use block.")
+                            # --- END CORRECTION ---
+
                             processed_blocks.append(
                                 {"type": "tool_use", "id": block.get("id", ""), "name": sanitized_name, "input": block.get("input", {})}
                             )
@@ -8187,11 +8303,14 @@ class MCPClient:
 
                     if is_internal_tool_result:
                         if tool_call_id_for_result:
+                            MAX_OPENAI_TOOL_ID_LEN = 40
+                            truncated_tool_call_id = tool_call_id_for_result[:MAX_OPENAI_TOOL_ID_LEN]
+                            if len(tool_call_id_for_result) > MAX_OPENAI_TOOL_ID_LEN:
+                                log.debug(f"Truncating tool_call_id '{tool_call_id_for_result}' to '{truncated_tool_call_id}' for OpenAI history.")
                             stringified_result = self._stringify_content(tool_result_content)
                             final_tool_content = f"Error: {stringified_result}" if tool_is_error else stringified_result
-                            formatted_messages.append({"role": "tool", "tool_call_id": tool_call_id_for_result, "content": final_tool_content})
-                        else:
-                            log.warning("Internal tool result missing 'tool_use_id'. Skipping.")
+                            formatted_messages.append({"role": "tool", "tool_call_id": truncated_tool_call_id, "content": final_tool_content}) # Use truncated ID
+                        else: log.warning("Internal tool result missing 'tool_use_id'. Skipping.")
                     else:
                         user_text = self._extract_text_from_internal_content(content)
                         formatted_messages.append({"role": "user", "content": user_text})
@@ -8200,42 +8319,68 @@ class MCPClient:
                 elif openai_role == "assistant":
                     assistant_text_content: Optional[str] = None
                     tool_calls_for_api: List[Dict[str, Any]] = []
+
                     if isinstance(content, str):
-                        assistant_text_content = content
+                        # Ensure we don't send empty strings if the original was just ""
+                        assistant_text_content = content if content else None
                     elif isinstance(content, list):
                         text_parts = []
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "text":
                                 text_parts.append(block.get("text", ""))
                             elif isinstance(block, dict) and block.get("type") == "tool_use":
+                                # --- Tool call parsing logic (remains the same) ---
                                 original_tool_name_from_history = block.get("name", "unknown_tool")
-                                tool_call_id = block.get("id", "")
+                                # --- Truncate tool_call_id for OpenAI Provider ---
+                                MAX_OPENAI_TOOL_ID_LEN = 40
+                                tool_call_id = block.get("id", "")[:MAX_OPENAI_TOOL_ID_LEN] # Truncate here
+                                if len(block.get("id", "")) > MAX_OPENAI_TOOL_ID_LEN:
+                                     log.debug(f"Truncating assistant tool_call.id '{block.get('id', '')}' to '{tool_call_id}' for OpenAI history.")
                                 tool_input = block.get("input", {})
-                                # Use the same regex pattern as in _format_tools_for_provider
                                 name_for_api = re.sub(r"[^a-zA-Z0-9_-]", "_", original_tool_name_from_history)[:64]
-                                if not name_for_api: # Handle case where sanitization results in empty string
+                                if not name_for_api:
                                      log.warning(f"Tool name '{original_tool_name_from_history}' resulted in empty sanitized name. Skipping tool call in history.")
-                                     continue # Skip this tool call block
+                                     continue
                                 try:
                                     arguments_str = json.dumps(tool_input)
                                 except TypeError:
-                                    # Log using the name being sent to API for clarity
                                     log.error(f"Could not JSON-stringify tool input for '{name_for_api}'. Sending empty args.")
                                     arguments_str = "{}"
-
-                                # --- Use the correctly sanitized name_for_api ---
                                 tool_calls_for_api.append(
                                     {"id": tool_call_id, "type": "function", "function": {"name": name_for_api, "arguments": arguments_str}}
                                 )
-                        assistant_text_content = "\n".join(text_parts).strip() or None
+                                # --- End tool call parsing ---
+                        # Combine text parts, ensure None if empty after stripping
+                        combined_text = "\n".join(text_parts).strip()
+                        assistant_text_content = combined_text if combined_text else None
+                    elif content is not None: # Handle unexpected types
+                         assistant_text_content = str(content) if str(content) else None
 
+
+                    # --- Build the payload carefully ---
                     assistant_msg_payload: Dict[str, Any] = {"role": "assistant"}
-                    assistant_msg_payload["content"] = assistant_text_content # Can be None
+                    added_something = False
+
+                    # Add 'content' ONLY if it's a non-empty string
+                    if assistant_text_content:
+                        assistant_msg_payload["content"] = assistant_text_content
+                        added_something = True
+                        log.debug("History Formatting (OpenAI): Added assistant text content.")
+
+                    # Add 'tool_calls' ONLY if the list is not empty
                     if tool_calls_for_api:
                         assistant_msg_payload["tool_calls"] = tool_calls_for_api
+                        added_something = True
+                        log.debug(f"History Formatting (OpenAI): Added {len(tool_calls_for_api)} assistant tool_calls.")
 
-                    if assistant_msg_payload.get("content") is not None or assistant_msg_payload.get("tool_calls"):
+                    # Append the message ONLY if content or tool_calls were added
+                    if added_something:
+                        log.debug(f"History Formatting (OpenAI): Appending assistant message. Payload keys: {list(assistant_msg_payload.keys())}")
                         formatted_messages.append(assistant_msg_payload)
+                    else:
+                        # Log if we intended to send an assistant message but it ended up empty
+                        log.warning(f"Skipping empty assistant message during formatting. Original content type: {type(content)}")
+                    # --- End payload building ---
 
             # Return messages *with* system prompt, and None for extracted prompt
             return formatted_messages, None # No separate system prompt for OpenAI call
@@ -8736,36 +8881,20 @@ class MCPClient:
 
     # --- Provider Determination Helper ---
     def get_provider_from_model(self, model_name: str) -> Optional[str]:
-        """Determine the provider based on the model name using MODEL_PROVIDER_MAP."""
+        """
+        Determine the provider based on the model name.
+        Uses the refined _infer_provider function.
+        """
         if not model_name:
             log.warning("get_provider_from_model called with empty model name.")
             return None
-
-        # 1. Direct Lookup (Case-insensitive check just in case)
-        if model_name.lower() in map(str.lower, MODEL_PROVIDER_MAP.keys()):
-            for k, v in MODEL_PROVIDER_MAP.items():
-                if k.lower() == model_name.lower():
-                    log.debug(f"Provider for '{model_name}' found via direct map: {v}")
-                    return v
-
-        # 2. Check Prefixes (e.g., "openai/gpt-4o", "anthropic:claude-3...")
-        parts = model_name.split("/", 1)
-        if len(parts) == 1:
-            parts = model_name.split(":", 1)
-
-        if len(parts) == 2:
-            prefix = parts[0].lower()
-            try:
-                provider_enum = Provider(prefix)
-                log.debug(f"Provider for '{model_name}' found via prefix: {provider_enum.value}")
-                return provider_enum.value
-            except ValueError:
-                log.debug(f"Prefix '{prefix}' in '{model_name}' is not a known provider.")
-                pass
-
-        # 4. Fallback / No Match
-        log.warning(f"Could not automatically determine provider for model: '{model_name}'. Ensure it's in MODEL_PROVIDER_MAP or has a known prefix.")
-        return None
+        provider = _infer_provider(model_name) # Use the refined inference function
+        if provider:
+            log.debug(f"Determined provider for '{model_name}': {provider}")
+            return provider
+        else:
+            log.warning(f"Could not determine provider for model: '{model_name}'. Ensure it has a known prefix (e.g., 'openrouter/', 'groq/') or is in MODEL_PROVIDER_MAP.")
+            return None
 
     def _extract_text_from_internal_content(self, content: Any) -> str:
         """Extracts and concatenates text from internal content format."""
@@ -8798,22 +8927,35 @@ class MCPClient:
             A list of dictionaries representing the tools in the provider's expected format,
             or None if no tools are available.
         """
-        mcp_tools = list(self.server_manager.tools.values())
-        if not mcp_tools:
+        mcp_tools_all = list(self.server_manager.tools.values())
+        if not mcp_tools_all:
             log.debug(f"No MCP tools found to format for provider '{provider}'.")
-            return None  # No tools to format
+            return None
 
+        # --- Load blacklist and filter tools ---
+        blacklisted_for_provider = self.tool_blacklist_manager.get_blacklisted_tools(provider)
+        mcp_tools_filtered = [
+            tool for tool in mcp_tools_all
+            if not self.tool_blacklist_manager.is_blacklisted(provider, tool.name)
+        ]
+        if len(mcp_tools_all) != len(mcp_tools_filtered):
+            excluded_count = len(mcp_tools_all) - len(mcp_tools_filtered)
+            log.info(f"Excluding {excluded_count} blacklisted tools for provider '{provider}'. Blacklist: {blacklisted_for_provider}")
+        else:
+            log.debug(f"No tools blacklisted for provider '{provider}'. Formatting all {len(mcp_tools_filtered)} tools.")
+        # --- End Blacklist Filtering ---
+        
         formatted_tools: List[Dict[str, Any]] = []
         # Ensure the mapping is cleared before formatting a new set of tools for a call
         self.server_manager.sanitized_to_original.clear()
-        log.debug(f"Cleared sanitized_to_original map. Formatting {len(mcp_tools)} tools for provider: {provider}")
+        log.debug(f"Cleared sanitized_to_original map. Formatting {len(mcp_tools_filtered)} tools for provider: {provider}")
 
         provider_enum_val = provider  # Use the string value directly
 
         # --- Anthropic ---
         if provider_enum_val == Provider.ANTHROPIC.value:
             log.debug("Formatting tools for Anthropic.")
-            for tool in sorted(mcp_tools, key=lambda t: t.name):
+            for tool in sorted(mcp_tools_filtered, key=lambda t: t.name):
                 original_name = tool.name
                 # Anthropic names: ^[a-zA-Z0-9_-]{1,64}$
                 sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_name)[:64]
@@ -8858,7 +9000,7 @@ class MCPClient:
             log.debug(f"Formatting tools for OpenAI-compatible provider: {provider_enum_val}")
             # Initial formatting loop (same as before)
             initially_formatted_tools: List[Dict[str, Any]] = [] # Store formatted tools here first
-            for tool in sorted(mcp_tools, key=lambda t: t.name):
+            for tool in sorted(mcp_tools_filtered, key=lambda t: t.name):
                 original_name = tool.name
                 # OpenAI names: ^[a-zA-Z0-9_-]{1,64}$
                 sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_name)[:64]
@@ -9280,6 +9422,7 @@ class MCPClient:
             log.error(f"Error during auto-pruning: {e}", exc_info=True)
             self.safe_print(f"[red]Error during automatic context pruning: {e}[/]")
 
+
     async def process_streaming_query(
         self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None
     ) -> AsyncGenerator[Tuple[str, Any], None]:
@@ -9296,29 +9439,29 @@ class MCPClient:
         span: Optional[trace.Span] = None
         span_context_manager = None
         current_task = asyncio.current_task()
-        stop_reason: Optional[str] = "processing"  # Track the final reason the loop stops
-        error_occurred = False  # Flag to indicate if any error happened
+        stop_reason: Optional[str] = "processing"
+        error_occurred = False
 
-        # Reset session stats for this new query
         self.session_input_tokens = 0
         self.session_output_tokens = 0
         self.session_total_cost = 0.0
         self.cache_hit_count = 0
         self.tokens_saved_by_cache = 0
+        retrying_without_tools = False # Flag for blacklist retry logic
 
         with safe_stdout():
             start_time = time.time()
-            # Determine model and provider
-            if not model:
-                model = self.current_model
+            # --- Determine Model and Provider ---
+            internal_model_name_for_cost_lookup = model or self.current_model
             if not max_tokens:
                 max_tokens = self.config.default_max_tokens
-            provider_name = self.get_provider_from_model(model)
+
+            provider_name = self.current_provider # Use the stored provider
 
             if not provider_name:
-                error_msg = f"Could not determine provider for model '{model}'."
+                error_msg = f"No provider determined for current model '{internal_model_name_for_cost_lookup}'. Cannot process query."
                 log.error(error_msg)
-                yield "error", error_msg  # Yield standardized error tuple
+                yield "error", error_msg
                 return
 
             # Get provider client
@@ -9326,24 +9469,41 @@ class MCPClient:
             if not provider_client and provider_name == Provider.ANTHROPIC.value:
                 provider_client = self.anthropic
             if not provider_client:
-                error_msg = f"API key/client for provider '{provider_name}' not configured or initialized."
+                error_msg = f"API key/client for provider '{provider_name}' not configured or initialized for model '{internal_model_name_for_cost_lookup}'."
                 log.error(error_msg)
-                yield "error", error_msg  # Yield standardized error tuple
+                yield "error", error_msg
                 return
 
-            log.info(f"Streaming query: Model='{model}', Provider='{provider_name}'")
+            # --- Prepare ACTUAL Model Name String for the API Call ---
+            actual_model_name_string = internal_model_name_for_cost_lookup
+            providers_to_strip = [
+                Provider.OPENROUTER.value,
+                Provider.GROQ.value,
+                Provider.CEREBRAS.value,
+            ]
+            if provider_name in providers_to_strip:
+                prefix_to_strip = f"{provider_name}/"
+                if internal_model_name_for_cost_lookup.lower().startswith(prefix_to_strip):
+                    actual_model_name_string = internal_model_name_for_cost_lookup[len(prefix_to_strip):]
+                    log.debug(f"Stripped prefix for API call. Original: '{internal_model_name_for_cost_lookup}', Sent: '{actual_model_name_string}'")
+                else:
+                    log.warning(f"Provider is '{provider_name}', but model '{internal_model_name_for_cost_lookup}' doesn't start with expected prefix '{prefix_to_strip}'. Sending model name as is.")
+
+            log.info(f"Streaming query: Provider='{provider_name}', Model (User Facing/Cost)='{internal_model_name_for_cost_lookup}', Model (API Param)='{actual_model_name_string}'")
 
             # Start OpenTelemetry Span
             if tracer:
                 try:
-                    span_attributes = {"llm.model_name": model, "llm.provider": provider_name, "query_length": len(query), "streaming": True}
+                    span_attributes = {"llm.model_name": internal_model_name_for_cost_lookup, "llm.provider": provider_name, "query_length": len(query), "streaming": True}
                     span_context_manager = tracer.start_as_current_span("process_streaming_query", attributes=span_attributes)
                     if span_context_manager:
                         span = span_context_manager.__enter__()
+                except TypeError as te:
+                     log.warning(f"OpenTelemetry type error setting attributes: {te}. Span attributes may be incomplete.")
+                     span = span_context_manager = None
                 except Exception as e:
                     log.warning(f"Failed to start trace span: {e}")
-                    span = None
-                    span_context_manager = None
+                    span = span_context_manager = None
 
             # Prepare initial conversation state
             await self.auto_prune_context()
@@ -9351,7 +9511,8 @@ class MCPClient:
             user_message: InternalMessage = {"role": "user", "content": query}
             messages.append(user_message)
             if span:
-                span.set_attribute("conversation_length", len(messages))
+                 try: span.set_attribute("conversation_length", len(messages))
+                 except Exception as e: log.warning(f"Failed to set span attribute 'conversation_length': {e}")
 
             # Function-scope state
             final_response_text: str = ""
@@ -9360,292 +9521,286 @@ class MCPClient:
             tool_results_for_history: List[Dict] = []
             cache_hits_during_query: int = 0
 
-        # --- 1. Main Interaction Loop (Handles Multi-Turn Tool Use) ---
+        # --- 1. Main Interaction Loop ---
         try:
-            while True:  # Loop handles potential multi-turn tool use
+            while True:
                 if current_task.cancelled():
-                    log.debug("Query cancelled before API turn")
                     raise asyncio.CancelledError("Query cancelled before API turn")
 
-                # --- 1a. Reset State For This Turn ---
-                accumulated_text_this_turn: str = ""
+                # --- 1a. Reset State ---
+                accumulated_text_this_turn = ""
                 tool_calls_in_progress: Dict[str, Dict] = {}
                 completed_tool_calls: List[Dict] = []
-                turn_input_tokens: int = 0
-                turn_output_tokens: int = 0
-                turn_cost: float = 0.0
-                turn_stop_reason: Optional[str] = None
-                turn_api_error: Optional[str] = None  # Track API/Stream error for this turn
+                turn_input_tokens = 0; turn_output_tokens = 0; turn_cost = 0.0
+                turn_stop_reason = None; turn_api_error = None
 
-                # --- 1b. Format Inputs for Provider ---
+                # --- 1b. Format Inputs ---
                 messages_to_send_this_turn = self._filter_faulty_client_tool_results(messages)
-                formatted_messages, system_prompt = self._format_messages_for_provider(messages_to_send_this_turn, provider_name, model)
-                formatted_tools = self._format_tools_for_provider(provider_name)
+                formatted_messages, system_prompt = self._format_messages_for_provider(
+                    messages_to_send_this_turn, provider_name, internal_model_name_for_cost_lookup
+                )
+
+                # --- Conditionally format tools based on blacklist retry ---
+                if retrying_without_tools:
+                    formatted_tools = None # Force no tools on retry
+                    log.info(f"Retrying API call for {provider_name} without tools due to previous error.")
+                else:
+                    formatted_tools = self._format_tools_for_provider(provider_name) # Normal formatting
+                # ----------------------------------------------------------
+
+                # --- DeepSeek Reasoner Tool Check ---
+                if provider_name == Provider.DEEPSEEK.value and "deepseek-reasoner" in internal_model_name_for_cost_lookup:
+                    if formatted_tools is not None: # Only log if tools were initially formatted
+                        log.warning(f"Model '{internal_model_name_for_cost_lookup}' does not support tools. Sending request without tools.")
+                    formatted_tools = None # Override tools for this specific model
+                # ----------------------------------
+
                 tools_len_str = str(len(formatted_tools)) if formatted_tools else "0"
                 log.debug(f"[{provider_name}] Turn Start: Msgs={len(formatted_messages)}, Tools={tools_len_str}")
 
-                # --- 1c. API Call and Stream Handling ---
-                stream_start_time = time.time()
+                if not formatted_messages and provider_name != Provider.ANTHROPIC.value:
+                     log.error(f"Error preparing API call for {provider_name}: Formatted messages list is empty.")
+                     yield "error", "Internal Error: No messages to send to the LLM after formatting."
+                     error_occurred = True; stop_reason = "error"; break
+                elif not formatted_messages and provider_name == Provider.ANTHROPIC.value and not system_prompt:
+                     log.error(f"Error preparing API call for Anthropic: Formatted messages and system prompt are both empty.")
+                     yield "error", "Internal Error: No messages or system prompt to send to Anthropic."
+                     error_occurred = True; stop_reason = "error"; break
 
+                # --- 1c. API Call & Stream ---
+                stream_start_time = time.time()
                 try:
-                    # --- Initiate Stream based on provider ---
-                    log.debug(f"Initiating API call to {provider_name}...")
+                    log.debug(f"Initiating API call to {provider_name} using model parameter '{actual_model_name_string}'...")
                     stream_iterator: Optional[AsyncGenerator] = None
-                    api_client: Any = provider_client  # Type hint for clarity
+                    api_client: Any = provider_client
+
                     if provider_name == Provider.ANTHROPIC.value:
                         anthropic_client = cast("AsyncAnthropic", api_client)
-                        # Build parameters dictionary dynamically
-                        stream_manager_params = {
-                            "model": model,
-                            "messages": formatted_messages, # Excludes system msg
+                        stream_params = {
+                            "model": actual_model_name_string,
+                            "messages": formatted_messages,
                             "tools": formatted_tools,
-                            "max_tokens": max_tokens,
+                            "max_tokens": max_tokens or self.config.default_max_tokens, # Use correct default
                             "temperature": self.config.temperature,
+                            "stream": True, # Anthropic SDK uses stream=True in messages.stream
                         }
-                        # Only add 'system' parameter if system_prompt has content
-                        if system_prompt:
-                             stream_manager_params["system"] = system_prompt
-
-                        stream_manager = anthropic_client.messages.stream(**stream_manager_params)
-
-                        # The actual stream handling happens *inside* the async with block
-                        async with stream_manager as api_stream:  # Enters the context manager
-                            # Pass the yielded stream to the handler
+                        if system_prompt: stream_params["system"] = system_prompt
+                        stream_manager = anthropic_client.messages.stream(**stream_params)
+                        async with stream_manager as api_stream:
                             stream_iterator = self._handle_anthropic_stream(api_stream)
-                            log.debug(f"API call successful for {provider_name}. Processing stream...")
-                            # --- Process Standardized Stream Events from the iterator (Inside async with) ---
                             async for std_event_type, std_event_data in stream_iterator:
-                                if current_task.cancelled():
-                                    log.debug("Query cancelled during stream processing")
-                                    raise asyncio.CancelledError("Query cancelled during stream processing")
-                                # (Event handling logic duplicated below - factor out later if needed)
-                                if std_event_type == "error":
-                                    turn_api_error = str(std_event_data)
-                                    log.error(f"Stream error event from {provider_name} handler: {turn_api_error}")
-                                    yield "status", f"[bold red]Stream Error ({provider_name}): {turn_api_error}[/]"
-                                    turn_stop_reason = "error"
-                                    break  # Break from inner stream processing loop
-                                elif std_event_type == "text_chunk":
-                                    if isinstance(std_event_data, str):
-                                        accumulated_text_this_turn += std_event_data
-                                        yield "text_chunk", std_event_data
+                                if current_task.cancelled(): raise asyncio.CancelledError("Query cancelled during stream")
+                                if std_event_type == "error": turn_api_error = str(std_event_data); break
+                                # --- Event Processing (Anthropic) ---
+                                elif std_event_type == "text_chunk": accumulated_text_this_turn += std_event_data; yield "text_chunk", std_event_data
                                 elif std_event_type == "tool_call_start":
-                                    tool_id = std_event_data.get("id", str(uuid.uuid4()))
-                                    original_tool_name = std_event_data.get("name", "unknown_tool")
+                                    tool_id = std_event_data["id"]
+                                    original_tool_name = std_event_data["name"]
                                     tool_calls_in_progress[tool_id] = {"name": original_tool_name, "args_acc": ""}
-                                    yield (
-                                        "status",
-                                        f"{EMOJI_MAP['tool']} Preparing tool: [bold]{original_tool_name.split(':')[-1]}[/] (ID: {tool_id[:8]})...",
-                                    )
+                                    yield "status", f"{EMOJI_MAP['tool']} Preparing tool: [bold]{original_tool_name.split(':')[-1]}[/] (ID: {tool_id[:8]})..."
                                 elif std_event_type == "tool_call_input_chunk":
-                                    tool_id = std_event_data.get("id")
-                                    json_chunk = std_event_data.get("json_chunk")
-                                    if tool_id and json_chunk and tool_id in tool_calls_in_progress:
-                                        tool_calls_in_progress[tool_id]["args_acc"] += json_chunk
-                                    elif tool_id:
-                                        log.warning(f"Input chunk for unknown tool call ID: {tool_id}")
+                                    tool_id = std_event_data["id"]
+                                    if tool_id in tool_calls_in_progress: tool_calls_in_progress[tool_id]["args_acc"] += std_event_data["json_chunk"]
                                 elif std_event_type == "tool_call_end":
-                                    tool_id = std_event_data.get("id")
-                                    parsed_input = std_event_data.get("parsed_input", {})
-                                    if tool_id and tool_id in tool_calls_in_progress:
+                                    tool_id = std_event_data["id"]
+                                    if tool_id in tool_calls_in_progress:
                                         tool_info = tool_calls_in_progress.pop(tool_id)
-                                        completed_tool_calls.append({"id": tool_id, "name": tool_info["name"], "input": parsed_input})
-                                        log.debug(f"Completed parsing tool call: ID={tool_id}, Name={tool_info['name']}")
-                                    elif tool_id:
-                                        log.warning(f"End event for unknown tool call ID: {tool_id}")
+                                        completed_tool_calls.append({"id": tool_id, "name": tool_info["name"], "input": std_event_data["parsed_input"]})
                                 elif std_event_type == "final_usage":
-                                    turn_input_tokens = std_event_data.get("input_tokens", 0)
-                                    turn_output_tokens = std_event_data.get("output_tokens", 0)
-                                    turn_cost = self._calculate_and_log_cost(model, turn_input_tokens, turn_output_tokens)
-                                    self.session_input_tokens += turn_input_tokens
-                                    self.session_output_tokens += turn_output_tokens
-                                    self.session_total_cost += turn_cost
-                                    yield (
-                                        "status",
-                                        f"{EMOJI_MAP['token']} Turn Tokens: In={turn_input_tokens:,}, Out={turn_output_tokens:,} | {EMOJI_MAP['cost']} Turn Cost: ${turn_cost:.4f}",
-                                    )
+                                    turn_input_tokens = std_event_data["input_tokens"]
+                                    turn_output_tokens = std_event_data["output_tokens"]
+                                    turn_cost = self._calculate_and_log_cost(internal_model_name_for_cost_lookup, turn_input_tokens, turn_output_tokens)
+                                    self.session_input_tokens += turn_input_tokens; self.session_output_tokens += turn_output_tokens; self.session_total_cost += turn_cost
+                                    yield "status", f"{EMOJI_MAP['token']} Turn Tokens: In={turn_input_tokens:,}, Out={turn_output_tokens:,} | {EMOJI_MAP['cost']} Turn Cost: ${turn_cost:.4f}"
                                     if span:
-                                        turn_idx = sum(1 for m in messages if m.get("role") == "assistant")
-                                        span.set_attribute(f"turn_{turn_idx}.input_tokens", turn_input_tokens)
-                                        span.set_attribute(f"turn_{turn_idx}.output_tokens", turn_output_tokens)
-                                        span.set_attribute(f"turn_{turn_idx}.cost", turn_cost)
+                                        try:
+                                            turn_index = sum(1 for m in messages if m.get("role") == "assistant") # Get current turn index
+                                            span.set_attribute(f"turn_{turn_index}.input_tokens", turn_input_tokens)
+                                            span.set_attribute(f"turn_{turn_index}.output_tokens", turn_output_tokens)
+                                            span.set_attribute(f"turn_{turn_index}.cost", turn_cost)
+                                        except Exception as span_err: log.warning(f"Failed set span attrs: {span_err}")
                                 elif std_event_type == "stop_reason":
                                     turn_stop_reason = std_event_data
-                                    log.debug(f"Received stop reason: {turn_stop_reason}")
 
                     elif provider_name in [
-                        Provider.OPENAI.value,
-                        Provider.GROK.value,
-                        Provider.DEEPSEEK.value,
-                        Provider.GROQ.value,
-                        Provider.MISTRAL.value,
-                        Provider.CEREBRAS.value,
-                        Provider.GEMINI.value,
+                        Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
+                        Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value,
+                        Provider.GEMINI.value, Provider.OPENROUTER.value,
                     ]:
                         openai_client = cast("AsyncOpenAI", api_client)
                         completion_params = {
-                            "model": model,
+                            "model": actual_model_name_string,
                             "messages": formatted_messages,  # type: ignore
                             "tools": formatted_tools,
-                            "max_tokens": max_tokens,
+                            "max_tokens": max_tokens or self.config.default_max_tokens, # Use correct default
                             "temperature": self.config.temperature,
                             "stream": True,
-                            "stream_options": {"include_usage": True},
                         }
+                        providers_without_stream_options = { Provider.MISTRAL.value }
+                        if provider_name not in providers_without_stream_options:
+                            completion_params["stream_options"] = {"include_usage": True}
+                        else: log.debug(f"Skipping stream_options for {provider_name}")
+
+                        # --- Cerebras Logging ---
+                        if provider_name == Provider.CEREBRAS.value:
+                             try:
+                                 log.debug(f"[{provider_name}] Sending API request. Params: {json.dumps(completion_params, indent=2, default=lambda o: f'<not serializable: {type(o).__name__}>')}")
+                             except Exception as json_log_err:
+                                 log.warning(f"Failed to log completion_params for Cerebras: {json_log_err}")
+                        # -----------------------
+
                         api_stream = await openai_client.chat.completions.create(**completion_params)
                         stream_iterator = self._handle_openai_compatible_stream(api_stream, provider_name)
-                        log.debug(f"API call successful for {provider_name}. Processing stream...")
-                        # --- Process Standardized Stream Events from the iterator ---
                         async for std_event_type, std_event_data in stream_iterator:
-                            if current_task.cancelled():
-                                log.debug("Query cancelled during stream processing")
-                                raise asyncio.CancelledError("Query cancelled during stream processing")
-                            # (Event handling logic duplicated - factor out later if needed)
-                            if std_event_type == "error":
-                                turn_api_error = str(std_event_data)
-                                log.error(f"Stream error event from {provider_name} handler: {turn_api_error}")
-                                yield "status", f"[bold red]Stream Error ({provider_name}): {turn_api_error}[/]"
-                                turn_stop_reason = "error"
-                                break  # Break from inner stream processing loop
-                            elif std_event_type == "text_chunk":
-                                if isinstance(std_event_data, str):
-                                    accumulated_text_this_turn += std_event_data
-                                    yield "text_chunk", std_event_data
+                            if current_task.cancelled(): raise asyncio.CancelledError("Query cancelled during stream")
+                            if std_event_type == "error": turn_api_error = str(std_event_data); break
+                            # --- Event Processing (OpenAI Compatible) ---
+                            elif std_event_type == "text_chunk": accumulated_text_this_turn += std_event_data; yield "text_chunk", std_event_data
                             elif std_event_type == "tool_call_start":
-                                tool_id = std_event_data.get("id", str(uuid.uuid4()))
-                                original_tool_name = std_event_data.get("name", "unknown_tool")
+                                tool_id = std_event_data["id"]
+                                original_tool_name = std_event_data["name"]
                                 tool_calls_in_progress[tool_id] = {"name": original_tool_name, "args_acc": ""}
-                                yield (
-                                    "status",
-                                    f"{EMOJI_MAP['tool']} Preparing tool: [bold]{original_tool_name.split(':')[-1]}[/] (ID: {tool_id[:8]})...",
-                                )
+                                yield "status", f"{EMOJI_MAP['tool']} Preparing tool: [bold]{original_tool_name.split(':')[-1]}[/] (ID: {tool_id[:8]})..."
                             elif std_event_type == "tool_call_input_chunk":
-                                tool_id = std_event_data.get("id")
-                                json_chunk = std_event_data.get("json_chunk")
-                                if tool_id and json_chunk and tool_id in tool_calls_in_progress:
-                                    tool_calls_in_progress[tool_id]["args_acc"] += json_chunk
-                                elif tool_id:
-                                    log.warning(f"Input chunk for unknown tool call ID: {tool_id}")
+                                tool_id = std_event_data["id"]
+                                if tool_id in tool_calls_in_progress: tool_calls_in_progress[tool_id]["args_acc"] += std_event_data["json_chunk"]
                             elif std_event_type == "tool_call_end":
-                                tool_id = std_event_data.get("id")
-                                parsed_input = std_event_data.get("parsed_input", {})
-                                if tool_id and tool_id in tool_calls_in_progress:
+                                tool_id = std_event_data["id"]
+                                if tool_id in tool_calls_in_progress:
                                     tool_info = tool_calls_in_progress.pop(tool_id)
-                                    completed_tool_calls.append({"id": tool_id, "name": tool_info["name"], "input": parsed_input})
-                                    log.debug(f"Completed parsing tool call: ID={tool_id}, Name={tool_info['name']}")
-                                elif tool_id:
-                                    log.warning(f"End event for unknown tool call ID: {tool_id}")
+                                    completed_tool_calls.append({"id": tool_id, "name": tool_info["name"], "input": std_event_data["parsed_input"]})
                             elif std_event_type == "final_usage":
-                                turn_input_tokens = std_event_data.get("input_tokens", 0)
-                                turn_output_tokens = std_event_data.get("output_tokens", 0)
-                                turn_cost = self._calculate_and_log_cost(model, turn_input_tokens, turn_output_tokens)
-                                self.session_input_tokens += turn_input_tokens
-                                self.session_output_tokens += turn_output_tokens
-                                self.session_total_cost += turn_cost
-                                yield (
-                                    "status",
-                                    f"{EMOJI_MAP['token']} Turn Tokens: In={turn_input_tokens:,}, Out={turn_output_tokens:,} | {EMOJI_MAP['cost']} Turn Cost: ${turn_cost:.4f}",
-                                )
+                                turn_input_tokens = std_event_data["input_tokens"]
+                                turn_output_tokens = std_event_data["output_tokens"]
+                                turn_cost = self._calculate_and_log_cost(internal_model_name_for_cost_lookup, turn_input_tokens, turn_output_tokens)
+                                self.session_input_tokens += turn_input_tokens; self.session_output_tokens += turn_output_tokens; self.session_total_cost += turn_cost
+                                yield "status", f"{EMOJI_MAP['token']} Turn Tokens: In={turn_input_tokens:,}, Out={turn_output_tokens:,} | {EMOJI_MAP['cost']} Turn Cost: ${turn_cost:.4f}"
                                 if span:
-                                    turn_idx = sum(1 for m in messages if m.get("role") == "assistant")
-                                    span.set_attribute(f"turn_{turn_idx}.input_tokens", turn_input_tokens)
-                                    span.set_attribute(f"turn_{turn_idx}.output_tokens", turn_output_tokens)
-                                    span.set_attribute(f"turn_{turn_idx}.cost", turn_cost)
-                            elif std_event_type == "stop_reason":
-                                turn_stop_reason = std_event_data
-                                log.debug(f"Received stop reason: {turn_stop_reason}")
-
+                                    try:
+                                        turn_index = sum(1 for m in messages if m.get("role") == "assistant") # Get current turn index
+                                        span.set_attribute(f"turn_{turn_index}.input_tokens", turn_input_tokens)
+                                        span.set_attribute(f"turn_{turn_index}.output_tokens", turn_output_tokens)
+                                        span.set_attribute(f"turn_{turn_index}.cost", turn_cost)
+                                    except Exception as span_err:
+                                        log.warning(f"Failed set span attrs: {span_err}")
+                            elif std_event_type == "stop_reason": turn_stop_reason = std_event_data
                     else:
                         raise NotImplementedError(f"Streaming API call not implemented for provider: {provider_name}")
 
-                    # --- Inner loop break check ---
-                    if turn_stop_reason == "error":
-                        break  # Exit main loop if stream error occurred during processing
+                    if turn_stop_reason == "error": break
 
-                # --- Catch API Call / Connection Errors ---
-                except (anthropic.APIConnectionError, openai.APIConnectionError) as e:
-                    turn_api_error = f"Connection Error: {e}"
-                    log.error(f"{provider_name} {turn_api_error}", exc_info=True)
-                except (anthropic.AuthenticationError, openai.AuthenticationError) as e:
-                    turn_api_error = f"Authentication Error (Check API Key): {e}"
-                    log.error(f"{provider_name} {turn_api_error}")
-                except (anthropic.PermissionDeniedError, openai.PermissionDeniedError) as e:
-                    turn_api_error = f"Permission Denied: {e}"
-                    log.error(f"{provider_name} {turn_api_error}")
-                except (anthropic.NotFoundError, openai.NotFoundError) as e:
-                    turn_api_error = f"API Endpoint or Model Not Found: {e}"
-                    log.error(f"{provider_name} {turn_api_error}")
-                except (anthropic.RateLimitError, openai.RateLimitError) as e:
-                    turn_api_error = f"Rate Limit Exceeded: {e}"
-                    log.warning(f"{provider_name} {turn_api_error}")
-                except (anthropic.BadRequestError, openai.BadRequestError) as e:
-                    turn_api_error = f"Invalid Request / Bad Request: {e}"
-                    log.error(f"{provider_name} {turn_api_error}", exc_info=True)
-                except (anthropic.APIStatusError, openai.APIStatusError) as e:
-                    turn_api_error = f"API Status Error ({e.status_code}): {e}"
-                    log.error(f"{provider_name} {turn_api_error}", exc_info=True)
-                except (anthropic.APIError, openai.APIError) as e:  # Catch other provider base errors
-                    turn_api_error = f"API Error: {e}"
-                    log.error(f"{provider_name} {turn_api_error}", exc_info=True)
-                except httpx.RequestError as e:  # Catch general network errors
-                    turn_api_error = f"Network Error: {e}"
-                    log.error(f"{provider_name} Network Error: {turn_api_error}", exc_info=True)
-                except asyncio.CancelledError:  # Catch cancellation during API call/stream setup
-                    log.debug(f"API call/stream setup cancelled for {provider_name}")
-                    raise  # Propagate cancellation immediately
-                except NotImplementedError as e:  # Catch our own error
-                    turn_api_error = str(e)
-                    log.error(turn_api_error)
-                except Exception as api_err:  # Catch unexpected errors
-                    turn_api_error = f"Unexpected API/Stream Error: {api_err}"
-                    log.error(f"Unexpected error during API call/stream for {provider_name}: {api_err}", exc_info=True)
-                # --- End API/Stream Try Block ---
+                # --- Catch API Errors & Handle Blacklisting ---
+                # Use more specific OpenAI error types where available
+                except OpenAIBadRequestError as e:
+                    error_detail = str(e)
+                    is_tool_error = "tool declaration" in error_detail or "'tools'" in error_detail or "Function Calling" in error_detail or "tool_calls" in error_detail or "'functions'" in error_detail # Broaden check
+                    failing_tool_name = None
+
+                    # Specific Gemini Error Parsing
+                    if provider_name == Provider.GEMINI.value and "Failed to parse parameters of tool declaration with name" in error_detail:
+                        match = re.search(r"with name (\S+)", error_detail)
+                        if match:
+                            sanitized_failing_tool_name = match.group(1)
+                            failing_tool_name = self.server_manager.sanitized_to_original.get(sanitized_failing_tool_name, sanitized_failing_tool_name)
+                            log.warning(f"Gemini tool parse error identified for: {failing_tool_name} (Sanitized: {sanitized_failing_tool_name})")
+                        else:
+                            log.warning("Could not extract tool name from Gemini error: " + error_detail)
+                            is_tool_error = False # Treat as generic if name extraction fails
+
+                    # Specific OpenAI Tool ID Length Error Parsing (Check if needed, might be handled by truncation)
+                    elif provider_name == Provider.OPENAI.value and "tool_calls[0].id': string too long" in error_detail:
+                         # We assume truncation fixed this, but log if it still happens
+                         log.error(f"Encountered OpenAI tool ID length error despite truncation logic: {error_detail}")
+                         # Treat as generic bad request for now, maybe blacklist all tools if persistent
+                         is_tool_error = True # Mark as tool error for potential blacklisting
+
+                    # Blacklist Logic
+                    if is_tool_error and not retrying_without_tools:
+                        log.warning(f"Caught tool-related BadRequestError for {provider_name}: {e}")
+                        tools_to_blacklist_now = []
+                        if failing_tool_name:
+                            tools_to_blacklist_now.append(failing_tool_name)
+                        elif formatted_tools: # If generic tool error, blacklist all tools sent in this turn
+                             tools_to_blacklist_now = []
+                             for tool_fmt in formatted_tools:
+                                 if tool_fmt.get("type") == "function" and isinstance(tool_fmt.get("function"), dict):
+                                     sanitized_name = tool_fmt["function"].get("name")
+                                     if sanitized_name:
+                                         original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
+                                         tools_to_blacklist_now.append(original_name)
+                             if tools_to_blacklist_now:
+                                 log.warning(f"Blacklisting all tools sent for {provider_name} due to generic tool error: {tools_to_blacklist_now}")
+                             else:
+                                 log.warning("Generic tool error detected, but couldn't determine which tools were sent to blacklist.")
+
+                        if tools_to_blacklist_now:
+                             # Use the instance method to add to blacklist
+                             self.tool_blacklist_manager.add_to_blacklist(provider_name, list(set(tools_to_blacklist_now))) # Use set to avoid duplicates
+                             retrying_without_tools = True # Set flag to retry without tools
+                             yield "status", f"[yellow]Tool error detected for {provider_name}. Retrying without blacklisted tool(s)...[/]"
+                             continue # Go to start of while loop for retry
+                        else:
+                             # Couldn't identify tools to blacklist, treat as normal error
+                             turn_api_error = f"BadRequestError (Tools?, No specific tool identified): {e}"
+                             log.error(f"{provider_name} {turn_api_error}", exc_info=False) # Less verbose log for this case
+                    else:
+                        # Not a tool error, or already retrying without tools
+                        turn_api_error = f"BadRequestError: {e}"
+                        log.error(f"{provider_name} {turn_api_error}", exc_info=True)
+
+                # --- More Specific Error Handling (Using imported exceptions) ---
+                except (anthropic.APIConnectionError, OpenAIAPIConnectionError) as e: turn_api_error = f"Connection Error: {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True)
+                except (anthropic.AuthenticationError, OpenAIAuthenticationError) as e: turn_api_error = f"Authentication Error (Check API Key): {e}"; log.error(f"{provider_name} {turn_api_error}")
+                except (anthropic.PermissionDeniedError, OpenAIPermissionDeniedError) as e: turn_api_error = f"Permission Denied: {e}"; log.error(f"{provider_name} {turn_api_error}")
+                except (anthropic.NotFoundError, OpenAINotFoundError) as e: turn_api_error = f"API Endpoint or Model Not Found: {e}"; log.error(f"{provider_name} {turn_api_error}")
+                except (anthropic.RateLimitError, OpenAIRateLimitError) as e: turn_api_error = f"Rate Limit Exceeded: {e}"; log.warning(f"{provider_name} {turn_api_error}")
+                except (anthropic.APIStatusError, OpenAIAPIStatusError) as e: turn_api_error = f"API Status Error ({e.status_code}): {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True)
+                except (anthropic.APIError, OpenAIAPIError) as e: turn_api_error = f"API Error: {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True) # Catch base API errors
+                except httpx.RequestError as e: turn_api_error = f"Network Error: {e}"; log.error(f"{provider_name} Network Error: {turn_api_error}", exc_info=True)
+                except asyncio.CancelledError: log.debug(f"API call/stream setup cancelled for {provider_name}"); raise
+                except NotImplementedError as e: turn_api_error = str(e); log.error(turn_api_error)
+                except Exception as api_err: turn_api_error = f"Unexpected API/Stream Error: {api_err}"; log.error(f"Unexpected error during API call/stream for {provider_name}: {api_err}", exc_info=True)
                 finally:
-                    # No stream object to close here, handled by async with or direct await
-                    log.debug(
-                        f"Stream processing finished for turn. Duration: {time.time() - stream_start_time:.2f}s. API Error: {turn_api_error}. Stop Reason: {turn_stop_reason}"
-                    )
+                    log.debug(f"Stream processing finished for turn. Duration: {time.time() - stream_start_time:.2f}s. API Error: {turn_api_error}. Stop Reason: {turn_stop_reason}")
 
-                # If an API or stream error occurred, report it and break the main loop
                 if turn_api_error:
                     error_occurred = True
-                    yield "error", f"Error ({provider_name}): {turn_api_error}"  # Yield standardized error
-                    stop_reason = "error"  # Set overall stop reason for the query
-                    break  # Exit the main while loop
+                    yield "error", f"Error ({provider_name}): {turn_api_error}"
+                    stop_reason = "error"
+                    break # Break loop on non-tool-related API error or failed retry
+
+                # --- Reset retry flag if this attempt (potentially without tools) succeeded ---
+                retrying_without_tools = False
 
                 # --- 1e. Post-Stream Processing & Assistant Message Update ---
                 assistant_content_blocks: List[Union[TextContentBlock, ToolUseContentBlock]] = []
                 if accumulated_text_this_turn:
-                    text_block: TextContentBlock = {"type": "text", "text": accumulated_text_this_turn}
-                    assistant_content_blocks.append(text_block)
-                    final_response_text += accumulated_text_this_turn  # Add to final display text
+                    assistant_content_blocks.append({"type": "text", "text": accumulated_text_this_turn})
+                    final_response_text += accumulated_text_this_turn
                 for tc in completed_tool_calls:
-                    tool_use_block: ToolUseContentBlock = {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["input"]}
-                    assistant_content_blocks.append(tool_use_block)
+                    assistant_content_blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["input"]})
                 if assistant_content_blocks:
-                    assistant_message: InternalMessage = {"role": "assistant", "content": assistant_content_blocks}
-                    messages.append(assistant_message)
+                    messages.append({"role": "assistant", "content": assistant_content_blocks})
+                else:
+                    # Only log warning if the stop reason wasn't 'tool_use' (it's expected to yield no text then)
+                    if turn_stop_reason != 'tool_use':
+                        log.warning(f"LLM turn for {provider_name} completed but yielded no text or tool calls. Stop Reason: {turn_stop_reason}")
 
                 # --- 1f. Handle Stop Reason ---
-                if current_task.cancelled():
-                    raise asyncio.CancelledError("Cancelled before stop reason handling")
-                stop_reason = turn_stop_reason  # Update the overall stop reason
+                if current_task.cancelled(): raise asyncio.CancelledError("Cancelled before stop reason handling")
+                stop_reason = turn_stop_reason
 
                 if stop_reason == "tool_use":
                     if not completed_tool_calls:
                         log.warning(f"{provider_name} stop reason 'tool_use' but no calls parsed.")
                         yield "status", "[yellow]Warning: Model requested tools, but none were identified.[/]"
-                        break  # Exit loop
+                        break # Stop if model wanted tools but none were found
 
                     tool_results_for_api: List[InternalMessage] = []
                     yield "status", f"{EMOJI_MAP['tool']} Processing {len(completed_tool_calls)} tool call(s)..."
-
-                    # --- Tool Execution Loop ---
                     try:
                         for tool_call in completed_tool_calls:
-                            if current_task.cancelled():
-                                raise asyncio.CancelledError("Cancelled during tool processing")
-
+                            if current_task.cancelled(): raise asyncio.CancelledError("Cancelled during tool processing")
                             tool_use_id = tool_call["id"]
                             original_tool_name = tool_call["name"]
                             tool_args = tool_call["input"]
@@ -9656,17 +9811,19 @@ class MCPClient:
                             is_error_flag = True
                             cache_used_flag = False
 
-                            # Check for client-side parse errors FIRST
+                            # Handle client-side parse error first
                             if isinstance(tool_args, dict) and "_tool_input_parse_error" in tool_args:
                                 error_text = f"Client JSON parse error for '{original_tool_name}'."
                                 tool_result_content = f"Error: {error_text}"
-                                raw_json_error_info = tool_args.get("_tool_input_parse_error", {})
-                                raw_json_str = raw_json_error_info.get("raw_json", "N/A")
-                                log_content_for_history = {"error": error_text, "raw_json": raw_json_str}
+                                # Extract raw JSON if available from the error dict
+                                raw_json_detail = "N/A"
+                                if isinstance(tool_args["_tool_input_parse_error"], dict):
+                                    raw_json_detail = tool_args["_tool_input_parse_error"].get("raw_json", "N/A")
+                                log_content_for_history = {"error": error_text, "raw_json": raw_json_detail}
                                 yield "status", f"{EMOJI_MAP['failure']} Input Error [bold]{tool_short_name}[/]: Client parse failed."
-                                log.error(f"{error_text} Raw: {raw_json_str}")
+                                log.error(f"{error_text} Raw: {log_content_for_history['raw_json']}")
                             else:
-                                # Proceed with cache check and execution
+                                # Check if tool exists locally
                                 mcp_tool_obj = self.server_manager.tools.get(original_tool_name)
                                 if not mcp_tool_obj:
                                     error_text = f"Tool '{original_tool_name}' not found by client."
@@ -9674,244 +9831,220 @@ class MCPClient:
                                     log_content_for_history = {"error": error_text}
                                     yield "status", f"{EMOJI_MAP['failure']} Tool Error: Tool '[bold]{original_tool_name}[/]' not found."
                                 else:
+                                    # Tool exists, proceed with cache check and execution
                                     server_name = mcp_tool_obj.server_name
                                     servers_used.add(server_name)
                                     tools_used.append(original_tool_name)
                                     cached_result = None
-                                    if self.tool_cache and self.config.enable_caching:
-                                        try:
-                                            cached_result = self.tool_cache.get(original_tool_name, tool_args)
-                                        except TypeError:
-                                            cached_result = None
 
-                                        cache_is_error = isinstance(cached_result, dict) and cached_result.get("error")
+                                    # Cache Check
+                                    if self.tool_cache and self.config.enable_caching:
+                                        try: cached_result = self.tool_cache.get(original_tool_name, tool_args)
+                                        except TypeError: cached_result = None # Unhashable args
+                                        # Check if cached result itself is an error indicator (e.g., {'error': ...})
+                                        # Adapt this check based on how errors might be stored in cache
+                                        cache_is_error = isinstance(cached_result, dict) and cached_result.get("error") is not None
+
                                         if cached_result is not None and not cache_is_error:
                                             tool_result_content = cached_result
                                             log_content_for_history = cached_result
                                             is_error_flag = False
                                             cache_used_flag = True
                                             cache_hits_during_query += 1
+                                            # Estimate tokens saved
                                             content_str_tokens = self._stringify_content(cached_result)
                                             cached_tokens = self._estimate_string_tokens(content_str_tokens)
-                                            self.tokens_saved_by_cache += cached_tokens  # Accumulate saved tokens
-                                            yield "status", f"{EMOJI_MAP['cached']} Using cache [bold]{tool_short_name}[/] ({cached_tokens:,} tokens)"
+                                            self.tokens_saved_by_cache += cached_tokens
+                                            yield "status", f"{EMOJI_MAP['cached']} Using cache [bold]{tool_short_name}[/] ({cached_tokens:,} tokens saved)"
                                             log.info(f"Using cached result for {original_tool_name}")
                                         elif cached_result is not None:
-                                            log.info(f"Ignoring cached error for {original_tool_name}")
-                                            cached_result = None  # Reset so we execute below
+                                            # We found a cached *error* result, ignore it and execute fresh
+                                            log.info(f"Ignoring cached error result for {original_tool_name}. Executing tool.")
+                                            cached_result = None # Ensure we don't use it
 
+                                    # Execute Tool if not cached or cache was error
                                     if not cache_used_flag:
                                         yield "status", f"{EMOJI_MAP['server']} Executing [bold]{tool_short_name}[/] via {server_name}..."
                                         log.info(f"Executing tool '{original_tool_name}' via server '{server_name}'...")
                                         try:
-                                            if current_task.cancelled():
-                                                raise asyncio.CancelledError("Cancelled before tool execution")
+                                            if current_task.cancelled(): raise asyncio.CancelledError("Cancelled before tool execution")
                                             with safe_stdout():
+                                                # Ensure execute_tool exists and handles context correctly
                                                 exec_params = {"server_name": server_name, "tool_name": original_tool_name, "tool_args": tool_args}
                                                 mcp_result: CallToolResult = await self.execute_tool(**exec_params)
                                             tool_latency = time.time() - tool_start_time
+
                                             if mcp_result.isError:
-                                                error_detail = str(mcp_result.content) if mcp_result.content else "Unknown server error"
+                                                error_detail = str(mcp_result.content) if mcp_result.content is not None else "Unknown server error"
                                                 tool_result_content = f"Error: Tool execution failed: {error_detail}"
+                                                # Store structured error info for history if possible
                                                 log_content_for_history = {"error": error_detail, "raw_content": mcp_result.content}
-                                                yield (
-                                                    "status",
-                                                    f"{EMOJI_MAP['failure']} Error [bold]{tool_short_name}[/] ({tool_latency:.1f}s): {error_detail[:100]}...",
-                                                )
+                                                yield "status", f"{EMOJI_MAP['failure']} Error [bold]{tool_short_name}[/] ({tool_latency:.1f}s): {error_detail[:100]}..."
                                                 log.warning(f"Tool '{original_tool_name}' failed on '{server_name}': {error_detail}")
+                                                # Note: is_error_flag remains True
                                             else:
+                                                # Success case
                                                 tool_result_content = mcp_result.content if mcp_result.content is not None else ""
                                                 log_content_for_history = mcp_result.content
                                                 is_error_flag = False
                                                 content_str_tokens = self._stringify_content(tool_result_content)
                                                 result_tokens = self._estimate_string_tokens(content_str_tokens)
-                                                yield (
-                                                    "status",
-                                                    f"{EMOJI_MAP['success']} Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {tool_latency:.1f}s)",
-                                                )
+                                                yield "status", f"{EMOJI_MAP['success']} Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {tool_latency:.1f}s)"
                                                 log.info(f"Tool '{original_tool_name}' OK ({result_tokens:,} tokens, {tool_latency:.1f}s)")
+                                                # Cache the successful result
                                                 if self.tool_cache and self.config.enable_caching and not is_error_flag:
-                                                    try:
-                                                        cache_set_params = {
-                                                            "tool_name": original_tool_name,
-                                                            "params": tool_args,
-                                                            "result": tool_result_content,
-                                                        }
-                                                        self.tool_cache.set(**cache_set_params)
-                                                    except TypeError:
-                                                        log.warning(f"Failed cache {original_tool_name}: unhashable args")
+                                                    try: self.tool_cache.set(original_tool_name, tool_args, tool_result_content)
+                                                    except TypeError: log.warning(f"Failed cache {original_tool_name}: unhashable args")
+
                                         except asyncio.CancelledError:
-                                            log.debug(f"Tool execution cancelled: {original_tool_name}")
                                             tool_result_content = "Error: Tool execution cancelled by user."
                                             log_content_for_history = {"error": "Tool execution cancelled"}
-                                            is_error_flag = True
+                                            is_error_flag = True # Ensure error flag is set
                                             yield "status", f"[yellow]Tool [bold]{tool_short_name}[/] aborted.[/]"
-                                            raise  # Propagate cancellation
+                                            raise # Re-raise cancellation to stop the query
                                         except Exception as exec_err:
+                                            # Catch client-side errors during execute_tool call
                                             tool_latency = time.time() - tool_start_time
-                                            log.error(f"Client error during tool execution {original_tool_name}: {exec_err}", exc_info=True)
-                                            error_text = f"Client error: {str(exec_err)}"
+                                            error_text = f"Client error during execution: {str(exec_err)}"
                                             tool_result_content = f"Error: {error_text}"
                                             log_content_for_history = {"error": error_text}
-                                            yield (
-                                                "status",
-                                                f"{EMOJI_MAP['failure']} Client Error [bold]{tool_short_name}[/] ({tool_latency:.2f}s): {str(exec_err)}",
-                                            )
+                                            is_error_flag = True # Ensure error flag is set
+                                            yield "status", f"{EMOJI_MAP['failure']} Client Error [bold]{tool_short_name}[/] ({tool_latency:.2f}s): {str(exec_err)}"
+                                            log.error(f"Client error executing {original_tool_name}: {exec_err}", exc_info=True)
 
-                            # Append result to message list for *next* turn
+                            # Construct the tool result block for the API call and history
                             tool_result_block: ToolResultContentBlock = {
                                 "type": "tool_result",
                                 "tool_use_id": tool_use_id,
-                                "content": tool_result_content,
+                                "content": tool_result_content, # The content to send back to LLM
                                 "is_error": is_error_flag,
-                                "_is_tool_result":  # Add internal marker
-                                True,
+                                "_is_tool_result": True # Internal flag
                             }
-                            tool_result_message: InternalMessage = {
-                                "role": "user",  # Tool results are sent back as 'user' role in internal format
-                                "content": [tool_result_block],
-                            }
+                            # Message to send back to API
+                            tool_result_message: InternalMessage = {"role": "user", "content": [tool_result_block]}
                             tool_results_for_api.append(tool_result_message)
-                            tool_results_for_history.append(
-                                {
-                                    "tool_name": original_tool_name,
-                                    "tool_use_id": tool_use_id,
-                                    "content": log_content_for_history,
-                                    "is_error": is_error_flag,
-                                    "cache_used": cache_used_flag,
-                                }
-                            )
-                            await asyncio.sleep(0.01)  # Tiny sleep between tool results
+                            # More detailed entry for client-side history log
+                            tool_results_for_history.append({
+                                "tool_name": original_tool_name,
+                                "tool_use_id": tool_use_id,
+                                "content": log_content_for_history, # Potentially more structured content/error
+                                "is_error": is_error_flag,
+                                "cache_used": cache_used_flag
+                            })
+                            await asyncio.sleep(0.01) # Slight delay for status updates
 
-                    # --- End Tool Execution Loop ---
-                    except asyncio.CancelledError:
-                        raise  # Propagate cancellation
-                    except Exception as tool_loop_err:  # Catch unexpected errors in the loop itself
+                    except asyncio.CancelledError: raise # Propagate cancellation
+                    except Exception as tool_loop_err:
                         log.error(f"Unexpected error during tool execution loop: {tool_loop_err}", exc_info=True)
                         yield "error", f"Error during tool processing: {tool_loop_err}"
-                        error_occurred = True
-                        stop_reason = "error"
-                        break  # Mark error and break outer loop
+                        error_occurred = True; stop_reason = "error"; break # Exit loop on tool processing error
 
-                    # If tool loop finished without error/cancellation
+                    # Add tool results to message history for the next API turn
                     messages.extend(tool_results_for_api)
-                    self.cache_hit_count += cache_hits_during_query  # Accumulate hits for this turn
+                    self.cache_hit_count += cache_hits_during_query # Update session cache hit count
                     log.info(f"Added {len(tool_results_for_api)} tool results. Continuing interaction loop.")
                     await asyncio.sleep(0.01)
-                    continue  # Continue main loop for next API call
+                    continue # Continue the main while loop to send results back to LLM
 
-                elif stop_reason == "error":  # Break if stream handler or API call yielded error
+                elif stop_reason == "error":
                     log.error(f"Exiting interaction loop due to error during turn for {provider_name}.")
                     yield "status", "[bold red]Exiting due to turn error.[/]"
                     error_occurred = True
                     break
-                else:  # Normal finish (end_turn, max_tokens, etc.)
+                else:
+                    # Any other stop reason (e.g., "stop", "max_tokens", "end_turn") terminates the loop
                     log.info(f"LLM interaction finished normally. Stop reason: {stop_reason}")
-                    break  # Exit the main loop
+                    break
 
         # --- Handle Outer Loop Exceptions ---
         except asyncio.CancelledError:
             log.info("Query processing was cancelled.")
             yield "status", "[yellow]Request cancelled by user.[/]"
-            if span:
-                span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
-            stop_reason = "cancelled"  # Set specific stop reason
-            error_occurred = True  # Treat cancellation as an error condition
-            # Don't re-raise here, let finally block handle cleanup
+            if span: span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
+            stop_reason = "cancelled"; error_occurred = True
         except Exception as e:
             error_msg = f"Unexpected error during query processing loop: {str(e)}"
             log.error(error_msg, exc_info=True)
             if span:
                 span.set_status(trace.StatusCode.ERROR, description=error_msg)
-                if hasattr(span, "record_exception"):
-                    span.record_exception(e)  # Check if method exists
-            yield "error", f"Unexpected Error: {error_msg}"  # Yield standardized error
-            stop_reason = "error"
-            error_occurred = True
+                if hasattr(span, "record_exception"): span.record_exception(e)
+            yield "error", f"Unexpected Error: {error_msg}"
+            stop_reason = "error"; error_occurred = True
 
         # --- Final Updates ---
         finally:
-            # Finalize OpenTelemetry Span
             if span:
                 final_status_code = trace.StatusCode.OK
                 final_desc = f"Query finished: {stop_reason or 'completed'}"
-                if error_occurred or stop_reason == "error":
-                    final_status_code = trace.StatusCode.ERROR
-                    final_desc = f"Query failed or cancelled: {stop_reason or 'unknown error'}"
-                elif stop_reason == "cancelled":  # Handle explicit cancellation case
-                    final_status_code = trace.StatusCode.ERROR
-                    final_desc = "Query cancelled by user"
+                is_error_status = False
+                if error_occurred or stop_reason == "error": final_status_code = trace.StatusCode.ERROR; final_desc = f"Query failed or cancelled: {stop_reason or 'unknown error'}"; is_error_status = True
+                elif stop_reason == "cancelled": final_status_code = trace.StatusCode.ERROR; final_desc = "Query cancelled by user"; is_error_status = True
 
-                is_error_status = False # Default to not an error
-                if error_occurred or stop_reason == "error":
-                    final_status_code = trace.StatusCode.ERROR
-                    final_desc = f"Query failed or cancelled: {stop_reason or 'unknown error'}"
-                    is_error_status = True # Set flag if error occurred
-                elif stop_reason == "cancelled":  # Handle explicit cancellation case
-                    final_status_code = trace.StatusCode.ERROR # Treat cancellation as error for span status
-                    final_desc = "Query cancelled by user"
-                    is_error_status = True # Set flag if cancelled
-
-                if is_error_status: # Use the flag defined above
+                # Set status based on outcome
+                if is_error_status:
                     span.set_status(final_status_code, description=final_desc)
                 else:
-                    span.set_status(final_status_code) # No description for OK status
+                    span.set_status(final_status_code)
 
-                # Record final session totals on the main span
-                span.set_attribute("total_input_tokens", self.session_input_tokens)
-                span.set_attribute("total_output_tokens", self.session_output_tokens)
-                span.set_attribute("total_estimated_cost", self.session_total_cost)
-                # Use cache hits accumulated during THIS query only for the span
-                span.set_attribute("cache_hits", cache_hits_during_query)
-                span.set_attribute("tokens_saved_by_cache", self.tokens_saved_by_cache)
-                span_final_event_payload = {"final_stop_reason": stop_reason}
-                span.add_event("query_processing_ended", attributes=span_final_event_payload)
+                # Add final attributes
+                try:
+                    span.set_attribute("total_input_tokens", self.session_input_tokens)
+                    span.set_attribute("total_output_tokens", self.session_output_tokens)
+                    span.set_attribute("total_estimated_cost", self.session_total_cost)
+                    span.set_attribute("cache_hits", cache_hits_during_query) # Use query-specific count
+                    span.set_attribute("tokens_saved_by_cache", self.tokens_saved_by_cache)
+                    # Add final stop reason as an event or attribute
+                    span.add_event("query_processing_ended", attributes={"final_stop_reason": stop_reason or "unknown"})
+                except Exception as span_final_err:
+                    log.warning(f"Failed set final span attrs: {span_final_err}")
 
+            # Close the span context manager if it was created
             if span_context_manager and hasattr(span_context_manager, "__exit__"):
-                with suppress(Exception):
+                with suppress(Exception): # Suppress errors during span closing
                     span_context_manager.__exit__(*sys.exc_info())
 
-            # Update Graph and History *only if not cancelled* and no fatal error
+            # Update Conversation Graph and History Log
             if not error_occurred and not (current_task and current_task.cancelled()):
                 try:
-                    self.conversation_graph.current_node.messages = messages  # Save final state
-                    self.conversation_graph.current_node.model = model  # Record model used
+                    # Save the final state of messages (including user query, assistant responses, tool results)
+                    self.conversation_graph.current_node.messages = messages
+                    self.conversation_graph.current_node.model = internal_model_name_for_cost_lookup # Save original name
                     await self.conversation_graph.save(str(self.conversation_graph_file))
 
+                    # Add entry to client's history log
                     end_time = time.time()
                     latency_ms = (end_time - start_time) * 1000
                     tokens_used_hist = self.session_input_tokens + self.session_output_tokens
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     if hasattr(self, "history") and hasattr(self.history, "add_async"):
-                        history_entry_data = {
-                            "query": query,
-                            "response": final_response_text,
-                            "model": model,
-                            "timestamp": timestamp,
-                            "server_names": list(servers_used),
-                            "tools_used": tools_used,
-                            "conversation_id": self.conversation_graph.current_node.id,
-                            "latency_ms": latency_ms,
-                            "tokens_used": tokens_used_hist,
-                            "streamed": True,
-                            "cached": (cache_hits_during_query > 0),
-                        }
-                        history_entry = ChatHistory(**history_entry_data)
+                        history_entry = ChatHistory(
+                            query=query,
+                            response=final_response_text, # The accumulated text part of the response
+                            model=internal_model_name_for_cost_lookup, # Use original name
+                            timestamp=timestamp,
+                            server_names=list(servers_used),
+                            tools_used=tools_used, # List of original tool names used
+                            conversation_id=self.conversation_graph.current_node.id,
+                            latency_ms=latency_ms,
+                            tokens_used=tokens_used_hist,
+                            streamed=True,
+                            cached=(cache_hits_during_query > 0), # Based on cache hits *during this query*
+                        )
                         await self.history.add_async(history_entry)
                     else:
                         log.warning("History object/method not found, cannot save history.")
                 except Exception as final_update_err:
                     log.error(f"Error during final graph/history update: {final_update_err}", exc_info=True)
-                    # Yield an error here? Maybe just log it.
+                    # Yield error but don't overwrite final usage/stop reason
                     yield "error", f"Failed to save history: {final_update_err}"
 
-            # Yield final usage and stop reason as standardized events
+            # Yield final usage statistics and stop reason
             final_usage_payload = {
                 "input_tokens": self.session_input_tokens,
                 "output_tokens": self.session_output_tokens,
                 "total_cost": self.session_total_cost,
-                "cache_hits": cache_hits_during_query,  # Use hits from this query
-                "tokens_saved": self.tokens_saved_by_cache,  # Use tokens saved during this query
+                "cache_hits": cache_hits_during_query, # Send query-specific count
+                "tokens_saved": self.tokens_saved_by_cache,
             }
             yield "final_usage", final_usage_payload
             yield "stop_reason", stop_reason or "unknown"
@@ -10957,26 +11090,36 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
             async def get_conversation_api(mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Gets the current state of the conversation graph."""
                 node = mcp_client.conversation_graph.current_node
-                # Build node list iteratively
-                nodes_data = []
-                for n in mcp_client.conversation_graph.nodes.values():
-                    nodes_data.append(n.to_dict())
+                nodes_data_serializable = [] # Store serializable node data
 
-                # Ensure messages are serializable
+                # Ensure nodes are serializable using jsonable_encoder
+                for n_id, n_obj in mcp_client.conversation_graph.nodes.items():
+                    try:
+                        # Convert node object to dict first using its method
+                        node_dict = n_obj.to_dict()
+                        # Then encode that dict using jsonable_encoder
+                        serializable_node_data = jsonable_encoder(node_dict)
+                        nodes_data_serializable.append(serializable_node_data)
+                    except Exception as e:
+                        log.error(f"Node data for {n_id} not serializable via jsonable_encoder: {e}", exc_info=True)
+                        # Skip adding problematic node data
+
                 try:
-                    _ = json.dumps(node.messages)
-                    _ = json.dumps(nodes_data)
-                except TypeError as e:
-                    log.error(f"Conversation data not serializable: {e}", exc_info=True)
-                    raise HTTPException(status_code=500, detail="Internal error: Conversation state not serializable") from e
+                    # Explicitly encode the messages list using jsonable_encoder
+                    # This should correctly handle TypedDicts within the list structure
+                    serializable_messages = jsonable_encoder(node.messages)
 
-                return {
-                    "currentNodeId": node.id,
-                    "currentNodeName": node.name,
-                    "messages": node.messages,
-                    "model": node.model or mcp_client.config.default_model,
-                    "nodes": nodes_data,
-                }
+                    # Return the fully encoded data structure
+                    return {
+                        "currentNodeId": node.id,
+                        "currentNodeName": node.name,
+                        "messages": serializable_messages, # Use the encoded list
+                        "model": node.model or mcp_client.config.default_model,
+                        "nodes": nodes_data_serializable, # Use the encoded list of nodes
+                    }
+                except Exception as e: # Catch potential errors during jsonable_encoder itself
+                    log.error(f"Conversation data not serializable via jsonable_encoder: {e}", exc_info=True)
+                    raise HTTPException(status_code=500, detail="Internal error: Conversation state not serializable") from e
 
             @app.post("/api/conversation/fork")
             async def fork_conversation_api(req: ForkRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -11458,21 +11601,32 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     nonlocal active_query_task # Allow modification of outer scope variable
                     try:
                         # Iterate over the standardized events yielded by the stream wrapper
+                        # Call process_streaming_query without model - it uses mcp_client.current_model
                         async for chunk_type, chunk_data in mcp_client._stream_wrapper(mcp_client.process_streaming_query(query_text)):
                             # Forward relevant events to the WebSocket client
                             if chunk_type == "text":
                                 await send_ws_message("text_chunk", chunk_data)
                             elif chunk_type == "status":
-                                plain_status_text = Text.from_markup(str(chunk_data)).plain # Convert potentially marked-up string to plain text
+                                # Convert potentially marked-up string to plain text for basic WS status
+                                plain_status_text = Text.from_markup(str(chunk_data)).plain
                                 await send_ws_message("status", plain_status_text)
                             elif chunk_type == "error":
                                 await send_ws_message("error", {"message": str(chunk_data)})
                             elif chunk_type == "final_stats":
                                 # Send final usage and completion status after stream completes
-                                usage_data = await get_token_usage(mcp_client) # Recalculate based on final client state
+                                # Use the get_token_usage function to get current session stats
+                                usage_data = await get_token_usage(mcp_client)
                                 await send_ws_message("token_usage", usage_data)
                                 await send_ws_message("query_complete", {"stop_reason": chunk_data.get("stop_reason", "unknown")})
-                            # Add handlers for other event types if needed (e.g., tool calls for UI)
+                            elif chunk_type == "tool_call_start":
+                                # Forward tool start event if UI needs it
+                                await send_ws_message("tool_call_start", chunk_data)
+                            elif chunk_type == "tool_call_input_chunk":
+                                # Forward input chunks if UI needs them
+                                await send_ws_message("tool_call_input_chunk", chunk_data)
+                            elif chunk_type == "tool_call_end":
+                                # Forward tool end event if UI needs it
+                                await send_ws_message("tool_call_end", chunk_data)
 
                     except asyncio.CancelledError:
                         log.info(f"WS-{connection_id}: Query task cancelled.")
@@ -11493,7 +11647,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                         if mcp_client.current_query_task and mcp_client.current_query_task is task_being_cleaned:
                             mcp_client.current_query_task = None
                         log.debug(f"WS-{connection_id}: Query consuming task finished.")
-                        # query_complete is now sent with final_stats
+                        # query_complete message is sent via 'final_stats' event handling now
 
                 # --- Main WebSocket Receive Loop ---
                 try:
@@ -11558,12 +11712,13 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                             await send_command_response(True, "Conversation branch cleared.", {"messages": []}) # Send cleared messages
                                         elif cmd == "model":
                                             if args:
-                                                # Optional: Add validation if model is known
-                                                mcp_client.current_model = args
-                                                mcp_client.config.default_model = args
-                                                # Save config in background, don't wait
-                                                asyncio.create_task(mcp_client.config.save_async())
-                                                await send_command_response(True, f"Model set to: {args}", {"currentModel": args})
+                                                # Use the set_active_model method which handles provider logic
+                                                success = await mcp_client.set_active_model(args, source="WebSocket")
+                                                if success:
+                                                    await send_command_response(True, f"Model set to: {args}", {"currentModel": args})
+                                                else:
+                                                    # Error message printed by set_active_model if provider unknown
+                                                    await send_command_response(False, f"Failed to set model to {args} (check logs).", {"currentModel": mcp_client.current_model})
                                             else:
                                                 await send_command_response(True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model})
                                         elif cmd == "fork":
@@ -11601,15 +11756,15 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                             log.info(f"WS-{connection_id} received abort command.")
                                             task_to_cancel = active_query_task # Target the task specific to this connection
                                             if task_to_cancel and not task_to_cancel.done():
-                                                was_cancelled = task_to_cancel.cancel() # Request cancellation
-                                                if was_cancelled:
-                                                    await send_command_response(True, "Abort signal sent to running query.")
-                                                else:
-                                                    # This is unlikely but possible if task finished between check and cancel
-                                                    await send_command_response(False, "Query finished before abort signal could be sent.")
+                                                was_cancelled = task_to_cancel.cancel() # Request cancellation  # noqa: F841
+                                                await send_command_response(True, "Abort signal sent.")
                                             else:
-                                                await send_command_response(False, "No active query running for this connection.")
-                                        # Add other command handlers here if needed
+                                                await send_command_response(False, "No active query for this connection.")
+                                        # Add other command handlers here as needed
+                                        # Example:
+                                        # elif cmd == "some_other_command":
+                                        #      # ... logic ...
+                                        #      await send_command_response(True, "Did something.")
                                         else:
                                             await send_command_response(False, f"Command '/{cmd}' not supported via WebSocket.")
                                     except Exception as cmd_err:
@@ -11706,7 +11861,6 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
             # No explicit return needed, finally block handles cleanup
         elif query:
             # --- Run Single Query ---
-            # ... (Single query logic as before) ...
             query_text = query
             model_to_use = model or client.current_model
             provider_name = client.get_provider_from_model(model_to_use)

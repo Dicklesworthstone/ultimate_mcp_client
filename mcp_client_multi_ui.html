@@ -1874,7 +1874,6 @@
             <div class="tooltip tooltip-bottom" data-tip="Tools">
                 <i class="fas fa-tools fa-fw"></i> <span x-text="tools.length"></span>
             </div>
-            ### Refined, fully-ready markup
 
 <!-- MODEL PICKER ----------------------------------------------------------->
 <div x-data="{search:''}" class="dropdown dropdown-end">
@@ -4761,7 +4760,6 @@
                     this.currentModel = modelName; // Update UI immediately
 
                     console.log(`UI attempting to set model to: ${modelName}`);
-                    this.addNotification(`Switching model to ${this.getFormattedModelName(modelName)}...`, 'info', 1500);
 
                     // Call the new backend API endpoint
                     this.apiFetch('/model', {
