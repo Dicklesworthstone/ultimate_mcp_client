@@ -1932,8 +1932,7 @@
                   x-show="!search
                           || modelInfo.name.toLowerCase().includes(search.toLowerCase())
                           || getFormattedModelName(modelInfo.name).toLowerCase().includes(search.toLowerCase())"
-                  @click="setModel(modelInfo.name);
-                          $root.querySelector('[tabindex]').click()"
+                  @click="setModel(modelInfo.name); if ($el.closest('.dropdown')) $el.closest('.dropdown').removeAttribute('open'); if (document.activeElement) document.activeElement.blur();"
                   :class="{
                     'bg-primary/10 text-primary shadow-sm font-medium':
                         modelInfo.name===currentModel,
@@ -1964,10 +1963,8 @@
                  type="text"
                  placeholder="Enter custom model ID…"
                  class="input input-sm input-bordered w-full pr-8 text-base-content"
-                 @keyup.enter="setCustomModel($refs.custom.value);
-                               $root.querySelector('[tabindex]').click()">
-          <button @click="setCustomModel($refs.custom.value);
-                          $root.querySelector('[tabindex]').click()"
+                 @keyup.enter="setCustomModel($refs.custom.value); if ($el.closest('.dropdown')) $el.closest('.dropdown').removeAttribute('open'); if (document.activeElement) document.activeElement.blur();"
+          <button @click="setCustomModel($refs.custom.value); if ($el.closest('.dropdown')) $el.closest('.dropdown').removeAttribute('open'); if (document.activeElement) document.activeElement.blur();"
                   class="absolute right-2 top-1/2 -translate-y-1/2
                          text-base-content/50 hover:text-primary">
             <i class="fas fa-check text-xs"></i>
@@ -2043,6 +2040,10 @@
                     :class="{ 'tab-active font-semibold !border-primary text-primary': activeTab === 'dashboard' }"
                     @click="activeTab = 'dashboard'" data-tippy-content="Dashboard"><i
                         class="fas fa-chart-bar fa-fw"></i></a>
+                <a role="tab" class="tab flex-1"
+                    :class="{ 'tab-active font-semibold !border-primary text-primary': activeTab === 'agent' }"
+                    @click="activeTab = 'agent'" data-tippy-content="Agent Control">
+                    <i class="fas fa-robot fa-fw"></i></a>                        
             </div>
             <!-- Tab Content -->
             <div class="flex-1 p-3 overflow-y-auto space-y-5">
@@ -3119,19 +3120,162 @@
                     </div>
                 </div>
                 <!-- End Dashboard Tab -->
+                <!-- Agent Tab -->
+                <div x-show="activeTab === 'agent'" x-transition.opacity>
+                    <h2 class="text-base font-semibold mb-3 flex items-center">
+                        <i class="fas fa-robot mr-2 text-primary"></i>Agent Self-Driving Mode
+                    </h2>
+
+                    <!-- Agent Status Display (read-only) -->
+                    <div class="card card-compact bg-base-200/60 shadow-sm p-3 mb-4 text-xs space-y-1">
+                        <div class="flex justify-between items-center">
+                            <span class="font-medium">Status:</span>
+                            <span class="badge badge-sm"
+                                  :class="{
+                                      'badge-success animate-pulse': agentStatus.status === 'running',
+                                      'badge-success': agentStatus.status === 'completed',
+                                      'badge-warning': agentStatus.status === 'starting' || agentStatus.status === 'stopping' || agentStatus.status === 'stopping_timeout',
+                                      'badge-error': agentStatus.status === 'failed' || agentStatus.status === 'error_stopping',
+                                      'badge-ghost': agentStatus.status === 'idle' || agentStatus.status === 'stopped' || agentStatus.status === 'max_loops_reached'
+                                  }"
+                                  x-text="agentStatus.status_display || agentStatus.status || 'Idle'">
+                            </span>
+                        </div>
+                        <div><span class="font-medium">Overall Goal:</span> <span class="opacity-80 truncate block" x-text="agentStatus.current_goal_description_from_agent || 'Not Set'" :title="agentStatus.current_goal_description_from_agent"></span></div>
+                        <div><span class="font-medium">Current Op Goal:</span> <span class="opacity-80 truncate block" x-text="agentStatus.agent_current_operational_goal_description || 'N/A'" :title="agentStatus.agent_current_operational_goal_description"></span></div>
+                        <div x-show="agentStatus.agent_running && agentStatus.max_loops > 0" class="pt-1">
+                            <div class="flex justify-between text-xs opacity-70 mb-0.5">
+                                <span>Loop Progress</span>
+                                <span class="font-mono" x-text="`${agentStatus.current_loop || 0} / ${agentStatus.max_loops || 0}`"></span>
+                            </div>
+                            <progress class="progress progress-primary w-full h-1.5"
+                                      :value="agentStatus.current_loop || 0"
+                                      :max="agentStatus.max_loops || 100"></progress>
+                        </div>
+                        <div><span class="font-medium">Last Action/Msg:</span> <span class="opacity-80 truncate block" x-text="agentStatus.last_action_summary_from_agent || agentStatus.last_message || 'N/A'" :title="agentStatus.last_action_summary_from_agent || agentStatus.last_message"></span></div>
+                        <div><span class="font-medium">Agent Model:</span> <span class="font-mono opacity-80" x-text="agentStatus.agent_target_model || 'N/A'"></span></div>
+
+                        <button class="btn btn-xs btn-ghost btn-block mt-1.5 text-info/80 hover:bg-info/10" @click="fetchAgentStatus">
+                            <i class="fas fa-sync fa-xs" :class="{'fa-spin': isLoadingAgentStatus}"></i> Refresh Status
+                        </button>
+                    </div>
+
+                    <!-- Current Goal Stack (Agent View) -->
+                    <div x-show="agentStatus.agent_current_operational_goal_stack_summary && agentStatus.agent_current_operational_goal_stack_summary.length > 0"
+                         class="my-3 p-3 bg-base-100/70 rounded-md shadow-sm border border-base-300/20">
+                        <h4 class="text-xs font-semibold mb-1.5 text-primary flex items-center">
+                            <i class="fas fa-tasks fa-fw mr-1.5"></i> Current Goal Stack (Agent View)
+                        </h4>
+                        <ul class="list-none pl-0 space-y-1 text-2xs">
+                            <template x-for="(goal, index) in agentStatus.agent_current_operational_goal_stack_summary" :key="goal.goal_id || index">
+                                <li class="flex items-center gap-1.5 p-1.5 rounded-md"
+                                    :class="index === agentStatus.agent_current_operational_goal_stack_summary.length - 1 ? 'bg-primary/10 ring-1 ring-primary/30' : 'bg-base-200/50'">
+                                    <i class="fas fa-flag text-xs opacity-60"
+                                       :class="index === agentStatus.agent_current_operational_goal_stack_summary.length - 1 ? '!text-primary !opacity-100' : 'text-base-content/50'"></i>
+                                    <div class="flex-1 min-w-0">
+                                        <p class="truncate font-medium" x-text="goal.description" :title="goal.description"></p>
+                                        <div class="flex items-center justify-between opacity-70 mt-0.5">
+                                            <span class="badge badge-xs badge-outline font-mono"
+                                                  :class="{
+                                                    'badge-success': goal.status === 'completed',
+                                                    'badge-error': goal.status === 'failed' || goal.status === 'abandoned',
+                                                    'badge-info': goal.status === 'active' || goal.status === 'in_progress',
+                                                    'badge-warning': goal.status === 'paused'
+                                                  }"
+                                                  x-text="goal.status"></span>
+                                            <span class="font-mono opacity-70" x-text="goal.goal_id ? '(...' + goal.goal_id.slice(-6) + ')' : 'Not Synced'"></span>
+                                        </div>
+                                    </div>
+                                </li>
+                            </template>
+                        </ul>
+                    </div>
+
+                    <!-- Current Plan Step Display -->
+                    <div x-show="agentStatus.agent_running && agentStatus.current_plan_from_agent && agentStatus.current_plan_from_agent.length > 0"
+                         class="my-3 p-3 bg-base-100/70 rounded-md shadow-sm border border-base-300/20">
+                        <h4 class="text-xs font-semibold mb-1.5 text-primary flex items-center">
+                            <i class="fas fa-clipboard-list fa-fw mr-1.5"></i> Agent's Current Plan Step
+                        </h4>
+                        <div id="agent-current-plan-table" class="text-xs">
+                            <!-- Tabulator will populate this -->
+                        </div>
+                    </div>
+
+
+                    <!-- Agent Start Controls -->
+                    <div class="space-y-3" x-show="!agentStatus.agent_running && !['starting', 'stopping', 'error_stopping', 'stopping_timeout'].includes(agentStatus.status)">
+                        <div>
+                            <label class="label py-1"><span class="label-text text-xs font-medium">Agent's Overall Goal</span></label>
+                            <textarea class="textarea textarea-bordered w-full text-sm leading-normal" rows="4"
+                                      placeholder="Enter the main objective for the agent... Be specific and actionable."
+                                      x-model.lazy="agentControl.goal"></textarea>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2 items-end">
+                            <div>
+                                <label class="label py-1"><span class="label-text text-xs font-medium">Max Loops</span></label>
+                                <input type="number" class="input input-bordered input-sm w-full" min="1" max="1000"
+                                       x-model.number="agentControl.maxLoops">
+                            </div>
+                            <div>
+                                <label class="label py-1"><span class="label-text text-xs font-medium">LLM Model (Optional)</span></label>
+                                <input type="text" class="input input-bordered input-sm w-full"
+                                       placeholder="Current client default or override"
+                                       x-model.lazy="agentControl.llmModel"
+                                       list="agentModelDatalistShared"> <!-- Use a shared datalist ID if applicable -->
+                                <!-- Re-using datalist from header might be good, ensure ID is consistent or duplicate it here if needed -->
+                                <datalist id="agentModelDatalistShared">
+                                    <template x-for="providerName in Object.keys(modelsByProvider)" :key="providerName">
+                                        <template x-for="modelInfo in modelsByProvider[providerName]" :key="modelInfo.name">
+                                            <option :value="modelInfo.name" x-text="getFormattedModelName(modelInfo.name) + ' (' + providerName + ')'"></option>
+                                        </template>
+                                    </template>
+                                </datalist>
+                            </div>
+                        </div>
+                        <button class="btn btn-primary btn-block mt-2"
+                                @click="startAgent"
+                                :disabled="!agentControl.goal.trim() || agentControl.maxLoops <= 0 || isLoadingAgentAction || agentStatus.agent_running">
+                            <i class="fas fa-play mr-2"></i> Start Agent
+                        </button>
+                    </div>
+
+                    <!-- Agent Active Controls (Stop, Guidance) -->
+                    <div x-show="agentStatus.agent_running || ['starting', 'stopping', 'stopping_timeout'].includes(agentStatus.status)" class="space-y-3 mt-2">
+                        <button class="btn btn-error btn-block"
+                                @click="stopAgent"
+                                :disabled="isLoadingAgentAction || ['stopped', 'idle', 'failed', 'completed', 'error_stopping'].includes(agentStatus.status)">
+                            <i class="fas fa-stop mr-2"></i>
+                            <span x-text="agentStatus.status === 'stopping' || agentStatus.status === 'stopping_timeout' ? 'Stopping...' : 'Stop Agent'"></span>
+                        </button>
+
+                        <div class="mt-4 pt-3 border-t border-base-300/30" x-show="agentStatus.agent_running">
+                            <label class="label py-1"><span class="label-text text-xs font-medium">Provide Guidance / Observation to Agent:</span></label>
+                            <div class="flex gap-2">
+                                <input type="text" class="input input-sm input-bordered flex-grow" x-model="agentControl.guidanceText"
+                                       placeholder="e.g., 'Focus on analyzing the CSV file first.'">
+                                <button class="btn btn-sm btn-secondary" @click="sendAgentGuidance"
+                                        :disabled="!agentControl.guidanceText.trim() || isLoadingAgentAction">
+                                    Send Hint
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- End Agent Tab -->
             </div>
             <!-- End Tab Content -->
         </aside>
         <!-- End Sidebar -->
         <!-- Chat Area -->
         <main class="flex-1 flex flex-col h-full bg-gradient-to-b from-base-200 to-base-300/50">
-
             <template id="message-render-template">
                 <!-- START: Reusable Message Rendering Block -->
-                <div :id="`message-${message.id || index}`" class="chat relative group/message" :class="{
-                       'chat-start': message.role !== 'user',  /* Corrected: Non-user messages are usually start */
-                       'chat-end': message.role === 'user',    /* Corrected: User messages are usually end */
-                       'compact-mode': uiSettings.compactMode
+                <div :id="`message-${message.id || index}`" class="chat relative group/message"
+                     :class="{
+                         'chat-start': message.role !== 'user', // Agent, Assistant, System messages are chat-start
+                         'chat-end': message.role === 'user',   // User messages are chat-end
+                         'compact-mode': uiSettings.compactMode
                      }">
 
                     <!-- Bookmark Indicator -->
@@ -3141,13 +3285,25 @@
 
                     <!-- Avatar -->
                     <div class="chat-image avatar" x-show="message.role !== 'user'">
-                        <div class="w-8 rounded-full flex items-center justify-center" :class="{
-                               'bg-secondary text-secondary-content': message.role === 'assistant' && !message.is_error && !message.content_type?.includes('tool'),
-                               'bg-neutral text-neutral-content': message.role === 'system' && !message.is_error,
-                               'bg-info text-info-content': (message.content_type === 'tool_result' || message.content_type === 'tool_use' || (Array.isArray(message.content) && message.content.some(b => b.type==='tool_use' || b.type==='tool_result'))) && !message.is_error,
-                               'bg-warning text-warning-content': message.is_error || ((message.content_type === 'tool_result' || message.content_type === 'tool_use' || (Array.isArray(message.content) && message.content.some(b => b.type==='tool_use' || b.type==='tool_result'))) && message.is_error)
+                        <div class="w-8 rounded-full flex items-center justify-center"
+                             :class="{
+                                 // Style for Agent Activity (distinct from regular assistant/LLM)
+                                 'bg-accent text-accent-content': message.is_agent_activity && !message.is_error,
+
+                                 // Style for direct LLM (Assistant) responses (NOT agent activity)
+                                 'bg-secondary text-secondary-content': message.role === 'assistant' && !message.is_agent_activity && !message.is_error && !message.content_type?.includes('tool'),
+
+                                 // Style for System messages
+                                 'bg-neutral text-neutral-content': message.role === 'system' && !message.is_agent_activity && !message.is_error,
+
+                                 // Style for Tool Results/Usage (can be from user-triggered or agent-triggered LLM turns)
+                                 // If it's agent activity and also a tool, agent color takes precedence
+                                 'bg-info text-info-content': !message.is_agent_activity && (message.content_type === 'tool_result' || message.content_type === 'tool_use' || (Array.isArray(message.content) && message.content.some(b => b.type==='tool_use' || b.type==='tool_result'))) && !message.is_error,
+
+                                 // Style for Errors (applies to any non-user role if error)
+                                 'bg-warning text-warning-content': message.is_error
                              }">
-                            <i :class="messageRoleIcon(message.role, message.content_type)" class="text-sm m-0 p-0"></i>
+                            <i :class="message.is_agent_activity ? 'fas fa-cogs' : messageRoleIcon(message.role, message.content_type)" class="text-sm m-0 p-0"></i>
                         </div>
                     </div>
                     <div class="chat-image avatar" x-show="message.role === 'user'">
@@ -3159,8 +3315,8 @@
                     <!-- Header -->
                     <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
                         :class="{'text-right mr-1': message.role === 'user'}">
-                        <span x-text="messageRoleDisplayName(message.role, message.content_type)"></span>
-                        <span x-show="message.model" class="opacity-70"
+                        <span x-text="message.is_agent_activity ? 'Agent Activity' : messageRoleDisplayName(message.role, message.content_type)"></span>
+                        <span x-show="message.model && (!message.is_agent_activity || message.content_type === 'agent_llm_stream_output')" class="opacity-70" <!-- Show model for agent's LLM stream, not for its generic logs -->
                             x-text="message.model ? (' (' + message.model + ')') : ''"></span>
                         <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
                             x-text="formatTimestamp(message.timestamp)"></time>
@@ -3172,19 +3328,21 @@
                     </div>
 
                     <!-- Chat Bubble -->
-                    <div class="chat-bubble prose prose-sm max-w-none" :class="{
-                            'chat-bubble-warning text-warning-content': message.is_error,
-                            'chat-bubble-primary text-primary-content': !message.is_error && message.role === 'user',
-                            'bg-neutral text-neutral-content': !message.is_error && message.role === 'assistant' && !message.current_status && !message.content_type?.includes('tool'),
-                            'chat-bubble-info text-info-content': !message.is_error && (message.role === 'system' || (message.role === 'assistant' && message.current_status) || message.content_type?.includes('tool')),
+                    <div class="chat-bubble prose prose-sm max-w-none"
+                         :class="{
+                            'chat-bubble-warning text-warning-content': message.is_error, // Error style first
+                            'chat-bubble-primary text-primary-content': !message.is_error && message.role === 'user', // User
+                            'chat-bubble-accent text-accent-content': !message.is_error && message.is_agent_activity, // Agent Activity (takes precedence over assistant/system if agent_activity)
+                            'bg-neutral text-neutral-content': !message.is_error && !message.is_agent_activity && message.role === 'assistant' && !message.current_status && !message.content_type?.includes('tool'), // LLM direct response (not agent)
+                            'chat-bubble-info text-info-content': !message.is_error && !message.is_agent_activity && (message.role === 'system' || (message.role === 'assistant' && message.current_status) || message.content_type?.includes('tool')), // System, LLM status, or tool data (not agent)
                             'animate__animated animate__fadeInUp animate__faster': shouldAnimate(message.id || index)
                          }"
                         x-html="isMessageSearchActive ? renderMessageWithHighlight(message) : renderMessageContent(message)">
                         <!-- Content rendered by x-html -->
                     </div>
 
-                    <!-- Status Updates -->
-                    <div class="chat-footer" x-show="message.role === 'assistant' && message.current_status">
+                    <!-- Status Updates (for direct LLM assistant responses, not agent specific status) -->
+                    <div class="chat-footer" x-show="message.role === 'assistant' && !message.is_agent_activity && message.current_status">
                         <span class="streaming-status opacity-70" x-text="message.current_status"></span>
                     </div>
                 </div>
@@ -4250,6 +4408,38 @@
                 },
                 originalThemeBeforePreview: null,
 
+                agentStatus: {
+                    agent_running: false,
+                    status: 'idle',
+                    status_display: 'Idle',
+                    current_goal_description_from_agent: '',        // Overall goal for this agent run
+                    agent_current_operational_goal_description: '', // Description of the current UMS goal the agent is focused on
+                    agent_current_operational_goal_id: null,        // ID of the current UMS goal
+                    current_loop: 0,
+                    max_loops: 0,
+                    last_message: '',                               // General last message from agent system
+                    last_action_summary_from_agent: '',             // Summary of last UMS action/thought
+                    current_plan_step_from_agent: '',               // Truncated description of current plan step
+                    current_plan_step_from_agent_full: '',          // Full description
+                    current_plan_step_dependencies: [],             // List of IDs it depends on
+                    agent_target_model: '',
+                    // New property to hold the goal stack summary from API
+                    agent_current_operational_goal_stack_summary: [],
+                    // New property to hold the full current plan from API
+                    current_plan_from_agent: [],
+                },
+                agentControl: {
+                    goal: '',
+                    maxLoops: 50,
+                    llmModel: '',
+                    guidanceText: '' // For the new guidance input
+                },
+                isLoadingAgentAction: false,
+                isLoadingAgentStatus: false, // For the refresh button spinner
+                agentStatusInterval: null,
+                agentPlanTable: null, // To hold the Tabulator instance for the agent's plan
+                currentAgentLlmMessageId: null,
+
                 // --- COMPUTED PROPERTIES ---
                 get connectedServersCount() {
                     return this.servers.filter(s => s.isConnected).length;
@@ -4351,6 +4541,13 @@
                         this.reconcileRecentTools();
                         if (this.uiSettings.groupMessagesByDate) this.updateGroupedMessages();
                         if (this.uiSettings.virtualScrolling) this.updateVirtualScrollHeight();
+                        
+                        // Fetch initial agent status AFTER other data, as it might depend on config
+                        this.fetchAgentStatus(); // Fetch initial agent status
+                        // Decide about polling based on initial status
+                        if (this.agentStatus.agent_running) {
+                            this.startAgentStatusPolling();
+                        }
                     });
                     this.connectWebSocket();
                     this.initTippy();
@@ -4364,6 +4561,8 @@
                             this.fetchCacheData();
                         } else if (newTab === 'dashboard' && !this.isLoadingDashboard) {
                             this.refreshDashboardData();
+                        } else if (newTab === 'agent') { // Refresh agent status when tab is viewed
+                            this.fetchAgentStatus();
                         }
                         if (window.innerWidth < 768) {
                             this.isSidebarOpen = false;
@@ -4407,7 +4606,7 @@
                     this.addMessageToConversation('system', 'Welcome! Connecting to backend...');
                     this.setupHljsThemeSwitcher();
                     document.body.classList.toggle('status-bar-active', this.uiSettings.showStatusBar);
-                    console.log('Multi-Provider MCP Client UI Initialized Successfully.');
+                    console.log('Multi-Provider MCP Client UI Initialized Successfully (with Agent support).');
                 },
                 // --- DATA FETCHING ---
                 async fetchInitialData() {
@@ -4532,6 +4731,292 @@
                         console.error(">>> fetchAvailableModels: Error during fetch:", e);
                         this.modelsByProvider = {}; // Reset on error
                     }
+                },
+                async fetchAgentStatus() {
+                    if (this.isLoadingAgentStatus) return;
+                    this.isLoadingAgentStatus = true;
+                    console.log("UI: Fetching agent status via API...");
+                    try {
+                        const statusData = await this.apiFetch('/agent/status'); // This might throw if fetch itself fails
+
+                        if (statusData && typeof statusData === 'object') { // Ensure statusData is an object
+                            // Merge carefully, only updating if keys exist in statusData
+                            // This prevents accidentally wiping parts of agentStatus if API returns partial data
+                            for (const key in this.agentStatus) {
+                                if (statusData.hasOwnProperty(key)) {
+                                    this.agentStatus[key] = statusData[key];
+                                }
+                            }
+
+                            // Ensure status_display is always sensible
+                            let display = this.agentStatus.status?.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Unknown';
+                            if (this.agentStatus.agent_running) {
+                                display = `Running (Loop ${this.agentStatus.current_loop || 0}/${this.agentStatus.max_loops || 0})`;
+                            } else if (this.agentStatus.status === 'completed') {
+                                display = 'Goal Achieved!';
+                            } else if (this.agentStatus.status === 'failed') {
+                                display = 'Failed';
+                            } else if (this.agentStatus.status === 'stopped') {
+                                display = 'Stopped';
+                            } else if (this.agentStatus.status === 'idle' && this.agentStatus.last_message?.includes("Agent task completed")) {
+                                display = 'Completed (Idle)';
+                            }
+                            this.agentStatus.status_display = display;
+
+
+                            console.log("UI: Agent status updated from API", JSON.parse(JSON.stringify(this.agentStatus))); // Deep copy for logging
+
+                            if (!this.agentStatus.agent_running && this.agentStatusInterval) {
+                                this.stopAgentStatusPolling();
+                            } else if (this.agentStatus.agent_running && !this.agentStatusInterval) {
+                                this.startAgentStatusPolling();
+                            }
+
+                            // Relay new agent action summaries to chat
+                            if (this.uiSettings.showToolDataMessages &&
+                                statusData.last_action_summary_from_agent &&
+                                (!this.lastDisplayedAgentAction || this.lastDisplayedAgentAction !== statusData.last_action_summary_from_agent)) {
+                                this.addMessageToConversation(
+                                    'system',
+                                    statusData.last_action_summary_from_agent,
+                                    {
+                                        is_agent_activity: true,
+                                        content_type: 'agent_log_summary',
+                                        timestamp: new Date().toISOString()
+                                    }
+                                );
+                                this.lastDisplayedAgentAction = statusData.last_action_summary_from_agent;
+                            }
+                        } else {
+                            // Handle cases where API returns 200 OK but body is not a valid object (e.g., null, empty string)
+                            console.warn("UI: Received non-object or empty data from /api/agent/status:", statusData);
+                            this.addNotification('Received invalid status data from server.', 'warning');
+                            // Potentially set a default error state for agentStatus here if needed
+                            this.agentStatus.status = 'error_fetching_data';
+                            this.agentStatus.status_display = 'Error: Invalid Data';
+                        }
+                    } catch (e) { // Catches errors from apiFetch (network, or if apiFetch re-throws HTTP errors)
+                        this.addNotification(`Failed to fetch agent status: ${e.message || 'Unknown API error'}`, 'error');
+                        console.error("UI: Error in fetchAgentStatus during apiFetch:", e);
+                        // Optionally set agentStatus to a default error state
+                        this.agentStatus.status = 'error_fetching_api';
+                        this.agentStatus.status_display = 'Error: API Unreachable';
+                    } finally {
+                        this.isLoadingAgentStatus = false;
+                    }
+                },
+
+                async startAgent() {
+                    if (!this.agentControl.goal.trim()) {
+                        this.addNotification('Agent goal cannot be empty.', 'warning');
+                        return;
+                    }
+                    const maxLoops = parseInt(this.agentControl.maxLoops, 10);
+                    if (isNaN(maxLoops) || maxLoops <= 0) {
+                        this.addNotification('Max loops must be a positive number.', 'warning');
+                        return;
+                    }
+                    this.isLoadingAgentAction = true;
+                    this.addNotification(`Requesting agent start for goal: "${this.agentControl.goal.substring(0,30)}..."`, 'info');
+                    // Clear previous agent messages if any, or start a new "run" section
+                    this.addMessageToConversation('system', `--- Agent Run Starting: ${this.agentControl.goal} ---`, { is_agent_activity: true, content_type: 'agent_run_marker' });
+
+                    try {
+                        const payload = {
+                            goal: this.agentControl.goal,
+                            max_loops: maxLoops,
+                        };
+                        if (this.agentControl.llmModel && this.agentControl.llmModel.trim()) {
+                            payload.llm_model = this.agentControl.llmModel.trim();
+                        }
+                        const result = await this.apiFetch('/agent/start', {
+                            method: 'POST',
+                            body: JSON.stringify(payload)
+                        });
+                        
+                        this.addNotification(result.message || 'Agent start request processing.', result.success ? 'success' : 'error');
+                        
+                        // Update status from the response of the start call itself
+                        if (result.agent_status) {
+                            this.agentStatus = { ...this.agentStatus, ...result.agent_status };
+                            let display = this.agentStatus.status?.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Unknown';
+                            if (this.agentStatus.agent_running) display = `Running (Loop ${this.agentStatus.current_loop || 0}/${this.agentStatus.max_loops || 0})`;
+                            this.agentStatus.status_display = display;
+                            if(this.agentStatus.current_plan_from_agent) this.initAgentPlanTable(this.agentStatus.current_plan_from_agent);
+
+
+                        } else { // Fallback to fetching status if not in direct response
+                            await this.fetchAgentStatus();
+                        }
+
+                        if(this.agentStatus.agent_running && !this.agentStatusInterval) {
+                            this.startAgentStatusPolling();
+                        }
+                    } catch (e) {
+                        this.addNotification(`Failed to start agent: ${e.message}`, 'error');
+                        await this.fetchAgentStatus(); // Refresh status even on error
+                    } finally {
+                        this.isLoadingAgentAction = false;
+                    }
+                },
+
+                async stopAgent() {
+                    if (!this.agentStatus.agent_running && !['starting', 'stopping', 'stopping_timeout'].includes(this.agentStatus.status)) {
+                        this.addNotification('Agent is not currently running or starting.', 'info');
+                        return;
+                    }
+                    this.isLoadingAgentAction = true;
+                    this.addNotification('Requesting agent to stop...', 'info');
+                    try {
+                        const result = await this.apiFetch('/agent/stop', { method: 'POST' });
+                        this.addNotification(result.message || 'Agent stop request sent.', result.success ? 'success' : 'warning');
+                        
+                        if (result.agent_status) {
+                            this.agentStatus = { ...this.agentStatus, ...result.agent_status };
+                            let display = this.agentStatus.status?.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Unknown';
+                            if (this.agentStatus.agent_running) display = `Running (Loop ${this.agentStatus.current_loop || 0}/${this.agentStatus.max_loops || 0})`;
+                            else if (this.agentStatus.status === 'stopped') display = 'Stopped';
+                            this.agentStatus.status_display = display;
+                            if(this.agentStatus.current_plan_from_agent) this.initAgentPlanTable(this.agentStatus.current_plan_from_agent);
+
+                        } else {
+                            await this.fetchAgentStatus();
+                        }
+
+                        if (!this.agentStatus.agent_running && this.agentStatusInterval) {
+                            this.stopAgentStatusPolling();
+                        }
+                    } catch (e) {
+                        this.addNotification(`Failed to send stop signal: ${e.message}`, 'error');
+                        await this.fetchAgentStatus();
+                    } finally {
+                        this.isLoadingAgentAction = false;
+                    }
+                },
+
+                startAgentStatusPolling() {
+                    if (this.agentStatusInterval) clearInterval(this.agentStatusInterval); // Clear existing before starting new
+                    this.agentStatusInterval = setInterval(() => {
+                        // Only poll if agent was seen as running or in a transition state by the last fetch
+                        if (this.agentStatus.agent_running || 
+                            ['starting', 'stopping', 'running', 'stopping_timeout'].includes(this.agentStatus.status)) {
+                            this.fetchAgentStatus();
+                        } else {
+                            this.stopAgentStatusPolling(); // Stop if no longer in an active state
+                        }
+                    }, 3000); // Poll every 3 seconds
+                    console.log("UI: Agent status polling started/restarted.");
+                },
+                stopAgentStatusPolling() {
+                    if (this.agentStatusInterval) {
+                        clearInterval(this.agentStatusInterval);
+                        this.agentStatusInterval = null;
+                        console.log("UI: Agent status polling stopped.");
+                    }
+                },
+                initAgentPlanTable(planData) {
+                    const tableId = 'agent-current-plan-table';
+                    // Defer execution slightly to ensure DOM is settled after tab switch or data load
+                    this.$nextTick(() => {
+                        const tableElement = document.getElementById(tableId);
+
+                        if (this.activeTab !== 'agent' || !tableElement) {
+                            if (this.agentPlanTable) {
+                                // If tab not active or element gone, destroy existing table
+                                console.log("UI: Agent tab not active or table element missing, destroying agent plan table if exists.");
+                                try { this.agentPlanTable.destroy(); } catch(e) { console.warn("Error destroying agent plan table:", e); }
+                                this.agentPlanTable = null;
+                            }
+                            return;
+                        }
+
+                        const validPlanData = Array.isArray(planData) ? planData : [];
+                        const columns = [ 
+                            { title: "ID", field: "id", width: 70, frozen:true, cssClass: "p-1 text-2xs font-mono", formatter: (cell) => cell.getValue() ? '...' + cell.getValue().slice(-6) : '' },
+                            { title: "Step Description", field: "description", hozAlign: "left", sorter: "string", minWidth: 250, tooltip: true, cssClass: "p-1 text-2xs whitespace-normal", formatter: "textarea" },
+                            { title: "Status", field: "status", width: 100, hozAlign: "center", cssClass: "p-1 text-2xs", formatter: (cell) => {
+                                const status = cell.getValue();
+                                let badgeClass = 'badge-ghost'; let icon = '';
+                                if (status === 'completed') { badgeClass = 'badge-success'; icon = '<i class="fas fa-check fa-xs mr-1"></i>'; }
+                                else if (status === 'failed') { badgeClass = 'badge-error'; icon = '<i class="fas fa-times fa-xs mr-1"></i>'; }
+                                else if (status === 'in_progress') { badgeClass = 'badge-info animate-pulse'; icon = '<i class="fas fa-spinner fa-spin fa-xs mr-1"></i>'; }
+                                else if (status === 'planned') { badgeClass = 'badge-outline'; icon = '<i class="fas fa-circle-notch fa-xs mr-1 opacity-50"></i>'; }
+                                else if (status === 'skipped') { badgeClass = 'badge-neutral opacity-60'; icon = '<i class="fas fa-forward fa-xs mr-1"></i>'; }
+                                return `<span class="badge badge-xs ${badgeClass} !text-2xs !leading-tight !h-auto !py-0.5 !px-1.5">${icon}${status}</span>`;
+                            }
+                            },
+                            { title: "Tool", field: "assigned_tool", width: 120, hozAlign: "left", cssClass: "p-1 text-2xs truncate", formatter: (cell) => cell.getValue() ? cell.getValue().split(':').pop() : '-', tooltip: (c) => c.getValue() },
+                            { title: "Depends On", field: "depends_on", width: 100, cssClass: "p-1 text-2xs", formatter: (cell) => (cell.getValue() || []).map(d => '...' + d.slice(-6)).join(', ') || '-' }
+                        ];
+                        if (!this.agentPlanTable) { // Table NOT initialized
+                            console.log("UI: Initializing new agent plan Tabulator table because instance is null.");
+                            const placeholderText = validPlanData.length === 0 ? "Agent has no active plan or is idle." : "Loading plan...";
+                            try {
+                                this.agentPlanTable = new Tabulator(tableElement, {
+                                    data: validPlanData,
+                                    layout: "fitData",
+                                    height: "180px",
+                                    placeholder: placeholderText,
+                                    columns: columns,
+                                    movableColumns: true,
+                                    initialSort: [{ column: "id", dir: "asc" }]
+                                });
+                                // this.$nextTick(() => this.initTippy()); // Tippy for table content if needed
+                            } catch(e) {
+                                console.error("UI: Failed to initialize agent plan Tabulator table:", e);
+                                this.agentPlanTable = null;
+                            }
+                        } else { // Table IS initialized, just update data
+                            console.log("UI: Updating data for existing agent plan Tabulator table.");
+                            const placeholderText = validPlanData.length === 0 ? "Agent has no active plan or is idle." : "";
+                            try {
+                                this.agentPlanTable.setPlaceholder(placeholderText);
+                                this.agentPlanTable.setData(validPlanData)
+                                    //.then(() => { this.$nextTick(() => this.initTippy()); }) // Tippy after data update
+                                    .catch(err => console.error("UI: Tabulator setData error for agent plan:", err));
+                            } catch (e) {
+                                console.error("UI: Error calling setData on agent plan table (instance might be invalid):", e);
+                                // If setData fails, instance might be broken, try re-initializing next time
+                                try {this.agentPlanTable.destroy(); } catch(de) {}
+                                this.agentPlanTable = null;
+                            }
+                        }
+                    }); // End $nextTick
+                },
+                async sendAgentGuidance() {
+                    if (!this.agentControl.guidanceText.trim()) {
+                        this.addNotification('Guidance text cannot be empty.', 'warning');
+                        return;
+                    }
+                    if (!this.agentStatus.agent_running) {
+                        this.addNotification('Agent is not running. Cannot send guidance.', 'warning');
+                        return;
+                    }
+
+                    this.isLoadingAgentAction = true; // Use the general agent action loader
+                    this.addNotification('Sending guidance to agent...', 'info');
+                    try {
+                        const payload = {
+                            content: this.agentControl.guidanceText,
+                            thought_type: "user_guidance" // Or "observation" if preferred by AML
+                        };
+                        // Assuming new API endpoint /api/agent/inject_thought
+                        const result = await this.apiFetch('/agent/inject_thought', {
+                            method: 'POST',
+                            body: JSON.stringify(payload)
+                        });
+                        this.addNotification(result.message || 'Guidance sent to agent.', result.success ? 'success' : 'error');
+                        if (result.success) {
+                            this.agentControl.guidanceText = ''; // Clear input on success
+                        }
+                    } catch (e) {
+                        this.addNotification(`Failed to send guidance: ${e.message}`, 'error');
+                    } finally {
+                        this.isLoadingAgentAction = false;
+                    }
+                },
+                getCurrentTimestamp() { // We already have formatTimestamp, this is for new messages
+                    return new Date().toISOString();
                 },
                 loadConfig() {
                     // Define default config structure matching Alpine state and Pydantic model (camelCase)
@@ -6716,193 +7201,325 @@
                     }
                 },
                 handleWebSocketMessage(message) {
-                    // --- MODIFIED START ---
-                    let assistantMsg = null;
-                    const backendMessageId = message.message_id; // Check if backend provides an ID
+                // Ensure message and message.type are valid
+                if (!message || typeof message.type !== 'string') {
+                    console.warn('WS: Received invalid or malformed message structure:', message);
+                    return;
+                }
 
-                    // 1. Try finding by backend ID first
+                console.log(`WS: Handling message type: ${message.type}`, message.payload);
+
+                let assistantMsg = null; // For user-initiated queries
+                let agentLlmMsg = null;  // For agent-initiated LLM interactions
+
+                // --- Logic to find/create the correct message object to update ---
+                // This needs to differentiate between a user's query stream and an agent's LLM stream.
+
+                if (message.type.startsWith('agent_llm_')) {
+                    // This message is part of an agent's LLM interaction stream
+                    if (this.currentAgentLlmMessageId) {
+                        agentLlmMsg = this.currentConversation.find(m => m.id === this.currentAgentLlmMessageId);
+                    }
+                    const isAgentStartingEvent = ['agent_llm_text_chunk', 'agent_llm_tool_call_start', 'agent_llm_status'].includes(message.type);
+                    if (!agentLlmMsg && isAgentStartingEvent) {
+                        const timestamp = new Date().toISOString();
+                        const newMsgId = `agent_llm_response_${timestamp}_${Math.random().toString(16).slice(2)}`;
+                        agentLlmMsg = {
+                            role: 'assistant', // Displayed as assistant, but styled as agent
+                            content: '',
+                            id: newMsgId,
+                            timestamp: timestamp,
+                            model: this.agentStatus.agent_target_model || this.currentModelShort, // Use agent's target model
+                            is_agent_activity: true, // Key flag for styling
+                            content_type: 'agent_llm_stream_output', // Specific content type
+                            current_status: message.type === 'agent_llm_status' ? message.payload : null,
+                        };
+                        this.currentConversation.push(agentLlmMsg);
+                        this.currentAgentLlmMessageId = newMsgId;
+                        console.log(`WS: Started NEW AGENT LLM message: ${newMsgId}`);
+                    } else if (!agentLlmMsg && !isAgentStartingEvent && message.type !== 'agent_llm_final_stats' && message.type !== 'agent_llm_error') {
+                        // Received a non-starting agent_llm event without an active agent_llm message (e.g., tool_call_end after text)
+                        // This might happen if an agent LLM turn has multiple content blocks.
+                        // We need to ensure agentLlmMsg is re-fetched if currentAgentLlmMessageId is set.
+                        if(this.currentAgentLlmMessageId) { // Attempt to re-find if ID exists
+                            agentLlmMsg = this.currentConversation.find(m => m.id === this.currentAgentLlmMessageId);
+                            if (!agentLlmMsg) console.warn(`WS: Agent LLM event '${message.type}' received, but currentAgentLlmMessageId '${this.currentAgentLlmMessageId}' not found in conversation.`);
+                        } else {
+                            console.warn(`WS: Agent LLM event '${message.type}' received, but no active currentAgentLlmMessageId.`);
+                        }
+                    }
+
+                } else if (!message.type.startsWith('agent_')) { // Regular user query stream
+                    const backendMessageId = message.message_id;
                     if (backendMessageId) {
                         assistantMsg = this.currentConversation.find(m => m.id === backendMessageId);
                         if (assistantMsg && this.currentAssistantMessageId !== backendMessageId) {
-                            // If found by backend ID, update the component's current ID tracker
-                            console.log(`WS: Switched processing to assistant message ID: ${backendMessageId} (found via backend ID)`);
                             this.currentAssistantMessageId = backendMessageId;
                         }
                     }
-
-                    // 2. If not found by backend ID, try the component's tracked ID (less reliable)
                     if (!assistantMsg && this.currentAssistantMessageId) {
                         assistantMsg = this.currentConversation.find(m => m.id === this.currentAssistantMessageId);
-                    
                     }
-
-                    // 3. Create a new message if it's a starting event AND no message was found yet
-                    const isStartingEvent = ['stream_start', 'text_chunk', 'status', 'tool_call'].includes(message.type); // Define what starts a message
-                    if (!assistantMsg && isStartingEvent) {
+                    const isUserQueryStartingEvent = ['stream_start', 'text_chunk', 'status', 'tool_call_start', 'tool_call_input_chunk', 'tool_call_end'].includes(message.type);
+                    if (!assistantMsg && isUserQueryStartingEvent) {
                         const timestamp = new Date().toISOString();
-                        // Use backend ID if available, otherwise generate temporary ID
                         const newMsgId = backendMessageId || `client_assistant_${timestamp}_${Math.random().toString(16).slice(2)}`;
                         assistantMsg = {
                             role: 'assistant',
-                            content: '', // Initialize content
+                            content: '',
                             id: newMsgId,
                             timestamp: timestamp,
                             current_status: message.type === 'status' ? message.payload : null,
-                            model: this.currentModelShort // Use computed property
+                            model: this.currentModelShort,
+                            is_agent_activity: false // This is a direct LLM response to user
                         };
                         this.currentConversation.push(assistantMsg);
-                        this.currentAssistantMessageId = newMsgId; // Track the ID of the newly created message
-                        if (backendMessageId) {
-                            console.log(`WS: Started NEW assistant message using backend ID: ${newMsgId}`);
-                        } else {
-                            console.warn(`WS: Started assistant message with temporary CLIENT ID: ${newMsgId}`);
-                        }
+                        this.currentAssistantMessageId = newMsgId;
                     }
-                    switch (message.type) {
-                        case 'text_chunk':
-                            // --- ADDED CHECK ---
-                            if (assistantMsg) {
-                                let chunkText = message.payload;
-                                // Ensure content is a string before appending
-                                if (typeof assistantMsg.content !== 'string') {
-                                    console.warn(`WS: Assistant message ${assistantMsg.id} content was not a string, resetting before appending chunk.`);
-                                    assistantMsg.content = '';
-                                }
-                                // Ensure chunk is a string
-                                if (typeof chunkText !== 'string') {
-                                    console.warn(`WS: Received non-string text_chunk payload, stringifying.`);
-                                    chunkText = JSON.stringify(chunkText); // Or handle differently
-                                }
-                                assistantMsg.content += chunkText;
-                                assistantMsg.current_status = null; // Clear status on text
-                                this.currentConversation = [...this.currentConversation]; // Trigger reactivity
-                            } else {
-                                console.warn("WS: Received text_chunk but no corresponding assistant message was found or created.");
-                                // Optionally buffer or discard? For now, just warn.
-                            }
-                            this.scrollToBottom();
-                            break;
-                        case 'status':
-                            // --- ADDED CHECK ---
-                            if (assistantMsg) {
-                                assistantMsg.current_status = message.payload;
-                                this.currentConversation = [...this.currentConversation]; // Trigger reactivity
-                            } else {
-                                // If no active assistant message, show as a general status update
-                                console.warn("WS: Received status but no corresponding assistant message, showing globally.");
-                                this.currentStatusMessage = message.payload;
-                                // Set a timer to clear the global status if needed
-                                setTimeout(() => {
-                                    if (this.currentStatusMessage === message.payload) this.currentStatusMessage = null;
-                                }, 4000);
-                            }
-                            this.scrollToBottom();
-                            break;
-                        case 'tool_result':
-                            const toolResultPayload = message.payload;
-                            this.addMessageToConversation('user', [toolResultPayload], {
-                                content_type: 'tool_result',
-                                id: `tool_result_${toolResultPayload.tool_use_id || Date.now()}`,
-                                is_error: toolResultPayload.is_error || false,
-                                tool_name: toolResultPayload.tool_name
-                            });
-                            this.scrollToBottom();
-                            break;
-                        case 'query_complete':
-                        case 'stream_end':
-                            this.isSendingMessage = false;
-                            this.isLoading = false;
-                            this.currentStatusMessage = null;
-                            if (assistantMsg) assistantMsg.current_status = null;
-                            this.currentAssistantMessageId = null;
+                }
+                // --- End logic to find/create message object ---
+
+                // --- Process message based on type ---
+                switch (message.type) {
+                    // == Standard User Query Stream Events ==
+                    case 'text_chunk':
+                        if (assistantMsg) { // For user's query
+                            if (typeof assistantMsg.content !== 'string') assistantMsg.content = '';
+                            assistantMsg.content += (typeof message.payload === 'string' ? message.payload : JSON.stringify(message.payload));
+                            assistantMsg.current_status = null;
                             this.currentConversation = [...this.currentConversation];
-                            this.$nextTick(() => this.initHighlighting(this.$refs.chatbox));
-                            break;
-                        case 'error':
-                            this.addNotification(`Backend Error: ${message.payload}`, 'error');
+                        } else {
+                            console.warn("WS (user query): Received text_chunk but no active assistant message.");
+                        }
+                        this.scrollToBottom();
+                        break;
+                    case 'status': // For user's query
+                        if (assistantMsg) {
+                            assistantMsg.current_status = message.payload;
+                            this.currentConversation = [...this.currentConversation];
+                        } else {
+                            this.currentStatusMessage = message.payload; // Global status
+                            setTimeout(() => { if (this.currentStatusMessage === message.payload) this.currentStatusMessage = null; }, 4000);
+                        }
+                        this.scrollToBottom();
+                        break;
+                    case 'tool_result': // This is when a tool called by USER's query returns data to LLM
+                        const toolResultPayload = message.payload;
+                        this.addMessageToConversation('user', [toolResultPayload], { // User role because it's input to LLM
+                            content_type: 'tool_result',
+                            id: `tool_result_user_${toolResultPayload.tool_use_id || Date.now()}`,
+                            is_error: toolResultPayload.is_error || false,
+                            tool_name: toolResultPayload.tool_name,
+                            is_agent_activity: false // Not agent's own activity
+                        });
+                        this.scrollToBottom();
+                        break;
+                    case 'query_complete': // For user's query
+                    case 'stream_end':     // For user's query
+                        this.isSendingMessage = false; // This is for user-initiated queries
+                        this.isLoading = false;
+                        this.currentStatusMessage = null;
+                        if (assistantMsg) assistantMsg.current_status = null;
+                        this.currentAssistantMessageId = null; // Reset for user queries
+                        this.currentConversation = [...this.currentConversation];
+                        this.$nextTick(() => this.initHighlighting(this.$refs.chatbox));
+                        break;
+
+                    // == Agent LLM Stream Events ==
+                    case 'agent_llm_text_chunk':
+                        if (agentLlmMsg) {
+                            if (typeof agentLlmMsg.content !== 'string') agentLlmMsg.content = '';
+                            agentLlmMsg.content += (typeof message.payload === 'string' ? message.payload : JSON.stringify(message.payload));
+                            agentLlmMsg.current_status = null;
+                            this.currentConversation = [...this.currentConversation];
+                        } else {
+                            console.warn("WS (agent LLM): Received agent_llm_text_chunk but no active agent LLM message.");
+                        }
+                        this.scrollToBottom();
+                        break;
+                    case 'agent_llm_tool_call_start':
+                        if (agentLlmMsg) { // Add to the agent's LLM output bubble
+                            // Ensure content is an array to hold multiple blocks
+                            if (!Array.isArray(agentLlmMsg.content)) agentLlmMsg.content = [];
+                            // Add a placeholder or representation for the tool call start
+                            agentLlmMsg.content.push({
+                                type: "agent_tool_call_placeholder_start", // Custom internal type for rendering
+                                name: message.payload.name,
+                                id: message.payload.id,
+                                status_text: `Agent preparing tool: ${message.payload.name.split(':').pop()} (ID: ${message.payload.id.substring(0,8)})...`
+                            });
+                            agentLlmMsg.current_status = `Agent preparing tool: ${message.payload.name.split(':').pop()}`;
+                            this.currentConversation = [...this.currentConversation];
+                        }
+                        this.scrollToBottom();
+                        break;
+                    case 'agent_llm_tool_call_input_chunk':
+                        // Could update a specific tool_call_placeholder in agentLlmMsg.content if needed
+                        // For now, a general status update is often enough for this.
+                        if (agentLlmMsg && agentLlmMsg.current_status) {
+                            agentLlmMsg.current_status = `Agent tool input streaming... (${message.payload.id.substring(0,8)})`;
+                            this.currentConversation = [...this.currentConversation];
+                        }
+                        break;
+                    case 'agent_llm_tool_call_end':
+                        if (agentLlmMsg) {
+                            // Update placeholder or add a new block for tool call decision
+                            if (!Array.isArray(agentLlmMsg.content)) agentLlmMsg.content = [];
+                            const toolEndPayload = message.payload; // {id, name, parsed_input}
+                            agentLlmMsg.content.push({
+                                type: "agent_tool_call_placeholder_end", // Custom internal type
+                                name: toolEndPayload.name,
+                                id: toolEndPayload.id,
+                                input: toolEndPayload.parsed_input, // Store the parsed input for potential display
+                                status_text: `Agent LLM decided to call: ${toolEndPayload.name.split(':').pop()}`
+                            });
+                            agentLlmMsg.current_status = `Agent LLM decided: Call ${toolEndPayload.name.split(':').pop()}`;
+                            this.currentConversation = [...this.currentConversation];
+                            // The actual execution and result will come via 'agent_activity_log'
+                        }
+                        // For agent's LLM stream, tool_call_end does NOT mean the agent stream is over.
+                        // It might yield more text or more tool calls.
+                        // We don't reset currentAgentLlmMessageId here.
+                        this.scrollToBottom();
+                        break;
+                    case 'agent_llm_status':
+                        if (agentLlmMsg) {
+                            agentLlmMsg.current_status = `Agent LLM: ${message.payload}`;
+                            this.currentConversation = [...this.currentConversation];
+                        } else {
+                            // General agent status if no specific agent LLM message is active
+                            this.addMessageToConversation('system', `Agent Status: ${message.payload}`, {
+                                is_agent_activity: true, content_type: 'agent_status_update'
+                            });
+                        }
+                        this.scrollToBottom();
+                        break;
+                    case 'agent_llm_final_stats': // This signifies the end of the agent's LLM turn stream
+                        this.currentStatusMessage = `Agent LLM turn finished. Stop: ${message.payload.stop_reason}`;
+                        // Update token usage for the agent's turn if provided in payload
+                        if (message.payload.input_tokens !== undefined) this.tokenUsage.input_tokens += message.payload.input_tokens;
+                        if (message.payload.output_tokens !== undefined) this.tokenUsage.output_tokens += message.payload.output_tokens;
+                        if (message.payload.total_cost !== undefined) this.tokenUsage.total_cost += message.payload.total_cost;
+                        // this.saveToStorage('mcp_token_usage', this.tokenUsage); // Save updated totals
+
+                        if (agentLlmMsg) agentLlmMsg.current_status = null; // Clear status on the bubble
+                        this.currentAgentLlmMessageId = null; // Reset, agent's LLM turn is done
+                        this.currentConversation = [...this.currentConversation];
+                        this.$nextTick(() => this.initHighlighting(this.$refs.chatbox));
+                        break;
+
+                    // == Agent Activity Log (from AML's own actions/thoughts) ==
+                    case 'agent_activity_log':
+                        const activityPayload = message.payload; // Expected: {summary: "...", timestamp: "..."}
+                        this.addMessageToConversation(
+                            'system', // Or a dedicated 'agent_log' role if you want different styling
+                            activityPayload.summary,
+                            {
+                                id: `agent_activity_${activityPayload.timestamp || Date.now()}`,
+                                timestamp: activityPayload.timestamp || new Date().toISOString(),
+                                is_agent_activity: true,
+                                content_type: 'agent_log_summary' // Specific content type
+                            }
+                        );
+                        this.scrollToBottom();
+                        break;
+
+                    // == General Websocket/Client State Messages (Mostly Unchanged) ==
+                    case 'error': // Generic error from backend/MCPClient
+                        this.addNotification(`Backend Error: ${message.payload.message || message.payload}`, 'error');
+                        // These flags are for user-initiated queries, agent has its own status
+                        if (!this.agentStatus.agent_running) {
                             this.isSendingMessage = false;
                             this.isLoading = false;
-                            this.currentStatusMessage = null;
-                            this.currentAssistantMessageId = null;
-                            this.addMessageToConversation('system', `Error processing last request: ${message.payload}`);
-                            break;
-                        case 'token_usage':
+                        }
+                        this.currentStatusMessage = null;
+                        this.currentAssistantMessageId = null; // Reset for user query
+                        this.currentAgentLlmMessageId = null; // Reset for agent query
+                        this.addMessageToConversation('system', `Error processing request: ${message.payload.message || message.payload}`);
+                        break;
+                    case 'token_usage': // Usually for user-initiated queries' final stats
+                        // If agent is running, its token usage is part of agent_llm_final_stats
+                        if (!this.agentStatus.agent_running) {
                             this.tokenUsage = message.payload;
                             this.saveToStorage('mcp_token_usage', this.tokenUsage);
-                            break;
-                        case 'command_response':
-                            const responseData = message.payload;
-                            const notificationType = responseData.success ? 'success' : 'error';
-                            this.addNotification(responseData.message, notificationType);
-                            if (responseData.success) {
-                                const command = responseData.originalCommand || this.lastSentCommand;
-                                if (responseData.message.startsWith("Model set to:")) {
-                                    const newModel = responseData.message.split("Model set to: ")[1];
-                                    if (newModel) {
-                                        this.currentModel = newModel;
-                                        if (!Object.values(this.modelsByProvider).flat().some(m => m.name === newModel)) {
-                                            console.warn("Setting custom model not in fetched list:", newModel); /* Optionally add to a custom list */
-                                        }
-                                    }
+                        }
+                        break;
+                    case 'command_response':
+                        const responseData = message.payload;
+                        const notificationType = responseData.success ? 'success' : 'error';
+                        this.addNotification(responseData.message, notificationType);
+                        if (responseData.success) {
+                            if (responseData.message.startsWith("Model set to:")) {
+                                const newModel = responseData.message.split("Model set to: ")[1];
+                                if (newModel) {
+                                    this.currentModel = newModel; // This is for the user's direct interaction model
+                                    // Potentially update config.defaultModel if the API confirms it
                                 }
-                                if (responseData.success) {
-                                    console.log("Command successful, refreshing conversation state...");
+                            }
+                            // Refresh conversation if a command might have changed its state
+                            // (e.g., clear, fork, checkout, apply_prompt)
+                            const commandsRequiringConvoRefresh = ["branch cleared", "Switched to branch", "Prompt applied"];
+                            if (commandsRequiringConvoRefresh.some(txt => responseData.message.includes(txt)) || responseData.messages) {
+                                console.log("Command successful, refreshing conversation state from command_response...");
+                                // If payload includes messages, use them directly
+                                if (responseData.messages) {
+                                    this.currentConversation = responseData.messages;
+                                    // If the command response provides the full new conversation state
+                                    if(responseData.currentNodeId) Alpine.store('conversation').setCurrentNodeId(responseData.currentNodeId);
+                                    if(responseData.nodes) Alpine.store('conversation').setNodes(responseData.nodes);
+                                    this.$nextTick(() => {
+                                        this.scrollToBottom(true);
+                                        this.initHighlighting(this.$refs.chatbox);
+                                    });
+                                } else {
+                                    // Fallback to fetching if messages not directly provided
                                     setTimeout(() => {
                                         this.fetchConversation().catch(err => console.error("Error fetching conversation after command:", err));
                                     }, 150);
                                 }
                             }
-                            break;
-                        case 'state_update':
-                            console.log("Received state update:", message.payload);
-                            if (message.payload.servers) this.servers = message.payload.servers;
-                            if (message.payload.tools) {
-                                this.tools = (message.payload.tools || []).map(t => ({
-                                    ...t,
-                                    shortName: t.name.split(':').pop()
-                                }));
-                                this.reconcileFavoriteTools();
-                                this.reconcileRecentTools();
-                            }
-                            if (message.payload.resources) {
-                                this.resources = (message.payload.resources || []).map(r => ({
-                                    ...r,
-                                    shortName: r.name.split(':').pop()
-                                }));
-                            }
-                            if (message.payload.prompts) {
-                                this.prompts = (message.payload.prompts || []).map(p => ({
-                                    ...p,
-                                    shortName: p.name.split(':').pop()
-                                }));
-                            }
-                            if (message.payload.conversation) {
-                                this.currentConversation = message.payload.conversation.messages || [];
-                                Alpine.store('conversation').setNodes(message.payload.conversation.nodes || [{
-                                    id: 'root',
-                                    name: 'Root',
-                                    parentId: null,
-                                    childrenIds: []
-                                }]);
-                                Alpine.store('conversation').setCurrentNodeId(message.payload.conversation.currentNodeId || 'root');
-                                this.currentModel = message.payload.conversation.model || this.config.defaultModel;
-                                this.scrollToBottom();
-                                this.$nextTick(() => this.initHighlighting(this.$refs.chatbox));
-                                this.loadConversationTags();
-                            }
-                            if (message.payload.config) {
-                                this.config = {
-                                    ...this.config,
-                                    ...message.payload.config
-                                };
-                                this.currentModel = this.config.defaultModel || '';
-                            }
-                            this.$nextTick(() => this.initTippy());
-                            break;
-                        default:
-                            console.warn('Received unknown WebSocket message type:', message.type, message);
-                    }
-                },
+                        }
+                        break;
+                    case 'state_update': // Full state update, less common for agent activity, more for initial load/major changes
+                        console.log("Received full state update:", message.payload);
+                        if (message.payload.servers) this.servers = message.payload.servers;
+                        if (message.payload.tools) {
+                            this.tools = (message.payload.tools || []).map(t => ({ ...t, shortName: t.name.split(':').pop() }));
+                            this.reconcileFavoriteTools(); this.reconcileRecentTools();
+                        }
+                        if (message.payload.resources) this.resources = (message.payload.resources || []).map(r => ({ ...r, shortName: r.name.split(':').pop() }));
+                        if (message.payload.prompts) this.prompts = (message.payload.prompts || []).map(p => ({ ...p, shortName: p.name.split(':').pop() }));
+
+                        if (message.payload.conversation) {
+                            this.currentConversation = message.payload.conversation.messages || [];
+                            Alpine.store('conversation').setNodes(message.payload.conversation.nodes || [{ id: 'root', name: 'Root', parentId: null, childrenIds: [] }]);
+                            Alpine.store('conversation').setCurrentNodeId(message.payload.conversation.currentNodeId || 'root');
+                            this.currentModel = message.payload.conversation.model || this.config.defaultModel;
+                            this.scrollToBottom(true);
+                            this.$nextTick(() => this.initHighlighting(this.$refs.chatbox));
+                            this.loadConversationTags();
+                        }
+                        if (message.payload.config) { // Update local config view
+                            this.config = { ...this.config, ...message.payload.config };
+                            this.currentModel = this.config.defaultModel || '';
+                        }
+                        // Update agent status if provided in state_update
+                        if (message.payload.agent_status) {
+                            this.agentStatus = { ...this.agentStatus, ...message.payload.agent_status };
+                            // Update display status string
+                            let display = this.agentStatus.status?.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Unknown';
+                            if (this.agentStatus.agent_running) display = `Running (Loop ${this.agentStatus.current_loop}/${this.agentStatus.max_loops})`;
+                            this.agentStatus.status_display = display;
+
+                            if (this.agentStatus.agent_running && !this.agentStatusInterval) this.startAgentStatusPolling();
+                            else if (!this.agentStatus.agent_running && this.agentStatusInterval) this.stopAgentStatusPolling();
+                        }
+                        this.$nextTick(() => this.initTippy());
+                        break;
+                    default:
+                        console.warn('WS: Received unknown message type:', message.type, message);
+                }
+            },
                 resetUsageStats() {
                     // Reset the object in memory
                     this.tokenUsage = { input_tokens: 0, output_tokens: 0, total_tokens: 0, total_cost: 0 };

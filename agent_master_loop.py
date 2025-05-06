@@ -16,57 +16,50 @@ a "Mental Momentum" bias. **
 Key Functionalities:
 --------------------
 *   **Workflow & Context Management:**
-    - Creates, manages, and tracks progress within structured workflows.
-    - Supports sub-workflow execution via a workflow stack.
-    - **Manages an explicit Goal Stack for hierarchical task decomposition.**
+    - Creates, manages, and tracks progress within structured workflows (via UMS).
+    - Supports sub-workflow execution via a workflow stack (agent-managed).
+    - **Manages an explicit Goal Stack (agent's view of UMS-managed goals).**
     - Gathers rich, multi-faceted context for the LLM decision-making process, including:
-        *   **Current Goal Stack information.**
-        *   Current working memory and focal points **(Prioritized)**.
-        *   Core workflow context (recent actions, important memories, key thoughts).
-        *   Proactively searched memories relevant to the current goal/plan step **(Limited Fetch)**.
-        *   Relevant procedural memories (how-to knowledge) **(Limited Fetch)**.
-        *   Summaries of memories linked to the current focus **(Limited Fetch)**.
+        *   **Current Goal Stack information (agent assembled, from UMS data).**
+        *   UMS-provided context package (working memory, core context, proactive/procedural memories, links).
         *   **Freshness indicators** for context components.
     - Implements structure-aware context truncation and optional LLM-based compression.
 
 *   **Planning & Execution:**
-    - Maintains an explicit, modifiable plan consisting of sequential steps with dependencies.
+    - Maintains an explicit, modifiable plan (agent-managed).
     - Allows the LLM to propose plan updates via a dedicated tool or text parsing.
-    - Includes a heuristic fallback mechanism to update plan steps based on action outcomes if the LLM doesn't explicitly replan.
+    - Includes a heuristic fallback mechanism to update plan steps.
     - **Validates plan steps and detects dependency cycles.**
-    - Checks action prerequisites (dependencies) before execution.
+    - Checks action prerequisites (dependencies) before execution (via UMS).
     - Executes tools via the MCPClient, handling server lookup and argument injection.
-    - Records detailed action history (start, completion, arguments, results, dependencies).
+    - Records detailed action history in UMS.
 
 *   **LLM Interaction & Reasoning:**
-    - Constructs detailed prompts for the LLM, providing comprehensive context, tool schemas, and cognitive instructions.
+    - Constructs detailed prompts for the LLM.
     - **Prompts explicitly guide analysis of working memory, goal stack, and provide error recovery strategies.**
-    - Parses LLM responses to identify tool calls, textual reasoning (recorded as thoughts), or goal completion signals.
-    - Manages dedicated thought chains for recording the agent's reasoning process.
+    - Parses LLM responses to identify tool calls, textual reasoning, or goal completion signals.
+    - Manages dedicated thought chains in UMS for recording reasoning.
 
 *   **Cognitive & Meta-Cognitive Processes:**
-    - **Memory Interaction:** Stores, updates, searches (semantic/hybrid/keyword), and links memories in the UMS.
-    - **Working Memory Management:** Retrieves, optimizes (based on relevance/diversity), and automatically focuses working memory via UMS tools.
-    - **Goal Management:** Uses UMS tools to push new sub-goals onto the stack and mark goals as completed/failed.
-    - **Background Cognitive Tasks:** Initiates asynchronous tasks **with timeouts and concurrency limits (semaphore)** for:
-        *   Automatic semantic linking of newly created/updated memories.
-        *   Checking and potentially promoting memories to higher cognitive levels (e.g., Episodic -> Semantic) based on usage/confidence.
-    - **Periodic Meta-cognition:** Runs scheduled tasks based on loop intervals or success counters:
-        *   **Reflection:** Generates analysis of progress, gaps, strengths, or plans using an LLM.
-        *   **Consolidation:** Synthesizes information from multiple memories into summaries, insights, or procedures using an LLM.
-        *   **Adaptive Thresholds:** Dynamically adjusts the frequency of reflection/consolidation based on agent performance (e.g., error rates, **memory statistics, trends, goal progress stability**) **with enhanced heuristics and dampening**. **Includes "Mental Momentum" bias.**
-    - **Maintenance:** Periodically deletes expired memories.
+    - **Memory Interaction:** Uses UMS tools for all memory operations.
+    - **Working Memory Management:** Uses UMS tools for WM retrieval, optimization, and focus.
+    - **Goal Management:** Uses UMS tools to create goals and mark their status. Agent maintains local view of stack.
+    - **Background Cognitive Tasks:** Initiates asynchronous tasks for UMS auto-linking and memory promotion.
+    - **Periodic Meta-cognition:** Runs scheduled tasks (reflection, consolidation via UMS tools).
+    - **Adaptive Thresholds:** Dynamically adjusts meta-cognition frequency based on performance and UMS stats.
+    - **Maintenance:** Uses UMS tool to delete expired memories.
 
 *   **State & Error Handling:**
-    - Persists the complete agent runtime state (workflow, **goal stack**, plan, counters, thresholds) atomically to a JSON file for resumption.
-    - Implements retry logic with backoff for potentially transient tool failures (especially for idempotent operations).
+    - Persists the complete agent runtime state (workflow, goal stack view, plan, counters, thresholds) to JSON.
+    - Implements retry logic with backoff for tool failures.
     - Tracks consecutive errors and halts execution if a limit is reached.
-    - Provides detailed, **categorized** error information back to the LLM for recovery attempts.
-    - Handles graceful shutdown via system signals (SIGINT, SIGTERM).
+    - Provides detailed, categorized error information to the LLM.
+    - Handles graceful shutdown via system signals.
 
 ────────────────────────────────────────────────────────────────────────────
 """
-from __future__ import annotations
+
+from __future__ import annotations  # VERY IMPORTANT: MUST BE THE FIRST LINE
 
 import asyncio
 import copy
@@ -76,54 +69,152 @@ import logging
 import math
 import os
 import random
-import signal
-import sys
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union  # Added TYPE_CHECKING
 
 import aiofiles
-from anthropic import APIConnectionError, APIStatusError, AsyncAnthropic, RateLimitError  # Correct imports
+from anthropic import APIConnectionError, APIStatusError, AsyncAnthropic, RateLimitError
 from pydantic import BaseModel, Field, ValidationError
 
-try:
-    # Note: Import all potentially used enums/classes from MCPClient for clarity
-    from mcp_client import (
-        ActionStatus,
-        ActionType,
-        LinkType,
-        MCPClient,
-        MemoryLevel,
-        MemoryType,
-        MemoryUtils,
-        ThoughtType,
-        ToolError,
-        ToolInputError,
-        WorkflowStatus,
+if TYPE_CHECKING:
+    from mcp_client_multi import MCPClient
+else:
+    MCPClient = "MCPClient"
+
+
+# --- Workflow & Action Status (from UMS) ---
+class WorkflowStatus(str, Enum):
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+
+
+class ActionStatus(str, Enum):
+    PLANNED = "planned"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+# --- Content Types (from UMS) ---
+class ActionType(str, Enum):
+    TOOL_USE = "tool_use"
+    REASONING = "reasoning"
+    PLANNING = "planning"
+    RESEARCH = "research"
+    ANALYSIS = "analysis"
+    DECISION = "decision"
+    OBSERVATION = "observation"
+    REFLECTION = "reflection"
+    SUMMARY = "summary"
+    CONSOLIDATION = "consolidation"
+    MEMORY_OPERATION = "memory_operation"
+
+
+class ArtifactType(str, Enum):
+    FILE = "file"
+    TEXT = "text"
+    IMAGE = "image"
+    TABLE = "table"
+    CHART = "chart"
+    CODE = "code"
+    DATA = "data"
+    JSON = "json"
+    URL = "url"
+
+
+class ThoughtType(str, Enum):
+    GOAL = "goal"
+    QUESTION = "question"
+    HYPOTHESIS = "hypothesis"
+    INFERENCE = "inference"
+    EVIDENCE = "evidence"
+    CONSTRAINT = "constraint"
+    PLAN = "plan"
+    DECISION = "decision"
+    REFLECTION = "reflection"
+    CRITIQUE = "critique"
+    SUMMARY = "summary"
+    USER_GUIDANCE = "user_guidance"
+    INSIGHT = "insight"
+
+
+class MemoryLevel(str, Enum):
+    WORKING = "working"
+    EPISODIC = "episodic"
+    SEMANTIC = "semantic"
+    PROCEDURAL = "procedural"
+
+
+class MemoryType(str, Enum):
+    OBSERVATION = "observation"
+    ACTION_LOG = "action_log"
+    TOOL_OUTPUT = "tool_output"
+    ARTIFACT_CREATION = "artifact_creation"
+    REASONING_STEP = "reasoning_step"
+    FACT = "fact"
+    INSIGHT = "insight"
+    PLAN = "plan"
+    QUESTION = "question"
+    SUMMARY = "summary"
+    REFLECTION = "reflection"  # Distinct from ThoughtType.REFLECTION
+    SKILL = "skill"
+    PROCEDURE = "procedure"
+    PATTERN = "pattern"
+    CODE = "code"
+    JSON = "json"
+    URL = "url"
+    USER_INPUT = "user_input"
+    TEXT = "text"
+
+
+class LinkType(str, Enum):
+    RELATED = "related"
+    CAUSAL = "causal"
+    SEQUENTIAL = "sequential"
+    HIERARCHICAL = "hierarchical"
+    CONTRADICTS = "contradicts"
+    SUPPORTS = "supports"
+    GENERALIZES = "generalizes"
+    SPECIALIZES = "specializes"
+    FOLLOWS = "follows"
+    PRECEDES = "precedes"
+    TASK = "task"
+    REFERENCES = "references"
+
+
+class GoalStatus(str, Enum):
+    ACTIVE = "active"
+    PLANNED = "planned"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    PAUSED = "paused"
+    ABANDONED = "abandoned"
+
+
+if TYPE_CHECKING:
+    from mcp_client_multi import MCPClient
+else:
+    MCPClient = "MCPClient"  # Placeholder for runtime, type hint only
+
+# Logger Setup
+log = logging.getLogger("AgentMasterLoop")
+if not logging.root.handlers and not log.handlers:
+    logging.basicConfig(
+        level=os.environ.get("AGENT_LOOP_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    log.warning("AgentMasterLoop logger self-initialized. If run integrated, mcp_client_multi should configure logging.")
 
-    MCP_CLIENT_AVAILABLE = True
-    log = logging.getLogger("AgentMasterLoop")
-    # Bootstrap logger if MCPClient didn't configure it
-    if not logging.root.handlers and not log.handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        )
-        log = logging.getLogger("AgentMasterLoop")
-        log.warning("MCPClient did not configure logger – falling back.")
-    log.info("Successfully imported MCPClient and required components.")
-except ImportError as import_err:
-    # Critical error if MCPClient cannot be imported
-    print(f"❌ CRITICAL ERROR: Could not import MCPClient: {import_err}")
-    sys.exit(1)
-
-# --------------------------------------------------------------------------
-# Runtime log‑level can be raised via AGENT_LOOP_LOG_LEVEL=DEBUG, etc.
-# --------------------------------------------------------------------------
 LOG_LEVEL_ENV = os.environ.get("AGENT_LOOP_LOG_LEVEL", "INFO").upper()
 log.setLevel(getattr(logging, LOG_LEVEL_ENV, logging.INFO))
 if log.level <= logging.DEBUG:
@@ -132,73 +223,48 @@ if log.level <= logging.DEBUG:
 # ==========================================================================
 # CONSTANTS
 # ==========================================================================
-# File for saving/loading agent state, versioned for this implementation phase
-AGENT_STATE_FILE = "agent_loop_state_v4.1_p1_goalstack_momentum.json" # Updated filename
-# Agent identifier used in prompts and logging
-AGENT_NAME = "EidenticEngine4.1-P1-GoalStackMomentum" # Updated agent name
-# Default LLM model string (can be overridden by environment or config)
-MASTER_LEVEL_AGENT_LLM_MODEL_STRING = "claude-3-5-sonnet-20240620" # Use the confirmed model
+AGENT_STATE_FILE = "agent_loop_state_v4.1_integrated.json"
+AGENT_NAME = "EidenticEngine4.1-P1-GoalStackMomentum"
 
-# ---------------- meta‑cognition thresholds ----------------
-# Base thresholds for triggering reflection and consolidation, adjustable via environment
 BASE_REFLECTION_THRESHOLD = int(os.environ.get("BASE_REFLECTION_THRESHOLD", "7"))
 BASE_CONSOLIDATION_THRESHOLD = int(os.environ.get("BASE_CONSOLIDATION_THRESHOLD", "12"))
-# Minimum and maximum bounds for adaptive thresholds to prevent extreme values
 MIN_REFLECTION_THRESHOLD = 3
 MAX_REFLECTION_THRESHOLD = 15
 MIN_CONSOLIDATION_THRESHOLD = 5
 MAX_CONSOLIDATION_THRESHOLD = 25
-# Dampening factor for threshold adjustments (e.g., 0.75 means apply 75% of calculated change)
 THRESHOLD_ADAPTATION_DAMPENING = float(os.environ.get("THRESHOLD_DAMPENING", "0.75"))
-# Positive bias added to thresholds during "Mental Momentum" (low errors)
-MOMENTUM_THRESHOLD_BIAS_FACTOR = 1.2 # e.g., multiply base adjustment by this if momentum is high
+MOMENTUM_THRESHOLD_BIAS_FACTOR = 1.2
 
-# ---------------- interval constants (in loop iterations) ----------------
-# How often to run working memory optimization and auto-focus checks
 OPTIMIZATION_LOOP_INTERVAL = int(os.environ.get("OPTIMIZATION_INTERVAL", "8"))
-# How often to check recently accessed memories for potential level promotion
 MEMORY_PROMOTION_LOOP_INTERVAL = int(os.environ.get("PROMOTION_INTERVAL", "15"))
-# How often to compute memory statistics and adapt thresholds
 STATS_ADAPTATION_INTERVAL = int(os.environ.get("STATS_ADAPTATION_INTERVAL", "10"))
-# How often to run maintenance tasks like deleting expired memories
 MAINTENANCE_INTERVAL = int(os.environ.get("MAINTENANCE_INTERVAL", "50"))
 
-# ---------------- context / token sizing ----------------
-# Delay range (seconds) before running background auto-linking task
 AUTO_LINKING_DELAY_SECS: Tuple[float, float] = (1.5, 3.0)
-# Default description for the initial plan step if none exists
 DEFAULT_PLAN_STEP = "Assess goal, gather context, formulate initial plan."
-
-# Limits for various context components included in the prompt (PRE-FETCH LIMITS)
-CONTEXT_RECENT_ACTIONS_FETCH_LIMIT = 10 # Fetch slightly more than shown
+CONTEXT_RECENT_ACTIONS_FETCH_LIMIT = 10
 CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT = 7
 CONTEXT_KEY_THOUGHTS_FETCH_LIMIT = 7
-CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT = 3 # Fetch limit for procedural
-CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT = 5 # Fetch limit for proactive goal-relevant
-CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT = 5 # Fetch limit for link traversal per direction
-CONTEXT_GOAL_DETAILS_FETCH_LIMIT = 3 # How many parent goals to fetch details for in context
-
-# Limits for items SHOWN in final prompt context (after potential truncation/summarization)
+CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT = 3
+CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT = 5
+CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT = 5
+CONTEXT_GOAL_DETAILS_FETCH_LIMIT = 3  # Max depth for parent goal fetching
 CONTEXT_RECENT_ACTIONS_SHOW_LIMIT = 7
 CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT = 5
 CONTEXT_KEY_THOUGHTS_SHOW_LIMIT = 5
-CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT = 2 # Limit procedural memories included
-CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT = 3 # Limit goal-relevant memories included
-CONTEXT_WORKING_MEMORY_SHOW_LIMIT = 10 # Max working memory items shown in context
-CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT = 3 # Max links shown per direction in link summary
-CONTEXT_GOAL_STACK_SHOW_LIMIT = 5 # Max goals shown from the stack in context
-
-# Token limits triggering context compression
+CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT = 2
+CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT = 3
+CONTEXT_WORKING_MEMORY_SHOW_LIMIT = 10
+CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT = 3
+CONTEXT_GOAL_STACK_SHOW_LIMIT = 5  # Max goals in stack summary for prompt
 CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD = 15_000
-CONTEXT_COMPRESSION_TARGET_TOKENS = 5_000 # Target size after compression
-
-# Maximum number of consecutive tool execution errors before aborting
+CONTEXT_COMPRESSION_TARGET_TOKENS = 5_000
 MAX_CONSECUTIVE_ERRORS = 3
 
-# ---------------- unified‑memory tool constants ----------------
-# Define constants for all UMS tool names for consistency and easy updates
+# UMS Tool constants (agent uses these to call specific UMS functions)
 TOOL_GET_WORKFLOW_DETAILS = "unified_memory:get_workflow_details"
-TOOL_GET_CONTEXT = "unified_memory:get_workflow_context" # Core context retrieval tool
+TOOL_GET_CONTEXT = "unified_memory:get_workflow_context"  # DEPRECATED IN FAVOR OF get_rich_context_package
+TOOL_GET_RICH_CONTEXT_PACKAGE = "unified_memory:get_rich_context_package"  # Main context tool
 TOOL_CREATE_WORKFLOW = "unified_memory:create_workflow"
 TOOL_UPDATE_WORKFLOW_STATUS = "unified_memory:update_workflow_status"
 TOOL_RECORD_ACTION_START = "unified_memory:record_action_start"
@@ -224,318 +290,221 @@ TOOL_CONSOLIDATION = "unified_memory:consolidate_memories"
 TOOL_OPTIMIZE_WM = "unified_memory:optimize_working_memory"
 TOOL_AUTO_FOCUS = "unified_memory:auto_update_focus"
 TOOL_PROMOTE_MEM = "unified_memory:promote_memory_level"
-TOOL_QUERY_MEMORIES = "unified_memory:query_memories" # Keyword/filter-based search
+TOOL_QUERY_MEMORIES = "unified_memory:query_memories"
 TOOL_CREATE_LINK = "unified_memory:create_memory_link"
 TOOL_GET_MEMORY_BY_ID = "unified_memory:get_memory_by_id"
 TOOL_GET_LINKED_MEMORIES = "unified_memory:get_linked_memories"
 TOOL_LIST_WORKFLOWS = "unified_memory:list_workflows"
-TOOL_GENERATE_REPORT = "unified_memory:generate_workflow_report"
 TOOL_SUMMARIZE_TEXT = "unified_memory:summarize_text"
-# --- New UMS Tool Constants for Goal Stack ---
-TOOL_PUSH_SUB_GOAL = "unified_memory:push_sub_goal" # Assumed UMS tool
-TOOL_MARK_GOAL_STATUS = "unified_memory:mark_goal_status" # Assumed UMS tool
-TOOL_GET_GOAL_DETAILS = "unified_memory:get_goal_details" # Assumed UMS tool
-# --- Agent-internal tool name constant ---
-AGENT_TOOL_UPDATE_PLAN = "agent:update_plan"
+TOOL_GET_GOAL_DETAILS = "unified_memory:get_goal_details"
+TOOL_CREATE_GOAL = "unified_memory:create_goal"
+TOOL_UPDATE_GOAL_STATUS = "unified_memory:update_goal_status"
+AGENT_TOOL_UPDATE_PLAN = "agent:update_plan"  # Agent's internal tool
 
-# --- Background Task Management ---
-BACKGROUND_TASK_TIMEOUT_SECONDS = 60.0 # Timeout for individual background tasks
-MAX_CONCURRENT_BG_TASKS = 10 # Limit concurrent background tasks (linking, promotion)
+BACKGROUND_TASK_TIMEOUT_SECONDS = 60.0
+MAX_CONCURRENT_BG_TASKS = 10
+
+
+# --- LOCAL CUSTOM EXCEPTIONS ---
+class ToolError(Exception):
+    pass
+
+
+class ToolInputError(ToolError):
+    pass
+
 
 # ==========================================================================
-# Utility helpers
+# LOCAL UTILITY CLASSES & HELPERS
 # ==========================================================================
+class MemoryUtils:
+    @staticmethod
+    def generate_id() -> str:
+        return str(uuid.uuid4())
+
 
 def _fmt_id(val: Any, length: int = 8) -> str:
-    """Return a short id string safe for logs."""
     s = str(val) if val is not None else "?"
     return s[:length] if len(s) >= length else s
 
 
 def _utf8_safe_slice(s: str, max_len: int) -> str:
-    """Return a UTF‑8 boundary‑safe slice ≤ max_len bytes."""
-    # Ensure input is a string
     if not isinstance(s, str):
         s = str(s)
     return s.encode("utf‑8")[:max_len].decode("utf‑8", "ignore")
 
 
 def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
-    """
-    Structure‑aware context truncation with UTF‑8 safe fallback.
-
-    Attempts to intelligently reduce context size while preserving structure
-    and indicating where truncation occurred. Honors CONTEXT_*_SHOW_LIMIT constants.
-
-    1. Serialise full context – if within limit, return.
-    2. Iteratively truncate known large lists (e.g., recent actions, memories, goal stack)
-       based on SHOW_LIMIT constants, adding a note about omissions.
-    3. Remove lowest‑priority top‑level keys (e.g., procedures, links)
-       until size fits.
-    4. Final fallback: utf‑8 safe byte slice of the full JSON, attempting to
-       make it syntactically valid-ish and adding a clear truncation marker.
-    """
     try:
-        # Serialize the context to JSON. Use default=str for non-serializable types like datetime.
         full = json.dumps(context, indent=2, default=str, ensure_ascii=False)
     except TypeError:
-        # Handle potential non-serializable types even before dumping if necessary
-        context = json.loads(json.dumps(context, default=str)) # Pre-process
+        context = json.loads(json.dumps(context, default=str))  # Force serialization
         full = json.dumps(context, indent=2, default=str, ensure_ascii=False)
 
-    # If already within the limit, return the full JSON string
     if len(full) <= max_len:
         return full
 
-    # Log that truncation is starting
     log.debug(f"Context length {len(full)} exceeds max {max_len}. Applying structured truncation.")
-    ctx_copy = copy.deepcopy(context) # Work on a copy
-    ctx_copy["_truncation_applied"] = "structure‑aware" # Add metadata about truncation
+    ctx_copy = copy.deepcopy(context)  # Work on a copy
+    ctx_copy["_truncation_applied"] = "structure‑aware_agent_side"
     original_length = len(full)
 
-    # Define paths to lists that can be truncated and the number of items to keep (using SHOW_LIMIT constants)
-    list_paths_to_truncate = [ # (parent_key or None, key_of_list, items_to_keep_constant)
-        ("core_context", "recent_actions", CONTEXT_RECENT_ACTIONS_SHOW_LIMIT),
-        ("core_context", "important_memories", CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT),
-        ("core_context", "key_thoughts", CONTEXT_KEY_THOUGHTS_SHOW_LIMIT),
-        (None, "proactive_memories", CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT),
-        # Apply limit to the list *within* the working memory dict
-        ("current_working_memory", "working_memories", CONTEXT_WORKING_MEMORY_SHOW_LIMIT),
-        (None, "relevant_procedures", CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT),
-        # --- Add goal stack truncation ---
-        ("current_goal_context", "goal_stack_summary", CONTEXT_GOAL_STACK_SHOW_LIMIT),
+    # Define paths and limits for truncation within the agent's view of context
+    # UMS context items are already dictionaries by the time they get here.
+    list_paths_to_truncate = [
+        ("ums_context_package", "core_context", "recent_actions", CONTEXT_RECENT_ACTIONS_SHOW_LIMIT),
+        ("ums_context_package", "core_context", "important_memories", CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT),
+        ("ums_context_package", "core_context", "key_thoughts", CONTEXT_KEY_THOUGHTS_SHOW_LIMIT),
+        ("ums_context_package", "proactive_memories", "memories", CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT),
+        ("ums_context_package", "current_working_memory", "working_memories", CONTEXT_WORKING_MEMORY_SHOW_LIMIT),
+        ("ums_context_package", "relevant_procedures", "procedures", CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT),
+        ("agent_assembled_goal_context", None, "goal_stack_summary_from_agent_state", CONTEXT_GOAL_STACK_SHOW_LIMIT),
+        (None, "current_plan_snapshot", None, 5),  # Truncate plan snapshot if long
     ]
-    # Define keys to remove entirely if context is still too large, in order of least importance
+
     keys_to_remove_low_priority = [
-        "relevant_procedures",
-        "proactive_memories",
-        "contextual_links", # Link summary is lower priority than core items
-        # Removing items from core_context is more impactful
-        ("core_context", "key_thoughts"), # Check nested key first
-        ("core_context", "important_memories"),
-        ("core_context", "recent_actions"),
-        "core_context", # Remove the entire core context dict last
-        "current_working_memory", # Remove working memory context before byte slice
-        "current_goal_context", # Remove goal context before byte slice (lower priority than plan?)
+        ("ums_context_package", "contextual_links"),
+        ("ums_context_package", "relevant_procedures"),
+        ("ums_context_package", "proactive_memories"),
+        ("ums_context_package", "core_context", "key_thoughts"),
+        ("ums_context_package", "core_context", "important_memories"),
+        ("ums_context_package", "core_context", "recent_actions"),
+        ("ums_context_package", "core_context"),
+        ("ums_context_package", "current_working_memory"),
+        ("agent_assembled_goal_context"),
+        ("ums_context_package"),  # Entire UMS package if still too large
     ]
 
-    # 1. Truncate specified lists based on SHOW_LIMIT constants
-    for parent, key, keep_count in list_paths_to_truncate:
-        try:
-            container = ctx_copy
-            # Navigate to the parent dictionary if specified
-            if parent:
-                if parent not in container or not isinstance(container[parent], dict):
-                    continue # Parent doesn't exist or isn't a dict
-                container = container[parent]
-
-            # Check if the key exists, is a list, and needs truncation
-            if key in container and isinstance(container[key], list) and len(container[key]) > keep_count:
-                original_count = len(container[key])
-                # Add a note indicating truncation within the list itself
-                note = {"truncated_note": f"{original_count - keep_count} items omitted from '{key}'"}
-                # Slice to keep the desired number of items
-                container[key] = container[key][:keep_count]
-                # Append the note if there's space or if it's crucial context
-                if keep_count > 0: # Only add note if we kept some items
-                    container[key].append(note)
-                log.debug(f"Truncated list '{key}' (under '{parent or 'root'}') to {keep_count} items (+ note).")
-
-            # Check size after each list truncation
-            serial = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
-            if len(serial) <= max_len:
-                log.info(f"Context truncated successfully after list reduction (Length: {len(serial)}).")
-                return serial
-        except (KeyError, TypeError, IndexError) as e:
-            # Log errors during this specific truncation but continue with others
-            log.warning(f"Error during list truncation for key '{key}' (under '{parent}'): {e}")
+    # Apply list truncations
+    for path_parts in list_paths_to_truncate:
+        container = ctx_copy
+        key_to_truncate = path_parts[-2]  # The key holding the list
+        limit_count = path_parts[-1]
+        # Navigate to the container
+        valid_path = True
+        for part_idx in range(len(path_parts) - 2):
+            part = path_parts[part_idx]
+            if part is None:
+                continue  # Skip None parts (e.g. for current_plan_snapshot)
+            if part in container and isinstance(container[part], dict):
+                container = container[part]
+            else:
+                valid_path = False
+                break
+        if not valid_path:
             continue
 
-    # 2. Remove low-priority keys if still too large
-    for key_info in keys_to_remove_low_priority:
-        removed = False
-        key_to_remove = key_info
-        parent_key_to_remove = None
-        if isinstance(key_info, tuple): # Handle nested keys like ("core_context", "key_thoughts")
-            parent_key_to_remove, key_to_remove = key_info
+        # Perform truncation
+        if key_to_truncate in container and isinstance(container[key_to_truncate], list) and len(container[key_to_truncate]) > limit_count:
+            original_count_val = len(container[key_to_truncate])
+            note = {"truncated_note": f"{original_count_val - limit_count} items omitted from '{'/'.join(str(p) for p in path_parts if p)}'"}
+            container[key_to_truncate] = container[key_to_truncate][:limit_count]
+            if limit_count > 0:
+                container[key_to_truncate].append(note)
+            log.debug(f"Truncated list at '{'/'.join(str(p) for p in path_parts if p)}' to {limit_count} items.")
+            serial_val = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
+            if len(serial_val) <= max_len:
+                log.info(f"Context truncated (List reduction: {len(serial_val)} bytes).")
+                return serial_val
 
-        # Try removing from the parent or root level
-        container_to_remove = ctx_copy
-        if parent_key_to_remove:
-            if parent_key_to_remove in container_to_remove and isinstance(container_to_remove[parent_key_to_remove], dict):
-                container_to_remove = container_to_remove[parent_key_to_remove]
+    # Apply key removals
+    for key_info_tuple in keys_to_remove_low_priority:
+        container = ctx_copy
+        key_to_remove_final = key_info_tuple[-1]
+        # Navigate to parent container
+        valid_path_pop = True
+        for part_idx in range(len(key_info_tuple) - 1):
+            part = key_info_tuple[part_idx]
+            if part in container and isinstance(container[part], dict):
+                container = container[part]
             else:
-                continue # Skip if parent doesn't exist or isn't a dict
+                valid_path_pop = False
+                break
+        if not valid_path_pop:
+            continue
 
-        # Remove the key if it exists in the target container
-        if key_to_remove in container_to_remove:
-            container_to_remove.pop(key_to_remove)
-            removed = True
-            log.debug(f"Removed low-priority key '{key_to_remove}' from {'root' if parent_key_to_remove is None else parent_key_to_remove} for truncation.")
+        if key_to_remove_final in container:
+            container.pop(key_to_remove_final)
+            log.debug(f"Removed low-priority key '{'/'.join(str(p) for p in key_info_tuple)}' for truncation.")
+            serial_val = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
+            if len(serial_val) <= max_len:
+                log.info(f"Context truncated (Key removal: {len(serial_val)} bytes).")
+                return serial_val
 
-        # Check size after each key removal
-        if removed:
-            serial = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
-            if len(serial) <= max_len:
-                log.info(f"Context truncated successfully after key removal (Length: {len(serial)}).")
-                return serial
-
-    # 3. Ultimate fallback: UTF-8 safe byte slice
-    log.warning(f"Structured truncation insufficient (Length still {len(serial)}). Applying final byte-slice.")
-    # Slice the original full JSON string, leaving some buffer for the truncation note/closing chars
+    serial_val = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
+    log.warning(f"Structured truncation insufficient (Length still {len(serial_val)}). Applying final byte-slice.")
     clipped_json_str = _utf8_safe_slice(full, max_len - 50)
-    # Attempt to make it look somewhat like valid JSON by finding the last closing brace/bracket
     try:
-        last_brace = clipped_json_str.rfind('}')
-        last_bracket = clipped_json_str.rfind(']')
+        last_brace = clipped_json_str.rfind("}")
+        last_bracket = clipped_json_str.rfind("]")
         cutoff = max(last_brace, last_bracket)
-        if cutoff > 0:
-            # Truncate after the last complete element and add a note + closing brace
-            final_str = clipped_json_str[:cutoff+1] + '\n// ... (CONTEXT TRUNCATED BY BYTE LIMIT) ...\n}'
-        else:
-            # If no closing elements found, just add a basic note
-            final_str = clipped_json_str + '... (CONTEXT TRUNCATED)'
+        final_str = (
+            clipped_json_str[: cutoff + 1] + "\n// ... (CONTEXT TRUNCATED BY BYTE LIMIT) ...\n}"
+            if cutoff > 0
+            else clipped_json_str + "... (CONTEXT TRUNCATED)"
+        )
     except Exception:
-        # Fallback if string manipulation fails
-        final_str = clipped_json_str + '... (CONTEXT TRUNCATED)'
-
+        final_str = clipped_json_str + "... (CONTEXT TRUNCATED)"
     log.error(f"Context severely truncated from {original_length} to {len(final_str)} bytes using fallback.")
     return final_str
 
-# ==========================================================================
-# Dataclass & pydantic models
-# ==========================================================================
 
+# ==========================================================================
+# Dataclass & pydantic models (LOCAL DEFINITIONS)
+# ==========================================================================
 class PlanStep(BaseModel):
-    """Represents a single step in the agent's plan."""
-    id: str = Field(default_factory=lambda: f"step-{MemoryUtils.generate_id()[:8]}", description="Unique identifier for the plan step.")
-    description: str = Field(..., description="Clear, concise description of the action or goal for this step.")
-    status: str = Field(
-        default="planned",
-        description="Current status of the step: planned, in_progress, completed, failed, skipped.",
-    )
-    depends_on: List[str] = Field(default_factory=list, description="List of other plan step IDs that must be completed before this step can start.")
-    assigned_tool: Optional[str] = Field(default=None, description="Specific tool designated for executing this step, if applicable.")
-    tool_args: Optional[Dict[str, Any]] = Field(default=None, description="Arguments to be passed to the assigned tool.")
-    result_summary: Optional[str] = Field(default=None, description="A brief summary of the outcome after the step is completed or failed.")
-    is_parallel_group: Optional[str] = Field(default=None, description="Optional tag to group steps that can potentially run in parallel.")
+    id: str = Field(default_factory=lambda: f"step-{MemoryUtils.generate_id()[:8]}")
+    description: str
+    status: str = Field(default="planned")
+    depends_on: List[str] = Field(default_factory=list)
+    assigned_tool: Optional[str] = None
+    tool_args: Optional[Dict[str, Any]] = None
+    result_summary: Optional[str] = None
+    is_parallel_group: Optional[str] = None
 
 
 def _default_tool_stats() -> Dict[str, Dict[str, Union[int, float]]]:
-    """Factory function for initializing tool usage statistics dictionary."""
-    # Use defaultdict for convenience: accessing a non-existent tool key will create its default stats entry
     return defaultdict(lambda: {"success": 0, "failure": 0, "latency_ms_total": 0.0})
 
 
 @dataclass
 class AgentState:
-    """
-    Represents the complete persisted runtime state of the Agent Master Loop.
-
-    This dataclass holds all information necessary to resume the agent's operation,
-    including workflow context, **goal hierarchy**, planning state, error tracking,
-    meta-cognition metrics, and adaptive thresholds.
-
-    Attributes:
-        workflow_id: The ID of the primary workflow the agent is currently focused on.
-        context_id: The specific context ID for memory operations (often matches workflow_id).
-        workflow_stack: A list maintaining the hierarchy of active workflows (e.g., for sub-workflows).
-        goal_stack: List of goal dictionaries tracking hierarchical goals. **(NEW)**
-        current_goal_id: ID of the goal at the top of the `goal_stack` (the agent's current focus). **(RENAMED/REPURPOSED)**
-        current_plan: A list of `PlanStep` objects representing the agent's current plan.
-        current_thought_chain_id: ID of the active thought chain for recording reasoning.
-        last_action_summary: A brief string summarizing the outcome of the last action taken.
-        current_loop: The current iteration number of the main agent loop.
-        goal_achieved_flag: Boolean flag indicating if the *overall root goal* has been marked as achieved.
-        consecutive_error_count: Counter for consecutive failed actions, used for error limiting.
-        needs_replan: Boolean flag indicating if the agent needs to revise its plan in the next cycle.
-        last_error_details: A dictionary holding structured information about the last error encountered **(Enhanced with category)**.
-        successful_actions_since_reflection: Counter for successful *agent-level* actions since the last reflection.
-        successful_actions_since_consolidation: Counter for successful *agent-level* actions since the last consolidation.
-        loops_since_optimization: Counter for loops since the last working memory optimization/focus update.
-        loops_since_promotion_check: Counter for loops since the last memory promotion check cycle.
-        loops_since_stats_adaptation: Counter for loops since the last statistics check and threshold adaptation.
-        loops_since_maintenance: Counter for loops since the last maintenance task (e.g., deleting expired memories).
-        reflection_cycle_index: Index to cycle through different reflection types.
-        last_meta_feedback: Stores the summary of the last reflection/consolidation output for the next prompt.
-        current_reflection_threshold: The current dynamic threshold for triggering reflection **(Adaptive + Momentum)**.
-        current_consolidation_threshold: The current dynamic threshold for triggering consolidation **(Adaptive + Momentum)**.
-        tool_usage_stats: Dictionary tracking success/failure counts and latency for each tool used.
-        background_tasks: (Transient) Set holding currently running asyncio background tasks (not saved to state file).
-    """
-
-    # --- workflow stack ---
     workflow_id: Optional[str] = None
     context_id: Optional[str] = None
     workflow_stack: List[str] = field(default_factory=list)
-
-    # --- Goal Management --- (NEW/MODIFIED)
-    goal_stack: List[Dict[str, Any]] = field(default_factory=list) # Stores {goal_id, description, status, ...}
-    current_goal_id: Optional[str] = None # ID of the active goal (top of the stack)
-
-    # --- planning & reasoning ---
-    current_plan: List[PlanStep] = field(
-        default_factory=lambda: [PlanStep(description=DEFAULT_PLAN_STEP)]
-    )
-    current_thought_chain_id: Optional[str] = None # Tracks the current reasoning thread
+    goal_stack: List[Dict[str, Any]] = field(default_factory=list)
+    current_goal_id: Optional[str] = None
+    current_plan: List[PlanStep] = field(default_factory=lambda: [PlanStep(description=DEFAULT_PLAN_STEP)])
+    current_thought_chain_id: Optional[str] = None
     last_action_summary: str = "Loop initialized."
     current_loop: int = 0
-    goal_achieved_flag: bool = False # Flag to signal loop termination (based on root goal)
-
-    # --- error/replan ---
+    goal_achieved_flag: bool = False
     consecutive_error_count: int = 0
-    needs_replan: bool = False # Flag to force replanning cycle
-    last_error_details: Optional[Dict[str, Any]] = None # Stores info about the last error **(Enhanced)**
-
-    # --- meta‑cognition metrics ---
-    # Counters reset when corresponding meta-task runs or on error
-    successful_actions_since_reflection: float = 0.0 # Use float for potential fractional counting
+    needs_replan: bool = False
+    last_error_details: Optional[Dict[str, Any]] = None
+    successful_actions_since_reflection: float = 0.0
     successful_actions_since_consolidation: float = 0.0
-    # Loop counters reset when corresponding periodic task runs
     loops_since_optimization: int = 0
     loops_since_promotion_check: int = 0
     loops_since_stats_adaptation: int = 0
     loops_since_maintenance: int = 0
-    reflection_cycle_index: int = 0 # Used to cycle through reflection types
-    last_meta_feedback: Optional[str] = None # Feedback from last meta-task for next prompt
-
-    # adaptive thresholds (dynamic) - Initialized from constants, adapted based on stats and momentum
+    reflection_cycle_index: int = 0
+    last_meta_feedback: Optional[str] = None
     current_reflection_threshold: int = BASE_REFLECTION_THRESHOLD
     current_consolidation_threshold: int = BASE_CONSOLIDATION_THRESHOLD
+    tool_usage_stats: Dict[str, Dict[str, Union[int, float]]] = field(default_factory=_default_tool_stats)
+    background_tasks: Set[asyncio.Task] = field(default_factory=set, init=False, repr=False)
 
-    # tool statistics - tracks usage counts and latency
-    tool_usage_stats: Dict[str, Dict[str, Union[int, float]]] = field(
-        default_factory=_default_tool_stats
-    )
-
-    # background tasks (transient) - Not saved/loaded, managed at runtime
-    background_tasks: Set[asyncio.Task] = field(
-        default_factory=set, init=False, repr=False
-    )
 
 # =====================================================================
 # Agent Master Loop
 # =====================================================================
 class AgentMasterLoop:
-    """
-    Agent Master Loop Orchestrator.
-
-    This class orchestrates the primary think-act cycle of the AI agent.
-    It manages state, interacts with the Unified Memory System via MCPClient,
-    calls the LLM for decision-making, handles plan execution, manages goal hierarchies,
-    and runs periodic meta-cognitive tasks (reflection, consolidation, optimization).
-    This version integrates rich context gathering, goal stack management, mental momentum bias,
-    and detailed prompting as defined in Phase 1 of the v4.1 plan.
-    """
-
-    # Set of tool names considered internal or meta-cognitive,
-    # which typically shouldn't be recorded as primary agent actions.
     _INTERNAL_OR_META_TOOLS: Set[str] = {
-        # Action recording itself is meta
         TOOL_RECORD_ACTION_START,
         TOOL_RECORD_ACTION_COMPLETION,
-        # Information retrieval is usually part of the agent's thought process, not a world-altering action
         TOOL_GET_CONTEXT,
+        TOOL_GET_RICH_CONTEXT_PACKAGE,
         TOOL_GET_WORKING_MEMORY,
         TOOL_SEMANTIC_SEARCH,
         TOOL_HYBRID_SEARCH,
@@ -547,212 +516,169 @@ class AgentMasterLoop:
         TOOL_GET_ARTIFACT_BY_ID,
         TOOL_GET_ACTION_DEPENDENCIES,
         TOOL_GET_THOUGHT_CHAIN,
-        TOOL_GET_WORKFLOW_DETAILS, # Getting details is informational
-        TOOL_GET_GOAL_DETAILS, # Getting goal details is informational (NEW)
-        # Managing relationships is meta
+        TOOL_GET_WORKFLOW_DETAILS,
+        TOOL_GET_GOAL_DETAILS,
         TOOL_ADD_ACTION_DEPENDENCY,
         TOOL_CREATE_LINK,
-        # Goal stack management is meta
-        TOOL_PUSH_SUB_GOAL, # (NEW)
-        TOOL_MARK_GOAL_STATUS, # (NEW)
-        # Admin/Utility tasks are not primary actions
+        TOOL_CREATE_GOAL,
+        TOOL_UPDATE_GOAL_STATUS,  # UMS Goal tools
         TOOL_LIST_WORKFLOWS,
         TOOL_COMPUTE_STATS,
-        TOOL_SUMMARIZE_TEXT, # Summarization is a utility
-        # Periodic cognitive maintenance and enhancement tasks
+        TOOL_SUMMARIZE_TEXT,
         TOOL_OPTIMIZE_WM,
         TOOL_AUTO_FOCUS,
         TOOL_PROMOTE_MEM,
         TOOL_REFLECTION,
         TOOL_CONSOLIDATION,
         TOOL_DELETE_EXPIRED_MEMORIES,
-        # Agent's internal mechanism for plan updates
         AGENT_TOOL_UPDATE_PLAN,
     }
 
-    # --------------------------------------------------------------- ctor --
     def __init__(
-        self, mcp_client_instance: MCPClient, agent_state_file: str = AGENT_STATE_FILE
+        self,
+        mcp_client_instance: MCPClient,  # Type hint fixed
+        default_llm_model_string: str,
+        agent_state_file: str = AGENT_STATE_FILE,
     ):
-        """
-        Initializes the AgentMasterLoop.
-
-        Args:
-            mcp_client_instance: An initialized instance of the MCPClient.
-            agent_state_file: Path to the file for saving/loading agent state.
-        """
-        # Ensure MCPClient dependency is met
-        if not MCP_CLIENT_AVAILABLE:
-            raise RuntimeError("MCPClient unavailable. Cannot initialize AgentMasterLoop.")
-
         self.mcp_client = mcp_client_instance
-        # Ensure the Anthropic client is available via MCPClient
-        if not hasattr(mcp_client_instance, 'anthropic') or not isinstance(mcp_client_instance.anthropic, AsyncAnthropic):
-             self.logger.critical("Anthropic client not found within provided MCPClient instance.")
-             raise ValueError("Anthropic client required via MCPClient.")
-        self.anthropic_client: AsyncAnthropic = self.mcp_client.anthropic # type: ignore
+        self.agent_llm_model = default_llm_model_string
         self.logger = log
         self.agent_state_file = Path(agent_state_file)
 
-        # Configuration parameters for cognitive processes
+        if not hasattr(self.mcp_client, "anthropic") or not isinstance(self.mcp_client.anthropic, AsyncAnthropic):
+            self.logger.critical("CRITICAL: MCPClient instance missing valid Anthropic client.")
+            raise ValueError("MCPClient instance missing Anthropic client.")
+        self.anthropic_client: AsyncAnthropic = self.mcp_client.anthropic  # type: ignore
+
         self.consolidation_memory_level = MemoryLevel.EPISODIC.value
-        self.consolidation_max_sources = 10 # Max memories to feed into consolidation
-        self.auto_linking_threshold = 0.7 # Similarity threshold for auto-linking
-        self.auto_linking_max_links = 3 # Max links to create per auto-link trigger
-
-        # Sequence of reflection types to cycle through
-        self.reflection_type_sequence = [
-            "summary", "progress", "gaps", "strengths", "plan",
-        ]
-
-        # Initialize agent state (will be overwritten by load if file exists)
+        self.consolidation_max_sources = 10
+        self.auto_linking_threshold = 0.7
+        self.auto_linking_max_links = 3
+        self.reflection_type_sequence = ["summary", "progress", "gaps", "strengths", "plan"]
         self.state = AgentState()
-        # Event to signal graceful shutdown
         self._shutdown_event = asyncio.Event()
-        # Lock for safely managing the background tasks set
         self._bg_tasks_lock = asyncio.Lock()
-        # Semaphore to limit concurrent background tasks
         self._bg_task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BG_TASKS)
-        # Placeholder for loaded tool schemas
         self.tool_schemas: List[Dict[str, Any]] = []
+        self.logger.info(f"AgentMasterLoop initialized. LLM: {self.agent_llm_model}")
 
-    # ----------------------------------------------------------- shutdown --
     async def shutdown(self) -> None:
-        """
-        Initiates graceful shutdown of the agent loop.
-
-        Sets the shutdown event, cancels pending background tasks,
-        and saves the final agent state.
-        """
         self.logger.info("Shutdown requested.")
-        self._shutdown_event.set() # Signal loops and tasks to stop
-        await self._cleanup_background_tasks() # Wait for background tasks
-        await self._save_agent_state() # Save final state
+        self._shutdown_event.set()
+        await self._cleanup_background_tasks()
+        await self._save_agent_state()
         self.logger.info("Agent loop shutdown complete.")
 
-    # ----------------------------------------------------------- prompt --
-    def _construct_agent_prompt(
-        self, goal: str, context: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """
-        Builds the system and user prompts for the agent LLM.
-
-        Integrates the overall goal, available tools with schemas, detailed
-        process instructions, cognitive guidance, and the current runtime context
-        (plan, errors, feedback, **goal stack**, memories, etc.) into the prompt structure
-        expected by the Anthropic API. Includes robust context truncation.
-        **Enhanced with goal stack guidance, mental momentum bias, and error recovery strategies.**
-        """
-        # <<< Start Integration Block: Enhance _construct_agent_prompt (Goal Stack + Momentum) >>>
-        # ---------- system ----------
-        # Initialize the list for system prompt blocks
+    def _construct_agent_prompt(self, goal: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         system_blocks: List[str] = [
             f"You are '{AGENT_NAME}', an AI agent orchestrator using a Unified Memory System.",
             "",
-            # --- GOAL CONTEXT (Logic moved outside list literal) ---
-            f"Overall Goal: {goal}", # This remains the root goal
+            f"Overall Goal: {goal}",
         ]
 
-        # Extract current goal details from context and append the appropriate string
-        current_goal_info = context.get("current_goal_context", {}).get("current_goal")
-        if current_goal_info:
-            system_blocks.append(f"Current Goal: {current_goal_info.get('description', 'N/A')} (ID: {_fmt_id(current_goal_info.get('goal_id'))}, Status: {current_goal_info.get('status', 'N/A')})")
+        # Extract current goal details from context (agent_assembled_goal_context)
+        current_goal_block = context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
+        if current_goal_block and isinstance(current_goal_block, dict):
+            desc = current_goal_block.get("description", "N/A")
+            gid = _fmt_id(current_goal_block.get("goal_id"))
+            status = current_goal_block.get("status", "N/A")
+            system_blocks.append(f"Current Goal: {desc} (ID: {gid}, Status: {status})")
         else:
             system_blocks.append("Current Goal: None specified (Focus on Overall Goal or plan step)")
 
-        # Add the separator and the next section header
-        system_blocks.append("") # Separator
+        system_blocks.append("")
         system_blocks.append("Available Unified Memory & Agent Tools (Use ONLY these):")
 
-        # --- Continue appending other system blocks as before ---
         if not self.tool_schemas:
             system_blocks.append("- CRITICAL WARNING: No tools loaded. Cannot function.")
         else:
-            # Define key tools to highlight in the prompt (adding Goal tools)
             essential_cognitive_tools = {
-                TOOL_ADD_ACTION_DEPENDENCY, TOOL_RECORD_ARTIFACT, TOOL_HYBRID_SEARCH,
-                TOOL_STORE_MEMORY, TOOL_UPDATE_MEMORY, TOOL_CREATE_LINK,
-                TOOL_CREATE_THOUGHT_CHAIN, TOOL_GET_THOUGHT_CHAIN, TOOL_RECORD_THOUGHT,
-                TOOL_REFLECTION, TOOL_CONSOLIDATION, TOOL_PROMOTE_MEM,
-                TOOL_OPTIMIZE_WM, TOOL_AUTO_FOCUS, TOOL_GET_WORKING_MEMORY,
-                TOOL_QUERY_MEMORIES, TOOL_SEMANTIC_SEARCH,
-                AGENT_TOOL_UPDATE_PLAN, # Also highlight the agent's own tool
-                # --- Goal Stack Tools ---
-                TOOL_PUSH_SUB_GOAL, TOOL_MARK_GOAL_STATUS, TOOL_GET_GOAL_DETAILS,
+                TOOL_ADD_ACTION_DEPENDENCY,
+                TOOL_RECORD_ARTIFACT,
+                TOOL_HYBRID_SEARCH,
+                TOOL_STORE_MEMORY,
+                TOOL_UPDATE_MEMORY,
+                TOOL_CREATE_LINK,
+                TOOL_CREATE_THOUGHT_CHAIN,
+                TOOL_GET_THOUGHT_CHAIN,
+                TOOL_RECORD_THOUGHT,
+                TOOL_REFLECTION,
+                TOOL_CONSOLIDATION,
+                TOOL_PROMOTE_MEM,
+                TOOL_OPTIMIZE_WM,
+                TOOL_AUTO_FOCUS,
+                TOOL_GET_WORKING_MEMORY,
+                TOOL_QUERY_MEMORIES,
+                TOOL_SEMANTIC_SEARCH,
+                AGENT_TOOL_UPDATE_PLAN,
+                TOOL_CREATE_GOAL,
+                TOOL_UPDATE_GOAL_STATUS,
+                TOOL_GET_GOAL_DETAILS,
             }
-            # Format each tool schema for the prompt
             for schema in self.tool_schemas:
                 sanitized = schema["name"]
-                # Ensure mapping exists before using it
                 original = self.mcp_client.server_manager.sanitized_to_original.get(sanitized, sanitized)
                 desc = schema.get("description", "No description.")
                 is_essential = original in essential_cognitive_tools
-                prefix = "**" if is_essential else "" # Highlight key tools
-                # Provide tool name, mapping, description, and schema
-                # Handle different schema formats ('input_schema' vs 'parameters')
-                input_schema_str = json.dumps(schema.get('input_schema', schema.get('parameters', {})))
+                prefix = "**" if is_essential else ""
+                input_schema_str = json.dumps(schema.get("input_schema", schema.get("parameters", {})))
                 system_blocks.append(
-                    f"\n- {prefix}Name: `{sanitized}` (Represents: `{original}`){prefix}\n"
-                    f"  Desc: {desc}\n"
-                    f"  Schema: {input_schema_str}"
+                    f"\n- {prefix}Name: `{sanitized}` (Represents: `{original}`){prefix}\n  Desc: {desc}\n  Schema: {input_schema_str}"
                 )
         system_blocks.append("")
-        # --- Detailed Process Instructions (Enhanced for Goals & Momentum) ---
-        system_blocks.extend([
-            "Your Process at each step:",
-            "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details` - *pay attention to error `type`*), **goal stack (`current_goal_context` -> `goal_stack_summary`) and the `current_goal`**, recent actions, memories (`core_context`, `proactive_memories`), thoughts, `current_plan`, `relevant_procedures`, **`current_working_memory` (use this for immediate relevance, note `focal_memory_id` if present)**, `current_thought_chain_id`, and `meta_feedback`. Pay attention to memory `importance`/`confidence` and context component `retrieved_at` timestamps.",
-            "2.  Error Handling: If `last_error_details` exists, **FIRST** reason about the error `type` and `message`. Propose a recovery strategy in your reasoning. Refer to 'Recovery Strategies' below.",
-            "3.  Reasoning & Planning:",
-            "    a. State step-by-step reasoning towards the **Current Goal**, integrating context and feedback. Consider `current_working_memory` for immediate context. Record key thoughts using `record_thought` and specify the `thought_chain_id` if different from `current_thought_chain_id`.",
-            "    b. Evaluate `current_plan`. Is it aligned with the **Current Goal**? Is it valid? Does it address errors? Are dependencies (`depends_on`) likely met? Check for cycles.",
-            "    c. **Goal Management:** If the Current Goal is too complex, break it down by using `push_sub_goal` with a clear `description`. When a sub-goal is achieved or fails, use `mark_goal_status` with the `goal_id` and appropriate `status` ('completed' or 'failed').", # Goal instructions
-            "    d. **Action Dependencies:** If planning Step B requires output from Step A (action ID 'a123'), include `\"depends_on\": [\"a123\"]` in Step B's plan object.",
-            "    e. **Artifact Tracking:** If planning to use a tool that creates a file/data, plan a subsequent step to call `record_artifact`. If needing a previously created artifact, plan to use `get_artifacts` or `get_artifact_by_id` first.",
-            "    f. **Direct Memory Management:** If you synthesize a critical new fact, insight, or procedure, plan to use `store_memory` to explicitly save it. If you find strong evidence contradicting a stored memory, plan to use `update_memory` to correct it. Provide clear `content`, `memory_type`, `importance`, and `confidence`.",
-            "    g. **Custom Thought Chains:** If tackling a distinct sub-problem or exploring a complex tangent, consider creating a new reasoning thread using `create_thought_chain`. Provide a clear `title`. Subsequent related thoughts should specify the new `thought_chain_id`.",
-            "    h. **Linking:** Identify potential memory relationships (causal, supportive, contradictory). Plan to use `create_memory_link` with specific `link_type`s (e.g., `SUPPORTS`, `CONTRADICTS`, `CAUSAL`, `REFERENCES`).",
-            "    i. **Search:** Prefer `hybrid_search_memories` for mixed queries needing relevance and keyword matching. Use `search_semantic_memories` for pure conceptual similarity.",
-            "    j. **Update Plan Tool / Repair:** Use `agent:update_plan` ONLY for significant changes (error recovery, major strategy shift, multi-step insertion/removal, fixing validation issues like cycles). **If `needs_replan` is true in context, prioritize using this tool to fix the plan.** Do NOT use it for simply marking a step complete.",
-            "4.  Action Decision: Choose **ONE** action based on the *first planned step* in your current plan:",
-            "    *   Call Memory/Other Tool: Select the most precise tool (including goal tools like `push_sub_goal` or `mark_goal_status`). Provide args per schema. **Mandatory:** Call `create_workflow` if context shows 'No Active Workflow'.", # Added goal tools example
-            "    *   Record Thought: Use `record_thought` for logging reasoning, questions, hypotheses etc. Specify `thought_chain_id` if not the current one.",
-            "    *   Update Plan Tool: Call `agent:update_plan` with the **complete, repaired** plan structure if major changes are needed or validation failed.",
-            "    *   Signal Completion: If the **Current Goal** is MET (use `mark_goal_status`) OR the Overall Goal is MET (respond ONLY with the text \"Goal Achieved:\" followed by a brief summary).", # Clarified goal completion
-            "5.  Output Format: Respond **ONLY** with the valid JSON for the chosen tool call OR the \"Goal Achieved:\" text."
-        ])
-        # --- Key Considerations (Enhanced for Goals & Momentum) ---
-        system_blocks.extend([
-            "\nKey Considerations:",
-            "*   Goal Focus: Always work towards the **Current Goal** (top of the stack). Use `push_sub_goal` and `mark_goal_status` to manage the hierarchy.",
-            "*   **Mental Momentum:** Prioritize completing the current plan steps if progress is steady. Justify significant deviations or replanning efforts.", # Momentum instruction
-            "*   Dependencies & Cycles: Ensure `depends_on` actions are likely complete. Avoid circular dependencies. Use `get_action_details` if unsure.",
-            "*   Artifacts: Track outputs (`record_artifact`), retrieve inputs (`get_artifacts`/`get_artifact_by_id`).",
-            "*   Memory: Store important learned info (`store_memory`). Update incorrect info (`update_memory`). Use confidence scores.",
-            "*   Thought Chains: Use `create_thought_chain` for complex sub-problems. Use the correct `thought_chain_id` when recording thoughts.",
-            "*   Linking: Use specific `link_type`s to build the knowledge graph.",
-            "*   Focus: Leverage `current_working_memory` for immediate context. Note the `focal_memory_id`.",
-            "*   Errors: Prioritize error analysis and recovery based on `last_error_details.type`."
-        ])
-        # --- Recovery Strategies Guidance ---
-        system_blocks.extend([
-            "\nRecovery Strategies based on `last_error_details.type`:",
-            "*   `InvalidInputError`: Review tool schema, arguments, and context. Correct the arguments and retry OR choose a different tool/step.",
-            "*   `DependencyNotMetError`: Use `get_action_details` on dependency IDs to check status. Adjust plan order using `agent:update_plan` or wait.",
-            "*   `ServerUnavailable` / `NetworkError`: The tool's server might be down. Try a different tool, wait, or adjust the plan.",
-            "*   `APILimitError` / `RateLimitError`: The external API (e.g., LLM) is busy. Plan to wait (record a thought) before retrying the step.",
-            "*   `ToolExecutionError` / `ToolInternalError`: The tool failed internally. Analyze the error message. Maybe try different arguments, use an alternative tool, or adjust the plan.",
-            "*   `PlanUpdateError`: The plan structure you proposed was invalid. Re-examine the plan steps and dependencies, then try `agent:update_plan` again with a valid list.",
-            "*   `PlanValidationError`: The proposed plan has logical issues (e.g., cycles). Debug dependencies and propose a corrected plan structure using `agent:update_plan`.",
-            "*   `CancelledError`: The previous action was cancelled. Re-evaluate the current step.",
-            "*   `GoalManagementError`: An error occurred managing the goal stack (e.g., trying to mark a non-existent goal). Review `current_goal_context` and the goal stack logic.", # Added Goal error
-            "*   `UnknownError` / `UnexpectedExecutionError`: Analyze the error message carefully. Try to understand the cause. You might need to simplify the step, use a different approach, or ask for clarification via `record_thought` if stuck."
-        ])
+        system_blocks.extend(
+            [
+                "Your Process at each step:",
+                "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details`), **goal stack (`agent_assembled_goal_context` -> `goal_stack_summary_from_agent_state`) and the `current_goal_details_from_ums`**, UMS package (`ums_context_package` containing core_context, working_memory, proactive/procedural memories, links), `current_plan`, `current_thought_chain_id`, and `meta_feedback`. Pay attention to `retrieved_at` timestamps for freshness.",
+                "2.  Error Handling: If `last_error_details` exists, **FIRST** reason about the error `type` and `message`. Propose a recovery strategy. Refer to 'Recovery Strategies'.",
+                "3.  Reasoning & Planning:",
+                "    a. State step-by-step reasoning towards the Current Goal. Record key thoughts using `record_thought`.",
+                "    b. Evaluate `current_plan`. Is it aligned with the Current Goal? Valid? Addresses errors? Dependencies met?",
+                "    c. **Goal Management:** If Current Goal is too complex, use `unified_memory:create_goal` (providing `parent_goal_id` as `current_goal_id`). When a goal is met/fails, use `unified_memory:update_goal_status` with the `goal_id` and status.",
+                '    d. Action Dependencies: If Step B needs output from Step A (ID \'a123\'), include `"depends_on": ["a123"]` in B\'s plan object. Then use `unified_memory:add_action_dependency` UMS tool.',
+                "    e. Artifacts: Plan `unified_memory:record_artifact` for creations. Use `unified_memory:get_artifacts` or `unified_memory:get_artifact_by_id` for existing.",
+                "    f. Memory: Use `unified_memory:store_memory` for new facts/insights. Use `unified_memory:update_memory` for corrections.",
+                "    g. Thought Chains: Use `unified_memory:create_thought_chain` for distinct sub-problems.",
+                "    h. Linking: Use `unified_memory:create_memory_link` for relationships.",
+                "    i. Search: Prefer `unified_memory:hybrid_search_memories`. Use `unified_memory:search_semantic_memories` for pure conceptual similarity.",
+                "    j. Plan Update Tool: Use `agent:update_plan` ONLY for significant changes, error recovery, or fixing validation issues. Do NOT use for simple step completion.",
+                "4.  Action Decision: Choose ONE action based on the *first planned step*:",
+                "    *   Call UMS Tool: (e.g., `unified_memory:create_goal`, `unified_memory:store_memory`). Provide args per schema. **Mandatory:** Call `unified_memory:create_workflow` if context shows 'No Active Workflow'.",
+                "    *   Record Thought: Use `unified_memory:record_thought`.",
+                "    *   Update Plan Tool: Call `agent:update_plan` with the **complete, repaired** plan.",
+                "    *   Signal Completion: If Current Goal is MET (use `unified_memory:update_goal_status`) OR Overall Goal is MET (respond ONLY with 'Goal Achieved: ...summary...').",
+                "5.  Output Format: Respond ONLY with the valid JSON for the chosen tool call OR 'Goal Achieved: ...summary...' text.",
+            ]
+        )
+        system_blocks.extend(
+            [
+                "\nKey Considerations:",
+                "*   Goal Focus: Always work towards the Current Goal. Use UMS goal tools.",
+                "*   Mental Momentum: Prioritize current plan steps if progress is steady.",
+                "*   Dependencies & Cycles: Ensure `depends_on` actions are complete. Avoid cycles.",
+                "*   UMS Context: Leverage the `ums_context_package` provided by the UMS.",
+                "*   Errors: Prioritize error analysis based on `last_error_details.type`.",
+                "*   User Guidance: Pay close attention to thoughts of type 'user_guidance' or memories of type 'user_input'. These are direct inputs from the operator and will likely require plan adjustments.*"
+            ]
+        )
+        system_blocks.extend(
+            [
+                "\nRecovery Strategies based on `last_error_details.type`:",
+                "*   `InvalidInputError`: Review tool schema, args, context. Correct args and retry OR choose different tool/step.",
+                "*   `DependencyNotMetError`: Use `unified_memory:get_action_details` on dependency IDs. Adjust plan order (`agent:update_plan`) or wait.",
+                "*   `ServerUnavailable` / `NetworkError`: Tool's server might be down. Try different tool, wait, or adjust plan.",
+                "*   `APILimitError` / `RateLimitError`: External API busy. Plan to wait (record thought) before retry.",
+                "*   `ToolExecutionError` / `ToolInternalError`: Tool failed. Analyze message. Try different args, alternative tool, or adjust plan.",
+                "*   `PlanUpdateError`: Proposed plan structure was invalid. Re-examine plan and dependencies, try `agent:update_plan` again.",
+                "*   `PlanValidationError`: Proposed plan has logical issues (e.g., cycles). Debug dependencies, propose corrected plan using `agent:update_plan`.",
+                "*   `CancelledError`: Previous action cancelled. Re-evaluate current step.",
+                "*   `GoalManagementError`: Error managing UMS goal stack (e.g., marking non-existent goal). Review `agent_assembled_goal_context` and goal logic.",
+                "*   `UnknownError` / `UnexpectedExecutionError`: Analyze error message carefully. Simplify step, use different approach, or record_thought if stuck.",
+            ]
+        )
         system_prompt = "\n".join(system_blocks)
-        # <<< End Integration Block: Enhance _construct_agent_prompt >>>
 
-        # ---------- user ----------
-        # Construct the user part of the prompt, including truncated context
-        context_json = _truncate_context(context) # Apply robust truncation
+        context_json = _truncate_context(context)
         user_blocks = [
             "Current Context:",
             "```json",
@@ -761,817 +687,541 @@ class AgentMasterLoop:
             "",
             "Current Plan:",
             "```json",
-            # Serialize current plan steps (ensure model_dump handles exclude_none)
-            json.dumps(
-                [step.model_dump(exclude_none=True) for step in self.state.current_plan],
-                indent=2,
-                ensure_ascii=False,
-            ),
+            json.dumps([step.model_dump(exclude_none=True) for step in self.state.current_plan], indent=2, ensure_ascii=False),
             "```",
             "",
-            # Include summary of the last action taken
             f"Last Action Summary:\n{self.state.last_action_summary}\n",
         ]
-        # If there was an error in the previous step, include details prominently
         if self.state.last_error_details:
             user_blocks += [
-                "**CRITICAL: Address Last Error Details**:", # Highlight error
+                "**CRITICAL: Address Last Error Details**:",
                 "```json",
-                # Use default=str for safe serialization of potential complex error objects
                 json.dumps(self.state.last_error_details, indent=2, default=str),
                 "```",
                 "",
             ]
-        # If there's feedback from meta-cognitive tasks, include it
         if self.state.last_meta_feedback:
-            user_blocks += [
-                "**Meta-Cognitive Feedback**:", # Highlight feedback
-                self.state.last_meta_feedback,
-                "",
-            ]
-        # Reiterate the overall goal and the final instruction
+            user_blocks += ["**Meta-Cognitive Feedback**:", self.state.last_meta_feedback, ""]
+
+        # Reiterate current goal from agent's assembled context for emphasis
+        current_goal_desc_for_prompt = "Overall Goal"
+        if context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums"):
+            cg_details = context["agent_assembled_goal_context"]["current_goal_details_from_ums"]
+            if isinstance(cg_details, dict) and cg_details.get("description"):
+                current_goal_desc_for_prompt = cg_details["description"]
+
         user_blocks += [
-            # Reiterate current goal from context for emphasis
-            f"Current Goal Reminder: {context.get('current_goal_context', {}).get('current_goal', {}).get('description', 'Overall Goal')}",
+            f"Current Goal Reminder: {current_goal_desc_for_prompt}",
             "",
-            # Updated instruction emphasizing error/plan repair AND goal management
-            "Instruction: Analyze context & errors (use recovery strategies if needed). Reason step-by-step towards the Current Goal. Evaluate and **REPAIR** the plan if `needs_replan` is true or errors indicate plan issues (use `agent:update_plan`). Manage goals using `push_sub_goal` or `mark_goal_status` if needed. Otherwise, decide ONE action based on the *first planned step*: call a tool (output tool_use JSON), record a thought (`record_thought`), or signal completion (use `mark_goal_status` for sub-goals or output 'Goal Achieved: ...' for overall goal).",
+            "Instruction: Analyze context & errors (use recovery strategies if needed). Reason step-by-step towards the Current Goal. Evaluate and **REPAIR** the plan if `needs_replan` is true or errors indicate plan issues (use `agent:update_plan`). Manage goals using UMS tools (`unified_memory:create_goal` or `unified_memory:update_goal_status`) if needed. Otherwise, decide ONE action based on the *first planned step*: call a UMS tool (output tool_use JSON), record a thought (`unified_memory:record_thought`), or signal completion (use `unified_memory:update_goal_status` for sub-goals or output 'Goal Achieved: ...' for overall goal).",
         ]
         user_prompt = "\n".join(user_blocks)
-
-        # Return structure for Anthropic API (user prompt combines system instructions and current state)
-        # Note: Anthropic recommends placing system prompts outside the 'messages' list if using their client directly.
-        # Here, we combine them into the user message content as per the original structure.
-        # >>>>> PRESERVED ORIGINAL PROMPT STRUCTURE <<<<<
         return [{"role": "user", "content": system_prompt + "\n---\n" + user_prompt}]
 
-
-    # ---------------------------------------------------------- bg‑task utils --
     def _background_task_done(self, task: asyncio.Task) -> None:
-        """Callback attached to background tasks upon completion."""
-        # Schedule the safe cleanup coroutine to avoid blocking the callback
         asyncio.create_task(self._background_task_done_safe(task))
 
     async def _background_task_done_safe(self, task: asyncio.Task) -> None:
-        """
-        Safely removes a completed task from the tracking set, releases the semaphore,
-        and logs any exceptions. Ensures thread-safety using an asyncio Lock.
-        """
-        # <<< Start Integration Block: Enhance _background_task_done_safe (Phase 1, Step 5) >>>
         was_present = False
-        async with self._bg_tasks_lock: # Acquire lock before modifying the set
+        async with self._bg_tasks_lock:
             if task in self.state.background_tasks:
-                 self.state.background_tasks.discard(task)
-                 was_present = True
-
-        # Release the semaphore ONLY if the task was successfully removed from the set
-        # This prevents releasing the semaphore multiple times if the callback somehow fires twice
+                self.state.background_tasks.discard(task)
+                was_present = True
         if was_present:
             try:
                 self._bg_task_semaphore.release()
                 log.debug(f"Released semaphore. Count: {self._bg_task_semaphore._value}. Task: {task.get_name()}")
             except ValueError:
-                 # This can happen if release is called more times than acquire (should not normally occur)
-                 log.warning(f"Semaphore release attempt failed for task {task.get_name()}. Already fully released?")
+                log.warning(f"Semaphore release failed for task {task.get_name()}.")
             except Exception as sem_err:
-                 log.error(f"Unexpected error releasing semaphore for task {task.get_name()}: {sem_err}")
-
-        # Log cancellation or exceptions after releasing the lock and semaphore
+                log.error(f"Error releasing semaphore for {task.get_name()}: {sem_err}")
         if task.cancelled():
-            self.logger.debug(f"Background task {task.get_name()} was cancelled.")
-            return
-        # Check if the task encountered an exception
+            self.logger.debug(f"Background task {task.get_name()} cancelled.")
         exc = task.exception()
         if exc:
-            # Log the exception details
-            self.logger.error(
-                # Provide task name/info for better debugging
-                f"Background task {task.get_name()} failed: {type(exc).__name__}",
-                exc_info=(type(exc), exc, exc.__traceback__), # Provide full traceback info
-            )
-        # <<< End Integration Block: Enhance _background_task_done_safe >>>
+            self.logger.error(f"Background task {task.get_name()} failed: {type(exc).__name__}", exc_info=(type(exc), exc, exc.__traceback__))
 
     def _start_background_task(self, coro_fn, *args, **kwargs) -> asyncio.Task:
-        """
-        Creates and starts an asyncio task for a background operation.
-
-        Acquires a semaphore slot before starting. Includes timeout handling.
-        Captures essential state (workflow_id, context_id) at the time of creation
-        to ensure the background task operates on the correct context, even if the
-        main agent state changes before the task runs. Adds the task to the
-        tracking set for cleanup.
-
-        Args:
-            coro_fn: The async function (coroutine) to run in the background.
-                     Must accept `self` as the first argument if it's an instance method.
-            *args: Positional arguments to pass to `coro_fn`.
-            **kwargs: Keyword arguments to pass to `coro_fn`.
-
-        Returns:
-            The created asyncio.Task object.
-        """
-        # <<< Start Integration Block: Enhance _start_background_task (Phase 1, Step 5) >>>
-        # Snapshot critical state needed by the background task at the moment of creation
         snapshot_wf_id = self.state.workflow_id
         snapshot_ctx_id = self.state.context_id
-        # Add other state variables here if specific background tasks need them
 
-        # Define an async wrapper function to execute the coroutine with snapshotted state
         async def _wrapper():
-            # Acquire semaphore before running the actual work
             log.debug(f"Waiting for semaphore... Task: {asyncio.current_task().get_name()}. Current count: {self._bg_task_semaphore._value}")
             await self._bg_task_semaphore.acquire()
             log.debug(f"Acquired semaphore. Task: {asyncio.current_task().get_name()}. New count: {self._bg_task_semaphore._value}")
             try:
-                # Run the actual coroutine with timeout
                 await asyncio.wait_for(
-                    coro_fn(
-                        self, # Pass the agent instance
-                        *args,
-                        workflow_id=snapshot_wf_id, # Pass snapshotted workflow_id
-                        context_id=snapshot_ctx_id, # Pass snapshotted context_id
-                        **kwargs,
-                    ),
-                    timeout=BACKGROUND_TASK_TIMEOUT_SECONDS
+                    coro_fn(self, *args, workflow_id=snapshot_wf_id, context_id=snapshot_ctx_id, **kwargs), timeout=BACKGROUND_TASK_TIMEOUT_SECONDS
                 )
             except asyncio.TimeoutError:
-                # Log timeout specifically
-                self.logger.warning(f"Background task {asyncio.current_task().get_name()} timed out after {BACKGROUND_TASK_TIMEOUT_SECONDS}s.")
+                self.logger.warning(f"Background task {asyncio.current_task().get_name()} timed out.")
             except Exception:
-                # Log other exceptions, they will also be logged by the done callback
-                self.logger.debug(f"Exception caught within background task wrapper {asyncio.current_task().get_name()}. Will be logged by done callback.")
-            # finally:
-            #     # Ensure semaphore is released *within the task itself*
-            #     # This is handled by the done callback now to simplify wrapper logic
-            #     # self._bg_task_semaphore.release()
-            #     # log.debug(f"Released semaphore via FINALLY. Task: {asyncio.current_task().get_name()}")
-            #     pass
+                self.logger.debug(f"Exception in wrapper {asyncio.current_task().get_name()}. Done callback logs.")
 
-        # Create the asyncio task
-        # Naming the task helps with debugging
-        task_name = f"bg_{coro_fn.__name__}_{_fmt_id(snapshot_wf_id)}_{random.randint(100,999)}"
+        task_name = f"bg_{coro_fn.__name__}_{_fmt_id(snapshot_wf_id)}_{random.randint(100, 999)}"
         task = asyncio.create_task(_wrapper(), name=task_name)
-
-        # Schedule adding the task to the tracking set safely using another task
-        # This avoids potential blocking if the lock is held
         asyncio.create_task(self._add_bg_task(task))
-
-        # Add the completion callback to handle cleanup and logging (this callback now also releases semaphore)
         task.add_done_callback(self._background_task_done)
         self.logger.debug(f"Started background task: {task.get_name()} for WF {_fmt_id(snapshot_wf_id)}")
         return task
-        # <<< End Integration Block: Enhance _start_background_task >>>
-
 
     async def _add_bg_task(self, task: asyncio.Task) -> None:
-        """Safely add a task to the background task set using the lock."""
         async with self._bg_tasks_lock:
             self.state.background_tasks.add(task)
 
     async def _cleanup_background_tasks(self) -> None:
-        """
-        Cancels all pending background tasks and awaits their completion.
-        Called during graceful shutdown. Ensures semaphores are released.
-        """
-        # <<< Start Integration Block: Enhance _cleanup_background_tasks (Phase 1, Step 5) >>>
         tasks_to_cleanup: List[asyncio.Task] = []
-        async with self._bg_tasks_lock: # Acquire lock to safely get the list
-            # Create a copy to iterate over, as the set might be modified by callbacks
+        async with self._bg_tasks_lock:
             tasks_to_cleanup = list(self.state.background_tasks)
-
         if not tasks_to_cleanup:
             self.logger.debug("No background tasks to clean up.")
             return
-
         self.logger.info(f"Cleaning up {len(tasks_to_cleanup)} background tasks…")
-        cancelled_tasks = []
-        already_done_tasks = []
-
-        # Cancel running tasks
         for t in tasks_to_cleanup:
             if not t.done():
-                # Cancel any task that hasn't finished yet
                 t.cancel()
-                cancelled_tasks.append(t)
-            else:
-                 already_done_tasks.append(t)
-
-        # Wait for all tasks (including those just cancelled) to finish
-        # return_exceptions=True prevents gather from stopping on the first exception
         results = await asyncio.gather(*tasks_to_cleanup, return_exceptions=True)
-
-        # Log the outcome of each task cleanup
         for i, res in enumerate(results):
             task = tasks_to_cleanup[i]
             task_name = task.get_name()
             if isinstance(res, asyncio.CancelledError):
-                # This is expected for tasks that were cancelled above
-                self.logger.debug(f"Task {task_name} successfully cancelled during cleanup.")
+                self.logger.debug(f"Task {task_name} cancelled during cleanup.")
             elif isinstance(res, Exception):
-                # Log any unexpected errors that occurred during task execution/cleanup
-                self.logger.error(f"Task {task_name} raised an exception during cleanup: {res}")
+                self.logger.error(f"Task {task_name} error during cleanup: {res}")
             else:
-                # Task completed normally before/during cleanup or was already done
-                self.logger.debug(f"Task {task_name} finalized during cleanup (completed normally or already done).")
-
-            # --- Ensure semaphore is released ---
-            # The done callback should handle release, but we add a check here as a failsafe
-            # during shutdown, especially if the callback didn't run or failed itself.
-            # This is tricky because we don't know if the task acquired the semaphore before being cancelled.
-            # A potentially safer approach is *not* to release here unless we are certain the task
-            # acquired it and didn't release it. Releasing without acquiring increments the semaphore count.
-            # Given the complexity, we rely on the robust done_callback for release.
-            # Adding a log message if the semaphore count seems wrong at the end might be useful.
-
-        # Clear the tracking set after all tasks are handled
+                self.logger.debug(f"Task {task_name} finalized during cleanup.")
         async with self._bg_tasks_lock:
             self.state.background_tasks.clear()
-
-        # Final check on semaphore count after cleanup
         final_sem_count = self._bg_task_semaphore._value
         if final_sem_count != MAX_CONCURRENT_BG_TASKS:
-             self.logger.warning(f"Semaphore count is {final_sem_count} after cleanup, expected {MAX_CONCURRENT_BG_TASKS}. Some tasks might not have released.")
-
+            self.logger.warning(f"Semaphore count {final_sem_count} after cleanup, expected {MAX_CONCURRENT_BG_TASKS}.")
         self.logger.info("Background tasks cleanup finished.")
-        # <<< End Integration Block: Enhance _cleanup_background_tasks >>>
 
-
-    # ------------------------------------------------------- token estimator --
     async def _estimate_tokens_anthropic(self, data: Any) -> int:
-        """
-        Estimates token count for given data using the Anthropic client.
-
-        Handles serialization of non-string data and provides a fallback
-        heuristic (chars/4) if the API call fails.
-        """
         if data is None:
             return 0
         try:
             if not self.anthropic_client:
-                # This should ideally be caught during initialization
-                raise RuntimeError("Anthropic client unavailable for token estimation")
-
-            # Convert data to string if it's not already (e.g., dict, list)
+                raise RuntimeError("Anthropic client unavailable")
             text_to_count = data if isinstance(data, str) else json.dumps(data, default=str, ensure_ascii=False)
-
-            # Use the actual count_tokens method from the anthropic client
             token_count = await self.anthropic_client.count_tokens(text_to_count)
-            return int(token_count) # Ensure result is an integer
-
+            return int(token_count)
         except Exception as e:
-            # Log the specific error from the API call
             self.logger.warning(f"Token estimation via Anthropic API failed: {e}. Using fallback.")
-            # Fallback heuristic: Estimate based on character count
-            try:
-                text_representation = data if isinstance(data, str) else json.dumps(data, default=str, ensure_ascii=False)
-                return len(text_representation) // 4 # Rough approximation
-            except Exception as fallback_e:
-                # Log error if even the fallback fails
-                self.logger.error(f"Token estimation fallback failed: {fallback_e}")
-                return 0 # Return 0 if all estimation methods fail
+            text_representation = data if isinstance(data, str) else json.dumps(data, default=str, ensure_ascii=False)
+            return len(text_representation) // 4
 
-    # --------------------------------------------------------------- retry util --
     async def _with_retries(
         self,
-        coro_fun, # The async function to call
+        coro_fun,
         *args,
         max_retries: int = 3,
-        # Exceptions to retry on (can be customized per call)
         retry_exceptions: Tuple[type[BaseException], ...] = (
-            ToolError, ToolInputError, # Specific MCP errors
-            asyncio.TimeoutError, ConnectionError, # Common network issues
-            APIConnectionError, RateLimitError, # Anthropic network issues
-            APIStatusError, # Treat potentially transient API status errors as retryable
+            ToolError,
+            ToolInputError,
+            asyncio.TimeoutError,
+            ConnectionError,
+            APIConnectionError,
+            RateLimitError,
+            APIStatusError,
         ),
-        retry_backoff: float = 2.0, # Exponential backoff factor
-        jitter: Tuple[float, float] = (0.1, 0.5), # Random jitter range (min_sec, max_sec)
+        retry_backoff: float = 2.0,
+        jitter: Tuple[float, float] = (0.1, 0.5),
         **kwargs,
     ):
-        """
-        Generic retry wrapper for coroutine functions with exponential backoff and jitter.
-
-        Args:
-            coro_fun: The async function to execute and potentially retry.
-            *args: Positional arguments for `coro_fun`.
-            max_retries: Maximum number of total attempts (1 initial + max_retries-1 retries).
-            retry_exceptions: Tuple of exception types that trigger a retry.
-            retry_backoff: Multiplier for exponential backoff calculation.
-            jitter: Tuple (min, max) defining the range for random delay added to backoff.
-            **kwargs: Keyword arguments for `coro_fun`.
-
-        Returns:
-            The result of `coro_fun` upon successful execution.
-
-        Raises:
-            The last exception encountered if all retry attempts fail.
-            asyncio.CancelledError: If cancellation occurs during the retry loop or wait.
-        """
         attempt = 0
-        last_exception = None # Store the last exception for re-raising
+        last_exception = None
         while True:
             try:
-                # Attempt to execute the coroutine
                 return await coro_fun(*args, **kwargs)
             except retry_exceptions as e:
                 attempt += 1
-                last_exception = e # Store the exception
-                # Check if max retries have been reached
+                last_exception = e
                 if attempt >= max_retries:
-                    self.logger.error(f"{coro_fun.__name__} failed after {max_retries} attempts. Last error: {e}")
-                    raise # Re-raise the last encountered exception
-                # Calculate delay with exponential backoff and random jitter
+                    self.logger.error(f"{coro_fun.__name__} failed after {max_retries} attempts: {e}")
+                    raise
                 delay = (retry_backoff ** (attempt - 1)) + random.uniform(*jitter)
                 self.logger.warning(
                     f"{coro_fun.__name__} failed ({type(e).__name__}: {str(e)[:100]}...); retry {attempt}/{max_retries} in {delay:.2f}s"
                 )
-                # Check for shutdown signal *before* sleeping
                 if self._shutdown_event.is_set():
-                    self.logger.warning(f"Shutdown signaled during retry wait for {coro_fun.__name__}. Aborting retry.")
-                    # Raise CancelledError to stop the process cleanly if shutdown occurs during wait
-                    raise asyncio.CancelledError(f"Shutdown during retry for {coro_fun.__name__}") from last_exception
-                # Wait for the calculated delay
+                    self.logger.warning(f"Shutdown during retry for {coro_fun.__name__}.")
+                    raise asyncio.CancelledError(f"Shutdown during retry") from last_exception
                 await asyncio.sleep(delay)
             except asyncio.CancelledError:
-                 # Propagate cancellation immediately if caught
-                 self.logger.info(f"Coroutine {coro_fun.__name__} was cancelled during retry loop.")
-                 raise
+                self.logger.info(f"{coro_fun.__name__} cancelled during retry.")
+                raise
 
-
-    # ---------------------------------------------------------------- state I/O --
     async def _save_agent_state(self) -> None:
-        """
-        Saves the current agent state to a JSON file atomically.
-
-        Uses a temporary file and `os.replace` for atomicity. Includes fsync
-        for robustness against crashes. Serializes the AgentState dataclass,
-        handling nested structures like the plan, goal stack, and tool stats. Excludes
-        transient fields like `background_tasks`.
-        """
-        # Create a dictionary from the dataclass state
         state_dict = dataclasses.asdict(self.state)
-        # Add a timestamp for when the state was saved
         state_dict["timestamp"] = datetime.now(timezone.utc).isoformat()
-        # Ensure background_tasks (non-serializable Set[Task]) is removed
         state_dict.pop("background_tasks", None)
-        # Convert defaultdict to regular dict for saving tool stats
-        state_dict["tool_usage_stats"] = {
-            k: dict(v) for k, v in self.state.tool_usage_stats.items()
-        }
-        # Convert PlanStep Pydantic objects to dictionaries for saving
-        state_dict["current_plan"] = [
-            step.model_dump(exclude_none=True) for step in self.state.current_plan
-        ]
-        # --- ADDED: Ensure goal_stack (list of dicts) is saved correctly ---
-        state_dict["goal_stack"] = self.state.goal_stack # Already a list of dicts
-
+        state_dict["tool_usage_stats"] = {k: dict(v) for k, v in self.state.tool_usage_stats.items()}
+        state_dict["current_plan"] = [step.model_dump(exclude_none=True) for step in self.state.current_plan]
+        state_dict["goal_stack"] = self.state.goal_stack
         try:
-            # Ensure the directory for the state file exists
             self.agent_state_file.parent.mkdir(parents=True, exist_ok=True)
-            # Define a temporary file path for atomic write
-            tmp_file = self.agent_state_file.with_suffix(f".tmp_{os.getpid()}") # Process-specific avoids collisions
-            # Write to the temporary file asynchronously
-            async with aiofiles.open(tmp_file, "w", encoding='utf-8') as f:
-                # Dump the state dictionary to JSON with indentation
+            tmp_file = self.agent_state_file.with_suffix(f".tmp_{os.getpid()}")
+            async with aiofiles.open(tmp_file, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(state_dict, indent=2, ensure_ascii=False))
-                # Ensure data is written to the OS buffer
                 await f.flush()
-                # Ensure data is physically written to disk (crucial for crash recovery)
                 try:
                     os.fsync(f.fileno())
                 except OSError as e:
-                    # fsync might fail on some systems/filesystems (e.g., network drives)
-                    self.logger.warning(f"os.fsync failed during state save: {e} (Continuing, but save might not be fully durable)")
-
-            # Atomically replace the old state file with the new temporary file
+                    self.logger.warning(f"os.fsync failed: {e}")
             os.replace(tmp_file, self.agent_state_file)
             self.logger.debug(f"State saved atomically → {self.agent_state_file}")
         except Exception as e:
-            # Log any errors during the save process
             self.logger.error(f"Failed to save agent state: {e}", exc_info=True)
-            # Attempt to clean up the temporary file if it exists after an error
-            if 'tmp_file' in locals() and tmp_file.exists():
+            if "tmp_file" in locals() and tmp_file.exists():
                 try:
                     os.remove(tmp_file)
                 except OSError as rm_err:
-                     self.logger.error(f"Failed to remove temporary state file {tmp_file}: {rm_err}")
-
+                    self.logger.error(f"Failed remove tmp state file {tmp_file}: {rm_err}")
 
     async def _load_agent_state(self) -> None:
-        """
-        Loads agent state from the JSON file.
-
-        Handles file not found, JSON decoding errors, and potential mismatches
-        between the saved state structure and the current `AgentState` dataclass
-        (missing keys use defaults, extra keys are ignored with a warning).
-        Ensures critical fields like thresholds and the **goal stack** are initialized
-        even if loading fails.
-        """
-        # Check if the state file exists
         if not self.agent_state_file.exists():
-            # If no file, initialize with defaults, ensuring thresholds are set
             self.state = AgentState(
-                 current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
-                 current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
-                 # Other fields will use their dataclass defaults
+                current_reflection_threshold=BASE_REFLECTION_THRESHOLD, current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
             )
-            self.logger.info("No prior state file found. Starting fresh with default state.")
+            self.logger.info("No prior state file. Starting fresh.")
             return
-        # Try loading the state file
         try:
-            async with aiofiles.open(self.agent_state_file, "r", encoding='utf-8') as f:
-                # Read and parse the JSON data
+            async with aiofiles.open(self.agent_state_file, "r", encoding="utf-8") as f:
                 data = json.loads(await f.read())
-
-            # Prepare keyword arguments for AgentState constructor
             kwargs: Dict[str, Any] = {}
-            processed_keys = set() # Track keys successfully processed from the file
-
-            # Iterate through the fields defined in the AgentState dataclass
+            processed_keys = set()
             for fld in dataclasses.fields(AgentState):
-                # Skip fields that are not meant to be initialized (like background_tasks)
                 if not fld.init:
                     continue
-
                 name = fld.name
                 processed_keys.add(name)
-
-                # Check if the field exists in the loaded data
                 if name in data:
                     value = data[name]
-                    # Handle specific fields needing type conversion or validation
                     if name == "current_plan":
                         try:
-                            # Validate and convert saved plan steps back to PlanStep objects
-                            if isinstance(value, list):
-                                kwargs["current_plan"] = [PlanStep(**d) for d in value]
-                            else:
-                                raise TypeError("Saved plan is not a list")
+                            kwargs["current_plan"] = (
+                                [PlanStep(**d) for d in value] if isinstance(value, list) else [PlanStep(description=DEFAULT_PLAN_STEP)]
+                            )
                         except (ValidationError, TypeError) as e:
-                            # If plan loading fails, reset to default plan
-                            self.logger.warning(f"Plan reload failed: {e}. Resetting plan.")
+                            self.logger.warning(f"Plan reload failed: {e}. Resetting.")
                             kwargs["current_plan"] = [PlanStep(description=DEFAULT_PLAN_STEP)]
                     elif name == "tool_usage_stats":
-                        # Reconstruct defaultdict structure for tool stats
                         dd = _default_tool_stats()
                         if isinstance(value, dict):
                             for k, v_dict in value.items():
                                 if isinstance(v_dict, dict):
-                                    # Ensure required keys exist with correct types
                                     dd[k]["success"] = int(v_dict.get("success", 0))
                                     dd[k]["failure"] = int(v_dict.get("failure", 0))
                                     dd[k]["latency_ms_total"] = float(v_dict.get("latency_ms_total", 0.0))
                         kwargs["tool_usage_stats"] = dd
-                    # --- ADDED: Handle loading goal_stack ---
                     elif name == "goal_stack":
-                        if isinstance(value, list):
-                             # Basic validation: ensure items are dicts (more complex validation could be added)
-                             if all(isinstance(item, dict) for item in value):
-                                 kwargs[name] = value
-                             else:
-                                 self.logger.warning("Invalid goal_stack format in saved state. Resetting.")
-                                 kwargs[name] = [] # Reset to empty list
-                        else:
-                             self.logger.warning("goal_stack in saved state is not a list. Resetting.")
-                             kwargs[name] = []
-                    # Add handling for other complex types here if necessary in the future
+                        kwargs[name] = value if isinstance(value, list) and all(isinstance(item, dict) for item in value) else []
                     else:
-                        # Directly assign the loaded value if no special handling is needed
                         kwargs[name] = value
-                else:
-                    # Field defined in AgentState but missing in saved data
-                    self.logger.debug(f"Field '{name}' not found in saved state. Using default.")
-                    # Use the dataclass default factory or default value if defined
+                else:  # Field missing, use default
                     if fld.default_factory is not dataclasses.MISSING:
                         kwargs[name] = fld.default_factory()
                     elif fld.default is not dataclasses.MISSING:
                         kwargs[name] = fld.default
-                    # Explicitly handle potentially missing thresholds if they didn't have defaults
                     elif name == "current_reflection_threshold":
                         kwargs[name] = BASE_REFLECTION_THRESHOLD
                     elif name == "current_consolidation_threshold":
                         kwargs[name] = BASE_CONSOLIDATION_THRESHOLD
-                    # Handle missing goal stack/ID explicitly
                     elif name == "goal_stack":
-                         kwargs[name] = [] # Default to empty list
+                        kwargs[name] = []
                     elif name == "current_goal_id":
-                         kwargs[name] = None # Default to None
-                    # Otherwise, the field will be missing if it had no default and wasn't saved
-
-            # Warn about extra keys found in the file but not defined in the current AgentState
-            # This helps detect state format drift or old fields
-            extra_keys = set(data.keys()) - processed_keys - {"timestamp"} # Exclude meta timestamp key
+                        kwargs[name] = None
+            extra_keys = set(data.keys()) - processed_keys - {"timestamp"}
             if extra_keys:
-                self.logger.warning(f"Ignoring unknown keys found in state file: {extra_keys}")
-
-            # Create the AgentState instance using the processed keyword arguments
-            # >>>>> PRESERVED ORIGINAL LOADING LOGIC FOR UNHANDLED FIELDS <<<<<
-            # Note: This implicitly handles fields not explicitly checked above,
-            # relying on the dataclass constructor to handle types if possible.
-            # It's generally safer to handle complex types explicitly as done for plan/stats.
+                self.logger.warning(f"Ignoring unknown keys in state file: {extra_keys}")
             temp_state = AgentState(**kwargs)
-
-            # --- Validation and Correction after loading ---
-            # Ensure mandatory fields (like thresholds) have values AFTER construction,
-            # using defaults if somehow missed or loading failed for them.
+            # Validate/Correct loaded state
             if not isinstance(temp_state.current_reflection_threshold, int):
-                 self.logger.warning(f"Invalid loaded reflection threshold ({temp_state.current_reflection_threshold}). Resetting to base.")
-                 temp_state.current_reflection_threshold = BASE_REFLECTION_THRESHOLD
+                temp_state.current_reflection_threshold = BASE_REFLECTION_THRESHOLD
             else:
-                 # Ensure loaded threshold is within bounds
-                 temp_state.current_reflection_threshold = max(MIN_REFLECTION_THRESHOLD, min(MAX_REFLECTION_THRESHOLD, temp_state.current_reflection_threshold))
-
+                temp_state.current_reflection_threshold = max(
+                    MIN_REFLECTION_THRESHOLD, min(MAX_REFLECTION_THRESHOLD, temp_state.current_reflection_threshold)
+                )
             if not isinstance(temp_state.current_consolidation_threshold, int):
-                 self.logger.warning(f"Invalid loaded consolidation threshold ({temp_state.current_consolidation_threshold}). Resetting to base.")
-                 temp_state.current_consolidation_threshold = BASE_CONSOLIDATION_THRESHOLD
+                temp_state.current_consolidation_threshold = BASE_CONSOLIDATION_THRESHOLD
             else:
-                 # Ensure loaded threshold is within bounds
-                 temp_state.current_consolidation_threshold = max(MIN_CONSOLIDATION_THRESHOLD, min(MAX_CONSOLIDATION_THRESHOLD, temp_state.current_consolidation_threshold))
-
-            # Ensure goal stack consistency
+                temp_state.current_consolidation_threshold = max(
+                    MIN_CONSOLIDATION_THRESHOLD, min(MAX_CONSOLIDATION_THRESHOLD, temp_state.current_consolidation_threshold)
+                )
             if not isinstance(temp_state.goal_stack, list):
-                self.logger.warning("Loaded goal_stack is not a list. Resetting.")
                 temp_state.goal_stack = []
-            # Ensure current_goal_id points to a goal actually in the stack (or is None)
-            if temp_state.current_goal_id and not any(g.get('goal_id') == temp_state.current_goal_id for g in temp_state.goal_stack):
-                 self.logger.warning(f"Loaded current_goal_id {_fmt_id(temp_state.current_goal_id)} not found in loaded goal_stack. Resetting.")
-                 # Set current_goal_id to the top of the loaded stack, or None if stack is empty
-                 temp_state.current_goal_id = temp_state.goal_stack[-1].get('goal_id') if temp_state.goal_stack else None
-
-            # Assign the potentially corrected state
+            if temp_state.current_goal_id and not any(g.get("goal_id") == temp_state.current_goal_id for g in temp_state.goal_stack):
+                self.logger.warning(f"Loaded current_goal_id {_fmt_id(temp_state.current_goal_id)} not in stack. Resetting.")
+                temp_state.current_goal_id = temp_state.goal_stack[-1].get("goal_id") if temp_state.goal_stack else None
             self.state = temp_state
-            self.logger.info(f"Loaded state from {self.agent_state_file}; current loop {self.state.current_loop}")
-
+            self.logger.info(f"Loaded state from {self.agent_state_file}; loop {self.state.current_loop}")
         except (json.JSONDecodeError, TypeError, FileNotFoundError) as e:
-            # Handle common file loading or parsing errors
-            self.logger.error(f"State load failed: {e}. Resetting to default state.", exc_info=True)
-            # Reset to a clean default state on failure
+            self.logger.error(f"State load failed: {e}. Resetting.", exc_info=True)
             self.state = AgentState(
-                current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
-                current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
+                current_reflection_threshold=BASE_REFLECTION_THRESHOLD, current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
             )
         except Exception as e:
-            # Catch any other unexpected errors during state loading
-            self.logger.critical(f"Unexpected error loading state: {e}. Resetting to default state.", exc_info=True)
+            self.logger.critical(f"Unexpected error loading state: {e}. Resetting.", exc_info=True)
             self.state = AgentState(
-                current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
-                current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
+                current_reflection_threshold=BASE_REFLECTION_THRESHOLD, current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
             )
 
-
-    # --------------------------------------------------- tool‑lookup helper --
     def _find_tool_server(self, tool_name: str) -> Optional[str]:
-        """
-        Finds an active server providing the specified tool via MCPClient's Server Manager.
-
-        Args:
-            tool_name: The original, potentially sanitized, tool name (e.g., "unified_memory:store_memory").
-
-        Returns:
-            The name of the active server providing the tool, "AGENT_INTERNAL" for the plan update tool,
-            or None if the tool is not found on any active server.
-        """
-        # Ensure MCP Client and its server manager are available
         if not self.mcp_client or not self.mcp_client.server_manager:
-            self.logger.error("MCP Client or Server Manager not available for tool lookup.")
             return None
-
         sm = self.mcp_client.server_manager
-        # Check registered tools first (uses original tool names)
         if tool_name in sm.tools:
             server_name = sm.tools[tool_name].server_name
-            # Verify the server is currently connected and considered active
-            if server_name in sm.active_sessions:
-                self.logger.debug(f"Found tool '{tool_name}' on active server '{server_name}'.")
-                return server_name
-            else:
-                # Tool is known but its server is not currently active
-                self.logger.debug(f"Server '{server_name}' for tool '{tool_name}' is registered but not active.")
-                return None
-
-        # Handle core tools if a server named "CORE" is active
-        # (Assuming core tools follow a "core:" prefix convention)
+            return server_name if server_name in sm.active_sessions else None
         if tool_name.startswith("core:") and "CORE" in sm.active_sessions:
-            self.logger.debug(f"Found core tool '{tool_name}' on active CORE server.")
             return "CORE"
-
-        # Handle the agent's internal plan update tool
         if tool_name == AGENT_TOOL_UPDATE_PLAN:
-            self.logger.debug(f"Internal tool '{tool_name}' does not require a server.")
-            return "AGENT_INTERNAL" # Return a special marker
-
-        # If the tool is not found in registered tools or core tools
-        self.logger.debug(f"Tool '{tool_name}' not found on any active server.")
+            return "AGENT_INTERNAL"
         return None
 
-
-    # ------------------------------------------------------------ initialization --
-    async def initialize(self) -> bool:
+    async def inject_manual_thought(self, content: str, thought_type: str = ThoughtType.USER_GUIDANCE.value) -> bool: # Default to new enum
         """
-        Initializes the Agent Master Loop.
-
-        Loads prior agent state, fetches available tool schemas from MCPClient,
-        validates the presence of essential tools (including goal tools),
-        checks the validity of any loaded workflow and goal state,
-        and sets the initial thought chain ID.
-
-        Returns:
-            True if initialization is successful, False otherwise.
+        Allows external injection of a thought into the agent's current reasoning process.
+        This thought will be recorded in UMS and optionally stored as a distinct memory.
         """
-        self.logger.info("Initializing Agent loop …")
-        # Load state from file first
-        await self._load_agent_state()
+        if not self.state.workflow_id or not self.state.current_thought_chain_id:
+            self.logger.warning("Cannot inject thought: No active workflow or thought chain.")
+            return False
 
-        # Ensure context_id matches workflow_id if context_id was missing after load
-        # This maintains consistency, assuming context usually maps 1:1 with workflow initially
-        if self.state.workflow_id and not self.state.context_id:
-            self.state.context_id = self.state.workflow_id
-            self.logger.info(f"Initialized context_id from loaded workflow_id: {_fmt_id(self.state.workflow_id)}")
-
+        # Validate the provided thought_type against the enum
         try:
-            # Check if MCPClient's server manager is ready
-            if not self.mcp_client.server_manager:
-                self.logger.error("MCP Client server manager not initialized.")
-                return False
+            validated_thought_type = ThoughtType(thought_type.lower()).value
+        except ValueError:
+            self.logger.error(f"AML: Invalid thought_type '{thought_type}' for injected thought. Defaulting to USER_GUIDANCE.")
+            validated_thought_type = ThoughtType.USER_GUIDANCE.value
 
-            # Fetch all available tool schemas formatted for the LLM (e.g., Anthropic format)
-            all_tools = self.mcp_client.server_manager.format_tools_for_anthropic()
-
-            # Manually inject the schema for the internal agent plan-update tool
-            plan_step_schema = PlanStep.model_json_schema()
-            # Remove 'title' if Pydantic adds it automatically, as it's not part of PlanStep definition
-            plan_step_schema.pop('title', None)
-            all_tools.append(
-                {
-                    "name": AGENT_TOOL_UPDATE_PLAN, # Use sanitized name expected by LLM
-                    "description": "Replace the agent's current plan with a new list of plan steps. Use this for significant replanning or error recovery.",
-                    "input_schema": { # Anthropic uses 'input_schema'
-                        "type": "object",
-                        "properties": {
-                            "plan": {
-                                "type": "array",
-                                "description": "Complete new plan as a list of PlanStep objects.",
-                                "items": plan_step_schema, # Embed the generated PlanStep schema
-                            }
-                        },
-                        "required": ["plan"],
-                    },
-                }
+        self.logger.info(f"AML: Injecting manual thought (type: {validated_thought_type}): '{content[:100]}...'")
+        try:
+            thought_payload = {
+                "workflow_id": self.state.workflow_id,
+                "content": content,
+                "thought_type": validated_thought_type,
+                "thought_chain_id": self.state.current_thought_chain_id,
+            }
+            result = await self._execute_tool_call_internal(
+                TOOL_RECORD_THOUGHT,
+                thought_payload,
+                record_action=False # This is an input, not a self-decided agent action
             )
 
-            # Filter the fetched schemas to keep only those relevant to this agent
-            # (Unified Memory tools and the internal agent tool)
-            self.tool_schemas = []
-            loaded_tool_names = set()
-            for sc in all_tools:
-                # Map the sanitized name back to the original for filtering
-                original_name = self.mcp_client.server_manager.sanitized_to_original.get(sc["name"], sc["name"])
-                # Keep if it's a unified_memory tool or the internal agent plan update tool
-                if original_name.startswith("unified_memory:") or sc["name"] == AGENT_TOOL_UPDATE_PLAN:
-                    self.tool_schemas.append(sc)
-                    loaded_tool_names.add(original_name)
+            if result.get("success") and result.get("thought_id"):
+                thought_id = result.get("thought_id")
+                self.logger.info(f"AML: Successfully injected and recorded thought ID: {_fmt_id(thought_id)}")
 
-            self.logger.info(f"Loaded {len(self.tool_schemas)} relevant tool schemas: {loaded_tool_names}")
+                # Store this injected thought also as a distinct, high-priority memory
+                # This makes it more discoverable by general memory searches.
+                memory_store_payload = {
+                    "workflow_id": self.state.workflow_id,
+                    "content": f"User Guidance Received: {content}",
+                    "memory_type": MemoryType.USER_INPUT.value, # Use the new memory type
+                    "memory_level": MemoryLevel.SEMANTIC.value, # Or EPISODIC if preferred, SEMANTIC makes sense for guidance
+                    "importance": 8.5, # Give user input high importance
+                    "confidence": 0.95, # Assume user input is fairly reliable
+                    "description": "Guidance or input directly provided by the user/operator.",
+                    "tags": ["user_input", "guidance", "manual_override_data"],
+                    "thought_id": thought_id, # Link memory back to the thought
+                    "generate_embedding": True, # Good to embed user inputs
+                }
+                mem_result = await self._execute_tool_call_internal(
+                    TOOL_STORE_MEMORY,
+                    memory_store_payload,
+                    record_action=False # Logging this as a separate agent action might be too noisy
+                )
+                if mem_result.get("success") and mem_result.get("memory_id"):
+                    self.logger.info(f"AML: Stored injected guidance as UMS memory ID: {_fmt_id(mem_result.get('memory_id'))}")
+                else:
+                    self.logger.warning(f"AML: Failed to store injected guidance as a separate memory: {mem_result.get('error')}")
 
-            # Verify that essential tools for core functionality are available
-            essential = [
+                self.state.last_action_summary = f"Received guidance: {content[:70]}..." # Update for visibility in agent status
+                self.state.needs_replan = True
+                self.logger.info("AML: Marked 'needs_replan = True' due to new user guidance.")
+                return True
+            else:
+                self.logger.error(f"AML: Failed to record injected thought via UMS: {result.get('error')}")
+                return False
+        except Exception as e:
+            self.logger.error(f"AML: Exception while injecting manual thought: {e}", exc_info=True)
+            return False
+        
+
+    async def initialize(self) -> bool:
+        self.logger.info("Initializing Agent loop …")
+        await self._load_agent_state()
+        if self.state.workflow_id and not self.state.context_id:
+            self.state.context_id = self.state.workflow_id
+            self.logger.info(f"Initialized context_id from workflow_id: {_fmt_id(self.state.workflow_id)}")
+        try:
+            if not self.mcp_client.server_manager:
+                self.logger.error("MCP Client server manager not init.")
+                return False
+
+            # Determine the provider for the agent's LLM model
+            agent_provider = self.mcp_client.get_provider_from_model(self.agent_llm_model)
+            if not agent_provider:
+                self.logger.error(f"Could not determine provider for agent's model '{self.agent_llm_model}'. Cannot format tools.")
+                return False
+
+            # Call MCPClient's method to get tools formatted for the agent's provider
+            # _format_tools_for_provider is a method of MCPClient, not ServerManager
+            all_formatted_tools = self.mcp_client._format_tools_for_provider(agent_provider) # Pass the determined provider
+
+            if all_formatted_tools is None: # Can be None if no tools or formatting fails
+                all_formatted_tools = [] 
+                self.logger.warning(f"No tools formatted by MCPClient for provider '{agent_provider}'. Agent might have limited capabilities.")
+
+            self.tool_schemas = [] 
+            loaded_tool_names = set() # This will store ORIGINAL MCP tool names that are kept
+
+            if all_formatted_tools: # Ensure it's not None
+                for llm_tool_schema in all_formatted_tools: # llm_tool_schema is what the LLM will see
+                    sanitized_name_for_llm = ""
+                    if isinstance(llm_tool_schema, dict):
+                        if "name" in llm_tool_schema: # Anthropic format
+                            sanitized_name_for_llm = llm_tool_schema["name"]
+                        elif "function" in llm_tool_schema and \
+                            isinstance(llm_tool_schema["function"], dict) and \
+                            "name" in llm_tool_schema["function"]: # OpenAI format
+                            sanitized_name_for_llm = llm_tool_schema["function"]["name"]
+                    
+                    if not sanitized_name_for_llm:
+                        self.logger.warning(f"AML Initialize: Skipping tool schema with unexpected structure or missing name: {str(llm_tool_schema)[:200]}")
+                        continue
+
+                    # Look up the original MCP name using the sanitized name from the LLM schema
+                    original_mcp_tool_name = self.mcp_client.server_manager.sanitized_to_original.get(sanitized_name_for_llm)
+
+                    if original_mcp_tool_name:
+                        # Check the prefix of the ORIGINAL MCP name
+                        if original_mcp_tool_name.startswith("unified_memory:"):
+                            self.tool_schemas.append(llm_tool_schema) # Add the LLM-formatted schema
+                            loaded_tool_names.add(original_mcp_tool_name) # Track by original name
+                    # We will add AGENT_TOOL_UPDATE_PLAN separately as it's not from MCP server_manager
+                    # else: # If not found in map, it might be a tool not originating from MCP server (like agent:update_plan later)
+                    #    self.logger.debug(f"AML Initialize: Sanitized name '{sanitized_name_for_llm}' not in MCPClient's original name map. Likely an agent-internal tool or new.")
+
+            # Now, add AGENT_TOOL_UPDATE_PLAN if it wasn't already processed (it shouldn't be in all_formatted_tools from MCPC)
+            # Construct its schema as the LLM needs to see it (this depends on the agent_provider)
+            plan_tool_llm_schema = { # Generic structure, adapt if provider needs specific 'type: function' wrapper
+                "name": AGENT_TOOL_UPDATE_PLAN,
+                "description": "Replace agent's current plan. Use for significant replanning, error recovery, or fixing validation issues.",
+                "input_schema": { # For Anthropic style
+                    "type": "object",
+                    "properties": {
+                        "plan": {
+                            "type": "array",
+                            "items": PlanStep.model_json_schema(), # Get Pydantic schema
+                            "description": "The new complete list of plan steps."
+                        }
+                    },
+                    "required": ["plan"],
+                }
+            }
+            # If OpenAI provider, wrap in "function" and "parameters"
+            if agent_provider == "openai": # Assuming Provider.OPENAI.value is 'openai'
+                plan_tool_llm_schema = {
+                    "type": "function",
+                    "function": {
+                        "name": AGENT_TOOL_UPDATE_PLAN, # OpenAI sanitization rules apply
+                        "description": plan_tool_llm_schema["description"],
+                        "parameters": plan_tool_llm_schema["input_schema"]
+                    }
+                }
+            # Add other provider specific formatting for AGENT_TOOL_UPDATE_PLAN if necessary
+
+            self.tool_schemas.append(plan_tool_llm_schema)
+            loaded_tool_names.add(AGENT_TOOL_UPDATE_PLAN) # Track it as loaded
+
+            self.logger.info(f"AML: Loaded {len(self.tool_schemas)} relevant tool schemas for agent's LLM ({self.agent_llm_model} / {agent_provider}): {sorted(loaded_tool_names)}")
+
+            essential = [ # These are ORIGINAL MCP tool names
                 TOOL_CREATE_WORKFLOW, TOOL_RECORD_ACTION_START, TOOL_RECORD_ACTION_COMPLETION,
                 TOOL_RECORD_THOUGHT, TOOL_STORE_MEMORY, TOOL_GET_WORKING_MEMORY,
-                TOOL_HYBRID_SEARCH, # Essential for enhanced context gathering
-                TOOL_GET_CONTEXT,   # Essential for core context
-                TOOL_REFLECTION,    # Essential for meta-cognition loop
-                TOOL_CONSOLIDATION, # Essential for meta-cognition loop
-                TOOL_GET_WORKFLOW_DETAILS, # Needed for setting default chain ID on load
-                # --- ADDED: Check essential Goal Stack tools ---
-                TOOL_PUSH_SUB_GOAL,
-                TOOL_MARK_GOAL_STATUS,
-                # TOOL_GET_GOAL_DETAILS, # Maybe not essential to *start*, but needed for context
+                TOOL_HYBRID_SEARCH, TOOL_GET_RICH_CONTEXT_PACKAGE, TOOL_REFLECTION,
+                TOOL_CONSOLIDATION, TOOL_GET_WORKFLOW_DETAILS, TOOL_CREATE_GOAL,
+                TOOL_UPDATE_GOAL_STATUS, TOOL_GET_GOAL_DETAILS, AGENT_TOOL_UPDATE_PLAN,
             ]
-            # Check availability using the server lookup helper
-            missing = [t for t in essential if not self._find_tool_server(t)]
-            if missing:
-                # Log as error because agent functionality will be significantly impaired
-                self.logger.error(f"Missing essential tools: {missing}. Agent functionality WILL BE impaired.")
-                # Depending on desired strictness, could return False here to halt initialization
+            missing = [t for t in essential if t not in loaded_tool_names] # Check against original names
 
-            # Check the validity of the workflow ID loaded from the state file
-            # Determine the top workflow ID from the stack or the primary ID
+            if missing:
+                self.logger.error(f"AML: Missing essential tools from available schemas: {missing}. Functionality WILL BE impaired.")
+
+            # Rest of the initialization (workflow check, goal stack validation, default thought chain)
             top_wf = (self.state.workflow_stack[-1] if self.state.workflow_stack else None) or self.state.workflow_id
             if top_wf and not await self._check_workflow_exists(top_wf):
-                # If the loaded workflow doesn't exist anymore, reset workflow-specific state
-                self.logger.warning(
-                    f"Stored workflow '{_fmt_id(top_wf)}' not found in UMS; resetting workflow-specific state."
-                )
-                # Preserve non-workflow specific state like stats and dynamic thresholds
+                self.logger.warning(f"AML: Stored workflow '{_fmt_id(top_wf)}' not found; resetting workflow state.")
                 preserved_stats = self.state.tool_usage_stats
                 pres_ref_thresh = self.state.current_reflection_threshold
                 pres_con_thresh = self.state.current_consolidation_threshold
-                # Reset state, keeping only preserved items
                 self.state = AgentState(
-                    tool_usage_stats=preserved_stats,
-                    current_reflection_threshold=pres_ref_thresh,
-                    current_consolidation_threshold=pres_con_thresh
-                    # All other fields reset to defaults (including goal_stack, current_goal_id)
+                    tool_usage_stats=preserved_stats, current_reflection_threshold=pres_ref_thresh, current_consolidation_threshold=pres_con_thresh
                 )
-                # Save the reset state immediately
                 await self._save_agent_state()
-
-            # --- ADDED: Validate loaded goal stack consistency ---
+            
             await self._validate_goal_stack_on_load()
-
-            # Initialize the current thought chain ID if a workflow exists but the chain ID is missing
-            # This ensures thoughts are recorded correctly after loading state
+            
             if self.state.workflow_id and not self.state.current_thought_chain_id:
-                await self._set_default_thought_chain_id() # Attempt to find/set the primary chain
-
+                await self._set_default_thought_chain_id()
+            
             self.logger.info("Agent loop initialization complete.")
-            return True # Initialization successful
+            return True
         except Exception as e:
-            # Catch any unexpected errors during initialization
-            self.logger.critical(f"Agent loop initialization failed: {e}", exc_info=True)
-            return False # Initialization failed
+            self.logger.critical(f"Agent loop init failed: {e}", exc_info=True)
+            return False
 
 
     async def _set_default_thought_chain_id(self):
-        """
-        Sets the `current_thought_chain_id` in the agent state to the primary
-        (usually first created) thought chain associated with the current workflow.
-        """
-        # Determine the current workflow ID from the stack or primary state
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         if not current_wf_id:
-            self.logger.debug("Cannot set default thought chain ID: No active workflow.")
-            return # Cannot set if no workflow is active
-
-        get_details_tool = TOOL_GET_WORKFLOW_DETAILS # Tool needed to fetch chains
-
-        # Check if the necessary tool is available
+            self.logger.debug("No active workflow for default thought chain.")
+            return
+        get_details_tool = TOOL_GET_WORKFLOW_DETAILS
         if self._find_tool_server(get_details_tool):
             try:
-                # Call the tool internally to get workflow details, including thought chains
                 details = await self._execute_tool_call_internal(
                     get_details_tool,
                     {
                         "workflow_id": current_wf_id,
-                        "include_thoughts": True, # Must include thoughts to get chain info
-                        "include_actions": False, # Not needed for this task
+                        "include_thoughts": True,
+                        "include_actions": False,
                         "include_artifacts": False,
-                        "include_memories": False
+                        "include_memories": False,
                     },
-                    record_action=False # Internal setup action, don't log as agent action
+                    record_action=False,
                 )
-                # Check if the tool call was successful and returned data
                 if details.get("success"):
                     thought_chains = details.get("thought_chains")
-                    # Check if thought_chains is a non-empty list
                     if isinstance(thought_chains, list) and thought_chains:
-                        # Assume the first chain in the list is the primary one (usually ordered by creation time)
                         first_chain = thought_chains[0]
                         chain_id = first_chain.get("thought_chain_id")
                         if chain_id:
-                            # Set the state variable
                             self.state.current_thought_chain_id = chain_id
-                            self.logger.info(f"Set current_thought_chain_id to primary chain: {_fmt_id(self.state.current_thought_chain_id)} for workflow {_fmt_id(current_wf_id)}")
-                            return # Successfully set
+                            self.logger.info(f"Set current_thought_chain_id: {_fmt_id(chain_id)} for WF {_fmt_id(current_wf_id)}")
+                            return
                         else:
-                             # Log warning if the found chain object is missing the ID
-                             self.logger.warning(f"Primary thought chain found for workflow {current_wf_id}, but it lacks an ID in the details.")
+                            self.logger.warning(f"Primary thought chain lacks ID for WF {current_wf_id}.")
                     else:
-                         # Log warning if no chains were found for the workflow
-                         self.logger.warning(f"Could not find any thought chains in details for workflow {current_wf_id}.")
+                        self.logger.warning(f"No thought chains in details for WF {current_wf_id}.")
                 else:
-                    # Log the error message returned by the tool if it failed
-                    self.logger.error(f"Tool '{get_details_tool}' failed while trying to get default thought chain: {details.get('error')}")
-
+                    self.logger.error(f"Tool '{get_details_tool}' failed for default chain: {details.get('error')}")
             except Exception as e:
-                # Log any exceptions encountered during the tool call itself
-                self.logger.error(f"Error fetching workflow details for default chain: {e}", exc_info=False)
+                self.logger.error(f"Error fetching WF details for default chain: {e}", exc_info=False)
         else:
-            # Log warning if the required tool is unavailable
-            self.logger.warning(f"Cannot set default thought chain ID: Tool '{get_details_tool}' unavailable.")
-
-        # Fallback message if the chain ID couldn't be set for any reason
-        self.logger.info(f"Could not determine primary thought chain ID for WF {_fmt_id(current_wf_id)}. Will use default on first thought.")
-
+            self.logger.warning(f"Tool '{get_details_tool}' unavailable for default chain.")
+        self.logger.info(f"Could not set primary thought chain ID for WF {_fmt_id(current_wf_id)}.")
 
     async def _check_workflow_exists(self, workflow_id: str) -> bool:
-        """
-        Efficiently checks if a given workflow ID exists using the UMS.
-
-        Args:
-            workflow_id: The workflow ID to check.
-
-        Returns:
-            True if the workflow exists, False otherwise.
-        """
         self.logger.debug(f"Checking existence of workflow {_fmt_id(workflow_id)} using {TOOL_GET_WORKFLOW_DETAILS}.")
         tool_name = TOOL_GET_WORKFLOW_DETAILS
-        # Check if the required tool is available
         if not self._find_tool_server(tool_name):
-            self.logger.error(f"Cannot check workflow existence: Tool {tool_name} unavailable.")
-            # If tool is unavailable, we cannot confirm existence, assume False for safety
+            self.logger.error(f"Tool {tool_name} unavailable.")
             return False
         try:
-            # Call get_workflow_details with minimal includes for efficiency
             result = await self._execute_tool_call_internal(
                 tool_name,
                 {
@@ -1579,980 +1229,574 @@ class AgentMasterLoop:
                     "include_actions": False,
                     "include_artifacts": False,
                     "include_thoughts": False,
-                    "include_memories": False
+                    "include_memories": False,
                 },
-                record_action=False # This is an internal check
+                record_action=False,
             )
-            # If the tool call returns success=True, the workflow exists
             return isinstance(result, dict) and result.get("success", False)
         except ToolInputError as e:
-            # A ToolInputError often indicates the ID was not found
-            self.logger.debug(f"Workflow {_fmt_id(workflow_id)} likely not found (ToolInputError: {e}).")
+            self.logger.debug(f"Workflow {_fmt_id(workflow_id)} not found (ToolInputError: {e}).")
             return False
         except Exception as e:
-            # Log other errors encountered during the check
-            self.logger.error(f"Error checking workflow {_fmt_id(workflow_id)} existence: {e}", exc_info=False)
-            # Assume not found if an error occurs
+            self.logger.error(f"Error checking WF {_fmt_id(workflow_id)}: {e}", exc_info=False)
             return False
 
-    # <<< Start Integration Block: Goal Stack Validation Helper >>>
     async def _validate_goal_stack_on_load(self):
         """
-        Validates the loaded goal stack against the UMS.
-
-        Checks if the goals in the stack still exist and belong to the correct
-        workflow context. Removes invalid goals from the stack.
-        This assumes a UMS tool `get_goal_details` exists.
+        Validates the loaded agent's goal stack against the UMS.
+        If `self.state.current_goal_id` is set, it rebuilds the stack from UMS.
+        If not, it clears the local stack.
         """
-        if not self.state.goal_stack:
-            return # Nothing to validate if stack is empty
-
-        tool_name = TOOL_GET_GOAL_DETAILS # Assumed UMS tool
-        if not self._find_tool_server(tool_name):
-            self.logger.warning(f"Cannot validate goal stack: Tool {tool_name} unavailable. Loaded stack may be invalid.")
-            return
-
-        current_wf_id = self.state.workflow_id
-        if not current_wf_id:
-            self.logger.warning("Cannot validate goal stack: No active workflow ID.")
-            # Clear the stack if there's no workflow context
+        if not self.state.workflow_id:
+            self.logger.warning("Cannot validate goal stack on load: No active workflow ID in state.")
             self.state.goal_stack = []
             self.state.current_goal_id = None
             return
 
-        valid_goals = []
-        needs_update = False
-        original_stack_ids = [g.get('goal_id') for g in self.state.goal_stack if g.get('goal_id')]
-
-        for goal_dict in self.state.goal_stack:
-            goal_id = goal_dict.get('goal_id')
-            if not goal_id:
-                self.logger.warning(f"Found goal with missing ID in loaded stack: {goal_dict}. Removing.")
-                needs_update = True
-                continue
-
-            try:
-                # Check goal existence and workflow association
-                goal_details = await self._execute_tool_call_internal(
-                    tool_name, {"goal_id": goal_id}, record_action=False
-                )
-                # Assuming the tool returns 'success' and 'workflow_id' if found
-                if goal_details.get("success") and goal_details.get("workflow_id") == current_wf_id:
-                    valid_goals.append(goal_dict) # Keep the goal if valid
+        if self.state.current_goal_id:
+            self.logger.info(f"Validating loaded goal stack, current_goal_id: {_fmt_id(self.state.current_goal_id)}")
+            # Rebuild the stack from UMS based on the current_goal_id
+            ums_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
+            if ums_stack:
+                # Check if the UMS-fetched stack's leaf goal matches our current_goal_id
+                if ums_stack[-1].get("goal_id") == self.state.current_goal_id:
+                    self.state.goal_stack = ums_stack
+                    self.logger.info(
+                        f"Goal stack re-validated and updated from UMS. Current: {_fmt_id(self.state.current_goal_id)}, Stack depth: {len(self.state.goal_stack)}"
+                    )
                 else:
-                    self.logger.warning(f"Removing goal {_fmt_id(goal_id)} from stack: Not found or wrong workflow ({goal_details.get('workflow_id')}) in UMS.")
-                    needs_update = True
-            except Exception as e:
-                 self.logger.error(f"Error validating goal {_fmt_id(goal_id)}: {e}. Removing from stack.")
-                 needs_update = True
+                    self.logger.warning(
+                        f"Loaded current_goal_id {_fmt_id(self.state.current_goal_id)} "
+                        f"could not be confirmed as leaf of a valid stack from UMS (UMS leaf: {_fmt_id(ums_stack[-1].get('goal_id'))}). "
+                        f"Resetting current_goal_id and stack."
+                    )
+                    self.state.goal_stack = []
+                    self.state.current_goal_id = None
+            else:  # UMS couldn't reconstruct the stack for the current_goal_id
+                self.logger.warning(
+                    f"Could not reconstruct goal stack from UMS for loaded current_goal_id {_fmt_id(self.state.current_goal_id)}. "
+                    f"Resetting goal stack and current_goal_id."
+                )
+                self.state.goal_stack = []
+                self.state.current_goal_id = None
+        else:  # No current_goal_id was loaded, so clear the stack
+            if self.state.goal_stack:  # If stack had items but no current_goal_id
+                self.logger.info("Loaded goal stack present but no current_goal_id. Clearing local stack.")
+                self.state.goal_stack = []
+            else:  # Both current_goal_id and stack are empty, which is fine
+                self.logger.debug("Goal stack and current_goal_id are empty on load, nothing to validate.")
 
-        if needs_update:
-            self.logger.info(f"Goal stack updated after validation. Original IDs: {[_fmt_id(g) for g in original_stack_ids]}, Valid IDs: {[_fmt_id(g.get('goal_id')) for g in valid_goals]}")
-            self.state.goal_stack = valid_goals
-            # Update current_goal_id to the top of the validated stack
-            self.state.current_goal_id = self.state.goal_stack[-1].get('goal_id') if self.state.goal_stack else None
-            self.logger.info(f"Reset current_goal_id after stack validation: {_fmt_id(self.state.current_goal_id)}")
-
-        # If stack became empty after validation, ensure current_goal_id is None
-        elif not self.state.goal_stack:
-             self.state.current_goal_id = None
-
-    # <<< End Integration Block: Goal Stack Validation Helper >>>
-
-    # <<< Start Integration Block: Plan Cycle Detection Helper (Phase 1, Step 3) >>>
     def _detect_plan_cycle(self, plan: List[PlanStep]) -> bool:
-        """
-        Detects cyclic dependencies in the agent's plan using Depth First Search.
-
-        Args:
-            plan: The list of PlanStep objects representing the current plan.
-
-        Returns:
-            True if a cycle is detected, False otherwise.
-        """
-        if not plan: return False # Empty plan has no cycles
-
-        adj: Dict[str, Set[str]] = defaultdict(set) # Adjacency list: step_id -> set(dependency_step_ids)
-        plan_step_ids = {step.id for step in plan} # Set of all valid step IDs in the current plan
-
-        # Build the adjacency list from depends_on relationships
+        if not plan:
+            return False
+        adj: Dict[str, Set[str]] = defaultdict(set)
+        plan_step_ids = {step.id for step in plan}
         for step in plan:
             for dep_id in step.depends_on:
-                # Only add dependency if the target step actually exists in the current plan
                 if dep_id in plan_step_ids:
                     adj[step.id].add(dep_id)
                 else:
-                    # Log if a dependency points to a non-existent step (potential issue)
-                    self.logger.warning(f"Plan step {_fmt_id(step.id)} depends on non-existent step {_fmt_id(dep_id)} in current plan.")
-
-        # DFS state tracking:
-        # path: nodes currently in the recursion stack for the current DFS path
-        # visited: nodes that have been completely explored (all descendants visited)
+                    self.logger.warning(f"Step {_fmt_id(step.id)} depends on non-existent step {_fmt_id(dep_id)}.")
         path: Set[str] = set()
         visited: Set[str] = set()
 
         def dfs(node_id: str) -> bool:
-            """Recursive DFS function. Returns True if a cycle is detected."""
-            path.add(node_id) # Mark node as currently visiting
-            visited.add(node_id) # Mark node as visited
-
-            # Explore neighbors (dependencies)
+            path.add(node_id)
+            visited.add(node_id)
             for neighbor_id in adj[node_id]:
-                if neighbor_id in path: # Cycle detected! Neighbor is already in the current path.
-                    self.logger.warning(f"Dependency cycle detected involving steps: {_fmt_id(node_id)} -> {_fmt_id(neighbor_id)}")
+                if neighbor_id in path:
+                    self.logger.warning(f"Cycle detected: {_fmt_id(node_id)} -> {_fmt_id(neighbor_id)}")
                     return True
-                if neighbor_id not in visited: # If neighbor not visited yet, recurse
-                    if dfs(neighbor_id):
-                        return True # Propagate cycle detection signal up
-
-            # Finished exploring node_id's descendants, remove from current path
+                if neighbor_id not in visited and dfs(neighbor_id):
+                    return True
             path.remove(node_id)
-            return False # No cycle found starting from this node
+            return False
 
-        # Run DFS from each node in the plan to check all potential cycles
         for step_id in plan_step_ids:
-            if step_id not in visited:
-                if dfs(step_id):
-                    return True # Cycle found
-
-        # If DFS completes for all nodes without finding a cycle
+            if step_id not in visited and dfs(step_id):
+                return True
         return False
-    # <<< End Integration Block: Plan Cycle Detection Helper >>>
 
-    # ------------------------------------------------ dependency check --
     async def _check_prerequisites(self, ids: List[str]) -> Tuple[bool, str]:
-        """
-        Checks if all specified prerequisite action IDs have status 'completed'.
-
-        Args:
-            ids: A list of action IDs to check.
-
-        Returns:
-            A tuple: (bool: True if all completed, False otherwise,
-                      str: Reason for failure or "All dependencies completed.")
-        """
-        # If no IDs are provided, prerequisites are met by default
         if not ids:
-            return True, "No dependencies listed."
-
-        tool_name = TOOL_GET_ACTION_DETAILS # Tool needed to get action status
-        # Check if the tool is available
+            return True, "No dependencies."
+        tool_name = TOOL_GET_ACTION_DETAILS
         if not self._find_tool_server(tool_name):
-            self.logger.error(f"Cannot check prerequisites: Tool {tool_name} unavailable.")
+            self.logger.error(f"Tool {tool_name} unavailable.")
             return False, f"Tool {tool_name} unavailable."
-
-        self.logger.debug(f"Checking prerequisites: {[_fmt_id(item_id) for item_id in ids]}")
+        self.logger.debug(f"Checking prerequisites: {[_fmt_id(i) for i in ids]}")
         try:
-            # Call the tool internally to get details for the specified action IDs
-            res = await self._execute_tool_call_internal(
-                tool_name,
-                {"action_ids": ids, "include_dependencies": False}, # Don't need nested dependencies for this check
-                record_action=False # Internal check
-            )
-
-            # Check if the tool call itself failed
+            res = await self._execute_tool_call_internal(tool_name, {"action_ids": ids, "include_dependencies": False}, record_action=False)
             if not res.get("success"):
-                error_msg = res.get("error", "Unknown error during dependency check.")
-                self.logger.warning(f"Dependency check failed: {error_msg}")
-                return False, f"Failed to check dependencies: {error_msg}"
-
-            # Process the returned action details
+                error_msg = res.get("error", "Unknown error.")
+                self.logger.warning(f"Dep check failed: {error_msg}")
+                return False, f"Failed: {error_msg}"
             actions_found = res.get("actions", [])
             found_ids = {a.get("action_id") for a in actions_found}
-            # Check if any requested dependency IDs were not found
             missing_ids = list(set(ids) - found_ids)
             if missing_ids:
-                self.logger.warning(f"Dependency actions not found: {[_fmt_id(item_id) for item_id in missing_ids]}")
-                return False, f"Dependency actions not found: {[_fmt_id(item_id) for item_id in missing_ids]}"
-
-            # Check the status of each found dependency action
-            incomplete_actions = []
-            for action in actions_found:
-                if action.get("status") != ActionStatus.COMPLETED.value:
-                    # Collect details of incomplete actions for the reason message
-                    incomplete_actions.append(
-                        f"'{action.get('title', _fmt_id(action.get('action_id')))}' (Status: {action.get('status', 'UNKNOWN')})"
-                    )
-
-            # If any actions are not completed, prerequisites are not met
-            if incomplete_actions:
-                reason = f"Dependencies not completed: {', '.join(incomplete_actions)}"
+                self.logger.warning(f"Dep actions not found: {[_fmt_id(i) for i in missing_ids]}")
+                return False, f"Not found: {[_fmt_id(i) for i in missing_ids]}"
+            incomplete = [
+                f"'{a.get('title', _fmt_id(a.get('action_id')))}' (Status: {a.get('status', 'UNK')})"
+                for a in actions_found
+                if a.get("status") != ActionStatus.COMPLETED.value
+            ]
+            if incomplete:
+                reason = f"Not completed: {', '.join(incomplete)}"
                 self.logger.warning(reason)
                 return False, reason
-
-            # If all checks passed, prerequisites are met
-            self.logger.debug("All dependencies completed.")
-            return True, "All dependencies completed."
-
+            self.logger.debug("All deps completed.")
+            return True, "All deps completed."
         except Exception as e:
-            # Log any exceptions during the prerequisite check
-            self.logger.error(f"Error during prerequisite check: {e}", exc_info=True)
-            return False, f"Exception checking prerequisites: {str(e)}"
+            self.logger.error(f"Error checking prereqs: {e}", exc_info=True)
+            return False, f"Exception: {str(e)}"
 
-
-    # ---------------------------------------------------- action recording --
     async def _record_action_start_internal(
-        self,
-        tool_name: str,
-        tool_args: Dict[str, Any],
-        planned_dependencies: Optional[List[str]] = None,
+        self, tool_name: str, tool_args: Dict[str, Any], planned_dependencies: Optional[List[str]] = None
     ) -> Optional[str]:
-        """
-        Records the start of an action using the UMS tool.
-
-        Optionally records dependencies declared for this action.
-
-        Args:
-            tool_name: The name of the tool being executed.
-            tool_args: The arguments passed to the tool.
-            planned_dependencies: Optional list of action IDs this action depends on.
-
-        Returns:
-            The generated `action_id` if successful, otherwise None.
-        """
-        start_tool = TOOL_RECORD_ACTION_START # Tool for recording action start
-        # Check if the recording tool is available
+        start_tool = TOOL_RECORD_ACTION_START
         if not self._find_tool_server(start_tool):
-            self.logger.error(f"Cannot record action start: Tool '{start_tool}' unavailable.")
+            self.logger.error(f"Tool '{start_tool}' unavailable.")
             return None
-
-        # Get the current workflow ID from the state
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         if not current_wf_id:
-            self.logger.warning("Cannot record action start: No active workflow ID in state.")
+            self.logger.warning("No active WF ID for action start.")
             return None
-
-        # Prepare the payload for the recording tool
         payload = {
             "workflow_id": current_wf_id,
-            # Generate a basic title based on the tool name
-            "title": f"Execute: {tool_name.split(':')[-1]}", # Use only the tool name part
-            "action_type": ActionType.TOOL_USE.value, # Assume it's a tool use action
+            "title": f"Execute: {tool_name.split(':')[-1]}",
+            "action_type": ActionType.TOOL_USE.value,
             "tool_name": tool_name,
-            "tool_args": tool_args, # Pass the arguments being used
-            "reasoning": f"Agent initiated tool call: {tool_name}", # Basic reasoning
-            # Status will likely be set to IN_PROGRESS by the tool itself
+            "tool_args": tool_args,
+            "reasoning": f"Agent initiated: {tool_name}",
         }
-
         action_id: Optional[str] = None
         try:
-            # Call the recording tool internally (don't record this recording action)
-            res = await self._execute_tool_call_internal(
-                start_tool, payload, record_action=False
-            )
-            # Check if the recording was successful and returned an action ID
+            res = await self._execute_tool_call_internal(start_tool, payload, record_action=False)
             if res.get("success"):
                 action_id = res.get("action_id")
                 if action_id:
-                    self.logger.debug(f"Action started: {_fmt_id(action_id)} for tool {tool_name}")
-                    # If dependencies were provided, record them *after* getting the action ID
+                    self.logger.debug(f"Action started: {_fmt_id(action_id)} for {tool_name}")
                     if planned_dependencies:
                         await self._record_action_dependencies_internal(action_id, planned_dependencies)
                 else:
-                    # Log if the tool succeeded but didn't return an ID
-                    self.logger.warning(f"Tool {start_tool} succeeded but returned no action_id.")
+                    self.logger.warning(f"{start_tool} success but no action_id.")
             else:
-                # Log if the recording tool itself failed
-                self.logger.error(f"Failed to record action start for {tool_name}: {res.get('error')}")
-
+                self.logger.error(f"Failed record action start for {tool_name}: {res.get('error')}")
         except Exception as e:
-            # Log any exceptions during the recording process
             self.logger.error(f"Exception recording action start for {tool_name}: {e}", exc_info=True)
+        return action_id
 
-        return action_id # Return the action ID or None
-
-
-    async def _record_action_dependencies_internal(
-        self,
-        source_id: str, # The action being started
-        target_ids: List[str], # The actions it depends on
-    ) -> None:
-        """
-        Records dependencies (source_id REQUIRES target_id) in the UMS.
-
-        Args:
-            source_id: The ID of the action that has dependencies.
-            target_ids: A list of action IDs that `source_id` depends on.
-        """
-        # Basic validation
+    async def _record_action_dependencies_internal(self, source_id: str, target_ids: List[str]) -> None:
         if not source_id or not target_ids:
-            self.logger.debug("Skipping dependency recording: Missing source or target IDs.")
             return
-        # Filter out empty/invalid target IDs and self-references
-        valid_target_ids = {tid for tid in target_ids if tid and tid != source_id}
-        if not valid_target_ids:
-            self.logger.debug(f"No valid dependencies to record for source action {_fmt_id(source_id)}.")
+        valid_targets = {tid for tid in target_ids if tid and tid != source_id}
+        if not valid_targets:
             return
-
-        dep_tool = TOOL_ADD_ACTION_DEPENDENCY # Tool for adding dependencies
-        # Check tool availability
+        dep_tool = TOOL_ADD_ACTION_DEPENDENCY
         if not self._find_tool_server(dep_tool):
-            self.logger.error(f"Cannot record dependencies: Tool '{dep_tool}' unavailable.")
+            self.logger.error(f"Tool '{dep_tool}' unavailable.")
             return
-
-        # Get current workflow ID (should match the source action's workflow)
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         if not current_wf_id:
-            self.logger.warning(f"Cannot record dependencies for action {_fmt_id(source_id)}: No active workflow ID.")
+            self.logger.warning(f"No active WF ID for dep record for action {_fmt_id(source_id)}.")
             return
-
-        self.logger.debug(f"Recording {len(valid_target_ids)} dependencies for action {_fmt_id(source_id)}: depends on {[_fmt_id(tid) for tid in valid_target_ids]}")
-
-        # Create tasks to record each dependency concurrently
-        tasks = []
-        for target_id in valid_target_ids:
-            args = {
-                # workflow_id might be inferred by the tool, but pass for robustness
-                # "workflow_id": current_wf_id, # Removed as UMS tool infers from action IDs
-                "source_action_id": source_id,
-                "target_action_id": target_id,
-                "dependency_type": "requires", # Assuming 'requires' is the default/most common type here
-            }
-            # Call the dependency tool internally for each target ID
-            task = asyncio.create_task(
-                self._execute_tool_call_internal(dep_tool, args, record_action=False)
-            )
-            tasks.append(task)
-
-        # Wait for all dependency recording tasks to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        target_list = list(valid_target_ids) # Ensure consistent ordering for results
-        # Log any failures encountered during dependency recording
-        for i, res in enumerate(results):
-            target_id = target_list[i] # Get corresponding target ID
-            if isinstance(res, Exception):
-                self.logger.error(f"Error recording dependency {_fmt_id(source_id)} -> {_fmt_id(target_id)}: {res}", exc_info=False)
-            elif isinstance(res, dict) and not res.get("success"):
-                # Log if the tool call itself failed
-                self.logger.warning(f"Failed recording dependency {_fmt_id(source_id)} -> {_fmt_id(target_id)}: {res.get('error')}")
-            # else: Successfully recorded
-
-
-    async def _record_action_completion_internal(
-        self,
-        action_id: str,
-        result: Dict[str, Any], # The final result dict from the tool execution
-    ) -> None:
-        """
-        Records the completion or failure status and result for a given action ID.
-
-        Args:
-            action_id: The ID of the action to mark as completed/failed.
-            result: The result dictionary returned by `_execute_tool_call_internal`.
-        """
-        completion_tool = TOOL_RECORD_ACTION_COMPLETION # Tool for recording completion
-        # Check tool availability
-        if not self._find_tool_server(completion_tool):
-            self.logger.error(f"Cannot record action completion: Tool '{completion_tool}' unavailable.")
-            return
-
-        # Determine the final status based on the 'success' key in the result dict
-        status = (
-            ActionStatus.COMPLETED.value
-            if isinstance(result, dict) and result.get("success")
-            else ActionStatus.FAILED.value
+        self.logger.debug(
+            f"Recording {len(valid_targets)} deps for action {_fmt_id(source_id)}: depends on {[_fmt_id(tid) for tid in valid_targets]}"
         )
+        tasks = [
+            asyncio.create_task(
+                self._execute_tool_call_internal(
+                    dep_tool, {"source_action_id": source_id, "target_action_id": target_id, "dependency_type": "requires"}, record_action=False
+                )
+            )
+            for target_id in valid_targets
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, res in enumerate(results):
+            target_id = list(valid_targets)[i]
+            if isinstance(res, Exception):
+                self.logger.error(f"Error recording dep {_fmt_id(source_id)} -> {_fmt_id(target_id)}: {res}", exc_info=False)
+            elif isinstance(res, dict) and not res.get("success"):
+                self.logger.warning(f"Failed recording dep {_fmt_id(source_id)} -> {_fmt_id(target_id)}: {res.get('error')}")
 
-        # Get current workflow ID (should match the action's workflow)
+    async def _record_action_completion_internal(self, action_id: str, result: Dict[str, Any]) -> None:
+        completion_tool = TOOL_RECORD_ACTION_COMPLETION
+        if not self._find_tool_server(completion_tool):
+            self.logger.error(f"Tool '{completion_tool}' unavailable.")
+            return
+        status = ActionStatus.COMPLETED.value if isinstance(result, dict) and result.get("success") else ActionStatus.FAILED.value
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         if not current_wf_id:
-            self.logger.warning(f"Cannot record completion for action {_fmt_id(action_id)}: No active workflow ID.")
+            self.logger.warning(f"No active WF ID for action completion {_fmt_id(action_id)}.")
             return
-
-        # Prepare payload for the completion tool
-        payload = {
-            # Pass workflow_id for context, though tool might infer from action_id
-            # "workflow_id": current_wf_id, # Removed as UMS tool infers from action ID
-            "action_id": action_id,
-            "status": status,
-            # Pass the entire result dictionary to be stored/summarized by the UMS tool
-            "tool_result": result,
-            # Optionally, extract a summary here if needed by the tool, but UMS likely handles this
-            # "summary": result.get("summary") or result.get("message") or str(result.get("data"))[:100]
-        }
-
+        payload = {"action_id": action_id, "status": status, "tool_result": result}
         try:
-            # Call the completion tool internally
-            completion_result = await self._execute_tool_call_internal(
-                completion_tool, payload, record_action=False # Don't record this meta-action
-            )
-            # Log success or failure of the recording itself
-            if completion_result.get("success"):
+            completion_res = await self._execute_tool_call_internal(completion_tool, payload, record_action=False)
+            if completion_res.get("success"):
                 self.logger.debug(f"Action completion recorded for {_fmt_id(action_id)} (Status: {status})")
             else:
-                self.logger.error(f"Failed to record action completion for {_fmt_id(action_id)}: {completion_result.get('error')}")
+                self.logger.error(f"Failed record action completion for {_fmt_id(action_id)}: {completion_res.get('error')}")
         except Exception as e:
-            # Log any exceptions during the completion recording call
             self.logger.error(f"Exception recording action completion for {_fmt_id(action_id)}: {e}", exc_info=True)
 
-    # ---------------------------------------------------- auto‑link helper --
-    async def _run_auto_linking(
-        self,
-        memory_id: str, # The ID of the newly created/updated memory
-        *,
-        workflow_id: Optional[str], # Snapshotted workflow ID
-        context_id: Optional[str], # Snapshotted context ID (unused here but passed)
-    ) -> None:
-        """
-        Background task to find semantically similar memories and automatically
-        create links to them. Uses richer link types based on memory types.
-        """
-        # (Keep the integrated _run_auto_linking method logic)
-        # Check if the agent's current workflow matches the one snapshotted when the task was created
-        # Also check if shutdown has been requested
+    async def _run_auto_linking(self, memory_id: str, *, workflow_id: Optional[str], context_id: Optional[str]) -> None:
         if workflow_id != self.state.workflow_id or self._shutdown_event.is_set():
-            self.logger.debug(f"Skipping auto-linking for {_fmt_id(memory_id)}: Workflow changed ({_fmt_id(self.state.workflow_id)} vs {_fmt_id(workflow_id)}) or shutdown signaled.")
+            self.logger.debug(f"Skipping auto-link for {_fmt_id(memory_id)}: WF changed or shutdown.")
             return
-
         try:
-            # Validate inputs
             if not memory_id or not workflow_id:
-                self.logger.debug(f"Skipping auto-linking: Missing memory_id ({_fmt_id(memory_id)}) or workflow_id ({_fmt_id(workflow_id)}).")
+                self.logger.debug(f"Skipping auto-link: Missing ID/WFID.")
                 return
-
-            # Introduce a small random delay to distribute load
             await asyncio.sleep(random.uniform(*AUTO_LINKING_DELAY_SECS))
-            # Check shutdown again after sleep
-            if self._shutdown_event.is_set(): return
-
-            self.logger.debug(f"Attempting auto-linking for memory {_fmt_id(memory_id)} in workflow {_fmt_id(workflow_id)}...")
-
-            # 1. Get details of the source memory (the one just created/updated)
-            source_mem_details_result = await self._execute_tool_call_internal(
+            if self._shutdown_event.is_set():
+                return
+            self.logger.debug(f"Attempting auto-link for memory {_fmt_id(memory_id)} in WF {_fmt_id(workflow_id)}...")
+            source_res = await self._execute_tool_call_internal(
                 TOOL_GET_MEMORY_BY_ID, {"memory_id": memory_id, "include_links": False}, record_action=False
             )
-            # Ensure retrieval succeeded and the memory still belongs to the expected workflow
-            if not source_mem_details_result.get("success") or source_mem_details_result.get("workflow_id") != workflow_id:
-                self.logger.warning(f"Auto-linking failed for {_fmt_id(memory_id)}: Couldn't retrieve source memory or workflow mismatch.")
+            if not source_res.get("success") or source_res.get("workflow_id") != workflow_id:
+                self.logger.warning(f"Auto-link failed for {_fmt_id(memory_id)}: Source mem error.")
                 return
-            source_mem = source_mem_details_result # Result is the memory dict
-
-            # 2. Determine text for similarity search (use description or truncated content)
-            query_text = source_mem.get("description", "") or source_mem.get("content", "")[:200] # Limit content length
+            source_mem = source_res
+            query_text = source_mem.get("description", "") or source_mem.get("content", "")[:200]
             if not query_text:
-                self.logger.debug(f"Skipping auto-linking for {_fmt_id(memory_id)}: No description or content for query.")
+                self.logger.debug(f"Skipping auto-link for {_fmt_id(memory_id)}: No query text.")
                 return
-
-            # 3. Perform semantic search for similar memories within the same workflow
-            # Prefer hybrid search if available, fall back to semantic
             search_tool = TOOL_HYBRID_SEARCH if self._find_tool_server(TOOL_HYBRID_SEARCH) else TOOL_SEMANTIC_SEARCH
             if not self._find_tool_server(search_tool):
-                self.logger.warning(f"Skipping auto-linking: Tool {search_tool} unavailable.")
+                self.logger.warning(f"Skipping auto-link: Tool {search_tool} unavailable.")
                 return
-
             search_args = {
-                "workflow_id": workflow_id, # Search within the snapshotted workflow
+                "workflow_id": workflow_id,
                 "query": query_text,
-                "limit": self.auto_linking_max_links + 1, # Fetch one extra to filter self
-                "threshold": self.auto_linking_threshold, # Use configured threshold
-                "include_content": False # Don't need full content of similar items
+                "limit": self.auto_linking_max_links + 1,
+                "threshold": self.auto_linking_threshold,
+                "include_content": False,
             }
-            # Adjust weights if using hybrid search (prioritize semantic similarity)
             if search_tool == TOOL_HYBRID_SEARCH:
                 search_args.update({"semantic_weight": 0.8, "keyword_weight": 0.2})
-
-            similar_results = await self._execute_tool_call_internal(
-                search_tool, search_args, record_action=False
-            )
-            if not similar_results.get("success"):
-                self.logger.warning(f"Auto-linking search failed for {_fmt_id(memory_id)}: {similar_results.get('error')}")
+            similar_res = await self._execute_tool_call_internal(search_tool, search_args, record_action=False)
+            if not similar_res.get("success"):
+                self.logger.warning(f"Auto-link search failed for {_fmt_id(memory_id)}: {similar_res.get('error')}")
                 return
-
-            # 4. Process results and create links
             link_count = 0
-            # Determine which key holds the similarity score based on the tool used
             score_key = "hybrid_score" if search_tool == TOOL_HYBRID_SEARCH else "similarity"
-
-            for similar_mem_summary in similar_results.get("memories", []):
-                # Check shutdown flag frequently during loop
-                if self._shutdown_event.is_set(): break
-
-                target_id = similar_mem_summary.get("memory_id")
-                similarity_score = similar_mem_summary.get(score_key, 0.0)
-
-                # Skip linking to self
-                if not target_id or target_id == memory_id: continue
-
-                # 5. Get details of the potential target memory for richer link type inference
-                target_mem_details_result = await self._execute_tool_call_internal(
+            for sim_mem_summary in similar_res.get("memories", []):
+                if self._shutdown_event.is_set():
+                    break
+                target_id = sim_mem_summary.get("memory_id")
+                sim_score = sim_mem_summary.get(score_key, 0.0)
+                if not target_id or target_id == memory_id:
+                    continue
+                target_res = await self._execute_tool_call_internal(
                     TOOL_GET_MEMORY_BY_ID, {"memory_id": target_id, "include_links": False}, record_action=False
                 )
-                # Ensure target retrieval succeeded and it's in the same workflow
-                if not target_mem_details_result.get("success") or target_mem_details_result.get("workflow_id") != workflow_id:
-                    self.logger.debug(f"Skipping link target {_fmt_id(target_id)}: Not found or workflow mismatch.")
+                if not target_res.get("success") or target_res.get("workflow_id") != workflow_id:
                     continue
-                target_mem = target_mem_details_result
-
-                # 6. Infer a more specific link type based on memory types
-                inferred_link_type = LinkType.RELATED.value # Default link type
+                target_mem = target_res
+                link_type = LinkType.RELATED.value
                 source_type = source_mem.get("memory_type")
                 target_type = target_mem.get("memory_type")
-
-                # Example inference rules (can be expanded)
-                if source_type == MemoryType.INSIGHT.value and target_type == MemoryType.FACT.value: inferred_link_type = LinkType.SUPPORTS.value
-                elif source_type == MemoryType.FACT.value and target_type == MemoryType.INSIGHT.value: inferred_link_type = LinkType.SUPPORTS.value # Or maybe GENERALIZES/SPECIALIZES?
-                elif source_type == MemoryType.QUESTION.value and target_type == MemoryType.FACT.value: inferred_link_type = LinkType.REFERENCES.value
-                # >>>>> PRESERVED ORIGINAL LINK TYPE RULES <<<<<
-                # (Can add more rules here based on analysis)
-                # elif source_type == MemoryType.HYPOTHESIS.value and target_type == MemoryType.EVIDENCE.value: inferred_link_type = LinkType.SUPPORTS.value # Assuming evidence supports hypothesis
-                # elif source_type == MemoryType.EVIDENCE.value and target_type == MemoryType.HYPOTHESIS.value: inferred_link_type = LinkType.SUPPORTS.value
-                # ... add other rules ...
-
-                # 7. Create the link using the UMS tool
-                link_tool_name = TOOL_CREATE_LINK
-                if not self._find_tool_server(link_tool_name):
-                    self.logger.warning(f"Cannot create link: Tool {link_tool_name} unavailable.")
-                    break # Stop trying if link tool is missing
-
+                if source_type == MemoryType.INSIGHT.value and target_type == MemoryType.FACT.value:
+                    link_type = LinkType.SUPPORTS.value
+                # ... (more link type rules)
+                link_tool = TOOL_CREATE_LINK
+                if not self._find_tool_server(link_tool):
+                    self.logger.warning(f"Tool {link_tool} unavailable.")
+                    break
                 link_args = {
-                    # workflow_id is usually inferred by the tool from memory IDs
                     "source_memory_id": memory_id,
                     "target_memory_id": target_id,
-                    "link_type": inferred_link_type,
-                    "strength": round(similarity_score, 3), # Use similarity score as strength
-                    "description": f"Auto-link ({inferred_link_type}) based on similarity ({score_key})"
+                    "link_type": link_type,
+                    "strength": round(sim_score, 3),
+                    "description": f"Auto-link ({link_type})",
                 }
-                link_result = await self._execute_tool_call_internal(
-                    link_tool_name, link_args, record_action=False # Don't record link creation as primary action
-                )
-
-                # Log success or failure of link creation
+                link_result = await self._execute_tool_call_internal(link_tool, link_args, record_action=False)
                 if link_result.get("success"):
                     link_count += 1
-                    self.logger.debug(f"Auto-linked memory {_fmt_id(memory_id)} to {_fmt_id(target_id)} ({inferred_link_type}, score: {similarity_score:.2f})")
+                    self.logger.debug(f"Auto-linked {_fmt_id(memory_id)} to {_fmt_id(target_id)} ({link_type}, {sim_score:.2f})")
                 else:
-                    # Log failure, but continue trying other potential links
-                    self.logger.warning(f"Failed to auto-create link {_fmt_id(memory_id)}->{_fmt_id(target_id)}: {link_result.get('error')}")
-
-                # Stop if max links reached for this source memory
+                    self.logger.warning(f"Failed auto-create link {_fmt_id(memory_id)}->{_fmt_id(target_id)}: {link_result.get('error')}")
                 if link_count >= self.auto_linking_max_links:
-                    self.logger.debug(f"Reached auto-linking limit ({self.auto_linking_max_links}) for memory {_fmt_id(memory_id)}.")
                     break
-                # Small delay between creating links if multiple are found
                 await asyncio.sleep(0.1)
-
         except Exception as e:
-            # Catch and log any errors occurring within the background task itself
-            self.logger.warning(f"Error in auto-linking task for {_fmt_id(memory_id)}: {e}", exc_info=False)
+            self.logger.warning(f"Error in auto-linking for {_fmt_id(memory_id)}: {e}", exc_info=False)
 
-
-    # ---------------------------------------------------- promotion helper --
-    async def _check_and_trigger_promotion(
-        self,
-        memory_id: str, # The ID of the memory to check
-        *,
-        workflow_id: Optional[str], # Snapshotted workflow ID
-        context_id: Optional[str], # Snapshotted context ID (unused but passed)
-    ):
-        """
-        Checks if a specific memory meets criteria for promotion to a higher
-        cognitive level and calls the UMS tool to perform the promotion if eligible.
-        Intended to be run as a background task.
-        """
-        # (Keep the integrated _check_and_trigger_promotion method logic)
-        # Abort if workflow context has changed or shutdown is signaled
+    async def _check_and_trigger_promotion(self, memory_id: str, *, workflow_id: Optional[str], context_id: Optional[str]):
         if workflow_id != self.state.workflow_id or self._shutdown_event.is_set():
-            self.logger.debug(f"Skipping promotion check for {_fmt_id(memory_id)}: Workflow changed ({_fmt_id(self.state.workflow_id)} vs {_fmt_id(workflow_id)}) or shutdown.")
+            self.logger.debug(f"Skipping promo check for {_fmt_id(memory_id)}: WF changed/shutdown.")
             return
-
-        promotion_tool_name = TOOL_PROMOTE_MEM # Tool for checking/promoting
-        # Basic validation
-        if not memory_id or not self._find_tool_server(promotion_tool_name):
-            self.logger.debug(f"Skipping promotion check for {_fmt_id(memory_id)}: Invalid ID or tool '{promotion_tool_name}' unavailable.")
+        promo_tool = TOOL_PROMOTE_MEM
+        if not memory_id or not self._find_tool_server(promo_tool):
+            self.logger.debug(f"Skipping promo check for {_fmt_id(memory_id)}: Invalid ID or tool unavailable.")
             return
-
         try:
-            # Optional slight delay
             await asyncio.sleep(random.uniform(0.1, 0.4))
-            # Check shutdown again after sleep
-            if self._shutdown_event.is_set(): return
-
-            self.logger.debug(f"Checking promotion potential for memory {_fmt_id(memory_id)} in workflow {_fmt_id(workflow_id)}...")
-            # Execute the promotion check tool internally
-            # Workflow ID is likely inferred by the tool from memory_id
-            promotion_result = await self._execute_tool_call_internal(
-                promotion_tool_name, {"memory_id": memory_id}, record_action=False # Don't record check as action
-            )
-
-            # Log the outcome of the promotion check
-            if promotion_result.get("success"):
-                if promotion_result.get("promoted"):
-                    # Log successful promotion clearly
-                    self.logger.info(f"Memory {_fmt_id(memory_id)} promoted from {promotion_result.get('previous_level')} to {promotion_result.get('new_level')}.", emoji_key="arrow_up")
+            if self._shutdown_event.is_set():
+                return
+            self.logger.debug(f"Checking promo potential for memory {_fmt_id(memory_id)} in WF {_fmt_id(workflow_id)}...")
+            promo_res = await self._execute_tool_call_internal(promo_tool, {"memory_id": memory_id}, record_action=False)
+            if promo_res.get("success"):
+                if promo_res.get("promoted"):
+                    self.logger.info(f"⬆️ Memory {_fmt_id(memory_id)} promoted from {promo_res.get('previous_level')} to {promo_res.get('new_level')}.")
                 else:
-                    # Log the reason if promotion didn't occur but check was successful
-                    self.logger.debug(f"Memory {_fmt_id(memory_id)} not promoted: {promotion_result.get('reason')}")
+                    self.logger.debug(f"Memory {_fmt_id(memory_id)} not promoted: {promo_res.get('reason')}")
             else:
-                 # Log if the promotion check tool itself failed
-                 self.logger.warning(f"Promotion check tool failed for {_fmt_id(memory_id)}: {promotion_result.get('error')}")
-
+                self.logger.warning(f"Promo check tool failed for {_fmt_id(memory_id)}: {promo_res.get('error')}")
         except Exception as e:
-            # Log any exceptions within the promotion check task
-            self.logger.warning(f"Error in memory promotion check task for {_fmt_id(memory_id)}: {e}", exc_info=False)
+            self.logger.warning(f"Error in promo check task for {_fmt_id(memory_id)}: {e}", exc_info=False)
 
-
-    # ------------------------------------------------------ execute tool call --
     async def _execute_tool_call_internal(
-        self,
-        tool_name: str,
-        arguments: Dict[str, Any],
-        record_action: bool = True,
-        planned_dependencies: Optional[List[str]] = None,
+        self, tool_name: str, arguments: Dict[str, Any], record_action: bool = True, planned_dependencies: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """
-        Central handler for executing tool calls via MCPClient.
-
-        Includes:
-        - Server lookup.
-        - Automatic injection of workflow/context IDs.
-        - Prerequisite dependency checking.
-        - Handling of the internal AGENT_TOOL_UPDATE_PLAN.
-        - Optional recording of action start/completion/dependencies.
-        - Retry logic for idempotent tools.
-        - Result parsing and standardization.
-        - **Enhanced error handling/categorization** and state updates (last_error_details).
-        - Triggering relevant background tasks (auto-linking, promotion check).
-        - Updating last_action_summary state.
-        - Handling workflow and **goal stack** side effects.
-        """
-        # <<< Start Integration Block: Enhance _execute_tool_call_internal (Goal Stack Side Effects) >>>
-        # --- Step 1: Server Lookup ---
         target_server = self._find_tool_server(tool_name)
-        # Handle case where tool server is not found, except for the internal agent tool
         if not target_server and tool_name != AGENT_TOOL_UPDATE_PLAN:
             err = f"Tool server unavailable for {tool_name}"
             self.logger.error(err)
-            # Set error details for the main loop to see - Enhanced Category
             self.state.last_error_details = {"tool": tool_name, "error": err, "type": "ServerUnavailable", "status_code": 503}
-            # Return a failure dictionary consistent with other error returns
-            return {"success": False, "error": err, "status_code": 503} # 503 Service Unavailable
-
-        # --- Step 2: Context Injection ---
-        # Get current workflow context IDs from state
-        current_wf_id = (self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id)
+            return {"success": False, "error": err, "status_code": 503}
+        current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
         current_ctx_id = self.state.context_id
-        current_goal_id = self.state.current_goal_id # Get current goal ID
-
-        # Make a copy to avoid modifying the original arguments dict passed in
+        current_goal_id_for_tool = self.state.current_goal_id
         final_arguments = arguments.copy()
-        # Inject workflow_id if missing and relevant for the tool
         if (
-            final_arguments.get("workflow_id") is None # Only if not already provided
-            and current_wf_id # Only if a workflow is active
-            and tool_name # Check if tool_name is valid
-            not in { # Exclude tools that don't operate on a specific workflow
-                TOOL_CREATE_WORKFLOW, # Creates a new one
-                TOOL_LIST_WORKFLOWS, # Lists across potentially many
-                "core:list_servers", # Core MCP tool
-                "core:get_tool_schema", # Core MCP tool
-                AGENT_TOOL_UPDATE_PLAN, # Internal agent tool
-                TOOL_PUSH_SUB_GOAL, # Assumes UMS handles workflow association
-                TOOL_MARK_GOAL_STATUS, # Uses goal_id, workflow inferred
-                TOOL_GET_GOAL_DETAILS, # Uses goal_id
+            final_arguments.get("workflow_id") is None
+            and current_wf_id
+            and tool_name
+            not in {
+                TOOL_CREATE_WORKFLOW,
+                TOOL_LIST_WORKFLOWS,
+                "core:list_servers",
+                "core:get_tool_schema",
+                AGENT_TOOL_UPDATE_PLAN,
+                TOOL_CREATE_GOAL,
+                TOOL_UPDATE_GOAL_STATUS,
+                TOOL_GET_GOAL_DETAILS,
             }
         ):
             final_arguments["workflow_id"] = current_wf_id
-        # Inject context_id if missing and relevant for the tool
-        if (
-            final_arguments.get("context_id") is None # Only if not already provided
-            and current_ctx_id # Only if a context ID is set
-            and tool_name # Check if tool_name is valid
-            in { # Tools known to operate on a specific cognitive context ID
-                TOOL_GET_WORKING_MEMORY,
-                TOOL_OPTIMIZE_WM,
-                TOOL_AUTO_FOCUS,
-                # Add others here if they accept/require context_id
-            }
-        ):
+        if final_arguments.get("context_id") is None and current_ctx_id and tool_name in {TOOL_GET_WORKING_MEMORY, TOOL_OPTIMIZE_WM, TOOL_AUTO_FOCUS}:
             final_arguments["context_id"] = current_ctx_id
-        # Inject current thought chain ID for thought recording if not specified
-        if (
-            final_arguments.get("thought_chain_id") is None # Only if not already provided
-            and self.state.current_thought_chain_id # Only if a chain ID is set
-            and tool_name == TOOL_RECORD_THOUGHT # Only for the record_thought tool
-        ):
+        if final_arguments.get("thought_chain_id") is None and self.state.current_thought_chain_id and tool_name == TOOL_RECORD_THOUGHT:
             final_arguments["thought_chain_id"] = self.state.current_thought_chain_id
-        # --- ADDED: Inject parent goal ID for push_sub_goal if not provided ---
-        if (
-             final_arguments.get("parent_goal_id") is None # Only if not already provided
-             and current_goal_id # Only if a goal is currently active
-             and tool_name == TOOL_PUSH_SUB_GOAL # Only for this tool
-        ):
-             final_arguments["parent_goal_id"] = current_goal_id
-
-        # --- Step 3: Dependency Check ---
-        # If dependencies were declared for this action, check them first
+        # Updated: Use TOOL_CREATE_GOAL for UMS interaction
+        if final_arguments.get("parent_goal_id") is None and current_goal_id_for_tool and tool_name == TOOL_CREATE_GOAL:
+            final_arguments["parent_goal_id"] = current_goal_id_for_tool
         if planned_dependencies:
             ok, reason = await self._check_prerequisites(planned_dependencies)
             if not ok:
-                # If dependencies not met, log warning, set error state, and return failure
                 err_msg = f"Prerequisites not met for {tool_name}: {reason}"
                 self.logger.warning(err_msg)
-                # Store detailed error info for the LLM - Enhanced Category
-                self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "DependencyNotMetError", "dependencies": planned_dependencies, "status_code": 412}
-                # Signal that replanning is needed due to dependency failure
+                self.state.last_error_details = {
+                    "tool": tool_name,
+                    "error": err_msg,
+                    "type": "DependencyNotMetError",
+                    "dependencies": planned_dependencies,
+                    "status_code": 412,
+                }
                 self.state.needs_replan = True
-                return {"success": False, "error": err_msg, "status_code": 412} # 412 Precondition Failed
-            else:
-                # Log if dependencies were checked and met
-                self.logger.info(f"Prerequisites {[_fmt_id(dep) for dep in planned_dependencies]} met for {tool_name}.")
-
-        # --- Step 4: Handle Internal Agent Tool ---
-        # Directly handle the AGENT_TOOL_UPDATE_PLAN without calling MCPClient
+                return {"success": False, "error": err_msg, "status_code": 412}
+            self.logger.info(f"Prerequisites {[_fmt_id(d) for d in planned_dependencies]} met for {tool_name}.")
         if tool_name == AGENT_TOOL_UPDATE_PLAN:
             try:
                 new_plan_data = final_arguments.get("plan", [])
-                # Validate the structure of the provided plan data
                 if not isinstance(new_plan_data, list):
-                    raise ValueError("`plan` argument must be a list of step objects.")
-                # Convert list of dicts to list of PlanStep objects (validates structure)
+                    raise ValueError("`plan` must be a list.")
                 validated_plan = [PlanStep(**p) for p in new_plan_data]
-
-                # --- Plan Cycle Detection ---
                 if self._detect_plan_cycle(validated_plan):
                     err_msg = "Proposed plan contains a dependency cycle."
                     self.logger.error(err_msg)
-                    self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "PlanValidationError", "proposed_plan": new_plan_data}
-                    self.state.needs_replan = True # Force replan again
+                    self.state.last_error_details = {
+                        "tool": tool_name,
+                        "error": err_msg,
+                        "type": "PlanValidationError",
+                        "proposed_plan": new_plan_data,
+                    }
+                    self.state.needs_replan = True
                     return {"success": False, "error": err_msg}
-
-                # Replace the agent's current plan
                 self.state.current_plan = validated_plan
-                # Plan was explicitly updated, so replan flag can be cleared
                 self.state.needs_replan = False
-                self.logger.info(f"Internal plan update successful. New plan has {len(validated_plan)} steps.")
-                # Clear any previous errors after a successful plan update
+                self.logger.info(f"Internal plan update successful ({len(validated_plan)} steps).")
                 self.state.last_error_details = None
                 self.state.consecutive_error_count = 0
                 return {"success": True, "message": f"Plan updated with {len(validated_plan)} steps."}
             except (ValidationError, TypeError, ValueError) as e:
-                # Handle errors during plan validation or application
                 err_msg = f"Failed to validate/apply new plan: {e}"
                 self.logger.error(err_msg)
-                # Store error details for the LLM - Enhanced Category
-                self.state.last_error_details = {"tool": tool_name, "error": err_msg, "type": "PlanUpdateError", "proposed_plan": final_arguments.get("plan")}
-                # Increment error count for internal failures too? Decide policy. Yes, for now.
+                self.state.last_error_details = {
+                    "tool": tool_name,
+                    "error": err_msg,
+                    "type": "PlanUpdateError",
+                    "proposed_plan": final_arguments.get("plan"),
+                }
                 self.state.consecutive_error_count += 1
-                # Failed plan update requires another attempt at planning
                 self.state.needs_replan = True
                 return {"success": False, "error": err_msg}
-
-        # --- Step 5: Record Action Start (Optional) ---
         action_id: Optional[str] = None
-        # Determine if this tool call should be recorded as a primary agent action
-        # Exclude internal/meta tools and calls where record_action is explicitly False
         should_record = record_action and tool_name not in self._INTERNAL_OR_META_TOOLS
         if should_record:
-            # Call internal helper to record the action start and dependencies
-            action_id = await self._record_action_start_internal(
-                 tool_name, final_arguments, planned_dependencies # Pass potentially modified args and dependencies
-            )
-            # Note: _record_action_start_internal now handles calling _record_action_dependencies_internal
-
-        # --- Step 6: Execute Tool Call (with Retries) ---
-        # Define the actual async function to call the tool via MCPClient
-        async def _do_call():
-            # Ensure None values are stripped *before* sending to MCPClient execute_tool
-            # Although MCPClient likely handles this, this adds robustness.
-            call_args = {k: v for k, v in final_arguments.items() if v is not None}
-            # Target server must be valid here because AGENT_INTERNAL was handled earlier
-            return await self.mcp_client.execute_tool(target_server, tool_name, call_args)
-
-        # Get the stats dictionary for this specific tool
+            action_id = await self._record_action_start_internal(tool_name, final_arguments, planned_dependencies)
         record_stats = self.state.tool_usage_stats[tool_name]
-        # Decide if the tool is safe to automatically retry on failure
         idempotent = tool_name in {
-            # Read-only operations are generally safe to retry
-            TOOL_GET_CONTEXT, TOOL_GET_MEMORY_BY_ID, TOOL_SEMANTIC_SEARCH,
-            TOOL_HYBRID_SEARCH, TOOL_GET_ACTION_DETAILS, TOOL_LIST_WORKFLOWS,
-            TOOL_COMPUTE_STATS, TOOL_GET_WORKING_MEMORY, TOOL_GET_LINKED_MEMORIES,
-            TOOL_GET_ARTIFACTS, TOOL_GET_ARTIFACT_BY_ID, TOOL_GET_ACTION_DEPENDENCIES,
-            TOOL_GET_THOUGHT_CHAIN, TOOL_GET_WORKFLOW_DETAILS,
-            TOOL_GET_GOAL_DETAILS, # Getting goal details is idempotent (NEW)
-            # Some meta operations might be considered retry-safe
+            TOOL_GET_CONTEXT,
+            TOOL_GET_RICH_CONTEXT_PACKAGE,
+            TOOL_GET_MEMORY_BY_ID,
+            TOOL_SEMANTIC_SEARCH,
+            TOOL_HYBRID_SEARCH,
+            TOOL_GET_ACTION_DETAILS,
+            TOOL_LIST_WORKFLOWS,
+            TOOL_COMPUTE_STATS,
+            TOOL_GET_WORKING_MEMORY,
+            TOOL_GET_LINKED_MEMORIES,
+            TOOL_GET_ARTIFACTS,
+            TOOL_GET_ARTIFACT_BY_ID,
+            TOOL_GET_ACTION_DEPENDENCIES,
+            TOOL_GET_THOUGHT_CHAIN,
+            TOOL_GET_WORKFLOW_DETAILS,
+            TOOL_GET_GOAL_DETAILS,
             TOOL_SUMMARIZE_TEXT,
         }
-
-        start_ts = time.time() # Record start time for latency calculation
-        res = {} # Initialize result dictionary
-
+        start_ts = time.time()
+        res = {}
         try:
-            # Execute the tool call using the retry wrapper
+
+            async def _do_call():
+                call_args = {k: v for k, v in final_arguments.items() if v is not None}
+                return await self.mcp_client.execute_tool(target_server, tool_name, call_args)
+
             raw = await self._with_retries(
                 _do_call,
-                max_retries=3 if idempotent else 1, # Retry only idempotent tools (3 attempts total)
-                # Specify exceptions that should trigger a retry attempt
+                max_retries=3 if idempotent else 1,
                 retry_exceptions=(
-                    ToolError, ToolInputError, # Specific MCP errors
-                    asyncio.TimeoutError, ConnectionError, # Common network issues
-                    APIConnectionError, RateLimitError, APIStatusError, # Anthropic/LLM network/API issues
+                    ToolError,
+                    ToolInputError,
+                    asyncio.TimeoutError,
+                    ConnectionError,
+                    APIConnectionError,
+                    RateLimitError,
+                    APIStatusError,
                 ),
             )
-            # Calculate execution latency
             latency_ms = (time.time() - start_ts) * 1000
             record_stats["latency_ms_total"] += latency_ms
-
-            # --- Step 7: Process and Standardize Result ---
-            # Handle different result formats returned by MCPClient/tools
             if isinstance(raw, dict) and ("success" in raw or "isError" in raw):
-                # Assume standard MCP result format with success/isError flag
                 is_error = raw.get("isError", not raw.get("success", True))
-                # Extract content or error message
                 content = raw.get("content", raw.get("error", raw.get("data")))
                 if is_error:
                     res = {"success": False, "error": str(content), "status_code": raw.get("status_code")}
                 else:
-                    # If content itself has a standard structure, use it directly
-                    if isinstance(content, dict) and "success" in content:
-                        res = content
-                    else: # Otherwise, wrap the content under a 'data' key for consistency
-                        res = {"success": True, "data": content}
-            elif isinstance(raw, dict): # Handle plain dictionaries without explicit success/isError
-                 # Assume success if no error indicators present
-                 res = {"success": True, "data": raw}
-            else:
-                # Handle non-dict results (e.g., simple strings, numbers, booleans)
+                    res = content if isinstance(content, dict) and "success" in content else {"success": True, "data": content}
+            elif isinstance(raw, dict):
                 res = {"success": True, "data": raw}
-
-            # --- Step 8: State Updates and Background Triggers on SUCCESS ---
+            else:
+                res = {"success": True, "data": raw}
             if res.get("success"):
-                # Update success stats for the tool
                 record_stats["success"] += 1
-
-                # --- Background Triggers Integration ---
-                # Snapshot the workflow ID *before* potentially starting background tasks
-                # (This ensures tasks operate on the workflow active during the trigger event)
-                current_wf_id_snapshot = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id  # noqa: F841
-
-                # Trigger auto-linking after storing/updating a memory or recording an artifact with a linked memory
+                self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
                 if tool_name in [TOOL_STORE_MEMORY, TOOL_UPDATE_MEMORY] and res.get("memory_id"):
-                    mem_id = res["memory_id"]
-                    self.logger.debug(f"Queueing auto-link check for memory {_fmt_id(mem_id)}")
-                    # Start background task, passing the memory ID
-                    self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=mem_id)
-                    # Note: _start_background_task automatically snapshots workflow_id/context_id
+                    self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=res["memory_id"])
                 if tool_name == TOOL_RECORD_ARTIFACT and res.get("linked_memory_id"):
-                    linked_mem_id = res["linked_memory_id"]
-                    self.logger.debug(f"Queueing auto-link check for memory linked to artifact: {_fmt_id(linked_mem_id)}")
-                    self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=linked_mem_id)
-
-                # Trigger promotion check after retrieving memories
+                    self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=res["linked_memory_id"])
                 if tool_name in [TOOL_GET_MEMORY_BY_ID, TOOL_QUERY_MEMORIES, TOOL_HYBRID_SEARCH, TOOL_SEMANTIC_SEARCH, TOOL_GET_WORKING_MEMORY]:
-                    mem_ids_to_check = set() # Use set to avoid duplicate checks
+                    mem_ids_to_check = set()
                     potential_mems = []
-                    # Extract memory IDs from various possible result structures
                     if tool_name == TOOL_GET_MEMORY_BY_ID:
-                        # Result might be the memory dict directly or nested under 'data'
                         mem_data = res if "memory_id" in res else res.get("data", {})
-                        if isinstance(mem_data, dict): potential_mems = [mem_data]
+                        potential_mems = [mem_data] if isinstance(mem_data, dict) else []
                     elif tool_name == TOOL_GET_WORKING_MEMORY:
                         potential_mems = res.get("working_memories", [])
-                        # Also check the focal memory if present
                         focus_id = res.get("focal_memory_id")
-                        if focus_id: mem_ids_to_check.add(focus_id)
-                    else: # Query/Search results typically under 'memories' key
-                         potential_mems = res.get("memories", [])
-
-                    # Add IDs from the list/dict structures found
+                    if focus_id:
+                        mem_ids_to_check.add(focus_id)  # type: ignore
+                    else:
+                        potential_mems = res.get("memories", [])
                     if isinstance(potential_mems, list):
-                        # Limit checks to the top few most relevant results to avoid overload
-                        mem_ids_to_check.update(
-                            m.get("memory_id") for m in potential_mems[:3] # Check top 3 retrieved
-                            if isinstance(m, dict) and m.get("memory_id") # Ensure it's a dict with an ID
-                        )
-
-                    # Start background tasks for each unique, valid memory ID found
-                    for mem_id in filter(None, mem_ids_to_check): # Filter out any None IDs
-                         self.logger.debug(f"Queueing promotion check for retrieved memory {_fmt_id(mem_id)}")
-                         self._start_background_task(AgentMasterLoop._check_and_trigger_promotion, memory_id=mem_id)
-                # --- Background Triggers Integration End ---
-
-                # Update current thought chain ID if a new one was just created successfully
+                        mem_ids_to_check.update(m.get("memory_id") for m in potential_mems[:3] if isinstance(m, dict) and m.get("memory_id"))
+                    for mem_id_chk in filter(None, mem_ids_to_check):
+                        self._start_background_task(AgentMasterLoop._check_and_trigger_promotion, memory_id=mem_id_chk)
                 if tool_name == TOOL_CREATE_THOUGHT_CHAIN and res.get("success"):
-                    # Find the chain ID in the result (might be root or under 'data')
                     chain_data = res if "thought_chain_id" in res else res.get("data", {})
                     if isinstance(chain_data, dict):
                         new_chain_id = chain_data.get("thought_chain_id")
-                        if new_chain_id:
-                            self.state.current_thought_chain_id = new_chain_id
-                            self.logger.info(f"Switched current thought chain to newly created: {_fmt_id(new_chain_id)}")
-
-            else: # Tool failed
-                # Update failure stats
+                    if new_chain_id:
+                        self.state.current_thought_chain_id = new_chain_id
+                        self.logger.info(f"Switched current thought chain: {_fmt_id(new_chain_id)}")  # type: ignore
+            else:
                 record_stats["failure"] += 1
-                # Ensure error details are captured from the result for the LLM context
-                # Enhance error details with categorization
-                error_type = "ToolExecutionError" # Default category
+                error_type = "ToolExecutionError"
                 status_code = res.get("status_code")
                 error_message = res.get("error", "Unknown failure")
-                if status_code == 412: error_type = "DependencyNotMetError"
-                elif status_code == 503: error_type = "ServerUnavailable"
-                elif "input" in str(error_message).lower() or "validation" in str(error_message).lower(): error_type = "InvalidInputError" # Basic keyword check
-                elif "timeout" in str(error_message).lower(): error_type = "NetworkError" # Assuming timeout implies network
-                # --- ADDED: Categorize goal management errors ---
-                elif tool_name in [TOOL_PUSH_SUB_GOAL, TOOL_MARK_GOAL_STATUS] and ("not found" in str(error_message).lower() or "invalid" in str(error_message).lower()):
-                     error_type = "GoalManagementError"
-
+                if status_code == 412:
+                    error_type = "DependencyNotMetError"
+                elif status_code == 503:
+                    error_type = "ServerUnavailable"
+                elif "input" in str(error_message).lower() or "validation" in str(error_message).lower():
+                    error_type = "InvalidInputError"
+                elif "timeout" in str(error_message).lower():
+                    error_type = "NetworkError"
+                elif tool_name in [TOOL_CREATE_GOAL, TOOL_UPDATE_GOAL_STATUS] and (
+                    "not found" in str(error_message).lower() or "invalid" in str(error_message).lower()
+                ):
+                    error_type = "GoalManagementError"
                 self.state.last_error_details = {
                     "tool": tool_name,
-                    "args": arguments, # Log the arguments that caused failure
+                    "args": arguments,
                     "error": error_message,
                     "status_code": status_code,
-                    "type": error_type # Store the categorized error type
+                    "type": error_type,
                 }
-                # Log the categorized error
                 self.logger.warning(f"Tool {tool_name} failed. Type: {error_type}, Error: {error_message}")
-
-
-            # --- Step 9: Update Last Action Summary ---
-            # Create a concise summary of the action's outcome for the next prompt
             summary = ""
             if res.get("success"):
-                # Try to find a meaningful summary field in the result or its 'data' payload
-                summary_keys = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "chain_id", "state_id", "report", "visualization", "goal_id"] # Added goal_id
-                data_payload = res.get("data", res) # Check 'data' key or root level
+                summary_keys = [
+                    "summary",
+                    "message",
+                    "memory_id",
+                    "action_id",
+                    "artifact_id",
+                    "link_id",
+                    "chain_id",
+                    "state_id",
+                    "report",
+                    "visualization",
+                    "goal_id",
+                ]
+                data_payload = res.get("data", res)
                 if isinstance(data_payload, dict):
                     for k in summary_keys:
                         if k in data_payload and data_payload[k]:
-                            # Format IDs concisely, use string value for others
                             summary = f"{k}: {_fmt_id(data_payload[k]) if 'id' in k else str(data_payload[k])}"
                             break
-                    else: # Fallback if no specific key found in dict
-                        data_str = str(data_payload)[:70] # Preview the dict
-                        summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
-                else: # Handle non-dict data payload
-                     data_str = str(data_payload)[:70] # Preview the data
-                     summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
-            else: # If failed
-                # Use the structured error details for a more informative summary
+                    else:
+                        data_str = str(data_payload)[:70]
+                        summary = f"Success. Data: {data_str}{'...' if len(str(data_payload)) > 70 else ''}"
+                else:
+                    data_str = str(data_payload)[:70]
+                    summary = f"Success. Data: {data_str}{'...' if len(str(data_payload)) > 70 else ''}"
+            else:
                 err_type = self.state.last_error_details.get("type", "Unknown") if self.state.last_error_details else "Unknown"
-                err_msg = str(res.get('error', 'Unknown Error'))[:100]
-                summary = f"Failed ({err_type}): {err_msg}" # Include error type
-                if res.get('status_code'): summary += f" (Code: {res['status_code']})" # Add status code if available
-
-            # Update the state variable
+                err_msg = str(res.get("error", "Unknown Error"))[:100]
+                summary = f"Failed ({err_type}): {err_msg}"
+            if res.get("status_code"):
+                summary += f" (Code: {res['status_code']})"
             self.state.last_action_summary = f"{tool_name} -> {summary}"
-            # Log the outcome
-            self.logger.info(self.state.last_action_summary, emoji_key="checkered_flag" if res.get('success') else "warning")
-
-
-        # --- Step 10: Exception Handling for Tool Call/Retries ---
-        # Updated Exception handling to add error categorization
+            self.logger.info(f"{"🏁" if res.get("success") else "⚠️"} {self.state.last_action_summary}")
         except (ToolError, ToolInputError) as e:
-            # Handle specific MCP exceptions caught during execution or retries
-            err_str = str(e); status_code = getattr(e, 'status_code', None)
-            # Determine category based on type and status code
+            err_str = str(e)
+            status_code = getattr(e, "status_code", None)
             error_type = "InvalidInputError" if isinstance(e, ToolInputError) else "ToolInternalError"
-            if status_code == 412: error_type = "DependencyNotMetError"
-            self.logger.error(f"Tool Error executing {tool_name}: {err_str}", exc_info=False) # Don't need full trace for these
+            if status_code == 412:
+                error_type = "DependencyNotMetError"
+            self.logger.error(f"Tool Error exec {tool_name}: {err_str}", exc_info=False)
             res = {"success": False, "error": err_str, "status_code": status_code}
-            record_stats["failure"] += 1 # Record failure
-            # Store categorized error details for the LLM
+            record_stats["failure"] += 1
             self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": error_type, "status_code": status_code}
             self.state.last_action_summary = f"{tool_name} -> Failed ({error_type}): {err_str[:100]}"
-
         except APIConnectionError as e:
-            err_str = f"LLM API Connection Error: {e}"
+            err_str = f"LLM API Conn Error: {e}"
             self.logger.error(err_str, exc_info=False)
             res = {"success": False, "error": err_str}
             record_stats["failure"] += 1
@@ -2572,1822 +1816,1134 @@ class AgentMasterLoop:
             record_stats["failure"] += 1
             self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "APIError", "status_code": e.status_code}
             self.state.last_action_summary = f"{tool_name} -> Failed: APIError ({e.status_code})"
-        except asyncio.TimeoutError as e: # Catch timeouts from retry wrapper or internal calls
-            err_str = f"Operation timed out: {e}"
-            self.logger.error(f"Timeout executing {tool_name}: {err_str}", exc_info=False)
+        except asyncio.TimeoutError as e:
+            err_str = f"Op timed out: {e}"
+            self.logger.error(f"Timeout exec {tool_name}: {err_str}", exc_info=False)
             res = {"success": False, "error": err_str}
             record_stats["failure"] += 1
             self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "TimeoutError"}
             self.state.last_action_summary = f"{tool_name} -> Failed: Timeout"
-
         except asyncio.CancelledError:
-             # Handle task cancellation gracefully (e.g., due to shutdown signal)
-             err_str = "Tool execution cancelled."
-             self.logger.warning(f"{tool_name} execution was cancelled.")
-             res = {"success": False, "error": err_str, "status_code": 499} # Use 499 Client Closed Request
-             record_stats["failure"] += 1 # Count cancellation as failure for stats
-             self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "CancelledError"}
-             self.state.last_action_summary = f"{tool_name} -> Cancelled"
-             # Re-raise cancellation to potentially stop the loop if needed
-             raise
-
+            err_str = "Tool exec cancelled."
+            self.logger.warning(f"{tool_name} exec cancelled.")
+            res = {"success": False, "error": err_str, "status_code": 499}
+            record_stats["failure"] += 1
+            self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "CancelledError"}
+            self.state.last_action_summary = f"{tool_name} -> Cancelled"
+            raise
         except Exception as e:
-            # Catch any other unexpected errors during execution or retries
             err_str = str(e)
-            self.logger.error(f"Unexpected Error executing {tool_name}: {err_str}", exc_info=True) # Log full traceback
+            self.logger.error(f"Unexpected Error exec {tool_name}: {err_str}", exc_info=True)
             res = {"success": False, "error": f"Unexpected error: {err_str}"}
-            record_stats["failure"] += 1 # Record failure
-            # Store categorized error
+            record_stats["failure"] += 1
             self.state.last_error_details = {"tool": tool_name, "args": arguments, "error": err_str, "type": "UnexpectedExecutionError"}
             self.state.last_action_summary = f"{tool_name} -> Failed: Unexpected error."
-
-        # --- Step 11: Record Action Completion (if start was recorded) ---
         if action_id:
-            # Pass the final result 'res' (success or failure dict) to the completion recorder
             await self._record_action_completion_internal(action_id, res)
-
-        # --- Step 12: Handle Workflow & Goal Side Effects ---
-        # Call this *after* execution and completion recording, using the final 'res'
-        await self._handle_workflow_and_goal_side_effects(tool_name, final_arguments, res)
-
-        # Return the final processed result dictionary
+        await self._handle_workflow_and_goal_side_effects(tool_name, final_arguments, res)  # Pass original arguments
         return res
-        # <<< End Integration Block: Enhance _execute_tool_call_internal >>>
-
 
     async def _handle_workflow_and_goal_side_effects(self, tool_name: str, arguments: Dict, result_content: Dict):
         """
         Handles agent state changes triggered by specific tool outcomes,
-        including workflow creation/termination and goal stack updates.
+        especially workflow creation/termination and UMS-driven goal stack updates.
         """
-        # <<< Start Integration Block: Goal Stack Side Effects >>>
         # --- Side effects for Workflow Creation ---
         if tool_name == TOOL_CREATE_WORKFLOW and result_content.get("success"):
             new_wf_id = result_content.get("workflow_id")
             primary_chain_id = result_content.get("primary_thought_chain_id")
-            parent_wf_id = arguments.get("parent_workflow_id") # Parent WF from original args
+            parent_wf_id_arg = arguments.get("parent_workflow_id")
             wf_title = result_content.get("title", "Untitled Workflow")
-            wf_goal_desc = result_content.get("goal", "Achieve objectives")
+            wf_goal_desc = result_content.get("goal", "Achieve objectives for this workflow")  # Use UMS goal desc
 
             if new_wf_id:
-                # Set the agent's primary workflow ID and context ID to the new one
                 self.state.workflow_id = new_wf_id
-                self.state.context_id = new_wf_id # Align context ID
-
-                # Manage the workflow stack
-                is_sub_workflow = parent_wf_id and parent_wf_id in self.state.workflow_stack
+                self.state.context_id = new_wf_id
+                is_sub_workflow = parent_wf_id_arg and parent_wf_id_arg in self.state.workflow_stack
+                log_prefix = "sub-" if is_sub_workflow else "new "
                 if is_sub_workflow:
                     self.state.workflow_stack.append(new_wf_id)
-                    log_prefix = "sub-"
-                else: # New root workflow or parent not on stack
+                else:
                     self.state.workflow_stack = [new_wf_id]
-                    log_prefix = "new "
-
-                # Set the current thought chain ID
                 self.state.current_thought_chain_id = primary_chain_id
 
-                # --- Goal Stack Update for New Workflow ---
-                # If it's a new root workflow, reset the goal stack and create a root goal
-                if not is_sub_workflow:
-                    self.state.goal_stack = []
-                    self.state.current_goal_id = None
-                    # Try to create a root goal in the UMS for this new workflow
-                    if self._find_tool_server(TOOL_PUSH_SUB_GOAL):
-                        try:
-                            goal_res = await self._execute_tool_call_internal(
-                                TOOL_PUSH_SUB_GOAL,
-                                {
-                                    "workflow_id": new_wf_id,
-                                    "description": wf_goal_desc,
-                                    # Parent is None for the root goal
-                                },
-                                record_action=False
+                # Create the root goal for this new workflow in UMS
+                self.state.goal_stack = []  # Reset local stack for new/root workflow
+                self.state.current_goal_id = None
+                if self._find_tool_server(TOOL_CREATE_GOAL):
+                    try:
+                        goal_creation_args = {
+                            "workflow_id": new_wf_id,
+                            "description": wf_goal_desc,
+                            # parent_goal_id is None for a root goal of a new workflow
+                        }
+                        self.logger.info(f"Attempting to create UMS root goal for {log_prefix}workflow {_fmt_id(new_wf_id)}: '{wf_goal_desc}'")
+                        goal_res = await self._execute_tool_call_internal(TOOL_CREATE_GOAL, goal_creation_args, record_action=False)
+                        # UMS create_goal should return the full goal object under a "goal" key
+                        created_ums_goal = goal_res.get("goal") if goal_res.get("success") else None
+
+                        if isinstance(created_ums_goal, dict) and created_ums_goal.get("goal_id"):
+                            self.state.goal_stack.append(created_ums_goal)  # Add full UMS goal object
+                            self.state.current_goal_id = created_ums_goal.get("goal_id")
+                            self.logger.info(
+                                f"Created UMS root goal {_fmt_id(self.state.current_goal_id)} for {log_prefix}workflow {_fmt_id(new_wf_id)}."
                             )
-                            if goal_res.get("success") and goal_res.get("goal_id"):
-                                new_goal = {"goal_id": goal_res["goal_id"], "description": wf_goal_desc, "status": "active"}
-                                self.state.goal_stack.append(new_goal)
-                                self.state.current_goal_id = new_goal["goal_id"]
-                                self.logger.info(f"Created root goal {_fmt_id(self.state.current_goal_id)} for {log_prefix}workflow {_fmt_id(new_wf_id)}.")
-                            else:
-                                self.logger.warning(f"Failed to create root goal via UMS for new workflow {_fmt_id(new_wf_id)}: {goal_res.get('error')}")
-                        except Exception as goal_err:
-                             self.logger.error(f"Error creating root goal for new workflow {_fmt_id(new_wf_id)}: {goal_err}")
-                    else:
-                        self.logger.warning(f"Cannot create root goal for new workflow: Tool {TOOL_PUSH_SUB_GOAL} unavailable.")
-                # If it's a sub-workflow, the goal that triggered its creation should already be on the stack.
-                # We don't automatically create a new goal here; the LLM should explicitly push one if needed.
+                        else:
+                            self.logger.warning(
+                                f"Failed to create UMS root goal for new workflow {_fmt_id(new_wf_id)}: {goal_res.get('error', 'UMS tool did not return valid goal data')}"
+                            )
+                    except Exception as goal_err:
+                        self.logger.error(f"Error creating UMS root goal for new workflow {_fmt_id(new_wf_id)}: {goal_err}", exc_info=True)
+                else:
+                    self.logger.warning(f"Cannot create root goal for new workflow: UMS Tool {TOOL_CREATE_GOAL} unavailable.")
 
-                self.logger.info(f"Switched to {log_prefix}workflow: {_fmt_id(new_wf_id)}. Current chain: {_fmt_id(primary_chain_id)}. Current goal: {_fmt_id(self.state.current_goal_id)}", emoji_key="label")
-
-                # Reset plan, errors, and replan flag for the new workflow context
+                self.logger.info(
+                    f"🏷️ Switched to {log_prefix}workflow: {_fmt_id(new_wf_id)}. Chain: {_fmt_id(primary_chain_id)}. Current Goal: {_fmt_id(self.state.current_goal_id)}"
+                )
                 self.state.current_plan = [PlanStep(description=f"Start {log_prefix}workflow: '{wf_title}'. Goal: {wf_goal_desc}.")]
                 self.state.consecutive_error_count = 0
                 self.state.needs_replan = False
                 self.state.last_error_details = None
 
-        # --- Side effects for Pushing a Sub-Goal ---
-        elif tool_name == TOOL_PUSH_SUB_GOAL and result_content.get("success"):
-            new_goal = result_content.get("goal") # Assuming tool returns the created goal object
-            if isinstance(new_goal, dict) and new_goal.get("goal_id"):
-                 # Add the new goal to the agent's state stack
-                 self.state.goal_stack.append(new_goal)
-                 # Set the new goal as the current goal
-                 self.state.current_goal_id = new_goal["goal_id"]
-                 self.logger.info(f"Pushed new sub-goal {_fmt_id(self.state.current_goal_id)} onto stack: '{new_goal.get('description', '')[:50]}...'. Stack depth: {len(self.state.goal_stack)}", emoji_key="arrow_down")
-                 # Force replan to address the new sub-goal
-                 self.state.needs_replan = True
-                 self.state.current_plan = [PlanStep(description=f"Start new sub-goal: '{new_goal.get('description', '')[:50]}...'")]
-                 self.state.last_error_details = None # Clear errors when pushing new goal
+        # --- Side effects for Creating a New Goal (typically a sub-goal) ---
+        elif tool_name == TOOL_CREATE_GOAL and result_content.get("success"):
+            # This case handles when the LLM decides to call create_goal, usually for a sub-goal
+            created_ums_goal = result_content.get("goal")  # UMS tool returns the created goal object
+            if isinstance(created_ums_goal, dict) and created_ums_goal.get("goal_id"):
+                # Add the new UMS goal to the agent's local stack representation
+                self.state.goal_stack.append(created_ums_goal)
+                # Set the new goal as the current focus
+                self.state.current_goal_id = created_ums_goal["goal_id"]
+                self.logger.info(
+                    f"📌 Pushed new UMS goal {_fmt_id(self.state.current_goal_id)} to local stack: '{created_ums_goal.get('description', '')[:50]}...'. Stack depth: {len(self.state.goal_stack)}"
+                )
+                self.state.needs_replan = True
+                self.state.current_plan = [PlanStep(description=f"Start new goal: '{created_ums_goal.get('description', '')[:50]}...'")]
+                self.state.last_error_details = None
             else:
-                 self.logger.warning(f"Tool {TOOL_PUSH_SUB_GOAL} succeeded but did not return valid goal data: {result_content}")
+                self.logger.warning(f"UMS Tool {TOOL_CREATE_GOAL} succeeded but did not return valid goal data: {result_content}")
 
-        # --- Side effects for Marking Goal Status ---
-        elif tool_name == TOOL_MARK_GOAL_STATUS and result_content.get("success"):
-            goal_id_marked = arguments.get("goal_id")
-            new_status = arguments.get("status")
+        # --- Side effects for Updating Goal Status ---
+        elif tool_name == TOOL_UPDATE_GOAL_STATUS and result_content.get("success"):
+            goal_id_marked_in_ums = arguments.get("goal_id")  # The goal ID passed to the UMS tool
+            new_status_in_ums = arguments.get("status")  # The new status passed to the UMS tool
 
-            # Update the goal status within the agent's state stack
-            goal_found_in_stack = False
-            for goal in self.state.goal_stack:
-                if goal.get("goal_id") == goal_id_marked:
-                    goal["status"] = new_status
-                    goal_found_in_stack = True
-                    self.logger.info(f"Updated goal {_fmt_id(goal_id_marked)} status in state stack to: {new_status}.")
+            # Get data returned by the UMS tool
+            updated_goal_details_from_ums = result_content.get("updated_goal_details")
+            parent_goal_id_from_ums = result_content.get("parent_goal_id")  # Parent of the *marked* goal
+            is_root_finished_from_ums = result_content.get("is_root_finished", False)
+
+            # Validate the UMS response
+            if not isinstance(updated_goal_details_from_ums, dict) or updated_goal_details_from_ums.get("goal_id") != goal_id_marked_in_ums:
+                self.logger.error(
+                    f"UMS {TOOL_UPDATE_GOAL_STATUS} returned inconsistent 'updated_goal_details' for {goal_id_marked_in_ums}. Aborting side-effects for this update."
+                )
+                return
+
+            # 1. Update the specific goal in the agent's local stack with fresh UMS data
+            goal_found_in_local_stack_and_updated = False
+            for i, local_goal_dict in enumerate(self.state.goal_stack):
+                if local_goal_dict.get("goal_id") == goal_id_marked_in_ums:
+                    self.state.goal_stack[i] = updated_goal_details_from_ums  # Replace with fresh full object
+                    goal_found_in_local_stack_and_updated = True
+                    self.logger.info(f"Updated goal {_fmt_id(goal_id_marked_in_ums)} in local stack with UMS data (new status: {new_status_in_ums}).")
                     break
+            if not goal_found_in_local_stack_and_updated:
+                self.logger.warning(
+                    f"Goal {_fmt_id(goal_id_marked_in_ums)} (marked {new_status_in_ums} in UMS) not found in current agent goal stack for update. Local stack: {[_fmt_id(g.get('goal_id')) for g in self.state.goal_stack]}"
+                )
 
-            if not goal_found_in_stack:
-                 self.logger.warning(f"Goal {_fmt_id(goal_id_marked)} (marked {new_status}) not found in current agent goal stack: {self.state.goal_stack}")
+            # 2. If the goal that was just marked in UMS was our *current* active goal, and it's now terminal...
+            if goal_id_marked_in_ums == self.state.current_goal_id and new_status_in_ums in ["completed", "failed", "abandoned"]:
+                self.logger.info(f"Current active goal {_fmt_id(self.state.current_goal_id)} reached terminal state '{new_status_in_ums}'.")
 
-            # If the goal marked was the *current* goal and it's now completed/failed
-            if goal_id_marked == self.state.current_goal_id and new_status in ["completed", "failed"]:
-                # Pop the completed/failed goal from the stack
-                if self.state.goal_stack and self.state.goal_stack[-1].get("goal_id") == goal_id_marked:
-                    finished_goal = self.state.goal_stack.pop()
-                    self.logger.info(f"Popped goal {_fmt_id(finished_goal.get('goal_id'))} (status: {new_status}) from stack.")
-                else:
-                     self.logger.warning(f"Attempted to pop goal {_fmt_id(goal_id_marked)}, but it wasn't at the top of the stack.")
+                # Set the new current_goal_id based on what UMS returned for the parent of the marked goal.
+                self.state.current_goal_id = parent_goal_id_from_ums  # This could be None if root was marked
+                self.logger.info(f"Agent's current_goal_id updated to parent: {_fmt_id(self.state.current_goal_id)}")
 
-                # Set the new current goal to the one now at the top
-                self.state.current_goal_id = self.state.goal_stack[-1].get("goal_id") if self.state.goal_stack else None
-                self.logger.info(f"Returning focus to goal: {_fmt_id(self.state.current_goal_id) if self.state.current_goal_id else 'Overall Goal'}. Stack depth: {len(self.state.goal_stack)}", emoji_key="arrow_up")
+                # Rebuild the local goal stack view from UMS, anchored by the new current_goal_id (or empty if it's None)
+                if self.state.current_goal_id:
+                    self.state.goal_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
+                else:  # Current goal became None (meaning root goal was likely finished)
+                    self.state.goal_stack = []  # Clear local stack
 
-                # Check if the stack is now empty (meaning the root goal was completed/failed)
-                if not self.state.goal_stack:
-                     self.logger.info("Goal stack empty. Overall goal presumed finished.")
-                     # Set overall goal achieved flag *only if the last goal was completed*
-                     self.state.goal_achieved_flag = (new_status == "completed")
-                     # Optionally update workflow status if stack is empty
-                     if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
-                         wf_status = WorkflowStatus.COMPLETED.value if self.state.goal_achieved_flag else WorkflowStatus.FAILED.value
-                         await self._execute_tool_call_internal(
-                             TOOL_UPDATE_WORKFLOW_STATUS,
-                             {
-                                 "workflow_id": self.state.workflow_id,
-                                 "status": wf_status,
-                                 "completion_message": f"Overall goal marked {wf_status} after stack completion."
-                             },
-                             record_action=False
-                         )
-                     # Clear plan when overall goal is done
-                     self.state.current_plan = []
-                else:
-                    # Force replan to address the parent goal after returning from sub-goal
+                self.logger.info(
+                    f"🎯 Focus shifted. New current goal: {_fmt_id(self.state.current_goal_id) if self.state.current_goal_id else 'Overall Goal (stack empty)'}. Local stack depth: {len(self.state.goal_stack)}"
+                )
+
+                # 3. Check if the overall workflow/root goal is finished based on UMS
+                if is_root_finished_from_ums:  # UMS explicitly said a root goal is now terminal
+                    self.logger.info("UMS indicated a root goal is finished. Overall goal/workflow presumed finished.")
+                    self.state.goal_achieved_flag = new_status_in_ums == "completed"  # Overall success depends on status of this root goal
+                    # Update UMS workflow status
+                    if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
+                        final_wf_status = WorkflowStatus.COMPLETED.value if self.state.goal_achieved_flag else WorkflowStatus.FAILED.value
+                        await self._execute_tool_call_internal(
+                            TOOL_UPDATE_WORKFLOW_STATUS,
+                            {
+                                "workflow_id": self.state.workflow_id,
+                                "status": final_wf_status,
+                                "completion_message": f"Overall root goal marked {new_status_in_ums} via UMS.",
+                            },
+                            record_action=False,
+                        )
+                    self.state.current_plan = []  # Clear plan as workflow is done
+                elif self.state.current_goal_id:  # If not root finished, but shifted to a new current goal
                     self.state.needs_replan = True
-                    self.state.current_plan = [PlanStep(description=f"Returned from sub-goal {_fmt_id(goal_id_marked)} (status: {new_status}). Re-assess current goal: {_fmt_id(self.state.current_goal_id)}.")]
-                self.state.last_error_details = None # Clear error details when goal status changes
+                    current_goal_desc_for_plan = "Unknown Goal"
+                    # Find description for the new current goal from the (rebuilt) stack
+                    for g_dict in self.state.goal_stack:
+                        if g_dict.get("goal_id") == self.state.current_goal_id:
+                            current_goal_desc_for_plan = g_dict.get("description", "Unknown Goal")[:50]
+                            break
+                    self.state.current_plan = [
+                        PlanStep(
+                            description=f"Returned from sub-goal {_fmt_id(goal_id_marked_in_ums)} (status: {new_status_in_ums}). Re-assess current goal: '{current_goal_desc_for_plan}...' ({_fmt_id(self.state.current_goal_id)})."
+                        )
+                    ]
+                self.state.last_error_details = None  # Clear error details when goal status changes
 
         # --- Side effects for Workflow Status Update (Completion/Failure/Abandonment) ---
         elif tool_name == TOOL_UPDATE_WORKFLOW_STATUS and result_content.get("success"):
-            status = arguments.get("status") # Status requested in the tool call
-            wf_id_updated = arguments.get("workflow_id") # Workflow that was updated
+            status = arguments.get("status")  # Status requested in the tool call
+            wf_id_updated = arguments.get("workflow_id")  # Workflow that was updated
 
-            # Check if the *currently active* workflow (top of stack) was the one updated
             if wf_id_updated and self.state.workflow_stack and wf_id_updated == self.state.workflow_stack[-1]:
-                # Check if the new status is a terminal one
-                is_terminal = status in [
-                    WorkflowStatus.COMPLETED.value,
-                    WorkflowStatus.FAILED.value,
-                    WorkflowStatus.ABANDONED.value
-                ]
-
+                is_terminal = status in [WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value, WorkflowStatus.ABANDONED.value]
                 if is_terminal:
-                    # Remove the finished workflow from the stack
                     finished_wf = self.state.workflow_stack.pop()
                     parent_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else None
-
-                    # --- Goal Stack Update for Completed Sub-Workflow ---
-                    # Find the goal on the *parent's* stack that likely corresponds to this finished sub-workflow.
-                    # This is heuristic - assumes the goal *currently active* when the sub-workflow finished is the relevant one.
-                    # A more robust system might store the initiating goal ID when the sub-workflow is created.
-                    corresponding_goal_id = self.state.current_goal_id # Goal active *before* popping WF stack
-                    if corresponding_goal_id and parent_wf_id: # Ensure we have a goal and a parent WF to mark it in
-                        # Infer goal status from workflow status
-                        goal_status_to_set = "completed" if status == WorkflowStatus.COMPLETED.value else "failed"
-                        self.logger.info(f"Attempting to mark goal {_fmt_id(corresponding_goal_id)} as {goal_status_to_set} due to sub-workflow {_fmt_id(finished_wf)} completion.")
-                        if self._find_tool_server(TOOL_MARK_GOAL_STATUS):
-                             mark_res = await self._execute_tool_call_internal(
-                                 TOOL_MARK_GOAL_STATUS,
-                                 {
-                                     "goal_id": corresponding_goal_id,
-                                     "status": goal_status_to_set,
-                                     "reason": f"Sub-workflow {_fmt_id(finished_wf)} finished with status: {status}"
-                                 },
-                                 record_action=False
-                             )
-                             # This call will trigger the goal stack popping logic above if successful
-                             if not mark_res.get("success"):
-                                 self.logger.warning(f"Failed to automatically mark goal {_fmt_id(corresponding_goal_id)} after sub-workflow completion: {mark_res.get('error')}")
-                        else:
-                             self.logger.warning(f"Cannot mark goal status after sub-workflow completion: Tool {TOOL_MARK_GOAL_STATUS} unavailable.")
-                    elif corresponding_goal_id and not parent_wf_id:
-                         self.logger.info(f"Root workflow {_fmt_id(finished_wf)} finished. Corresponding goal {_fmt_id(corresponding_goal_id)} likely represents overall completion.")
-                         # The MARK_GOAL_STATUS logic above should handle the root goal completion and set goal_achieved_flag
-                    else:
-                         self.logger.warning(f"Sub-workflow {_fmt_id(finished_wf)} finished, but couldn't identify corresponding goal to mark.")
-
-
-                    # --- Update Agent State Based on Workflow Stack ---
                     if parent_wf_id:
-                        # If there's a parent workflow remaining on the stack, return to it
                         self.state.workflow_id = parent_wf_id
-                        self.state.context_id = self.state.workflow_id # Realign context ID
-                        # Set thought chain (should align with parent)
+                        self.state.context_id = self.state.workflow_id
                         await self._set_default_thought_chain_id()
-                        # Note: Current goal ID should have been updated by the MARK_GOAL_STATUS call above
-                        self.logger.info(f"Sub-workflow {_fmt_id(finished_wf)} finished ({status}). Returning to parent {_fmt_id(self.state.workflow_id)}. Current chain: {_fmt_id(self.state.current_thought_chain_id)}. Current Goal: {_fmt_id(self.state.current_goal_id)}", emoji_key="arrow_left")
-                        # Force replan in the parent context
+                        # If returning to a parent workflow, its goal stack should be re-established
+                        # The current_goal_id for the parent workflow should be the goal that *spawned* the sub-workflow.
+                        # This requires the agent to have stored this initiating_goal_id when it created the sub-workflow.
+                        # For now, we'll assume the agent needs to re-evaluate its goals in the parent context.
+                        # A robust way is to re-fetch the parent's current/leaf goal from UMS if its ID is known.
+                        # As a simpler heuristic for now, if goal_stack has items and top one is for parent_wf_id, use it.
+                        if self.state.goal_stack and self.state.goal_stack[-1].get("workflow_id") == parent_wf_id:
+                            self.state.current_goal_id = self.state.goal_stack[-1].get("goal_id")
+                        else:  # Fallback: clear stack and let agent figure it out, or try to find parent's leaf goal
+                            self.state.goal_stack = []  # Clear local stack, agent needs to re-evaluate in parent WF
+                            self.state.current_goal_id = None  # Or try to find active goal for parent_wf_id in UMS
+
+                        self.logger.info(
+                            f"⬅️ Sub-workflow {_fmt_id(finished_wf)} finished ({status}). Returning to parent {_fmt_id(self.state.workflow_id)}. Chain: {_fmt_id(self.state.current_thought_chain_id)}. Goal: {_fmt_id(self.state.current_goal_id)}"
+                        )
                         self.state.needs_replan = True
-                        self.state.current_plan = [PlanStep(description=f"Returned from sub-workflow {_fmt_id(finished_wf)} (status: {status}). Re-assess current goal: {_fmt_id(self.state.current_goal_id)}.")]
-                        self.state.last_error_details = None # Clear error details from the sub-task
-                    else:
-                        # If the stack is empty, the root workflow finished
-                        self.logger.info(f"Root workflow {_fmt_id(finished_wf)} finished with status: {status}.")
-                        # Clear active workflow state
+                        self.state.current_plan = [
+                            PlanStep(description=f"Sub-workflow {_fmt_id(finished_wf)} ({status}) finished. Re-assess current context.")
+                        ]
+                        self.state.last_error_details = None
+                    else:  # Root workflow finished
+                        self.logger.info(f"Root workflow {_fmt_id(finished_wf)} finished ({status}).")
                         self.state.workflow_id = None
                         self.state.context_id = None
                         self.state.current_thought_chain_id = None
-                        # The goal_achieved_flag should have been set by the MARK_GOAL_STATUS logic when the stack became empty
-                        # Clear the plan as the workflow is over
                         self.state.current_plan = []
-        # <<< End Integration Block: Goal Stack Side Effects >>>
+                        self.state.goal_stack = []
+                        self.state.current_goal_id = None
+                        self.state.goal_achieved_flag = status == WorkflowStatus.COMPLETED.value
 
+    async def _fetch_goal_stack_from_ums(self, leaf_goal_id: Optional[str]) -> List[Dict[str, Any]]:
+        """
+        Helper to reconstruct the current goal stack by querying UMS.
+        Traverses from the given leaf_goal_id up to its root parent.
+
+        Args:
+            leaf_goal_id: The ID of the current/leaf goal to start from.
+                          If None, returns an empty stack.
+
+        Returns:
+            A list of goal dictionaries (full UMS goal objects),
+            ordered from root to leaf.
+        """
+        if not leaf_goal_id:
+            self.logger.debug("_fetch_goal_stack_from_ums: No leaf_goal_id provided, returning empty stack.")
+            return []
+
+        tool_name = TOOL_GET_GOAL_DETAILS
+        if not self._find_tool_server(tool_name):
+            self.logger.warning(f"Tool {tool_name} unavailable. Cannot reconstruct goal stack from UMS.")
+            return []  # Cannot fetch if tool is missing
+
+        reconstructed_stack: List[Dict[str, Any]] = []
+        current_id_to_fetch: Optional[str] = leaf_goal_id
+        fetch_depth = 0
+        max_fetch_depth = CONTEXT_GOAL_DETAILS_FETCH_LIMIT  # Use defined constant
+
+        self.logger.debug(f"Reconstructing goal stack from UMS, starting with leaf: {_fmt_id(leaf_goal_id)}")
+
+        while current_id_to_fetch and fetch_depth < max_fetch_depth:
+            try:
+                # Call UMS tool to get details of the current goal ID
+                res = await self._execute_tool_call_internal(
+                    tool_name,
+                    {"goal_id": current_id_to_fetch},
+                    record_action=False,  # Internal fetch, don't log as agent action
+                )
+                # The UMS get_goal_details tool returns the goal object under the "goal" key
+                goal_data = res.get("goal") if isinstance(res, dict) and res.get("success") else None
+
+                if isinstance(goal_data, dict):
+                    reconstructed_stack.append(goal_data)  # Add the full goal object
+                    parent_id = goal_data.get("parent_goal_id")
+                    self.logger.debug(f"Fetched goal {_fmt_id(current_id_to_fetch)}. Parent: {_fmt_id(parent_id)}. Depth: {fetch_depth}")
+                    current_id_to_fetch = parent_id  # Move to the parent for next iteration
+                    fetch_depth += 1
+                else:
+                    self.logger.warning(
+                        f"Failed to fetch details for goal {_fmt_id(current_id_to_fetch)} "
+                        f"or invalid data received from UMS. Stopping stack reconstruction. Response: {res}"
+                    )
+                    break  # Stop if a goal in the chain is not found or data is invalid
+            except Exception as e:
+                self.logger.error(f"Exception while fetching goal {_fmt_id(current_id_to_fetch)} for stack reconstruction: {e}", exc_info=True)
+                break  # Stop on any exception
+
+        reconstructed_stack.reverse()  # Order from root (oldest parent) to leaf (current)
+        self.logger.info(
+            f"Reconstructed goal stack from UMS: {[_fmt_id(g.get('goal_id')) for g in reconstructed_stack]} (Depth: {len(reconstructed_stack)})"
+        )
+        return reconstructed_stack
 
     async def _apply_heuristic_plan_update(self, last_decision: Dict[str, Any], last_tool_result_content: Optional[Dict[str, Any]] = None):
-        """
-        Applies heuristic updates to the plan based on the last action's outcome
-        when the LLM doesn't explicitly call `agent:update_plan`.
-
-        This acts as a default progression mechanism. It marks steps completed
-        on success, handles failures by marking the step failed and inserting
-        an analysis step, and updates meta-cognitive counters.
-        """
-        # <<< Start Integration Block: Heuristic Plan Update Method (Phase 1, Step 3) >>>
-        self.logger.info("Applying heuristic plan update (fallback)...", emoji_key="clipboard")
-
-        # Handle case where plan might be empty (shouldn't usually happen)
+        self.logger.info("📋 Applying heuristic plan update (fallback)...")
         if not self.state.current_plan:
-            self.logger.warning("Plan is empty during heuristic update, adding default re-evaluation step.")
-            self.state.current_plan = [PlanStep(description="Fallback: Re-evaluate situation.")]
-            self.state.needs_replan = True # Force replan if plan was empty
+            self.state.current_plan = [PlanStep(description="Fallback: Re-evaluate.")]
+            self.state.needs_replan = True
             return
-
-        # Get the step the agent was working on (assumed to be the first)
         current_step = self.state.current_plan[0]
-        decision_type = last_decision.get("decision") # What the LLM decided to do
-
-        action_successful = False # Flag to track if the action succeeded for counter updates
-        tool_name_executed = last_decision.get("tool_name") # Tool name if a tool was called
-
-        # --- Update plan based on decision type and success ---
-        # Case 1: LLM called a tool (and it wasn't AGENT_TOOL_UPDATE_PLAN)
+        decision_type = last_decision.get("decision")
+        action_successful = False
+        tool_name_executed = last_decision.get("tool_name")
         if decision_type == "call_tool" and tool_name_executed != AGENT_TOOL_UPDATE_PLAN:
-            # Check the success status from the tool execution result
             tool_success = isinstance(last_tool_result_content, dict) and last_tool_result_content.get("success", False)
             action_successful = tool_success
-
             if tool_success:
-                # On success, mark step completed and remove from plan
-                current_step.status = ActionStatus.COMPLETED.value # Use enum value
-                # Generate a concise summary for the plan step
+                current_step.status = ActionStatus.COMPLETED.value
                 summary = "Success."
                 if isinstance(last_tool_result_content, dict):
-                     # Prioritize specific meaningful keys from the result
-                     summary_keys = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "chain_id", "state_id", "report", "visualization", "goal_id"] # Added goal_id
-                     data_payload = last_tool_result_content.get("data", last_tool_result_content) # Look in 'data' or root
-                     if isinstance(data_payload, dict):
-                         for k in summary_keys:
-                              if k in data_payload and data_payload[k]:
-                                   # Format IDs or use string representation
-                                   summary = f"{k}: {_fmt_id(data_payload[k]) if 'id' in k else str(data_payload[k])}"
-                                   break
-                         else: # Fallback preview for dicts
-                              data_str = str(data_payload)[:70]
-                              summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
-                     else: # Handle non-dict data payload
-                          data_str = str(data_payload)[:70]
-                          summary = f"Success. Data: {data_str}..." if len(str(data_payload)) > 70 else f"Success. Data: {data_str}"
-
-                current_step.result_summary = summary[:150] # Add summary to step, truncated
-                self.state.current_plan.pop(0) # Remove completed step from the front
-                # If the plan is now empty, add a final analysis step
+                    summary_keys = [
+                        "summary",
+                        "message",
+                        "memory_id",
+                        "action_id",
+                        "artifact_id",
+                        "link_id",
+                        "chain_id",
+                        "state_id",
+                        "report",
+                        "visualization",
+                        "goal_id",
+                    ]
+                    data_payload = last_tool_result_content.get("data", last_tool_result_content)
+                    if isinstance(data_payload, dict):
+                        for k in summary_keys:
+                            if k in data_payload and data_payload[k]:
+                                summary = f"{k}: {_fmt_id(data_payload[k]) if 'id' in k else str(data_payload[k])}"
+                                break
+                        else:
+                            data_str = str(data_payload)[:70]
+                            summary = f"Success. Data: {data_str}{'...' if len(str(data_payload)) > 70 else ''}"
+                    else:
+                        data_str = str(data_payload)[:70]
+                        summary = f"Success. Data: {data_str}{'...' if len(str(data_payload)) > 70 else ''}"
+                current_step.result_summary = summary[:150]
+                self.state.current_plan.pop(0)
                 if not self.state.current_plan:
-                    self.logger.info("Plan completed. Adding final analysis step.")
                     self.state.current_plan.append(PlanStep(description="Plan finished. Analyze overall result and decide if goal is met."))
-                self.state.needs_replan = False # Success usually doesn't require immediate replan
-            else: # Tool failed
-                current_step.status = ActionStatus.FAILED.value # Mark step as failed
-                # Extract error message for summary
+                self.state.needs_replan = False
+            else:
+                current_step.status = ActionStatus.FAILED.value
                 error_msg = "Unknown failure"
                 if isinstance(last_tool_result_content, dict):
-                     # Use the enhanced error details if available
-                     error_details = self.state.last_error_details
-                     if error_details:
-                         error_msg = f"Type: {error_details.get('type', 'Unknown')}, Msg: {error_details.get('error', 'Unknown')}"
-                     else: # Fallback to basic error message
-                         error_msg = str(last_tool_result_content.get('error', 'Unknown failure'))
-
-                current_step.result_summary = f"Failure: {error_msg[:150]}" # Add error summary
-                # Keep the failed step in the plan for context.
-                # Insert an analysis step *after* the failed step, if one isn't already there.
+                    error_details = self.state.last_error_details
+                    if error_details:
+                        error_msg = f"Type: {error_details.get('type', 'Unknown')}, Msg: {error_details.get('error', 'Unknown')}"
+                    else:
+                        error_msg = str(last_tool_result_content.get("error", "Unknown failure"))
+                current_step.result_summary = f"Failure: {error_msg[:150]}"
                 if len(self.state.current_plan) < 2 or not self.state.current_plan[1].description.startswith("Analyze failure of step"):
-                    self.state.current_plan.insert(1, PlanStep(description=f"Analyze failure of step '{current_step.description[:30]}...' and replan."))
-                self.state.needs_replan = True # Failure always requires replanning
-
-        # Case 2: LLM decided to record a thought
+                    self.state.current_plan.insert(
+                        1, PlanStep(description=f"Analyze failure of step '{current_step.description[:30]}...' and replan.")
+                    )
+                self.state.needs_replan = True
         elif decision_type == "thought_process":
-            action_successful = True # Recording a thought is considered a successful step completion heuristically
+            action_successful = True
             current_step.status = ActionStatus.COMPLETED.value
-            current_step.result_summary = f"Thought Recorded: {last_decision.get('content','')[:50]}..." # Summary based on thought
-            self.state.current_plan.pop(0) # Remove completed step
-            # If plan is empty after thought, add next step prompt
+            current_step.result_summary = f"Thought Recorded: {last_decision.get('content', '')[:50]}..."
+            self.state.current_plan.pop(0)
             if not self.state.current_plan:
-                self.logger.info("Plan completed after thought. Adding next action step.")
                 self.state.current_plan.append(PlanStep(description="Decide next action based on recorded thought and overall goal."))
-            self.state.needs_replan = False # Recording a thought doesn't force replan
-
-        # Case 3: LLM signaled completion
+            self.state.needs_replan = False
         elif decision_type == "complete":
-            action_successful = True # Achieving goal is success
-            # Overwrite plan with a final step (status handled in main loop)
+            action_successful = True
             self.state.current_plan = [PlanStep(description="Goal Achieved. Finalizing.", status="completed")]
             self.state.needs_replan = False
-
-        # Case 4: Handle errors or unexpected decisions (including AGENT_TOOL_UPDATE_PLAN failure)
         else:
-            action_successful = False # Mark as failure for counter updates
-            # Only mark the *current plan step* as failed if it wasn't the plan update tool itself that caused the error state
+            action_successful = False
             if tool_name_executed != AGENT_TOOL_UPDATE_PLAN:
                 current_step.status = ActionStatus.FAILED.value
-                # Use the last action summary (which should contain the error) for the result summary
                 err_summary = self.state.last_action_summary or "Unknown agent error"
                 current_step.result_summary = f"Agent/Tool Error: {err_summary[:100]}..."
-                # Insert re-evaluation step if not already present
                 if len(self.state.current_plan) < 2 or not self.state.current_plan[1].description.startswith("Re-evaluate due to agent error"):
-                     self.state.current_plan.insert(1, PlanStep(description="Re-evaluate due to agent error or unclear decision."))
-            # Always set needs_replan if an error occurred or the decision was unexpected
+                    self.state.current_plan.insert(1, PlanStep(description="Re-evaluate due to agent error or unclear decision."))
             self.state.needs_replan = True
-
-        # --- Update Meta-Cognitive Counters ---
         if action_successful:
-            # Reset error counter on any successful progression
             self.state.consecutive_error_count = 0
-
-            # Increment success counters *only* if the action wasn't internal/meta
-            # Check if a tool was executed and if it's not in the excluded set
             if tool_name_executed and tool_name_executed not in self._INTERNAL_OR_META_TOOLS:
-                 # Use float increments for flexibility
-                 self.state.successful_actions_since_reflection += 1.0
-                 self.state.successful_actions_since_consolidation += 1.0
-                 self.logger.debug(f"Incremented success counters R:{self.state.successful_actions_since_reflection:.1f}, C:{self.state.successful_actions_since_consolidation:.1f} after successful action: {tool_name_executed}")
+                self.state.successful_actions_since_reflection += 1.0
+                self.state.successful_actions_since_consolidation += 1.0
+                self.logger.debug(
+                    f"Incr success R:{self.state.successful_actions_since_reflection:.1f}, C:{self.state.successful_actions_since_consolidation:.1f} after: {tool_name_executed}"
+                )
             elif decision_type == "thought_process":
-                 # Option: Count thoughts as partial progress (e.g., 0.5)
-                 self.state.successful_actions_since_reflection += 0.5 # Example: count thought as half an action
-                 self.state.successful_actions_since_consolidation += 0.5
-                 self.logger.debug(f"Incremented success counters R:{self.state.successful_actions_since_reflection:.1f}, C:{self.state.successful_actions_since_consolidation:.1f} after thought recorded.")
-
-        else: # Action failed or was an error condition handled above
-            # Increment consecutive error count
+                self.state.successful_actions_since_reflection += 0.5
+                self.state.successful_actions_since_consolidation += 0.5
+                self.logger.debug(
+                    f"Incr success R:{self.state.successful_actions_since_reflection:.1f}, C:{self.state.successful_actions_since_consolidation:.1f} after thought."
+                )
+        else:
             self.state.consecutive_error_count += 1
-            self.logger.warning(f"Consecutive error count increased to: {self.state.consecutive_error_count}")
-            # Reset reflection counter immediately on error to encourage faster reflection
+            self.logger.warning(f"Consecutive error count: {self.state.consecutive_error_count}")
             if self.state.successful_actions_since_reflection > 0:
-                 self.logger.info(f"Resetting reflection counter due to error (was {self.state.successful_actions_since_reflection:.1f}).")
-                 self.state.successful_actions_since_reflection = 0
-                 # Policy Decision: Keep consolidation counter running unless error rate is very high (handled in _adapt_thresholds)
-
-        # --- Log Final Plan State ---
-        log_plan_msg = f"Plan updated heuristically. Steps remaining: {len(self.state.current_plan)}. "
+                self.logger.info(f"Reset reflection counter (was {self.state.successful_actions_since_reflection:.1f}).")
+                self.state.successful_actions_since_reflection = 0
+        log_plan_msg = f"Plan updated heuristically. Steps: {len(self.state.current_plan)}. "
         if self.state.current_plan:
             next_step = self.state.current_plan[0]
             depends_str = f"Depends: {[_fmt_id(d) for d in next_step.depends_on]}" if next_step.depends_on else "Depends: None"
             log_plan_msg += f"Next: '{next_step.description[:60]}...' (Status: {next_step.status}, {depends_str})"
         else:
-            log_plan_msg += "Plan is now empty."
-        self.logger.info(log_plan_msg, emoji_key="clipboard")
-        # <<< End Integration Block: Heuristic Plan Update Method >>>
+            log_plan_msg += "Plan empty."
+        self.logger.info(f"📋 {log_plan_msg}")
 
-
-    # ------------------------------------------------ adaptive thresholds --
     def _adapt_thresholds(self, stats: Dict[str, Any]) -> None:
-        """
-        Adjusts reflection and consolidation thresholds based on memory statistics,
-        tool usage patterns, and **progress stability** to dynamically control
-        meta-cognition frequency. Includes "Mental Momentum" bias.
-        """
-        # <<< Start Integration Block: Enhance _adapt_thresholds (Goal Stack + Momentum) >>>
-        # Validate stats input
         if not stats or not stats.get("success"):
-             self.logger.warning("Cannot adapt thresholds: Invalid or failed stats received.")
-             return
-
+            self.logger.warning("Cannot adapt thresholds: Invalid stats.")
+            return
         self.logger.debug(f"Adapting thresholds based on stats: {stats}")
-        # Use dampening factor from constant
         adjustment_dampening = THRESHOLD_ADAPTATION_DAMPENING
-        changed = False # Flag to log if any threshold changed
-
-        # --- Consolidation Threshold Adaptation ---
+        changed = False
         episodic_count = stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0)
-        total_memories = stats.get("total_memories", 1) # Avoid division by zero
+        total_memories = stats.get("total_memories", 1)
         episodic_ratio = episodic_count / total_memories if total_memories > 0 else 0
-        # Target range for episodic ratio (e.g., ideally keep it below 30%)
         target_episodic_ratio_upper = 0.30
         target_episodic_ratio_lower = 0.10
-        # Calculate deviation from the middle of the target range
         mid_target_ratio = (target_episodic_ratio_upper + target_episodic_ratio_lower) / 2
         ratio_deviation = episodic_ratio - mid_target_ratio
-        # Calculate adjustment: more negative deviation (low ratio) -> increase threshold
-        # More positive deviation (high ratio) -> decrease threshold
-        # Scale adjustment based on current threshold (larger thresholds allow bigger steps)
-        consolidation_adjustment = -math.ceil(ratio_deviation * self.state.current_consolidation_threshold * 2.0) # Factor of 2 controls sensitivity
-
-        # Apply dampening to the adjustment
+        consolidation_adjustment = -math.ceil(ratio_deviation * self.state.current_consolidation_threshold * 2.0)
         dampened_adjustment = int(consolidation_adjustment * adjustment_dampening)
         if dampened_adjustment != 0:
             old_threshold = self.state.current_consolidation_threshold
-            # Calculate potential new threshold, enforcing MIN/MAX bounds
             potential_new = max(MIN_CONSOLIDATION_THRESHOLD, min(MAX_CONSOLIDATION_THRESHOLD, old_threshold + dampened_adjustment))
-            # Apply change only if it's different from the current threshold
             if potential_new != old_threshold:
                 change_direction = "Lowering" if dampened_adjustment < 0 else "Raising"
                 self.logger.info(
-                    f"{change_direction} consolidation threshold: {old_threshold} -> {potential_new} "
-                    f"(Episodic Ratio: {episodic_ratio:.1%}, Deviation: {ratio_deviation:+.1%}, Adjustment: {dampened_adjustment})"
+                    f"{change_direction} consolidation threshold: {old_threshold} -> {potential_new} (Episodic Ratio: {episodic_ratio:.1%}, Dev: {ratio_deviation:+.1%}, Adj: {dampened_adjustment})"
                 )
                 self.state.current_consolidation_threshold = potential_new
                 changed = True
-
-        # --- Reflection Threshold Adaptation ---
-        # Use tool usage stats accumulated in agent state
         total_calls = sum(v.get("success", 0) + v.get("failure", 0) for v in self.state.tool_usage_stats.values())
         total_failures = sum(v.get("failure", 0) for v in self.state.tool_usage_stats.values())
-        # Calculate failure rate, avoid division by zero, require minimum calls for statistical significance
-        min_calls_for_rate = 5 # Need at least 5 calls to calculate a meaningful rate
+        min_calls_for_rate = 5
         failure_rate = (total_failures / total_calls) if total_calls >= min_calls_for_rate else 0.0
-        # Target failure rate (e.g., aim for below 10%)
         target_failure_rate = 0.10
         failure_deviation = failure_rate - target_failure_rate
-        # Calculate adjustment: more positive deviation (high failure) -> decrease threshold
-        # More negative deviation (low failure) -> increase threshold
-        reflection_adjustment = -math.ceil(failure_deviation * self.state.current_reflection_threshold * 3.0) # Factor of 3 controls sensitivity
-
-        # --- Mental Momentum Bias ---
+        reflection_adjustment = -math.ceil(failure_deviation * self.state.current_reflection_threshold * 3.0)
         is_stable_progress = (failure_rate < target_failure_rate * 0.5) and (self.state.consecutive_error_count == 0)
-        if is_stable_progress and reflection_adjustment >= 0: # Only apply bias if adjustment is non-negative (i.e., increasing or zero)
-             momentum_bias = math.ceil(reflection_adjustment * (MOMENTUM_THRESHOLD_BIAS_FACTOR - 1.0)) # Calculate the *additional* bias
-             reflection_adjustment += momentum_bias # Add the positive bias
-             self.logger.debug(f"Applying Mental Momentum: Adding +{momentum_bias} bias to reflection threshold adjustment (Stable progress).")
-
-        # Apply dampening to the (potentially biased) adjustment
+        momentum_bias = 0  # Initialize momentum_bias
+        if is_stable_progress and reflection_adjustment >= 0:
+            momentum_bias = math.ceil(reflection_adjustment * (MOMENTUM_THRESHOLD_BIAS_FACTOR - 1.0))
+            reflection_adjustment += momentum_bias
+            self.logger.debug(f"Mental Momentum: Adding +{momentum_bias} to reflection adj (Stable).")
         dampened_adjustment = int(reflection_adjustment * adjustment_dampening)
-        if dampened_adjustment != 0 and total_calls >= min_calls_for_rate: # Only adjust if enough calls
+        if dampened_adjustment != 0 and total_calls >= min_calls_for_rate:
             old_threshold = self.state.current_reflection_threshold
-            # Calculate potential new threshold, enforcing MIN/MAX bounds
             potential_new = max(MIN_REFLECTION_THRESHOLD, min(MAX_REFLECTION_THRESHOLD, old_threshold + dampened_adjustment))
-            # Apply change only if different
             if potential_new != old_threshold:
                 change_direction = "Lowering" if dampened_adjustment < 0 else "Raising"
                 momentum_tag = " (+Momentum)" if is_stable_progress and momentum_bias > 0 else ""
                 self.logger.info(
-                    f"{change_direction} reflection threshold: {old_threshold} -> {potential_new} "
-                    f"(Failure Rate: {failure_rate:.1%}, Deviation: {failure_deviation:+.1%}, Adjustment: {dampened_adjustment}{momentum_tag})"
+                    f"{change_direction} reflection threshold: {old_threshold} -> {potential_new} (Fail Rate: {failure_rate:.1%}, Dev: {failure_deviation:+.1%}, Adj: {dampened_adjustment}{momentum_tag})"
                 )
                 self.state.current_reflection_threshold = potential_new
                 changed = True
-
-        # Log if no changes were made
         if not changed:
-             self.logger.debug("No threshold adjustments triggered based on current stats/heuristics.")
-        # <<< End Integration Block: Enhance _adapt_thresholds >>>
+            self.logger.debug("No threshold adjustments triggered.")
 
-
-    # ------------------------------------------------ periodic task runner --
     async def _run_periodic_tasks(self):
-        """
-        Runs scheduled cognitive maintenance and enhancement tasks periodically.
-
-        Checks intervals and thresholds to trigger tasks like reflection,
-        consolidation, working memory optimization, focus updates, promotion checks,
-        statistics computation, threshold adaptation, and memory maintenance.
-        Executes triggered tasks sequentially within the loop cycle.
-        """
-        # Prevent running if no workflow or shutting down
         if not self.state.workflow_id or not self.state.context_id or self._shutdown_event.is_set():
             return
-
-        # List to hold tasks scheduled for this cycle: (tool_name, args_dict)
         tasks_to_run: List[Tuple[str, Dict]] = []
-        # List to track reasons for triggering tasks (for logging)
         trigger_reasons: List[str] = []
-
-        # Check tool availability once per cycle for efficiency
         reflection_tool_available = self._find_tool_server(TOOL_REFLECTION) is not None
         consolidation_tool_available = self._find_tool_server(TOOL_CONSOLIDATION) is not None
         optimize_wm_tool_available = self._find_tool_server(TOOL_OPTIMIZE_WM) is not None
         auto_focus_tool_available = self._find_tool_server(TOOL_AUTO_FOCUS) is not None
-        promote_mem_tool_available = self._find_tool_server(TOOL_PROMOTE_MEM) is not None
+        promotion_query_tool_available = self._find_tool_server(TOOL_QUERY_MEMORIES) is not None
         stats_tool_available = self._find_tool_server(TOOL_COMPUTE_STATS) is not None
         maintenance_tool_available = self._find_tool_server(TOOL_DELETE_EXPIRED_MEMORIES) is not None
-
-        # --- Tier 1: Highest Priority - Stats Check & Adaptation ---
-        # Increment counter for stats adaptation interval
         self.state.loops_since_stats_adaptation += 1
-        # Check if interval reached
         if self.state.loops_since_stats_adaptation >= STATS_ADAPTATION_INTERVAL:
             if stats_tool_available:
                 trigger_reasons.append("StatsInterval")
                 try:
-                    # Fetch current statistics for the workflow
-                    stats = await self._execute_tool_call_internal(
+                    stats_result = await self._execute_tool_call_internal(
                         TOOL_COMPUTE_STATS, {"workflow_id": self.state.workflow_id}, record_action=False
                     )
-                    if stats.get("success"):
-                        # Adapt thresholds based on the fetched stats
-                        self._adapt_thresholds(stats)
-                        # Example: Potentially trigger consolidation *now* if stats show high episodic count
-                        episodic_count = stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0)
-                        # Trigger if count significantly exceeds the *current dynamic* threshold
-                        if episodic_count > (self.state.current_consolidation_threshold * 2.0) and consolidation_tool_available:
-                            # Check if consolidation isn't already scheduled for other reasons this cycle
-                            if not any(task[0] == TOOL_CONSOLIDATION for task in tasks_to_run):
-                                self.logger.info(f"High episodic count ({episodic_count}) detected via stats, scheduling consolidation.")
-                                # Schedule consolidation task
-                                tasks_to_run.append((TOOL_CONSOLIDATION, {
+                    if stats_result.get("success"):
+                        self._adapt_thresholds(stats_result)
+                    episodic_count = stats_result.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0)
+                    if (
+                        episodic_count > (self.state.current_consolidation_threshold * 2.0)
+                        and consolidation_tool_available
+                        and not any(task[0] == TOOL_CONSOLIDATION for task in tasks_to_run)
+                    ):
+                        self.logger.info(f"High episodic ({episodic_count}), scheduling consolidation.")
+                        tasks_to_run.append(
+                            (
+                                TOOL_CONSOLIDATION,
+                                {
                                     "workflow_id": self.state.workflow_id,
-                                    "consolidation_type": "summary", # Default to summary
-                                    # Filter consolidation sources to episodic memories
+                                    "consolidation_type": "summary",
                                     "query_filter": {"memory_level": MemoryLevel.EPISODIC.value},
-                                    "max_source_memories": self.consolidation_max_sources
-                                }))
-                                trigger_reasons.append(f"HighEpisodic({episodic_count})")
-                                # Reset consolidation counter as we're triggering it now based on stats
-                                self.state.successful_actions_since_consolidation = 0
+                                    "max_source_memories": self.consolidation_max_sources,
+                                },
+                            )
+                        )
+                        trigger_reasons.append(f"HighEpisodic({episodic_count})")
+                        self.state.successful_actions_since_consolidation = 0
                     else:
-                        # Log if stats computation failed
-                        self.logger.warning(f"Failed to compute stats for adaptation: {stats.get('error')}")
+                        self.logger.warning(f"Failed compute stats for adaptation: {stats_result.get('error')}")
                 except Exception as e:
-                    # Log errors during the stats/adaptation process
-                    self.logger.error(f"Error during stats computation/adaptation: {e}", exc_info=False)
+                    self.logger.error(f"Error during stats/adaptation: {e}", exc_info=False)
                 finally:
-                     # Reset the interval counter regardless of success/failure
-                     self.state.loops_since_stats_adaptation = 0
+                    self.state.loops_since_stats_adaptation = 0
             else:
-                # Log if stats tool is unavailable
                 self.logger.warning(f"Skipping stats/adaptation: Tool {TOOL_COMPUTE_STATS} not available")
-
-        # --- Tier 2: Reflection & Consolidation (Based on dynamic thresholds) ---
-        # Reflection Trigger (Check replan flag OR success counter vs. *dynamic* threshold)
         needs_reflection = self.state.needs_replan or self.state.successful_actions_since_reflection >= self.state.current_reflection_threshold
         if needs_reflection:
-            if reflection_tool_available:
-                # Check if reflection isn't already scheduled this cycle
-                if not any(task[0] == TOOL_REFLECTION for task in tasks_to_run):
-                    # Cycle through different reflection types for variety
-                    reflection_type = self.reflection_type_sequence[self.state.reflection_cycle_index % len(self.reflection_type_sequence)]
-                    # Schedule reflection task
-                    tasks_to_run.append((TOOL_REFLECTION, {"workflow_id": self.state.workflow_id, "reflection_type": reflection_type}))
-                    # Log the specific reason for triggering
-                    reason_str = f"ReplanNeeded({self.state.needs_replan})" if self.state.needs_replan else f"SuccessCount({self.state.successful_actions_since_reflection:.1f}>={self.state.current_reflection_threshold})"
-                    trigger_reasons.append(f"Reflect({reason_str})")
-                    # Reset the success counter and advance the cycle index
-                    self.state.successful_actions_since_reflection = 0
-                    self.state.reflection_cycle_index += 1
-            else:
-                # Log if tool unavailable, still reset counter to prevent immediate re-trigger
-                self.logger.warning(f"Skipping reflection: Tool {TOOL_REFLECTION} not available")
+            if reflection_tool_available and not any(task[0] == TOOL_REFLECTION for task in tasks_to_run):
+                reflection_type = self.reflection_type_sequence[self.state.reflection_cycle_index % len(self.reflection_type_sequence)]
+                tasks_to_run.append((TOOL_REFLECTION, {"workflow_id": self.state.workflow_id, "reflection_type": reflection_type}))
+                reason_str = (
+                    f"Replan({self.state.needs_replan})"
+                    if self.state.needs_replan
+                    else f"SuccessCount({self.state.successful_actions_since_reflection:.1f}>={self.state.current_reflection_threshold})"
+                )
+                trigger_reasons.append(f"Reflect({reason_str})")
                 self.state.successful_actions_since_reflection = 0
-
-        # Consolidation Trigger (Check success counter vs. *dynamic* threshold)
+                self.state.reflection_cycle_index += 1
+            else:
+                self.logger.warning(f"Skipping reflection: Tool {TOOL_REFLECTION} unavailable")
+                self.state.successful_actions_since_reflection = 0
         needs_consolidation = self.state.successful_actions_since_consolidation >= self.state.current_consolidation_threshold
         if needs_consolidation:
-            if consolidation_tool_available:
-                # Check if consolidation isn't already scheduled this cycle
-                if not any(task[0] == TOOL_CONSOLIDATION for task in tasks_to_run):
-                    # Schedule consolidation task (e.g., summarize episodic memories)
-                    tasks_to_run.append((TOOL_CONSOLIDATION, {
-                        "workflow_id": self.state.workflow_id,
-                        "consolidation_type": "summary",
-                        "query_filter": {"memory_level": MemoryLevel.EPISODIC.value},
-                        "max_source_memories": self.consolidation_max_sources
-                    }))
-                    trigger_reasons.append(f"ConsolidateThreshold({self.state.successful_actions_since_consolidation:.1f}>={self.state.current_consolidation_threshold})")
-                    # Reset the success counter
-                    self.state.successful_actions_since_consolidation = 0
-            else:
-                # Log if tool unavailable, still reset counter
-                self.logger.warning(f"Skipping consolidation: Tool {TOOL_CONSOLIDATION} not available")
+            if consolidation_tool_available and not any(task[0] == TOOL_CONSOLIDATION for task in tasks_to_run):
+                tasks_to_run.append(
+                    (
+                        TOOL_CONSOLIDATION,
+                        {
+                            "workflow_id": self.state.workflow_id,
+                            "consolidation_type": "summary",
+                            "query_filter": {"memory_level": MemoryLevel.EPISODIC.value},
+                            "max_source_memories": self.consolidation_max_sources,
+                        },
+                    )
+                )
+                trigger_reasons.append(
+                    f"ConsolidateThreshold({self.state.successful_actions_since_consolidation:.1f}>={self.state.current_consolidation_threshold})"
+                )
                 self.state.successful_actions_since_consolidation = 0
-
-        # --- Tier 3: Optimization & Focus (Based on loop interval) ---
-        # Increment optimization interval counter
+            else:
+                self.logger.warning(f"Skipping consolidation: Tool {TOOL_CONSOLIDATION} unavailable")
+                self.state.successful_actions_since_consolidation = 0
         self.state.loops_since_optimization += 1
-        # Check if interval reached
         if self.state.loops_since_optimization >= OPTIMIZATION_LOOP_INTERVAL:
-            # Schedule working memory optimization if tool available
             if optimize_wm_tool_available:
                 tasks_to_run.append((TOOL_OPTIMIZE_WM, {"context_id": self.state.context_id}))
                 trigger_reasons.append("OptimizeInterval")
             else:
-                self.logger.warning(f"Skipping optimization: Tool {TOOL_OPTIMIZE_WM} not available")
-
-            # Schedule automatic focus update if tool available
+                self.logger.warning(f"Skipping WM opt: Tool {TOOL_OPTIMIZE_WM} unavailable")
             if auto_focus_tool_available:
                 tasks_to_run.append((TOOL_AUTO_FOCUS, {"context_id": self.state.context_id}))
-                trigger_reasons.append("FocusUpdate")
+                trigger_reasons.append("FocusUpdateInterval")
             else:
-                self.logger.warning(f"Skipping auto-focus: Tool {TOOL_AUTO_FOCUS} not available")
-
-            # Reset the interval counter
+                self.logger.warning(f"Skipping auto-focus: Tool {TOOL_AUTO_FOCUS} unavailable")
             self.state.loops_since_optimization = 0
-
-        # --- Tier 4: Promotion Check (Based on loop interval) ---
-        # Increment promotion check interval counter
         self.state.loops_since_promotion_check += 1
-        # Check if interval reached
         if self.state.loops_since_promotion_check >= MEMORY_PROMOTION_LOOP_INTERVAL:
-            if promote_mem_tool_available:
-                # Schedule the internal check function, not the tool directly
-                tasks_to_run.append(("CHECK_PROMOTIONS", {})) # Special marker task name
+            if promotion_query_tool_available:
+                tasks_to_run.append(("CHECK_PROMOTIONS", {}))
                 trigger_reasons.append("PromotionInterval")
             else:
-                self.logger.warning(f"Skipping promotion check: Tool {TOOL_PROMOTE_MEM} unavailable.")
-            # Reset the interval counter
+                self.logger.warning(f"Skipping promo check: Tool {TOOL_QUERY_MEMORIES} unavailable.")
             self.state.loops_since_promotion_check = 0
-
-        # --- Tier 5: Lowest Priority - Maintenance ---
-        # Increment maintenance interval counter
         self.state.loops_since_maintenance += 1
-        # Check if interval reached
         if self.state.loops_since_maintenance >= MAINTENANCE_INTERVAL:
             if maintenance_tool_available:
-                # Schedule memory expiration task
-                tasks_to_run.append((TOOL_DELETE_EXPIRED_MEMORIES, {})) # No args needed usually
+                tasks_to_run.append((TOOL_DELETE_EXPIRED_MEMORIES, {}))
                 trigger_reasons.append("MaintenanceInterval")
-                self.state.loops_since_maintenance = 0 # Reset interval counter
+                self.state.loops_since_maintenance = 0
             else:
-                # Log if tool unavailable
-                self.logger.warning(f"Skipping maintenance: Tool {TOOL_DELETE_EXPIRED_MEMORIES} not available")
-
-
-        # --- Execute Scheduled Tasks ---
+                self.logger.warning(f"Skipping maintenance: Tool {TOOL_DELETE_EXPIRED_MEMORIES} unavailable")
         if tasks_to_run:
-            unique_reasons_str = ', '.join(sorted(set(trigger_reasons))) # Log unique reasons
-            self.logger.info(f"Running {len(tasks_to_run)} periodic tasks (Triggers: {unique_reasons_str})...", emoji_key="brain")
-
-            # Optional: Prioritize tasks (e.g., run maintenance first)
+            unique_reasons_str = ", ".join(sorted(set(trigger_reasons)))
+            self.logger.info(f"🧠 Running {len(tasks_to_run)} periodic tasks (Triggers: {unique_reasons_str})...")
             tasks_to_run.sort(key=lambda x: 0 if x[0] == TOOL_DELETE_EXPIRED_MEMORIES else 1 if x[0] == TOOL_COMPUTE_STATS else 2)
-
-            # Execute tasks sequentially in this loop cycle
             for tool_name, args in tasks_to_run:
-                # Check shutdown flag before each task execution
                 if self._shutdown_event.is_set():
-                    self.logger.info("Shutdown detected during periodic tasks, aborting remaining.")
+                    self.logger.info("Shutdown during periodic tasks.")
                     break
                 try:
-                    # Handle the special internal promotion check task
                     if tool_name == "CHECK_PROMOTIONS":
-                        await self._trigger_promotion_checks() # Call the helper method
-                        continue # Move to next scheduled task
-
-                    # Execute standard UMS tool calls
-                    self.logger.debug(f"Executing periodic task: {tool_name} with args: {args}")
-                    result_content = await self._execute_tool_call_internal(
-                        tool_name, args, record_action=False # Don't record periodic tasks as agent actions
-                    )
-
-                    # --- Meta-Cognition Feedback Loop ---
-                    # Check if the task was reflection or consolidation and if it succeeded
-                    if tool_name in [TOOL_REFLECTION, TOOL_CONSOLIDATION] and result_content.get('success'):
+                        await self._trigger_promotion_checks()
+                        continue
+                    self.logger.debug(f"Executing periodic UMS Tool: {tool_name} with args: {args}")
+                    result_content = await self._execute_tool_call_internal(tool_name, args, record_action=False)
+                    if tool_name in [TOOL_REFLECTION, TOOL_CONSOLIDATION] and result_content.get("success"):
                         feedback = ""
-                        # Extract the relevant content from the result dictionary
                         if tool_name == TOOL_REFLECTION:
                             feedback = result_content.get("content", "")
                         elif tool_name == TOOL_CONSOLIDATION:
-                             feedback = result_content.get("consolidated_content", "")
-
-                        # Handle cases where result might be nested under 'data'
+                            feedback = result_content.get("consolidated_content", "")
                         if not feedback and isinstance(result_content.get("data"), dict):
-                            if tool_name == TOOL_REFLECTION:
-                                feedback = result_content["data"].get("content", "")
-                            elif tool_name == TOOL_CONSOLIDATION:
-                                feedback = result_content["data"].get("consolidated_content", "")
-
-                        # If feedback content exists, store a summary for the next main loop iteration
+                            nested_data = result_content["data"]
+                            feedback = nested_data.get("content" if tool_name == TOOL_REFLECTION else "consolidated_content", "")
                         if feedback:
-                            # Create a concise summary (e.g., first line)
-                            feedback_summary = str(feedback).split('\n', 1)[0][:150]
+                            feedback_summary = str(feedback).split("\n", 1)[0][:150]
                             self.state.last_meta_feedback = f"Feedback from {tool_name.split(':')[-1]}: {feedback_summary}..."
-                            self.logger.info(f"Received meta-feedback: {self.state.last_meta_feedback}")
-                            # Force replan after receiving significant feedback
+                            self.logger.info(f"Meta-feedback from UMS {tool_name}: {self.state.last_meta_feedback}")
                             self.state.needs_replan = True
                         else:
-                            # Log if the task succeeded but returned no content for feedback
-                            self.logger.debug(f"Periodic task {tool_name} succeeded but provided no feedback content.")
-
+                            self.logger.debug(f"Periodic UMS task {tool_name} no feedback content. Result: {result_content}")
                 except Exception as e:
-                    # Log errors from periodic tasks but allow the agent loop to continue
                     self.logger.warning(f"Periodic task {tool_name} failed: {e}", exc_info=False)
-
-                # Optional small delay between periodic tasks within a cycle
                 await asyncio.sleep(0.1)
 
-
     async def _trigger_promotion_checks(self):
-        """
-        Queries for recently accessed memories eligible for promotion
-        (Episodic -> Semantic, Semantic -> Procedural) and schedules
-        background checks for each candidate using `_check_and_trigger_promotion`.
-        """
-        # Ensure a workflow is active
         if not self.state.workflow_id:
-             self.logger.debug("Skipping promotion check: No active workflow.")
-             return
-
-        self.logger.debug("Running periodic promotion check for recent memories...")
-        query_tool_name = TOOL_QUERY_MEMORIES # Tool for searching memories
-        # Check tool availability
-        if not self._find_tool_server(query_tool_name):
-            self.logger.warning(f"Skipping promotion check: Tool {query_tool_name} unavailable.")
+            self.logger.debug("Skipping promo check: No active WF.")
             return
-
-        candidate_memory_ids = set() # Use set to store unique IDs
+        self.logger.debug("Running periodic promotion check...")
+        query_tool = TOOL_QUERY_MEMORIES
+        candidate_ids = set()
         try:
-            # 1. Find recent Episodic memories (potential for Semantic promotion)
             episodic_args = {
                 "workflow_id": self.state.workflow_id,
                 "memory_level": MemoryLevel.EPISODIC.value,
-                "sort_by": "last_accessed", # Prioritize recently used
-                "sort_order": "DESC",
-                "limit": 5, # Check top N recent/relevant
-                "include_content": False # Don't need content for this check
-            }
-            episodic_results = await self._execute_tool_call_internal(query_tool_name, episodic_args, record_action=False)
-            if episodic_results.get("success"):
-                mems = episodic_results.get("memories", [])
-                if isinstance(mems, list):
-                    # Add valid memory IDs to the candidate set
-                    candidate_memory_ids.update(m.get('memory_id') for m in mems if isinstance(m, dict) and m.get('memory_id'))
-
-            # 2. Find recent Semantic memories of PROCEDURE or SKILL type (potential for Procedural promotion)
-            semantic_args = {
-                "workflow_id": self.state.workflow_id,
-                "memory_level": MemoryLevel.SEMANTIC.value,
-                # No type filter here yet, filter after retrieval
                 "sort_by": "last_accessed",
                 "sort_order": "DESC",
                 "limit": 5,
-                "include_content": False
+                "include_content": False,
             }
-            semantic_results = await self._execute_tool_call_internal(query_tool_name, semantic_args, record_action=False)
-            if semantic_results.get("success"):
-                mems = semantic_results.get("memories", [])
-                if isinstance(mems, list):
-                     # Filter for specific types eligible for promotion to Procedural
-                     candidate_memory_ids.update(
-                          m.get('memory_id') for m in mems
-                          if isinstance(m, dict) and m.get('memory_id') and
-                          m.get('memory_type') in [MemoryType.PROCEDURE.value, MemoryType.SKILL.value] # Check type
-                     )
-
-            # 3. Schedule background checks for each candidate
-            if candidate_memory_ids:
-                self.logger.debug(f"Checking {len(candidate_memory_ids)} memories for potential promotion: {[_fmt_id(item_id) for item_id in candidate_memory_ids]}")
-                # Create background tasks to check each memory individually
-                promo_tasks = []
-                for mem_id in candidate_memory_ids:
-                     # Use _start_background_task to correctly snapshot state and manage task
-                     task = self._start_background_task(AgentMasterLoop._check_and_trigger_promotion, memory_id=mem_id)
-                     promo_tasks.append(task)
-                # Option: Wait for these checks if promotion status is needed immediately,
-                # otherwise let them run truly in the background. For now, fire-and-forget.
-                # await asyncio.gather(*promo_tasks, return_exceptions=True) # Uncomment to wait
+            episodic_res = await self._execute_tool_call_internal(query_tool, episodic_args, record_action=False)
+            if episodic_res.get("success"):
+                mems = episodic_res.get("memories", [])
+                candidate_ids.update(m.get("memory_id") for m in mems if isinstance(m, dict) and m.get("memory_id"))
+            semantic_args = {
+                "workflow_id": self.state.workflow_id,
+                "memory_level": MemoryLevel.SEMANTIC.value,
+                "sort_by": "last_accessed",
+                "sort_order": "DESC",
+                "limit": 5,
+                "include_content": False,
+            }
+            semantic_res = await self._execute_tool_call_internal(query_tool, semantic_args, record_action=False)
+            if semantic_res.get("success"):
+                mems = semantic_res.get("memories", [])
+                candidate_ids.update(
+                    m.get("memory_id")
+                    for m in mems
+                    if isinstance(m, dict) and m.get("memory_id") and m.get("memory_type") in [MemoryType.PROCEDURE.value, MemoryType.SKILL.value]
+                )
+            if candidate_ids:
+                self.logger.debug(f"Checking {len(candidate_ids)} memories for promo: {[_fmt_id(i) for i in candidate_ids]}")
+            for mem_id in candidate_ids:
+                self._start_background_task(AgentMasterLoop._check_and_trigger_promotion, memory_id=mem_id)
             else:
-                # Log if no eligible candidates were found
-                self.logger.debug("No recently accessed, eligible memories found for promotion check.")
+                self.logger.debug("No eligible memories for promo check.")
         except Exception as e:
-            # Log errors occurring during the query phase
-            self.logger.error(f"Error during periodic promotion check query: {e}", exc_info=False)
+            self.logger.error(f"Error during promo check query: {e}", exc_info=False)
 
-    # ================================================================= context gather --
     async def _gather_context(self) -> Dict[str, Any]:
-        """
-        Gathers comprehensive context for the agent LLM.
-
-        Includes:
-        - Core context (recent actions, important memories, key thoughts) via TOOL_GET_CONTEXT.
-        - **Current goal stack context (NEW)**.
-        - Current working memory via TOOL_GET_WORKING_MEMORY **(Prioritized)**.
-        - Proactively searched memories relevant to the current plan step **(Limited Fetch)**.
-        - Relevant procedural memories **(Limited Fetch)**.
-        - Summary of links around a focal or important memory **(Limited Fetch)**.
-        - **Freshness indicators** for components.
-        - Handles potential errors during retrieval.
-        - Initiates context compression if token estimates exceed thresholds.
-        """
-        # <<< Start Integration Block: Enhance _gather_context (Goal Stack Context) >>>
-        self.logger.info("Gathering comprehensive context...", emoji_key="satellite")
+        self.logger.info("🛰️ Gathering comprehensive context for LLM...")
         start_time = time.time()
-        retrieval_timestamp = datetime.now(timezone.utc).isoformat() # Timestamp for freshness
+        agent_retrieval_timestamp = datetime.now(timezone.utc).isoformat()
 
-        # Initialize context dictionary with placeholders and essential state
-        base_context = {
-            # Core agent state info
+        context_payload: Dict[str, Any] = {
+            "agent_name": AGENT_NAME,
             "current_loop": self.state.current_loop,
-            "workflow_id": self.state.workflow_id, # Include current WF ID
-            "context_id": self.state.context_id, # Include current Context ID
-            "current_plan": [p.model_dump(exclude_none=True) for p in self.state.current_plan], # Current plan state
+            "current_plan_snapshot": [p.model_dump(exclude_none=True) for p in self.state.current_plan],
             "last_action_summary": self.state.last_action_summary,
             "consecutive_error_count": self.state.consecutive_error_count,
-            "last_error_details": copy.deepcopy(self.state.last_error_details), # Deep copy error details
-            "needs_replan": self.state.needs_replan, # Include replan flag in context
-            "workflow_stack": self.state.workflow_stack,
-            "meta_feedback": self.state.last_meta_feedback, # Include feedback from last meta task
+            "last_error_details": copy.deepcopy(self.state.last_error_details),
+            "needs_replan": self.state.needs_replan,
+            "workflow_stack_summary": [_fmt_id(wf_id) for wf_id in self.state.workflow_stack[-3:]],
+            "meta_feedback": self.state.last_meta_feedback,
             "current_thought_chain_id": self.state.current_thought_chain_id,
-            # Placeholders for dynamically fetched context components
-            "current_goal_context": None, # (NEW) Dict: {"retrieved_at": ..., "current_goal": {...}, "goal_stack_summary": [...]}
-            "core_context": None, # From TOOL_GET_CONTEXT
-            "current_working_memory": None, # From TOOL_GET_WORKING_MEMORY (will be dict)
-            "proactive_memories": None, # Dict: {"retrieved_at": ..., "memories": [...]}
-            "relevant_procedures": None, # Dict: {"retrieved_at": ..., "memories": [...]}
-            "contextual_links": None, # Dict: {"retrieved_at": ..., "summary": {...}}
-            "compression_summary": None, # If compression is applied
-            "status": "Gathering...", # Initial status
-            "errors": [] # List to collect errors during gathering
+            "retrieval_timestamp_agent_state": agent_retrieval_timestamp,
+            "status_message_from_agent": "Context assembly by agent.",
+            "errors_in_context_gathering": [],
         }
-        # Clear feedback after adding it to context
         self.state.last_meta_feedback = None
 
-        # Determine the current workflow and context IDs from state
         current_workflow_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
-        current_context_id = self.state.context_id
+        current_cognitive_context_id = self.state.context_id  # Agent's current UMS cognitive_state.state_id
+        current_plan_step_desc = self.state.current_plan[0].description if self.state.current_plan else DEFAULT_PLAN_STEP
 
-        # If no workflow is active, return immediately
         if not current_workflow_id:
-            base_context["status"] = "No Active Workflow"
-            base_context["message"] = "Agent must create or load a workflow."
-            self.logger.warning(base_context["message"])
-            return base_context
+            context_payload["status_message_from_agent"] = "No Active Workflow."
+            self.logger.warning(context_payload["status_message_from_agent"])
+            context_payload["ums_package_retrieval_status"] = "skipped_no_workflow"
+            context_payload["processing_time_sec"] = time.time() - start_time
+            return context_payload
 
-        # --- Fetch Goal Stack Context (NEW) ---
-        goal_context_data = {"retrieved_at": retrieval_timestamp, "current_goal": None, "goal_stack_summary": []}
-        if self.state.goal_stack:
-             # Provide summary of the stack (limited depth)
-             goal_context_data["goal_stack_summary"] = self.state.goal_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:]
-             # Fetch details for the current goal (top of stack) if tool exists
-             current_goal_id = self.state.current_goal_id
-             if current_goal_id and self._find_tool_server(TOOL_GET_GOAL_DETAILS):
-                 try:
-                     goal_details_res = await self._execute_tool_call_internal(
-                         TOOL_GET_GOAL_DETAILS, {"goal_id": current_goal_id}, record_action=False
-                     )
-                     if goal_details_res.get("success") and isinstance(goal_details_res.get("goal"), dict):
-                         goal_context_data["current_goal"] = goal_details_res["goal"] # Store full details of current goal
-                     else:
-                          err_msg = f"Failed to get details for current goal {_fmt_id(current_goal_id)}: {goal_details_res.get('error')}"
-                          goal_context_data["current_goal"] = {"goal_id": current_goal_id, "error": err_msg} # Store error marker
-                          base_context["errors"].append(err_msg)
-                          self.logger.warning(err_msg)
-                 except Exception as e:
-                      err_msg = f"Exception getting goal details for {_fmt_id(current_goal_id)}: {e}"
-                      goal_context_data["current_goal"] = {"goal_id": current_goal_id, "error": err_msg}
-                      base_context["errors"].append(err_msg)
-                      self.logger.error(err_msg, exc_info=False)
-             elif current_goal_id: # If tool missing, use basic info from state
-                goal_context_data["current_goal"] = next # If tool missing, use basic info from state stack if available
-                current_goal_from_stack = next((g for g in self.state.goal_stack if g.get('goal_id') == current_goal_id), None)
-                if current_goal_from_stack:
-                    goal_context_data["current_goal"] = current_goal_from_stack # Use basic info from state
-                    self.logger.debug(f"Using basic goal info from state stack for current goal {_fmt_id(current_goal_id)} (Tool {TOOL_GET_GOAL_DETAILS} unavailable).")
-                else: # This case should be rare if state is consistent
-                    err_msg = f"Current goal ID {_fmt_id(current_goal_id)} exists, but details unavailable (Tool missing or goal not in stack)."
-                    goal_context_data["current_goal"] = {"goal_id": current_goal_id, "error": err_msg}
-                    base_context["errors"].append(err_msg)
-                    self.logger.warning(err_msg)
-        else: # No goals on the stack
-             goal_context_data["current_goal"] = None
-             goal_context_data["goal_stack_summary"] = []
-        # Assign the gathered goal context to the main context dictionary
-        base_context["current_goal_context"] = goal_context_data
-        self.logger.debug(f"Gathered goal context. Current Goal ID: {_fmt_id(self.state.current_goal_id)}")
+        context_payload["workflow_id"] = current_workflow_id
+        context_payload["cognitive_context_id_agent"] = current_cognitive_context_id
 
-        # --- Fetch Core Context (e.g., Recent Actions, Important Memories, Key Thoughts) ---
-        if self._find_tool_server(TOOL_GET_CONTEXT):
-            try:
-                # Fetch core context with predefined limits (FETCH_LIMIT constants)
-                core_ctx_result = await self._execute_tool_call_internal(
-                    TOOL_GET_CONTEXT,
-                    {
-                        "workflow_id": current_workflow_id,
-                        # Use FETCH limits here, truncation to SHOW limits happens later if needed
-                        "recent_actions_limit": CONTEXT_RECENT_ACTIONS_FETCH_LIMIT,
-                        "important_memories_limit": CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT,
-                        "key_thoughts_limit": CONTEXT_KEY_THOUGHTS_FETCH_LIMIT,
-                    },
-                    record_action=False # Internal context fetch
-                )
-                if core_ctx_result.get("success"):
-                    # Store the successful result and add freshness timestamp
-                    base_context["core_context"] = core_ctx_result
-                    base_context["core_context"]["retrieved_at"] = retrieval_timestamp # Add freshness
-                    # Clean up redundant success/timing info from the nested result
-                    base_context["core_context"].pop("success", None)
-                    base_context["core_context"].pop("processing_time", None)
-                    self.logger.debug(f"Successfully retrieved core context via {TOOL_GET_CONTEXT}.")
-                else:
-                    err_msg = f"Core context retrieval ({TOOL_GET_CONTEXT}) failed: {core_ctx_result.get('error')}"
-                    base_context["errors"].append(err_msg)
-                    self.logger.warning(err_msg)
-            except Exception as e:
-                err_msg = f"Core context retrieval exception: {e}"
-                self.logger.error(err_msg, exc_info=False)
-                base_context["errors"].append(err_msg)
-        else:
-            self.logger.warning(f"Skipping core context: Tool {TOOL_GET_CONTEXT} unavailable.")
+        # 1. Agent Assembles Its Goal Context using _fetch_goal_stack_from_ums
+        agent_goal_context_block: Dict[str, Any] = {
+            "retrieved_at": agent_retrieval_timestamp,
+            "current_goal_details_from_ums": None,  # This will be the leaf goal object
+            "goal_stack_summary_from_agent_state": [],  # This will be list of parent summaries
+            "data_source_comment": "Goal stack and current goal details fetched from UMS by agent.",
+        }
+        if self.state.current_goal_id:
+            full_ums_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
+            if full_ums_stack:
+                agent_goal_context_block["current_goal_details_from_ums"] = full_ums_stack[-1]  # Leaf is current
+                # Create summary for prompt, applying show limit
+                agent_goal_context_block["goal_stack_summary_from_agent_state"] = [
+                    {"goal_id": _fmt_id(g.get("goal_id")), "description": (g.get("description") or "")[:150] + "...", "status": g.get("status")}
+                    for g in full_ums_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:]  # Show N items from root towards leaf
+                ]
+            else:
+                err_msg = f"Agent: Failed to fetch UMS goal stack for current goal {_fmt_id(self.state.current_goal_id)}."
+                context_payload["errors_in_context_gathering"].append(err_msg)
+                agent_goal_context_block["current_goal_details_from_ums"] = {
+                    "error_fetching_details": err_msg,
+                    "goal_id_attempted": self.state.current_goal_id,
+                }
+                self.logger.warning(err_msg)
+        context_payload["agent_assembled_goal_context"] = agent_goal_context_block
 
-        # --- Get Current Working Memory (Provides active memories and focal point) ---
-        focal_mem_id_from_wm: Optional[str] = None # Store focal ID if found
-        working_mem_list_from_wm: List[Dict] = [] # Store memory list if found
-        if current_context_id and self._find_tool_server(TOOL_GET_WORKING_MEMORY):
-            try:
-                wm_result = await self._execute_tool_call_internal(
-                    TOOL_GET_WORKING_MEMORY,
-                    {
-                        "context_id": current_context_id,
-                        "include_content": False, # Keep context lighter
-                        "include_links": False # Links fetched separately if needed
-                    },
-                    record_action=False
-                )
-                if wm_result.get("success"):
-                    # Store the entire result dict and add freshness
-                    base_context["current_working_memory"] = wm_result
-                    base_context["current_working_memory"]["retrieved_at"] = retrieval_timestamp # Add freshness
-                    # Clean up redundant fields
-                    base_context["current_working_memory"].pop("success", None)
-                    base_context["current_working_memory"].pop("processing_time", None)
-                    # Extract focal ID and memory list for later use
-                    focal_mem_id_from_wm = wm_result.get("focal_memory_id")
-                    working_mem_list_from_wm = wm_result.get("working_memories", [])
-                    # Log count of retrieved working memories
-                    wm_count = len(working_mem_list_from_wm)
-                    self.logger.info(f"Retrieved {wm_count} items from working memory (Context: {_fmt_id(current_context_id)}). Focal: {_fmt_id(focal_mem_id_from_wm)}")
-                else:
-                    err_msg = f"Working memory retrieval failed: {wm_result.get('error')}"
-                    base_context["errors"].append(err_msg)
-                    self.logger.warning(err_msg)
-            except Exception as e:
-                err_msg = f"Working memory retrieval exception: {e}"
-                self.logger.error(err_msg, exc_info=False)
-                base_context["errors"].append(err_msg)
-        else:
-            self.logger.warning(f"Skipping working memory retrieval: Context ID missing or tool {TOOL_GET_WORKING_MEMORY} unavailable.")
+        # 2. Call UMS Tool for Rich Context Package (excluding goals)
+        ums_package_tool_name = TOOL_GET_RICH_CONTEXT_PACKAGE
+        ums_package_data: Optional[Dict[str, Any]] = {
+            "error_ums_package_tool_unavailable": f"Tool {ums_package_tool_name} unavailable."
+        }  # Default error
 
+        if self._find_tool_server(ums_package_tool_name):
+            # Determine focal_memory_id_hint from the agent's current working memory state if available
+            # The UMS `get_rich_context_package` might use its own `get_working_memory` call.
+            # If agent maintains its own working memory list (e.g., `self.state.working_memory_ids`), use focal from there.
+            # For now, assume UMS `get_rich_context_package` handles WM details based on `context_id`.
+            # We can pass a hint if the agent has a strong idea from a previous cycle.
+            focal_id_hint_for_ums = None  # Placeholder
+            if context_payload.get("ums_context_package", {}).get("current_working_memory", {}).get("focal_memory_id"):  # If UMS already provided WM
+                focal_id_hint_for_ums = context_payload["ums_context_package"]["current_working_memory"]["focal_memory_id"]
+            elif isinstance(self.state.last_error_details, dict) and self.state.last_error_details.get(
+                "focal_memory_id_from_last_wm"
+            ):  # Fallback from previous error context
+                focal_id_hint_for_ums = self.state.last_error_details["focal_memory_id_from_last_wm"]
 
-        # --- Goal-Directed Proactive Memory Retrieval (Using Hybrid Search) ---
-        # Find memories relevant to the current plan step OR current goal description
-        # Determine the primary query source: plan step or goal description
-        query_source_desc = "Achieve main goal" # Default if no plan/goal
-        if self.state.current_plan:
-            query_source_desc = self.state.current_plan[0].description
-        elif goal_context_data.get("current_goal"):
-            query_source_desc = goal_context_data["current_goal"].get("description", query_source_desc)
-
-        # Formulate a query based on the current step/goal
-        proactive_query = f"Information relevant to planning or executing: {query_source_desc}"
-        # Prefer hybrid search, fallback to semantic
-        search_tool_proactive = TOOL_HYBRID_SEARCH if self._find_tool_server(TOOL_HYBRID_SEARCH) else TOOL_SEMANTIC_SEARCH
-        if self._find_tool_server(search_tool_proactive):
-            search_args = {
+            ums_package_params = {
                 "workflow_id": current_workflow_id,
-                "query": proactive_query,
-                "limit": CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT, # Use FETCH limit
-                "include_content": False # Keep context light
+                "context_id": current_cognitive_context_id,
+                "current_plan_step_description": current_plan_step_desc,
+                "focal_memory_id_hint": focal_id_hint_for_ums,
+                "fetch_limits": {
+                    "recent_actions": CONTEXT_RECENT_ACTIONS_FETCH_LIMIT,
+                    "important_memories": CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT,
+                    "key_thoughts": CONTEXT_KEY_THOUGHTS_FETCH_LIMIT,
+                    "proactive_memories": CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT,
+                    "procedural_memories": CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT,
+                    "link_traversal": CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT,
+                },
+                "show_limits": {  # For UMS to use if it does truncation/summarization
+                    "working_memory": CONTEXT_WORKING_MEMORY_SHOW_LIMIT,
+                    "link_traversal": CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT,
+                },
+                "include_core_context": True,
+                "include_working_memory": True,
+                "include_proactive_memories": True,
+                "include_relevant_procedures": True,
+                "include_contextual_links": True,
+                "compression_token_threshold": CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD,
+                "compression_target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS,
             }
-            # Adjust weights for hybrid search
-            if search_tool_proactive == TOOL_HYBRID_SEARCH:
-                search_args.update({"semantic_weight": 0.7, "keyword_weight": 0.3}) # Prioritize semantics a bit
             try:
-                result_content = await self._execute_tool_call_internal(
-                    search_tool_proactive, search_args, record_action=False
-                )
-                if result_content.get("success"):
-                    proactive_mems = result_content.get("memories", [])
-                    # Determine score key based on tool used
-                    score_key = "hybrid_score" if search_tool_proactive == TOOL_HYBRID_SEARCH else "similarity"
-                    # Format results for context, include freshness
-                    base_context["proactive_memories"] = {
-                        "retrieved_at": retrieval_timestamp,
-                        "memories": [
-                            {
-                                "memory_id": m.get("memory_id"),
-                                "description": m.get("description"),
-                                "score": round(m.get(score_key, 0), 3), # Include score
-                                "type": m.get("memory_type") # Include type
-                             }
-                            for m in proactive_mems # Iterate through results
-                        ]
-                    }
-                    if base_context["proactive_memories"]["memories"]:
-                        self.logger.info(f"Retrieved {len(base_context['proactive_memories']['memories'])} proactive memories using {search_tool_proactive.split(':')[-1]}.")
+                self.logger.debug(f"Agent: Calling UMS tool '{ums_package_tool_name}'...")
+                raw_ums_response = await self._execute_tool_call_internal(ums_package_tool_name, ums_package_params, record_action=False)
+                if raw_ums_response.get("success"):
+                    ums_package_data = raw_ums_response.get("context_package", {})  # UMS tool returns under "context_package"
+                    if not isinstance(ums_package_data, dict):
+                        err_msg = f"Agent: UMS tool {ums_package_tool_name} returned invalid 'context_package'."
+                        self.logger.error(err_msg)
+                        context_payload["errors_in_context_gathering"].append(err_msg)
+                        ums_package_data = {"error_ums_pkg_invalid": err_msg}
+                    else:
+                        self.logger.info("Agent: Successfully retrieved rich context package from UMS.")
+                        ums_internal_errors = ums_package_data.get("errors")  # UMS tool should use "errors" key for its own errors
+                        if ums_internal_errors and isinstance(ums_internal_errors, list):
+                            context_payload["errors_in_context_gathering"].extend([f"UMS_PKG_ERR: {e}" for e in ums_internal_errors])
+                        ums_package_data.pop("errors", None)  # Clean from context
                 else:
-                    err_msg = f"Proactive memory search ({search_tool_proactive}) failed: {result_content.get('error')}"
-                    base_context["errors"].append(err_msg)
+                    err_msg = f"Agent: UMS rich context pkg retrieval failed: {raw_ums_response.get('error')}"
+                    context_payload["errors_in_context_gathering"].append(err_msg)
                     self.logger.warning(err_msg)
+                    ums_package_data = {"error_ums_pkg_retrieval": err_msg}
             except Exception as e:
-                err_msg = f"Proactive memory search exception: {e}"
-                self.logger.warning(err_msg, exc_info=False)
-                base_context["errors"].append(err_msg)
-        else:
-            self.logger.warning("Skipping proactive memory search: No suitable search tool available.")
+                err_msg = f"Agent: Exception calling UMS for rich context pkg: {e}"
+                self.logger.error(err_msg, exc_info=True)
+                context_payload["errors_in_context_gathering"].append(err_msg)
+                ums_package_data = {"error_ums_pkg_exception": err_msg}
+        else:  # UMS tool not available
+            err_msg = f"Agent: UMS tool '{ums_package_tool_name}' unavailable."
+            self.logger.error(err_msg)
+            context_payload["errors_in_context_gathering"].append(err_msg)
+            # ums_package_data remains the default error set above
 
-        # --- Fetch Relevant Procedural Memories (Using Hybrid Search) ---
-        # Find procedural memories related to the current step/goal
-        search_tool_proc = TOOL_HYBRID_SEARCH if self._find_tool_server(TOOL_HYBRID_SEARCH) else TOOL_SEMANTIC_SEARCH
-        if self._find_tool_server(search_tool_proc):
-            # Formulate a query focused on finding procedures/how-to steps based on the same source description
-            proc_query = f"How to accomplish step-by-step: {query_source_desc}"
-            search_args = {
-                "workflow_id": current_workflow_id,
-                "query": proc_query,
-                "limit": CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT, # Use FETCH limit
-                "memory_level": MemoryLevel.PROCEDURAL.value, # Explicitly filter for procedural level
-                "include_content": False # Keep context light
-            }
-            if search_tool_proc == TOOL_HYBRID_SEARCH:
-                search_args.update({"semantic_weight": 0.6, "keyword_weight": 0.4}) # Balanced weights maybe?
+        context_payload["ums_context_package"] = ums_package_data
+
+        # 3. Agent-Side Final Compression (if needed)
+        # This logic remains similar, but acts on the combined context_payload
+        # It uses self._estimate_tokens_anthropic and UMS TOOL_SUMMARIZE_TEXT
+        ums_compression_info = context_payload.get("ums_context_package", {}).get("compression_summary")  # UMS tool uses "compression_summary"
+        needs_agent_compression = True
+        if ums_compression_info:
+            self.logger.info("Agent: UMS provided compression. Checking if agent-side pass needed.")
+            current_tokens = await self._estimate_tokens_anthropic(context_payload)
+            if current_tokens <= CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD:
+                needs_agent_compression = False
+            else:
+                self.logger.warning(f"Agent: Context still large ({current_tokens}) after UMS compression. Agent pass.")
+        if needs_agent_compression:
             try:
-                proc_result = await self._execute_tool_call_internal(
-                    search_tool_proc, search_args, record_action=False
-                )
-                if proc_result.get("success"):
-                    proc_mems = proc_result.get("memories", [])
-                    score_key = "hybrid_score" if search_tool_proc == TOOL_HYBRID_SEARCH else "similarity"
-                    # Format results for context, include freshness
-                    base_context["relevant_procedures"] = {
-                         "retrieved_at": retrieval_timestamp,
-                         "procedures": [
+                est_tokens = await self._estimate_tokens_anthropic(context_payload)
+                if est_tokens > CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD:
+                    self.logger.warning(f"Agent: Context ({est_tokens} tokens) > threshold. Agent-side summary compression.")
+                    if self._find_tool_server(TOOL_SUMMARIZE_TEXT):
+                        # Summarize the *entire* context_payload. This can be lossy.
+                        # A more nuanced approach would pick specific large sub-sections from context_payload.
+                        context_str_to_summarize = json.dumps(context_payload, default=str, ensure_ascii=False)
+                        MAX_INPUT_SUMMARY = 45000  # Limit for summarizer input
+                        if len(context_str_to_summarize) > MAX_INPUT_SUMMARY:
+                            self.logger.warning("Agent: Full context for agent summary too long. Truncating input.")
+                            context_str_to_summarize = context_str_to_summarize[-MAX_INPUT_SUMMARY:]
+
+                        summary_res = await self._execute_tool_call_internal(
+                            TOOL_SUMMARIZE_TEXT,
                             {
-                                "memory_id": m.get("memory_id"),
-                                "description": m.get("description"),
-                                "score": round(m.get(score_key, 0), 3)
+                                "text_to_summarize": context_str_to_summarize,
+                                "target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS,
+                                "context_type": "full_agent_context_payload_agent_pass",
+                                "workflow_id": current_workflow_id,
+                                "record_summary": False,
+                            },
+                            record_action=False,
+                        )
+                        if summary_res.get("success") and summary_res.get("summary"):
+                            context_payload["agent_final_compression_summary"] = {
+                                "summary_content": summary_res["summary"],
+                                "original_tokens_before_agent_pass": est_tokens,
+                                "retrieved_at": agent_retrieval_timestamp,
                             }
-                            for m in proc_mems
-                         ]
-                    }
-                    if base_context["relevant_procedures"]["procedures"]:
-                        self.logger.info(f"Retrieved {len(base_context['relevant_procedures']['procedures'])} relevant procedures using {search_tool_proc.split(':')[-1]}.")
-                else:
-                    err_msg = f"Procedure search failed: {proc_result.get('error')}"
-                    base_context["errors"].append(err_msg)
-                    self.logger.warning(err_msg)
+                            self.logger.info("Agent: Agent-side full context compression applied.")
+                            # The _construct_agent_prompt method needs to be aware of 'agent_final_compression_summary'
+                            # and potentially use it as the primary context if present, or merge it smartly.
+                        else:
+                            err_msg = f"Agent: Agent-side full compression failed: {summary_res.get('error')}"
+                            context_payload["errors_in_context_gathering"].append(err_msg)
+                            self.logger.warning(err_msg)
+                    else:
+                        self.logger.warning("Agent: Agent-side compression needed but UMS summarize_text tool unavailable.")
             except Exception as e:
-                err_msg = f"Procedure search exception: {e}"
-                self.logger.warning(err_msg, exc_info=False)
-                base_context["errors"].append(err_msg)
-        else:
-            self.logger.warning("Skipping procedure search: No suitable search tool available.")
+                err_msg = f"Agent: Error during agent-side context compression: {e}"
+                context_payload["errors_in_context_gathering"].append(err_msg)
+                self.logger.error(err_msg, exc_info=True)
 
-        # --- Contextual Link Traversal (Prioritizing Focal Memory) ---
-        # Find memories linked to the current focus or most relevant items
-        get_linked_memories_tool = TOOL_GET_LINKED_MEMORIES
-        if self._find_tool_server(get_linked_memories_tool):
-            mem_id_to_traverse = None
-            # 1. PRIORITIZE focal memory from working memory result
-            if focal_mem_id_from_wm:
-                mem_id_to_traverse = focal_mem_id_from_wm
-                self.logger.debug(f"Link traversal starting from focal memory: {_fmt_id(mem_id_to_traverse)}")
-
-            # 2. If no focal, try the first memory *in* the working memory list
-            if not mem_id_to_traverse and working_mem_list_from_wm:
-                first_wm_item = working_mem_list_from_wm[0]
-                if isinstance(first_wm_item, dict):
-                    mem_id_to_traverse = first_wm_item.get("memory_id")
-                    if mem_id_to_traverse:
-                        self.logger.debug(f"Link traversal starting from first working memory item: {_fmt_id(mem_id_to_traverse)}")
-
-            # 3. If still no ID, try the first important memory from the core context
-            if not mem_id_to_traverse:
-                core_ctx_data = base_context.get("core_context", {})
-                if isinstance(core_ctx_data, dict):
-                    important_mem_list = core_ctx_data.get("important_memories", [])
-                    if isinstance(important_mem_list, list) and important_mem_list:
-                        first_mem = important_mem_list[0]
-                        if isinstance(first_mem, dict):
-                            mem_id_to_traverse = first_mem.get("memory_id")
-                            if mem_id_to_traverse:
-                                self.logger.debug(f"Link traversal starting from first important memory: {_fmt_id(mem_id_to_traverse)}")
-
-            # If we found a relevant memory ID to start traversal from
-            if mem_id_to_traverse:
-                self.logger.debug(f"Attempting link traversal from relevant memory: {_fmt_id(mem_id_to_traverse)}...")
-                try:
-                    links_result_content = await self._execute_tool_call_internal(
-                        get_linked_memories_tool,
-                        {
-                            "memory_id": mem_id_to_traverse,
-                            "direction": "both", # Get incoming and outgoing links
-                            "limit": CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT, # Use FETCH limit
-                            "include_memory_details": False # Just need link info for context
-                         },
-                        record_action=False
-                    )
-                    if links_result_content.get("success"):
-                        links_data = links_result_content.get("links", {})
-                        outgoing_links = links_data.get("outgoing", [])
-                        incoming_links = links_data.get("incoming", [])
-                        # Create a concise summary of the links found
-                        link_summary = {
-                            "source_memory_id": mem_id_to_traverse,
-                            "outgoing_count": len(outgoing_links),
-                            "incoming_count": len(incoming_links),
-                            "top_links_summary": [] # List of concise link descriptions
-                        }
-                        # Add summaries for top outgoing links (up to SHOW limit)
-                        for link in outgoing_links[:CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT]:
-                            link_summary["top_links_summary"].append(
-                                f"OUT: {link.get('link_type', 'related')} -> {_fmt_id(link.get('target_memory_id'))}"
-                            )
-                        # Add summaries for top incoming links (up to SHOW limit)
-                        for link in incoming_links[:CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT]:
-                            link_summary["top_links_summary"].append(
-                                f"IN: {_fmt_id(link.get('source_memory_id'))} -> {link.get('link_type', 'related')}"
-                            )
-                        # Add freshness timestamp to the link summary
-                        base_context["contextual_links"] = {"retrieved_at": retrieval_timestamp, "summary": link_summary}
-                        self.logger.info(f"Retrieved link summary for memory {_fmt_id(mem_id_to_traverse)} ({len(outgoing_links)} out, {len(incoming_links)} in).")
-                    else:
-                        err_msg = f"Link retrieval ({get_linked_memories_tool}) failed: {links_result_content.get('error', 'Unknown')}"
-                        base_context["errors"].append(err_msg)
-                        self.logger.warning(err_msg)
-                except Exception as e:
-                    err_msg = f"Link retrieval exception: {e}"
-                    self.logger.warning(err_msg, exc_info=False)
-                    base_context["errors"].append(err_msg)
-            else:
-                # Log if no suitable starting point for link traversal was found
-                self.logger.debug("No relevant memory found (focal/working/important) to perform link traversal from.")
-        else:
-            # Log if the link retrieval tool is unavailable
-            self.logger.debug(f"Skipping link traversal: Tool '{get_linked_memories_tool}' unavailable.")
-
-        # --- Context Compression Check ---
-        # This should happen *after* all components are gathered
-        try:
-            # Estimate tokens of the fully assembled context
-            estimated_tokens = await self._estimate_tokens_anthropic(base_context)
-            # If estimate exceeds threshold, attempt compression
-            if estimated_tokens > CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD:
-                self.logger.warning(f"Context ({estimated_tokens} tokens) exceeds threshold {CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD}. Attempting summary compression.")
-                # Check if summarization tool is available
-                if self._find_tool_server(TOOL_SUMMARIZE_TEXT):
-                    # Strategy: Summarize the potentially longest/most verbose part first
-                    # Example: Summarize 'core_context' -> 'recent_actions' if it exists and is large
-                    core_ctx = base_context.get("core_context")
-                    actions_to_summarize = None
-                    # Check structure before accessing potentially missing keys
-                    if isinstance(core_ctx, dict):
-                        actions_to_summarize = core_ctx.get("recent_actions")
-
-                    # Only summarize if the actions list exists and is substantial (e.g., > 1000 chars JSON)
-                    if actions_to_summarize and isinstance(actions_to_summarize, list) and len(json.dumps(actions_to_summarize, default=str)) > 1000:
-                         actions_text = json.dumps(actions_to_summarize, default=str) # Serialize for summarizer
-                         summary_result = await self._execute_tool_call_internal(
-                              TOOL_SUMMARIZE_TEXT,
-                              {
-                                  "text_to_summarize": actions_text,
-                                  "target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS, # Use target constant
-                                  # Use specialized summarizer prompt for actions
-                                  "prompt_template": "summarize_context_block", # Assuming this maps to the right prompt in UMS
-                                  "context_type": "actions", # Tell summarizer what it's summarizing
-                                  "workflow_id": current_workflow_id, # Provide workflow context
-                                  "record_summary": False # Don't store this ephemeral summary
-                              },
-                              record_action=False # Internal action
-                         )
-                         if summary_result.get("success"):
-                              # Add a note about the compression to the context
-                              base_context["compression_summary"] = f"Summary of recent actions: {summary_result.get('summary', 'Summary failed.')[:150]}..."
-                              # Replace the original actions list in core_context with a reference to the summary
-                              if isinstance(core_ctx, dict):
-                                   core_ctx["recent_actions"] = f"[Summarized: See compression_summary field]"
-                              self.logger.info(f"Compressed recent actions. New context size estimate: {await self._estimate_tokens_anthropic(base_context)} tokens")
-                         else:
-                              err_msg = f"Context compression tool ({TOOL_SUMMARIZE_TEXT}) failed: {summary_result.get('error')}"
-                              base_context["errors"].append(err_msg); self.logger.warning(err_msg)
-                    else:
-                         # Log if no suitable large component found for compression
-                         self.logger.info("No large action list found to compress, context remains large.")
-                else:
-                    # Log if summarization tool is unavailable
-                    self.logger.warning(f"Cannot compress context: Tool '{TOOL_SUMMARIZE_TEXT}' unavailable.")
-        except Exception as e:
-            # Catch errors during the estimation/compression process
-            err_msg = f"Error during context compression check: {e}"
-            self.logger.error(err_msg, exc_info=False)
-            base_context["errors"].append(err_msg)
-        # <<< End Integration Block: Context Gathering >>>
-
-        # Final status update
-        base_context["status"] = "Ready" if not base_context["errors"] else "Ready with Errors"
-        self.logger.info(f"Context gathering complete. Errors: {len(base_context['errors'])}. Time: {(time.time() - start_time):.3f}s")
-        return base_context
+        final_errors = len(context_payload.get("errors_in_context_gathering", []))
+        context_payload["status_message_from_agent"] = "Context ready" if not final_errors else f"Context ready with {final_errors} errors"
+        self.logger.info(f"Agent: Context gathering complete. Errors: {final_errors}. Time: {(time.time() - start_time):.3f}s")
+        if final_errors > 0:
+            self.logger.debug(f"Agent: Errors during context gathering: {context_payload.get('errors_in_context_gathering')}")
+        return context_payload
 
 
-    # ----------------------------------------------------------- call‑llm --
-    async def _call_agent_llm(
-        self, goal: str, context: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    async def prepare_next_turn_data(self, overall_goal: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Calls the Anthropic LLM with the constructed prompt and context,
-        parsing the response to extract the agent's decision (tool call,
-        thought, or completion signal). Includes retry logic for API errors.
-
-        Returns:
-            A dictionary representing the agent's decision:
-            - {"decision": "call_tool", "tool_name": str, "arguments": dict}
-            - {"decision": "thought_process", "content": str}
-            - {"decision": "complete", "summary": str}
-            - {"decision": "error", "message": str}
-            - {"decision": "plan_update", "updated_plan_steps": List[PlanStep]} (Parsed from text)
-        """
-        # --- 1. Prepare Prompt ---
-        messages = self._construct_agent_prompt(goal, context)
-
-        # --- 2. Define Tools for Anthropic API ---
-        # Filter schemas slightly for Anthropic's specific format if needed,
-        # although MCPClient's format_tools_for_anthropic should handle this.
-        anthropic_tools = self.tool_schemas
-
-        # --- 3. Execute LLM Call (with Retries) ---
-        async def _do_llm_call():
-            # Ensure client is available
-            if not self.anthropic_client:
-                raise RuntimeError("Anthropic client unavailable for LLM call")
-
-            # Make the API call using the configured model
-            response = await self.anthropic_client.messages.create(
-                model=MASTER_LEVEL_AGENT_LLM_MODEL_STRING,
-                max_tokens=2048, # Allow sufficient tokens for response + tool use
-                system="", # System prompt is included in user message per original structure
-                messages=messages, # Pass the constructed messages list
-                tools=anthropic_tools, # Provide the tool schemas
-                tool_choice={"type": "auto"}, # Let model decide whether to use a tool
-                temperature=0.5, # Moderate temperature for balanced creativity/determinism
-            )
-            return response
-
-        try:
-            # Use retry wrapper for the API call
-            response = await self._with_retries(
-                _do_llm_call,
-                max_retries=3,
-                # Retry on specific Anthropic API errors and common network issues
-                retry_exceptions=(
-                    APIConnectionError, RateLimitError, APIStatusError,
-                    asyncio.TimeoutError, ConnectionError
-                ),
-            )
-            self.logger.debug(f"LLM Response Stop Reason: {response.stop_reason}")
-            # --- 4. Parse LLM Response ---
-            # Check if the response involves a tool call
-            if response.stop_reason == "tool_use" and response.content:
-                tool_calls = []
-                # Iterate through content blocks to find tool_use blocks
-                for block in response.content:
-                    if block.type == "tool_use":
-                        # Found a tool use block, extract name and input arguments
-                        tool_name_raw = block.name # This is the sanitized name
-                        tool_args = block.input or {}
-                        # Map sanitized name back to original MCP name
-                        original_name = self.mcp_client.server_manager.sanitized_to_original.get(tool_name_raw, tool_name_raw)
-                        tool_calls.append({"tool_name": original_name, "arguments": tool_args})
-                        self.logger.info(f"LLM decided to call tool: {original_name}", emoji_key="hammer")
-
-                # Currently designed to handle ONE tool call per response
-                if len(tool_calls) == 1:
-                    return {"decision": "call_tool", **tool_calls[0]}
-                elif len(tool_calls) > 1:
-                    # If multiple tool calls are requested, log a warning and handle only the first one
-                    self.logger.warning(f"LLM requested multiple tool calls ({len(tool_calls)}). Executing only the first: {tool_calls[0]['tool_name']}")
-                    return {"decision": "call_tool", **tool_calls[0]}
-                else: # Should not happen if stop_reason is tool_use, but handle defensively
-                     err_msg = "LLM stop reason was 'tool_use' but no tool calls found in content."
-                     self.logger.error(err_msg)
-                     return {"decision": "error", "message": err_msg}
-
-            # Check if the response is plain text (thought or goal completion)
-            elif response.content and response.content[0].type == "text":
-                response_text = response.content[0].text.strip()
-                # Check for explicit Goal Achieved signal
-                if response_text.upper().startswith("GOAL ACHIEVED:"):
-                    summary = response_text[len("GOAL ACHIEVED:"):].strip()
-                    self.logger.info(f"LLM signaled goal completion. Summary: {summary}", emoji_key="tada")
-                    return {"decision": "complete", "summary": summary}
-
-                # --- Check for Plan Update via Text ---
-                # Heuristic check: Does the text contain something like "Updated Plan:", "New Plan:", etc.
-                # followed by a list structure? This is less robust than the tool but provides a fallback.
-                plan_marker = "updated plan:" # Case-insensitive check
-                if plan_marker in response_text.lower():
-                     try:
-                          # Attempt to extract and parse the plan structure after the marker
-                          plan_part = response_text[response_text.lower().find(plan_marker) + len(plan_marker):].strip()
-                          # Simple JSON/list parsing attempt (might need more robust parsing)
-                          if plan_part.startswith("[") and plan_part.endswith("]"):
-                               plan_data = json.loads(plan_part)
-                               if isinstance(plan_data, list):
-                                    # Validate structure using Pydantic models
-                                    validated_plan = [PlanStep(**step_data) for step_data in plan_data]
-                                    self.logger.info(f"LLM proposed plan update via text ({len(validated_plan)} steps).")
-                                    # Return the validated plan steps for application
-                                    return {"decision": "plan_update", "updated_plan_steps": validated_plan}
-                     except (json.JSONDecodeError, ValidationError, TypeError) as e:
-                          # If parsing/validation fails, treat it as a regular thought
-                          self.logger.warning(f"LLM text suggested plan update, but parsing/validation failed: {e}. Treating as thought.")
-                          pass # Fall through to treat as thought
-
-                # Otherwise, treat the text response as a thought process
-                self.logger.info(f"LLM provided reasoning/thought: '{response_text[:100]}...'", emoji_key="speech_balloon")
-                return {"decision": "thought_process", "content": response_text}
-            else:
-                # Handle unexpected empty response or unknown content type
-                err_msg = f"LLM returned unexpected response content or stop reason: {response.stop_reason}, Content: {response.content}"
-                self.logger.error(err_msg)
-                return {"decision": "error", "message": err_msg}
-
-        except APIStatusError as e: # Handle API status errors specifically
-            err_msg = f"Anthropic API Error {e.status_code}: {e.message}"
-            self.logger.error(err_msg, exc_info=False)
-            return {"decision": "error", "message": err_msg}
-        except Exception as e: # Catch other exceptions during API call or parsing
-            err_msg = f"Error calling LLM or parsing response: {e}"
-            self.logger.error(err_msg, exc_info=True)
-            return {"decision": "error", "message": err_msg}
-
-
-    # ------------------------------------------------------------ main loop --
-    async def run(self, goal: str, max_loops: int = 100) -> None:
-        """
-        The main execution loop for the agent.
+        Prepares all data needed by MCPClient to make the next LLM call.
+        This includes gathering context, constructing prompt messages, and providing tool schemas.
 
         Args:
-            goal: The high-level goal for the agent to achieve.
-            max_loops: Maximum number of iterations before stopping automatically.
-        """
-        self.logger.info(f"Starting agent loop. Goal: '{goal}'. Max loops: {max_loops}")
+            overall_goal: The overarching goal for the agent.
 
-        # Initialize or ensure workflow exists
+        Returns:
+            A tuple containing:
+            - prompt_messages_for_llm (List[Dict]): The messages to send to the LLM.
+            - tool_schemas_for_llm (List[Dict]): The tool schemas for the LLM.
+            - agent_context_snapshot (Dict): The full context dictionary that was used to build the prompt.
+                                            (MCPClient might use this for logging or its own UI).
+        """
+        self.logger.info(
+            f"AML: Preparing next turn data for Loop {self.state.current_loop} (WF: {_fmt_id(self.state.workflow_id)}, Goal: {_fmt_id(self.state.current_goal_id)})"
+        )
+
+        # 1. Periodic Cognitive Tasks (Run before gathering context for the turn)
+        #    This ensures meta-cognitive outputs can influence the current turn.
+        try:
+            await self._run_periodic_tasks()
+        except Exception as e:
+            self.logger.error(f"AML: Error during periodic tasks: {e}", exc_info=True)
+        if self._shutdown_event.is_set():
+            # If shutdown, return empty/signal to stop
+            raise asyncio.CancelledError("AML shutdown during periodic tasks in prepare_next_turn_data")
+
+
+        # 2. Gather Context
+        agent_context_snapshot = await self._gather_context()
+        if not self.state.workflow_id: # Check if workflow ended
+            self.logger.info("AML: No active workflow after context gathering. Signaling to stop.")
+            raise asyncio.CancelledError("AML: No active workflow, cannot prepare turn.") # Or a custom exception
+
+        # 3. Construct Prompt
+        if not self.state.needs_replan: # Clear previous error if not actively replanning for it
+            self.state.last_error_details = None
+        prompt_messages_for_llm = self._construct_agent_prompt(overall_goal, agent_context_snapshot)
+
+        # Tool schemas are already loaded in self.tool_schemas during agent.initialize()
+        return prompt_messages_for_llm, self.tool_schemas, agent_context_snapshot
+
+
+    async def execute_llm_decision(
+        self,
+        llm_decision: Dict[str, Any],
+        # overall_goal: str # May not be needed here if decisions are self-contained
+    ) -> bool:
+        """
+        Executes the decision received from the LLM (via MCPClient).
+        This includes calling tools, recording thoughts, updating plans, etc.
+        Handles error limits and state saving.
+
+        Args:
+            llm_decision: The decision dictionary from the LLM.
+                          Expected format:
+                          {"decision": "call_tool", "tool_name": "...", "arguments": {...}}
+                          OR {"decision": "thought_process", "content": "..."}
+                          OR {"decision": "complete", "summary": "..."}
+                          OR {"decision": "plan_update", "updated_plan_steps": List[PlanStep]}
+                          OR {"decision": "error", "message": "..."}
+            overall_goal: The overarching goal (might be useful for some heuristic fallbacks).
+
+        Returns:
+            bool: True if the agent should continue to the next loop,
+                  False if the agent should stop (e.g., goal achieved, max errors).
+        """
+        self.logger.info(
+            f"AML: Executing LLM Decision for Loop {self.state.current_loop} (WF: {_fmt_id(self.state.workflow_id)}, Goal: {_fmt_id(self.state.current_goal_id)})"
+        )
+        self.logger.debug(f"AML: Received LLM Decision: {str(llm_decision)[:300]}")
+
+        tool_result_content: Optional[Dict[str, Any]] = None
+        llm_proposed_plan_steps: Optional[List[PlanStep]] = llm_decision.get("updated_plan_steps")
+        decision_type = llm_decision.get("decision")
+
+        if decision_type == "call_tool":
+            tool_name = llm_decision.get("tool_name")
+            arguments = llm_decision.get("arguments", {})
+            if not self.state.current_plan:
+                self.logger.error("AML: Plan empty before tool call! Forcing replan.")
+                self.state.needs_replan = True; self.state.last_error_details = {"error": "Plan empty.", "type": "PlanValidationError"}
+            elif not self.state.current_plan[0].description:
+                self.logger.error(f"AML: Invalid plan step (no desc)! Step ID: {self.state.current_plan[0].id}. Forcing replan.")
+                self.state.needs_replan = True; self.state.last_error_details = {"error": "Current plan step invalid.", "type": "PlanValidationError", "step_id": self.state.current_plan[0].id}
+            elif tool_name:
+                current_step_deps = self.state.current_plan[0].depends_on if self.state.current_plan else []
+                tool_result_content = await self._execute_tool_call_internal(
+                    tool_name, arguments, record_action=True, planned_dependencies=current_step_deps
+                )
+            else:
+                self.logger.error("AML: LLM tool call decision missing tool name."); self.state.last_error_details = {"error": "LLM missing tool name.", "type": "LLMOutputError"}; tool_result_content = {"success": False, "error": "Missing tool name from LLM."}
+        elif decision_type == "thought_process":
+            thought_content = llm_decision.get("content")
+            if thought_content:
+                tool_result_content = await self._execute_tool_call_internal(
+                    TOOL_RECORD_THOUGHT,
+                    {"content": thought_content, "thought_type": ThoughtType.INFERENCE.value},
+                    record_action=False
+                )
+            else:
+                self.logger.warning("AML: LLM 'thought_process' decision but no content."); tool_result_content = {"success": False, "error": "Missing thought content from LLM."}
+        elif decision_type == "complete":
+            self.logger.info(f"AML: LLM signaled OVERALL goal completion: {llm_decision.get('summary')}")
+            root_goal_to_mark = None
+            if self.state.goal_stack:
+                for g_dict in self.state.goal_stack:
+                    if not g_dict.get("parent_goal_id"): root_goal_to_mark = g_dict.get("goal_id"); break
+            if root_goal_to_mark and self._find_tool_server(TOOL_UPDATE_GOAL_STATUS):
+                self.logger.info(f"AML: Marking UMS root goal {_fmt_id(root_goal_to_mark)} as completed based on LLM.")
+                await self._execute_tool_call_internal(
+                    TOOL_UPDATE_GOAL_STATUS,
+                    {"goal_id": root_goal_to_mark, "status": GoalStatus.COMPLETED.value, "reason": "LLM signaled overall goal completion."},
+                    record_action=False
+                ) # Side-effect handler will set goal_achieved_flag
+            else:
+                self.logger.warning(f"AML: LLM signaled overall completion, but couldn't mark UMS root goal automatically. Setting flag manually.")
+                self.state.goal_achieved_flag = True # Set flag manually if UMS tool unavailable for root
+            # No further processing if overall goal achieved
+            if self.state.goal_achieved_flag:
+                await self._save_agent_state()
+                return False # Signal to stop the loop
+        elif decision_type == "plan_update":
+            self.logger.info("AML: LLM proposed structured plan update.")
+            # llm_proposed_plan_steps is already set from the decision
+        elif decision_type == "error": # Error from MCPClient's LLM processing
+            self.logger.error(f"AML: LLM decision processing error from MCPClient: {llm_decision.get('message')}")
+            self.state.last_action_summary = f"LLM Decision Error: {llm_decision.get('message', 'Unknown')[:100]}"
+            if not self.state.last_error_details:
+                self.state.last_error_details = {"error": llm_decision.get('message'), "type": "LLMError"}
+            self.state.needs_replan = True
+        else: # Unexpected decision type
+            self.logger.error(f"AML: Unexpected decision type from MCPClient: {decision_type}")
+            self.state.last_action_summary = f"Agent Error: Unexpected decision '{decision_type}'"
+            self.state.last_error_details = {"error": f"Unexpected decision type '{decision_type}'", "type": "AgentError"}
+            self.state.needs_replan = True
+
+        # --- Apply Plan Updates (if any) ---
+        if llm_proposed_plan_steps:
+            try:
+                if self._detect_plan_cycle(llm_proposed_plan_steps):
+                    err_msg = "AML: LLM-proposed plan has cycle. Applying heuristic update instead."
+                    self.logger.error(err_msg)
+                    self.state.last_error_details = {"error": err_msg, "type": "PlanValidationError", "proposed_plan": [p.model_dump() for p in llm_proposed_plan_steps]}
+                    self.state.needs_replan = True
+                    await self._apply_heuristic_plan_update(llm_decision, tool_result_content)
+                else:
+                    self.state.current_plan = llm_proposed_plan_steps
+                    self.state.needs_replan = False
+                    self.logger.info(f"AML: Applied LLM-proposed plan update ({len(llm_proposed_plan_steps)} steps).")
+                    self.state.last_error_details = None; self.state.consecutive_error_count = 0
+            except Exception as plan_apply_err:
+                self.logger.error(f"AML: Error applying LLM proposed plan: {plan_apply_err}. Fallback.", exc_info=True)
+                self.state.last_error_details = {"error": f"Failed apply LLM plan: {plan_apply_err}", "type": "PlanUpdateError"}
+                self.state.needs_replan = True
+                await self._apply_heuristic_plan_update(llm_decision, tool_result_content)
+        elif decision_type != "call_tool" or llm_decision.get("tool_name") != AGENT_TOOL_UPDATE_PLAN:
+            # Apply heuristic if LLM didn't use AGENT_TOOL_UPDATE_PLAN or provide a structured plan
+            await self._apply_heuristic_plan_update(llm_decision, tool_result_content)
+
+        # --- Check Error Limit & Save State ---
+        if self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
+            self.logger.critical(f"AML: Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) reached. Signaling stop.")
+            if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
+                await self._execute_tool_call_internal(
+                    TOOL_UPDATE_WORKFLOW_STATUS,
+                    {"workflow_id": self.state.workflow_id, "status": WorkflowStatus.FAILED.value, "completion_message": f"Aborted after {MAX_CONSECUTIVE_ERRORS} errors."},
+                    record_action=False
+                )
+            await self._save_agent_state()
+            return False # Signal to stop
+
+        await self._save_agent_state()
+
+        # Check if the loop should continue
+        if self.state.goal_achieved_flag or self._shutdown_event.is_set() or not self.state.workflow_id:
+            return False # Signal to stop
+
+        return True # Signal to continue
+
+
+    async def run_main_loop(self, initial_goal: str, max_loops: int = 100):
+        """
+        The main execution loop that MCPClient will call repeatedly
+        if it's running the agent in a self-driving mode.
+        """
+        self.logger.info(f"AgentMasterLoop.run_main_loop called. Goal: '{initial_goal}'. Max loops: {max_loops}")
+
+        # --- Initialization of Workflow and Root Goal (if first run for this agent instance) ---
         if not self.state.workflow_id:
-            self.logger.info("No active workflow found. Creating initial workflow.")
+            self.logger.info("AML: No active workflow. Creating initial workflow via UMS.")
             wf_create_args = {
-                "title": f"Agent Task: {goal[:50]}...",
-                "goal": goal,
-                "description": f"Agent workflow initiated at {datetime.now(timezone.utc).isoformat()} to achieve: {goal}",
+                "title": f"Agent Task: {initial_goal[:50]}...",
+                "goal": initial_goal,
+                "description": f"Agent workflow initiated at {datetime.now(timezone.utc).isoformat()} to achieve: {initial_goal}",
                 "tags": ["agent_run", AGENT_NAME.lower()]
             }
             wf_create_result = await self._execute_tool_call_internal(
                 TOOL_CREATE_WORKFLOW, wf_create_args, record_action=False
             )
-            # Note: _handle_workflow_and_goal_side_effects should set self.state.workflow_id, context_id, stack, chain_id etc.
             if not wf_create_result.get("success") or not self.state.workflow_id:
-                self.logger.critical(f"Failed to create initial workflow: {wf_create_result.get('error')}. Aborting.")
+                self.logger.critical(f"AML: Failed to create initial UMS workflow: {wf_create_result.get('error')}. Aborting.")
+                return # Cannot proceed without a workflow
+            if not self.state.current_goal_id:
+                self.logger.critical("AML: UMS Workflow created, but UMS root goal ID was not set. Aborting.")
                 return
-            # Note: The root goal should now be created within _handle_workflow_and_goal_side_effects if successful
-            elif not self.state.current_goal_id:
-                 self.logger.critical("Workflow created, but root goal ID was not set. Aborting.")
-                 return
-
+            self.logger.info(f"AML: Initial workflow {_fmt_id(self.state.workflow_id)} and root goal {_fmt_id(self.state.current_goal_id)} established.")
         elif not self.state.current_thought_chain_id:
-            # If workflow loaded but no chain ID, try setting default
             await self._set_default_thought_chain_id()
-        # --- ADDED: Ensure current_goal_id is set if stack isn't empty ---
         elif self.state.goal_stack and not self.state.current_goal_id:
-             self.state.current_goal_id = self.state.goal_stack[-1].get("goal_id")
-             self.logger.info(f"Set current_goal_id from top of loaded stack: {_fmt_id(self.state.current_goal_id)}")
+            self.state.current_goal_id = self.state.goal_stack[-1].get("goal_id")
+            self.logger.info(f"AML: Set current_goal_id from loaded stack: {_fmt_id(self.state.current_goal_id)}")
 
+        # --- Main Agent Logic Loop (driven by MCPClient now) ---
+        # This loop represents one "turn" or cycle of the agent's independent operation.
+        # MCPClient will call this method repeatedly.
 
-        # --- Main Think-Act Loop ---
-        while self.state.current_loop < max_loops and not self.state.goal_achieved_flag and not self._shutdown_event.is_set():
-            self.state.current_loop += 1
-            self.logger.info(f"--- Starting Loop {self.state.current_loop}/{max_loops} (WF: {_fmt_id(self.state.workflow_id)}, Goal: {_fmt_id(self.state.current_goal_id)}) ---")
+        if self.state.current_loop >= max_loops:
+            self.logger.warning(f"AML: Agent loop reached max iterations ({max_loops}). Stopping.")
+            return # MCPClient should stop calling if this returns (or if it tracks loops)
 
-            # --- 1. Periodic Cognitive Tasks ---
-            try:
-                 await self._run_periodic_tasks()
-            except Exception as e:
-                 self.logger.error(f"Error during periodic tasks: {e}", exc_info=True) # Log but continue loop
+        if self.state.goal_achieved_flag:
+            self.logger.info("AML: Goal previously achieved. Loop will not run further.")
+            return
 
-            # Check shutdown flag again after periodic tasks
-            if self._shutdown_event.is_set(): break
-
-            # --- 2. Gather Context ---
-            context = await self._gather_context()
-
-            # Check if no active workflow after context gathering (e.g., root workflow finished)
-            if not self.state.workflow_id:
-                 self.logger.info("No active workflow. Agent loop concluding.")
-                 break # Exit loop if workflow finished
-
-            # --- 3. Pre-computation/Pre-analysis (If needed before LLM call) ---
-            # (Placeholder for future logic)
-
-            # --- 4. Call LLM for Decision ---
-            # Clear error details before LLM call (unless needs_replan is set for error recovery)
-            if not self.state.needs_replan:
-                 self.state.last_error_details = None
-            # Call the LLM
-            decision = await self._call_agent_llm(goal, context)
-
-            # --- 5. Execute Decision ---
-            tool_result_content: Optional[Dict[str, Any]] = None # Store result for heuristic update
-            llm_proposed_plan = decision.get("updated_plan_steps") # Check if LLM proposed plan via text
-
-            # Handle decision based on type
-            if decision.get("decision") == "call_tool":
-                tool_name = decision.get("tool_name")
-                arguments = decision.get("arguments", {})
-
-                # --- Plan Validation (Pre-Execution Check) ---
-                # Ensure the intended step (likely first in plan) is valid
-                if not self.state.current_plan:
-                    self.logger.error("Attempting tool call but plan is empty! Forcing replan.")
-                    self.state.needs_replan = True
-                    self.state.last_error_details = {"error": "Plan became empty before tool call.", "type": "PlanValidationError"}
-                elif not self.state.current_plan[0].description:
-                    self.logger.error(f"Attempting tool call for invalid plan step (missing description)! Step ID: {self.state.current_plan[0].id}. Forcing replan.")
-                    self.state.needs_replan = True
-                    self.state.last_error_details = {"error": "Current plan step is invalid (missing description).", "type": "PlanValidationError", "step_id": self.state.current_plan[0].id}
-                # If checks pass, execute the tool call
-                elif tool_name:
-                    # Extract dependencies *from the current plan step* that this tool call corresponds to
-                    current_step_deps = self.state.current_plan[0].depends_on if self.state.current_plan else []
-                    # Execute the tool call, passing planned dependencies for checking
-                    tool_result_content = await self._execute_tool_call_internal(
-                        tool_name, arguments, record_action=True, planned_dependencies=current_step_deps
-                    )
-                else: # Should not happen if parsing worked correctly
-                    self.logger.error("LLM decided to call tool but no tool name was provided.")
-                    self.state.last_error_details = {"error": "LLM tool call decision missing tool name.", "type": "LLMOutputError"}
-                    tool_result_content = {"success": False, "error": "Missing tool name from LLM."}
-
-            elif decision.get("decision") == "thought_process":
-                # Record the thought provided by the LLM
-                thought_content = decision.get("content")
-                if thought_content:
-                    # Default to 'inference' type if LLM doesn't specify
-                    thought_type = ThoughtType.INFERENCE.value
-                    # Advanced: Could try to infer type from text content if needed
-                    tool_result_content = await self._execute_tool_call_internal(
-                        TOOL_RECORD_THOUGHT,
-                        {"content": thought_content, "thought_type": thought_type},
-                        # Allow workflow_id and thought_chain_id injection
-                        record_action=False # Recording thoughts isn't a primary world action
-                    )
-                else: # Handle missing content
-                    self.logger.warning("LLM provided 'thought_process' decision but no content.")
-                    tool_result_content = {"success": False, "error": "Missing thought content from LLM."}
-
-            elif decision.get("decision") == "complete":
-                # Goal achieved signal from LLM (Handles *overall* goal completion)
-                self.logger.info(f"LLM signaled OVERALL goal completion: {decision.get('summary')}")
-                self.state.goal_achieved_flag = True # Set flag to terminate loop
-                # Update workflow status to completed if possible
-                if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
-                    await self._execute_tool_call_internal(
-                        TOOL_UPDATE_WORKFLOW_STATUS,
-                        {
-                            "workflow_id": self.state.workflow_id,
-                            "status": WorkflowStatus.COMPLETED.value,
-                            "completion_message": decision.get('summary', 'Overall goal marked achieved by agent.')
-                        },
-                        record_action=False # Meta-action
-                    )
-                    # Note: _handle_workflow_and_goal_side_effects will clear WF state if root WF finished
-                # Break the loop after handling completion
-                break
-
-            elif decision.get("decision") == "plan_update": # Handle plan parsed from text
-                self.logger.info("LLM proposed plan update via text response.")
-                # The plan is already validated in _call_agent_llm
-                llm_proposed_plan = decision.get("updated_plan_steps") # Already validated PlanStep list
-                # We'll handle application of this plan in Step 6
-
-            elif decision.get("decision") == "error":
-                 # LLM or internal error during decision making
-                 self.logger.error(f"LLM decision error: {decision.get('message')}")
-                 self.state.last_action_summary = f"LLM Decision Error: {decision.get('message', 'Unknown')[:100]}"
-                 # Store error details if not already set by tool execution
-                 if not self.state.last_error_details:
-                     self.state.last_error_details = {"error": decision.get('message'), "type": "LLMError"}
-                 self.state.needs_replan = True # Force replan after LLM error
-                 # action_successful remains False
-
-            # --- 6. Apply Plan Updates ---
-            # Priority: Plan proposed by LLM via text > Heuristic update
-            if llm_proposed_plan:
-                 try:
-                     # --- Plan Cycle Detection ---
-                     if self._detect_plan_cycle(llm_proposed_plan):
-                         err_msg = "LLM-proposed plan contains a dependency cycle. Applying heuristic update instead."
-                         self.logger.error(err_msg)
-                         self.state.last_error_details = {"error": err_msg, "type": "PlanValidationError", "proposed_plan": [p.model_dump() for p in llm_proposed_plan]}
-                         self.state.needs_replan = True # Force replan again
-                         # Fallback to heuristic update if LLM plan is invalid
-                         await self._apply_heuristic_plan_update(decision, tool_result_content)
-                     else:
-                         # Apply the LLM's validated plan
-                         self.state.current_plan = llm_proposed_plan
-                         self.state.needs_replan = False # LLM provided the plan, assume it's intended
-                         self.logger.info(f"Applied LLM-proposed plan update ({len(llm_proposed_plan)} steps).")
-                         # Clear errors after successful LLM plan update
-                         self.state.last_error_details = None
-                         self.state.consecutive_error_count = 0
-                 except Exception as plan_apply_err:
-                      # Catch errors applying the plan (should be rare if validation passed)
-                      self.logger.error(f"Error applying LLM proposed plan: {plan_apply_err}. Falling back to heuristic.", exc_info=True)
-                      self.state.last_error_details = {"error": f"Failed to apply LLM plan: {plan_apply_err}", "type": "PlanUpdateError"}
-                      self.state.needs_replan = True
-                      await self._apply_heuristic_plan_update(decision, tool_result_content)
-
-            elif decision.get("tool_name") != AGENT_TOOL_UPDATE_PLAN: # Heuristic only if LLM didn't explicitly update plan
-                # Apply heuristic updates if LLM didn't use the plan update tool or provide a valid text plan
-                await self._apply_heuristic_plan_update(decision, tool_result_content)
-            # else: If AGENT_TOOL_UPDATE_PLAN was called, success/failure already handled by _execute_tool_call_internal
-
-            # --- 7. Check Error Limit & Save State ---
-            if self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
-                self.logger.critical(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) reached. Aborting loop.")
-                # Update workflow status to failed if possible
-                if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
-                     await self._execute_tool_call_internal(
-                         TOOL_UPDATE_WORKFLOW_STATUS,
-                         {
-                             "workflow_id": self.state.workflow_id,
-                             "status": WorkflowStatus.FAILED.value,
-                             "completion_message": f"Aborted after {MAX_CONSECUTIVE_ERRORS} consecutive errors."
-                         },
-                         record_action=False
-                     )
-                break # Exit loop
-
-            # Save state at the end of each loop iteration
-            await self._save_agent_state()
-
-            # Optional: Small delay between loops
-            # await asyncio.sleep(0.5)
-
-        # --- Loop End ---
         if self._shutdown_event.is_set():
-            self.logger.info("Agent loop terminated due to shutdown signal.")
-        elif self.state.current_loop >= max_loops:
-            self.logger.warning(f"Agent loop reached max iterations ({max_loops}). Stopping.")
-        elif self.state.goal_achieved_flag:
-            self.logger.info("Agent loop finished: Goal achieved.", emoji_key="tada")
-        else:
-             # Log reason if loop finished but goal_achieved_flag is false (e.g., error limit, no active workflow)
-             if self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
-                 self.logger.warning("Agent loop finished due to reaching max consecutive errors.")
-             elif not self.state.workflow_id:
-                 self.logger.info("Agent loop finished because no workflow is active.")
-             else: # Generic case if workflow still active but loop ended
-                 self.logger.warning("Agent loop finished for unexpected reason (goal not achieved, loop limit not reached).")
+            self.logger.info("AML: Shutdown signaled. Loop will not run.")
+            return
 
+        self.state.current_loop += 1 # Increment loop counter *managed by agent*
 
-        # Final state save and cleanup handled by shutdown() or run_agent_process() finally block
+        # 1. Prepare data for LLM
+        try:
+            prompt_messages, tool_schemas, agent_context = await self.prepare_next_turn_data(initial_goal)
+        except asyncio.CancelledError:
+            self.logger.info("AML: prepare_next_turn_data was cancelled (likely shutdown or no active workflow).")
+            return # Stop this turn
+        except Exception as e:
+            self.logger.error(f"AML: Error in prepare_next_turn_data: {e}", exc_info=True)
+            # Potentially set error state and allow MCPClient to decide if it retries or stops agent
+            self.state.last_error_details = {"error": f"Context/Prompt prep error: {e}", "type": "AgentError"}
+            return # Stop this turn
 
+        # 2. MCPClient makes the LLM call and gets a decision
+        # This step is now OUTSIDE AgentMasterLoop.run_main_loop.
+        # MCPClient will call:
+        #   llm_decision = await self.mcp_client.process_agent_llm_turn(prompt_messages, tool_schemas, self.agent_llm_model)
 
-# =============================================================================
-# Driver helpers & CLI entry‑point
-# =============================================================================
+        # 3. AgentMasterLoop executes the decision (this part is called by MCPClient after it gets LLM decision)
+        # For now, this method `run_main_loop` will effectively *return* the necessary data
+        # to `MCPClient` so that `MCPClient` can make the LLM call.
+        # The result of the LLM call would then be passed back to a different method like `execute_llm_decision`.
 
-async def run_agent_process(
-    mcp_server_url: str,
-    anthropic_key: str,
-    goal: str,
-    max_loops: int,
-    state_file: str,
-    config_file: Optional[str],
-) -> None:
-    """
-    Sets up the MCPClient, Agent Master Loop, signal handling,
-    and runs the main agent execution loop.
-    """
-    # Ensure MCPClient is available
-    if not MCP_CLIENT_AVAILABLE:
-        print("❌ ERROR: MCPClient dependency not met.")
-        sys.exit(1)
+        # So, `run_main_loop` should now probably be split or its responsibility changed.
+        # Let's assume MCPClient calls:
+        #   `prompt_messages, tool_schemas, agent_context = await agent_loop.prepare_next_turn_data(initial_goal)`
+        # Then MCPClient does its LLM call.
+        # Then MCPClient calls:
+        #   `should_continue = await agent_loop.execute_llm_decision(llm_decision)`
+        # And MCPClient uses `should_continue` to decide whether to call `prepare_next_turn_data` again.
 
-    mcp_client_instance = None
-    agent_loop_instance = None
-    exit_code = 0
-    # Use standard print initially, switch to client's safe_print if available
-    printer = print
+        # For the purpose of this refactoring, `run_main_loop` will just prepare and return.
+        self.logger.info(f"AML: Data prepared for MCPClient to make LLM call for loop {self.state.current_loop}.")
+        # Return the necessary components for MCPClient
+        # MCPClient should also know if the agent thinks it should stop (e.g. goal achieved)
+        if self.state.goal_achieved_flag or self._shutdown_event.is_set() or not self.state.workflow_id:
+            return None # Signal to MCPClient that agent loop should stop.
 
-    try:
-        printer("Instantiating MCP Client...")
-        # Initialize MCP Client (pass URL and optional config path)
-        mcp_client_instance = MCPClient(base_url=mcp_server_url, config_path=config_file)
-        # Use safe_print for console output if provided by the client
-        if hasattr(mcp_client_instance, 'safe_print') and callable(mcp_client_instance.safe_print):
-            printer = mcp_client_instance.safe_print
-            log.info("Using MCPClient's safe_print for output.")
-
-        # Configure API key if not already set in config
-        if not mcp_client_instance.config.api_key:
-            if anthropic_key:
-                printer("Using provided Anthropic API key.")
-                mcp_client_instance.config.api_key = anthropic_key
-                # Re-initialize the anthropic client instance within MCPClient if necessary
-                mcp_client_instance.anthropic = AsyncAnthropic(api_key=anthropic_key)
-            else:
-                # Critical error if key is missing
-                printer("❌ CRITICAL ERROR: Anthropic API key missing in config and not provided.")
-                raise ValueError("Anthropic API key missing.")
-
-        printer("Setting up MCP Client connections...")
-        # Perform necessary setup (like connecting to servers/discovery)
-        await mcp_client_instance.setup(interactive_mode=False) # Run in non-interactive mode
-
-        printer("Instantiating Agent Master Loop...")
-        # Create the agent instance, passing the initialized MCP client and state file path
-        agent_loop_instance = AgentMasterLoop(mcp_client_instance=mcp_client_instance, agent_state_file=state_file)
-
-        # --- Signal Handling Setup ---
-        # Get the current asyncio event loop
-        loop = asyncio.get_running_loop()
-        # Create an event to signal shutdown across tasks
-        stop_event = asyncio.Event()
-
-        # Define the signal handler function
-        def signal_handler_wrapper(signum):
-            signal_name = signal.Signals(signum).name
-            log.warning(f"Signal {signal_name} received. Initiating graceful shutdown.")
-            # Set the event to signal other tasks
-            stop_event.set()
-            # Trigger the agent's internal shutdown method asynchronously
-            if agent_loop_instance:
-                 asyncio.create_task(agent_loop_instance.shutdown())
-            # Avoid calling loop.stop() directly, let tasks finish gracefully
-
-        # Register the handler for SIGINT (Ctrl+C) and SIGTERM
-        for sig in [signal.SIGINT, signal.SIGTERM]:
-            try:
-                loop.add_signal_handler(sig, signal_handler_wrapper, sig)
-                log.debug(f"Registered signal handler for {sig.name}")
-            except ValueError: # Might fail if handler already registered
-                log.debug(f"Signal handler for {sig.name} may already be registered.")
-            except NotImplementedError: # Signal handling might not be supported (e.g., Windows sometimes)
-                log.warning(f"Signal handling for {sig.name} not supported on this platform.")
-
-
-        printer("Initializing agent...")
-        if not await agent_loop_instance.initialize():
-             printer("❌ Agent initialization failed. Exiting.")
-             exit_code = 1
-             return # Exit early if initialization fails
-
-        printer(f"Running Agent Loop for goal: \"{goal}\"")
-        # Create tasks for the main agent run and for waiting on the stop signal
-        run_task = asyncio.create_task(agent_loop_instance.run(goal=goal, max_loops=max_loops))
-        stop_task = asyncio.create_task(stop_event.wait())
-
-        # Wait for either the agent run to complete OR the stop signal to be received
-        done, pending = await asyncio.wait(
-            {run_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED # Return as soon as one task finishes
-        )
-
-        # Handle shutdown signal completion
-        if stop_task in done:
-             printer("\n[yellow]Shutdown signal processed. Waiting for agent task to finalize...[/yellow]")
-             # If the agent task is still running, attempt to cancel it
-             if run_task in pending:
-                 run_task.cancel()
-                 try:
-                     # Wait for the cancellation to be processed
-                     await run_task
-                 except asyncio.CancelledError:
-                      log.info("Agent run task cancelled gracefully after signal.")
-                 except Exception as e:
-                      # Log error if cancellation failed unexpectedly
-                      log.error(f"Exception during agent run task finalization after signal: {e}", exc_info=True)
-             # Set standard exit code for signal interruption (like Ctrl+C)
-             exit_code = 130
-
-        # Handle normal agent completion or error completion
-        elif run_task in done:
-             try:
-                 run_task.result() # Check for exceptions raised by the run task
-                 log.info("Agent run task completed normally.")
-             except Exception as e:
-                 # If the run task raised an exception, log it and set error exit code
-                 printer(f"\n❌ Agent loop finished with error: {e}")
-                 log.error("Agent run task finished with an exception:", exc_info=True)
-                 exit_code = 1
-
-
-    except KeyboardInterrupt:
-        # Fallback for Ctrl+C if signal handler doesn't catch it (e.g., during setup)
-        printer("\n[yellow]KeyboardInterrupt caught (fallback).[/yellow]")
-        exit_code = 130
-    except ValueError as ve: # Catch specific config/value errors during setup
-        printer(f"\n❌ Configuration Error: {ve}")
-        exit_code = 2
-    except Exception as main_err:
-        # Catch any other critical errors during setup or main execution
-        printer(f"\n❌ Critical error during setup or execution: {main_err}")
-        log.critical("Top-level execution error", exc_info=True)
-        exit_code = 1
-    finally:
-        # --- Cleanup Sequence ---
-        printer("Initiating final shutdown sequence...")
-        # Ensure agent shutdown method is called (might be redundant if signaled, but safe)
-        if agent_loop_instance and not agent_loop_instance._shutdown_event.is_set():
-             printer("Ensuring agent loop shutdown...")
-             await agent_loop_instance.shutdown() # Call directly if not already shutting down
-        # Ensure MCP client connections are closed
-        if mcp_client_instance:
-            printer("Closing MCP client connections...")
-            try:
-                await mcp_client_instance.close()
-            except Exception as close_err:
-                printer(f"[red]Error closing MCP client:[/red] {close_err}")
-        printer("Agent execution finished.")
-        # Exit the process only if running as the main script
-        if __name__ == "__main__":
-            # Short delay to allow logs/output to flush before exiting
-            await asyncio.sleep(0.5)
-            sys.exit(exit_code)
-
-# Main execution block when script is run directly
-if __name__ == "__main__":
-    # (Keep existing __main__ block for configuration loading and running)
-    # Load configuration from environment variables or defaults
-    MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8013")
-    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-    AGENT_GOAL = os.environ.get(
-        "AGENT_GOAL", # Default goal for testing/example
-        "Create workflow 'Tier 3 Test': Research Quantum Computing impact on Cryptography.",
-    )
-    MAX_ITER = int(os.environ.get("MAX_ITERATIONS", "30")) # Default max loops
-    STATE_FILE = os.environ.get("AGENT_STATE_FILE", AGENT_STATE_FILE) # Use constant default
-    CONFIG_PATH = os.environ.get("MCP_CLIENT_CONFIG") # Optional MCPClient config file path
-
-    # Validate essential configuration
-    if not ANTHROPIC_API_KEY:
-        print("❌ ERROR: ANTHROPIC_API_KEY missing in environment variables.")
-        sys.exit(1)
-    if not MCP_CLIENT_AVAILABLE:
-        # This check happens earlier, but keep for robustness
-        print("❌ ERROR: MCPClient dependency missing.")
-        sys.exit(1)
-
-    # Display configuration being used before starting
-    print(f"--- {AGENT_NAME} ---")
-    print(f"Memory System URL: {MCP_SERVER_URL}")
-    print(f"Agent Goal: {AGENT_GOAL}")
-    print(f"Max Iterations: {MAX_ITER}")
-    print(f"State File: {STATE_FILE}")
-    print(f"Client Config: {CONFIG_PATH or 'Default internal config'}")
-    print(f"Log Level: {logging.getLevelName(log.level)}")
-    print("Anthropic API Key: Found")
-    print("-----------------------------------------")
-
-
-    # Define the main async function to run the agent process
-    async def _main() -> None:
-        await run_agent_process(
-            MCP_SERVER_URL,
-            ANTHROPIC_API_KEY,
-            AGENT_GOAL,
-            MAX_ITER,
-            STATE_FILE,
-            CONFIG_PATH,
-        )
-
-    # Run the main async function using asyncio.run()
-    try:
-        asyncio.run(_main())
-    except KeyboardInterrupt:
-        # Catch Ctrl+C during initial asyncio.run setup if signal handler isn't active yet
-        print("\n[yellow]Initial KeyboardInterrupt detected. Exiting.[/yellow]")
-        sys.exit(130)
+        return {"prompt_messages": prompt_messages, "tool_schemas": tool_schemas, "agent_context": agent_context}

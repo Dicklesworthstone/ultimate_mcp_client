@@ -162,10 +162,11 @@ import uuid
 from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Callable,
@@ -263,10 +264,17 @@ from starlette.responses import FileResponse
 from typing_extensions import Annotated, Literal, TypeAlias
 from zeroconf import EventLoopBlocked, NonUniqueNameException, ServiceBrowser, ServiceInfo, Zeroconf
 
+if TYPE_CHECKING:
+    from agent_master_loop import AgentMasterLoop, PlanStep
+
+else:
+    AgentMasterLoop = "AgentMasterLoop" # Placeholder for AgentMasterLoop
+    PlanStep = "PlanStep"             # Placeholder for PlanStep
+
 decouple_config = DecoupleConfig(RepositoryEnv(".env"))
 
 # =============================================================================
-# Constants Integration (Copied from user input)
+# Constants Integration
 # =============================================================================
 
 
@@ -351,11 +359,9 @@ COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
     "groq/gemma2-9b-it": {"input": 0.0, "output": 0.0},
     "groq/compound-beta": {"input": 0.0, "output": 0.0},
     "groq/compound-beta-mini": {"input": 0.0, "output": 0.0},
-
     # Cerebras models (Prefixed)
     "cerebras/llama-4-scout-17b-16e-instruct": {"input": 0.0001, "output": 0.0001}, # Using placeholder cost
     "cerebras/llama-3.3-70b": {"input": 0.0001, "output": 0.0001}, # Using placeholder cost
-
 }
 
 # Default models by provider (Updated with prefixed names)
@@ -511,12 +517,7 @@ def _infer_provider(model_name: str) -> Optional[str]:
     # Mistral models might be Mistral, OpenRouter, etc. - cannot reliably infer.
     # If it starts with mistral- but NOT mistralai/, it's ambiguous.
 
-    # 3. Specific Known Model Names (Can override prefixes if needed)
-    # Example: if 'llama-3.1-...' was ONLY on Groq, you could add:
-    # if "llama-3.1" in lname: return Provider.GROQ.value
-    # Be careful with this, as models move between providers.
-
-    # 4. Check if the name *exactly matches* a key in COST_PER_MILLION_TOKENS
+    # 3. Check if the name *exactly matches* a key in COST_PER_MILLION_TOKENS
     # This is useful for models like `mistralai/mistral-nemo` if they haven't been prefixed
     if model_name in COST_PER_MILLION_TOKENS:
         # Try inferring based *solely* on COST_PER_MILLION_TOKENS keys (less reliable)
@@ -756,13 +757,20 @@ class ServerType(Enum):
     STDIO = "stdio"
     SSE = "sse"
 
-
 class ServerAddRequest(BaseModel):
     name: str
     type: ServerType
     path: str
     argsString: Optional[str] = ""
 
+class AgentStartRequest(BaseModel):
+    goal: str
+    max_loops: int = Field(default=50, gt=0)
+    llm_model: Optional[str] = None # Optional model override for this run
+
+class AgentInjectThoughtRequest(BaseModel):
+    content: str
+    thought_type: str = Field(default="user_guidance")
 
 # Model for the GET /api/config response (excluding sensitive data)
 class ConfigGetResponse(BaseModel):
@@ -2160,6 +2168,7 @@ class Config:
         and applying environment variable overrides for simple settings.
         """
         log.debug("Initializing Config object...")
+        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.1_integrated.json") # Default agent state file
         self._set_defaults()
         self.dotenv_path = find_dotenv(raise_error_if_not_found=False, usecwd=True)
         if self.dotenv_path:
@@ -2229,6 +2238,7 @@ class Config:
         self.port_scan_concurrency: int = 50
         self.port_scan_timeout: float = 4.5
         self.port_scan_targets: List[str] = ["127.0.0.1"]
+        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.1_integrated.json")
 
         # Complex structures
         self.servers: Dict[str, ServerConfig] = {}
@@ -4787,6 +4797,15 @@ class MCPClient:
         self.cache_hit_count = 0
         self.cache_miss_count = 0
         self.tokens_saved_by_cache = 0
+
+        # Agent related properties
+        self.agent_loop_instance: Optional[AgentMasterLoop] = None
+        self.agent_task: Optional[asyncio.Task] = None
+        self.agent_goal: Optional[str] = None
+        self.agent_status: str = "idle" # idle, running, completed, failed, stopped
+        self.agent_last_message: Optional[str] = None
+        self.agent_current_loop: int = 0
+        self.agent_max_loops: int = 0
 
         # Pre-compile emoji pattern
         self._emoji_chars = [re.escape(str(emoji)) for emoji in EMOJI_MAP.values()]
@@ -9636,7 +9655,7 @@ class MCPClient:
                             "temperature": self.config.temperature,
                             "stream": True,
                         }
-                        providers_without_stream_options = { Provider.MISTRAL.value }
+                        providers_without_stream_options = { Provider.MISTRAL.value, Provider.CEREBRAS.value }
                         if provider_name not in providers_without_stream_options:
                             completion_params["stream_options"] = {"include_usage": True}
                         else: log.debug(f"Skipping stream_options for {provider_name}")
@@ -10112,6 +10131,606 @@ class MCPClient:
                 yield "final_stats", final_stats  # Yield collected stats
             else:
                 log.warning("Stream wrapper did not capture final stats/reason.")
+
+
+    async def process_agent_llm_turn(
+        self,
+        prompt_messages: List[Dict[str, Any]], # This is already in the InternalMessageList-like format from Agent
+        tool_schemas: List[Dict[str, Any]],    # Tools formatted for the target provider
+        model_name: str,
+        ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
+        # Optional: temperature, max_tokens_llm if agent should control these per turn
+    ) -> Dict[str, Any]:
+        """
+        Handles the LLM API call for an agent turn USING THE EXISTING STREAMING INFRASTRUCTURE.
+        It collects the full response (text and tool calls) from the stream and
+        parses it into a standardized decision format for AgentMasterLoop.
+        """
+        self.safe_print(f"MCPC: Processing LLM turn for Agent via STREAMING. Model: {model_name}. Tools: {len(tool_schemas) if tool_schemas else 'None'}")
+        log.debug(f"MCPC: Agent turn - Prompt messages for LLM: {str(prompt_messages)[:500]}...")
+
+        # --- 1. MCPClient needs to temporarily set its internal conversation state ---
+        # This is because process_streaming_query uses self.conversation_graph.current_node.messages
+        # We'll save and restore the original conversation state.
+        original_graph_node_messages: Optional[List[Dict[str,Any]]] = None
+        original_graph_node_model: Optional[str] = None
+        agent_turn_temp_node_id = f"agent_turn_temp_{uuid.uuid4().hex[:8]}"  # noqa: F841
+
+        if hasattr(self, 'conversation_graph') and self.conversation_graph and self.conversation_graph.current_node:
+            # Save current conversational messages and model
+            original_graph_node_messages = self.conversation_graph.current_node.messages.copy()
+            original_graph_node_model = self.conversation_graph.current_node.model
+            # Temporarily set the messages for this agent turn
+            self.conversation_graph.current_node.messages = prompt_messages # prompt_messages are already in InternalMessage format
+            self.conversation_graph.current_node.model = model_name # Set model for this turn
+            log.debug(f"MCPC: Temporarily set conversation graph for agent turn (Node: {self.conversation_graph.current_node.id}).")
+        else:
+            # This case should ideally not happen if MCPClient is properly initialized.
+            log.error("MCPC: Conversation graph or current_node not available for agent LLM turn. This is unexpected.")
+            return {"decision": "error", "message": "Internal MCPClient state error: Conversation graph unavailable.", "error_type_for_agent": "InternalError"}
+
+        # --- 2. Variables to collect data from the stream ---
+        full_text_response_accumulated = ""
+        tool_calls_detected: List[Dict[str, Any]] = [] # To store parsed tool_call_end events
+        final_decision: Dict[str, Any] = {"decision": "error", "message": "No actionable response from LLM stream.", "error_type_for_agent": "LLMOutputError"}
+        llm_error_message: Optional[str] = None
+        llm_stop_reason: Optional[str] = None
+
+        try:
+            # --- 3. Call process_streaming_query and iterate through the _stream_wrapper ---
+            # The `process_streaming_query` itself determines the provider and formats messages/tools.
+            # We pass `model_name` to ensure it uses the agent's desired model.
+            # `max_tokens` and `temperature` from `self.config` will be used by default by `process_streaming_query`.
+            # If agent needs to override these, `process_streaming_query` would need to accept them.
+
+            async for event_type, event_data in self._stream_wrapper(
+                self.process_streaming_query(
+                    query="", # Query text is already part of prompt_messages
+                    model=model_name, # Explicitly use the agent's chosen model
+                    # max_tokens=max_tokens_for_llm, # If agent needs to control this
+                    # temperature=temperature_for_llm # If agent needs to control this
+                )
+            ):
+                # Relay specific events from the LLM stream to the UI WebSocket for the agent
+                if ui_websocket_sender:
+                    # Prefix event types to distinguish them from user-initiated query streams
+                    # e.g., "agent_llm_text_chunk", "agent_llm_tool_call_start", etc.
+                    if event_type in ["text_chunk", "tool_call_start", "tool_call_input_chunk", "tool_call_end", "status", "error", "final_stats"]:
+                        # The "final_stats" already includes "stop_reason"
+                        await ui_websocket_sender(f"agent_llm_{event_type}", event_data)
+                        
+                if event_type == "text_chunk":
+                    full_text_response_accumulated += str(event_data)
+                elif event_type == "tool_call_end": # We care about the fully formed tool call
+                    # event_data for tool_call_end is expected to be:
+                    # {"id": tool_id, "parsed_input": parsed_input_dict, "name": original_tool_name (added by _stream_wrapper or _handle_*_stream)}
+                    # The 'name' here should be the *original* (un-sanitized) tool name.
+                    tool_call_info = {
+                        "id": event_data.get("id"),
+                        "name": event_data.get("name"), # Original name
+                        "input": event_data.get("parsed_input")
+                    }
+                    if tool_call_info["id"] and tool_call_info["name"]:
+                        tool_calls_detected.append(tool_call_info)
+                        log.debug(f"MCPC (Agent Turn Stream): Detected tool_call_end: {tool_call_info}")
+                    else:
+                        log.warning(f"MCPC (Agent Turn Stream): tool_call_end event missing id or name: {event_data}")
+                elif event_type == "error":
+                    llm_error_message = str(event_data)
+                    log.error(f"MCPC (Agent Turn Stream): Error event received: {llm_error_message}")
+                    break # Stop processing stream on error
+                elif event_type == "final_stats": # Was "final_usage" and "stop_reason"
+                    llm_stop_reason = event_data.get("stop_reason", "unknown")
+                    # Token counts are already handled by self.session_input/output_tokens
+                    # within process_streaming_query and its helpers.
+                    log.debug(f"MCPC (Agent Turn Stream): Final stats received. Stop reason: {llm_stop_reason}")
+                    # Break after final_stats as it's the end of the stream events from _stream_wrapper
+                    break
+
+            # --- 4. Formulate the decision based on collected stream data ---
+            if llm_error_message:
+                final_decision = {"decision": "error", "message": llm_error_message, "error_type_for_agent": "LLMError"} # General LLM error
+            elif tool_calls_detected:
+                # If multiple tool calls are possible, AgentMasterLoop would need to handle a list.
+                # For now, assuming agent framework expects one primary tool call or will iterate.
+                # We'll pass all detected tool calls. Agent can decide.
+                # AgentMasterLoop expects a single tool_name and arguments.
+                # Let's make it return the first tool call if multiple, and log a warning.
+                if len(tool_calls_detected) > 1:
+                    log.warning(f"MCPC (Agent Turn): LLM decided multiple tool calls ({len(tool_calls_detected)}). Agent will receive the first: {tool_calls_detected[0]['name']}")
+                
+                first_tool_call = tool_calls_detected[0]
+                final_decision = {
+                    "decision": "call_tool",
+                    "tool_name": first_tool_call["name"], # Original name
+                    "arguments": first_tool_call["input"],
+                    "tool_use_id": first_tool_call["id"], # Pass the ID for linking results
+                    # Optionally include all tool calls if agent can handle it:
+                    # "all_tool_calls": tool_calls_detected
+                }
+            elif full_text_response_accumulated.lower().startswith("goal achieved:"):
+                summary = full_text_response_accumulated[len("goal achieved:") :].strip()
+                log.info(f"MCPC (Agent Turn): LLM signaled goal completion via stream: {summary}")
+                final_decision = {"decision": "complete", "summary": summary}
+            # Check for plan update in text (same logic as before)
+            elif "plan:" in full_text_response_accumulated.lower() or \
+                 "steps:" in full_text_response_accumulated.lower() or \
+                 "```json" in full_text_response_accumulated:
+                try:
+                    json_match = re.search(r"```json\s*([\s\S]*?)\s*```", full_text_response_accumulated)
+                    if json_match:
+                        plan_json_str = json_match.group(1)
+                        parsed_plan_list = json.loads(plan_json_str)
+                        if isinstance(parsed_plan_list, list):
+                            validated_steps = [PlanStep(**step_data) for step_data in parsed_plan_list]
+                            log.info(f"MCPC (Agent Turn): Parsed structured plan from LLM stream text ({len(validated_steps)} steps).")
+                            final_decision = {"decision": "plan_update", "updated_plan_steps": validated_steps, "original_text": full_text_response_accumulated}
+                        else: # Not a list of steps, treat as thought
+                            log.debug("MCPC (Agent Turn): JSON found in text but not a list of plan steps. Treating as thought.")
+                            final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
+                    else: # No JSON plan found, treat as thought
+                        final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
+                except (json.JSONDecodeError, ValidationError) as e:
+                    log.warning(f"MCPC (Agent Turn): Failed to parse plan from LLM stream text (error: {e}). Treating as thought. Text: {full_text_response_accumulated[:200]}...")
+                    final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
+            elif full_text_response_accumulated:
+                log.info(f"MCPC (Agent Turn): LLM stream response is textual thought/reasoning.")
+                final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
+            else: # No tool calls, no "goal achieved", no text with plan, no text at all
+                log.warning(f"MCPC (Agent Turn): LLM stream yielded no actionable content. Stop reason: {llm_stop_reason}")
+                final_decision = {"decision": "error", "message": f"LLM stream no actionable content. Stop: {llm_stop_reason}", "error_type_for_agent": "LLMOutputError"}
+
+        except asyncio.CancelledError:
+            log.warning("MCPC (Agent Turn): LLM turn processing cancelled.")
+            final_decision = {"decision": "error", "message": "LLM turn cancelled by MCPClient.", "error_type_for_agent": "CancelledError"}
+        except Exception as e:
+            log.error(f"MCPC (Agent Turn): Unexpected error processing LLM turn stream: {e}", exc_info=True)
+            final_decision = {"decision": "error", "message": f"Unexpected error processing LLM stream: {e}", "error_type_for_agent": "InternalError"}
+        finally:
+            # --- 5. Restore original conversation graph state ---
+            if hasattr(self, 'conversation_graph') and self.conversation_graph and self.conversation_graph.current_node:
+                if original_graph_node_messages is not None:
+                    self.conversation_graph.current_node.messages = original_graph_node_messages
+                if original_graph_node_model is not None:
+                    self.conversation_graph.current_node.model = original_graph_node_model
+                # Persist any modifications made by process_streaming_query to the temp node (if any)
+                # For agent turns, we typically don't want to save this temp state to the main graph file.
+                log.debug("MCPC: Restored original conversation graph state after agent LLM turn.")
+            else:
+                log.warning("MCPC: Could not restore conversation graph state, was not available.")
+
+        return final_decision
+
+    async def _initialize_agent_if_needed(self, default_llm_model_override: Optional[str] = None) -> bool:
+        """Initializes the AgentMasterLoop instance if not already done."""
+        if self.agent_loop_instance is None:
+            log.info("MCPC: Initializing AgentMasterLoop instance...")
+            ActualAgentMasterLoopClass = None # Initialize to None
+            try:
+                from agent_master_loop import AgentMasterLoop as AMLClass
+                ActualAgentMasterLoopClass = AMLClass # Assign to our variable
+                log.debug(f"MCPC: Successfully imported AgentMasterLoop as AMLClass: {type(ActualAgentMasterLoopClass)}")
+            except ImportError as ie:
+                log.critical(f"MCPC: CRITICAL - Failed to import AgentMasterLoop class from agent_master_loop.py: {ie}", exc_info=True)
+                self.agent_loop_instance = None
+                return False
+            
+            if ActualAgentMasterLoopClass is None or not callable(ActualAgentMasterLoopClass):
+                # This case should ideally be caught by ImportError, but as a safeguard:
+                log.critical(f"MCPC: CRITICAL - AgentMasterLoop was not a callable class after import. Type: {type(ActualAgentMasterLoopClass)}")
+                self.agent_loop_instance = None
+                return False
+
+            try:
+                agent_model_to_use = default_llm_model_override or self.current_model
+                # Now, use the explicitly imported class alias
+                self.agent_loop_instance = ActualAgentMasterLoopClass(
+                    mcp_client_instance=self, 
+                    default_llm_model_string=agent_model_to_use,
+                    agent_state_file=self.config.agent_state_file_path
+                )
+                if not await self.agent_loop_instance.initialize():
+                    self.agent_loop_instance = None 
+                    log.error("MCPC: AgentMasterLoop instance .initialize() method failed.")
+                    return False
+                log.info(f"MCPC: AgentMasterLoop initialized successfully with model {agent_model_to_use}.")
+                return True
+            except TypeError as te: # Catch TypeError specifically around instantiation
+                log.critical(f"MCPC: CRITICAL - TypeError during AgentMasterLoop instantiation: {te}. This might indicate the class was not imported correctly.", exc_info=True)
+                self.agent_loop_instance = None
+                return False
+            except Exception as e: # Catch other general exceptions during init
+                log.critical(f"MCPC: CRITICAL - Error initializing AgentMasterLoop instance: {e}", exc_info=True)
+                self.agent_loop_instance = None
+                return False
+        return True # Already initialized
+
+    async def start_agent_task(self, goal: str, max_loops: int = 100, llm_model_override: Optional[str] = None, ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None) -> Dict[str, Any]:
+        """
+        Starts the self-driving agent task in the background.
+        """
+        if self.agent_task and not self.agent_task.done():
+            log.warning("MCPC: Agent task is already running.")
+            return {"success": False, "message": "Agent is already running.", "status": self.agent_status}
+
+        if not await self._initialize_agent_if_needed(default_llm_model_override=llm_model_override):
+            return {"success": False, "message": "Agent initialization failed.", "status": "error"}
+
+        if not self.agent_loop_instance: # Should be caught by above, but defensive check
+            return {"success": False, "message": "Agent loop instance is not available.", "status": "error"}
+
+        self.agent_goal = goal
+        self.agent_status = "starting"
+        self.agent_last_message = "Agent task initiated."
+        self.agent_current_loop = 0
+        self.agent_max_loops = max_loops
+        self.agent_loop_instance.state.goal_achieved_flag = False # Reset flag for new run
+        agent_loop_instance_ref = self.agent_loop_instance # Capture current instance
+
+        async def agent_runner_wrapper():
+            try:
+                self.agent_status = "running"
+                log.info(f"MCPC Agent Task: Starting self-driving agent for goal: '{self.agent_goal}' (Max Loops: {max_loops})")
+                # The run_self_driving_agent now orchestrates calls to prepare_next_turn_data and execute_llm_decision
+                await self.run_self_driving_agent(
+                    agent_loop=agent_loop_instance_ref,
+                    overall_goal=self.agent_goal,
+                    max_agent_loops=max_loops,
+                    ui_websocket_sender=ui_websocket_sender
+                )
+                # After run_self_driving_agent finishes, check the agent's final state
+                if agent_loop_instance_ref.state.goal_achieved_flag:
+                    self.agent_status = "completed"
+                    self.agent_last_message = "Agent achieved its goal."
+                    log.info(f"MCPC Agent Task: Goal '{self.agent_goal}' achieved.")
+                elif agent_loop_instance_ref._shutdown_event.is_set():
+                    self.agent_status = "stopped"
+                    self.agent_last_message = "Agent task was stopped or shut down."
+                    log.info(f"MCPC Agent Task: Agent for goal '{self.agent_goal}' was stopped/shut down.")
+                else:
+                    self.agent_status = "max_loops_reached" # Or could be "failed" if errors occurred
+                    self.agent_last_message = f"Agent reached max loops ({max_loops}) or stopped for other reasons."
+                    log.info(f"MCPC Agent Task: Agent for goal '{self.agent_goal}' finished (max_loops or other).")
+
+            except asyncio.CancelledError:
+                self.agent_status = "stopped"
+                self.agent_last_message = "Agent task was cancelled."
+                log.info(f"MCPC Agent Task: Run for goal '{self.agent_goal}' cancelled.")
+                if agent_loop_instance_ref and not agent_loop_instance_ref._shutdown_event.is_set():
+                    await agent_loop_instance_ref.shutdown() # Ensure agent cleans up if wrapper cancelled
+            except Exception as e:
+                self.agent_status = "failed"
+                self.agent_last_message = f"Agent task failed: {str(e)[:100]}"
+                log.error(f"MCPC Agent Task: Error running agent for goal '{self.agent_goal}': {e}", exc_info=True)
+                if agent_loop_instance_ref and not agent_loop_instance_ref._shutdown_event.is_set():
+                    await agent_loop_instance_ref.shutdown() # Ensure agent cleans up on error
+            finally:
+                self.agent_current_loop = agent_loop_instance_ref.state.current_loop if agent_loop_instance_ref else self.agent_max_loops
+                # Don't clear self.agent_task here, status endpoint needs it to know if it was run
+
+        self.agent_task = asyncio.create_task(agent_runner_wrapper(), name=f"mcp_agent_task_{self.agent_goal[:20]}")
+        return {"success": True, "message": "Agent task started in background.", "status": self.agent_status}
+
+    async def stop_agent_task(self) -> Dict[str, Any]:
+        """
+        Stops the currently running self-driving agent task.
+        """
+        if not self.agent_task or self.agent_task.done():
+            log.info("MCPC: No active agent task to stop.")
+            return {"success": False, "message": "No active agent task to stop.", "status": self.agent_status}
+
+        log.info("MCPC: Attempting to stop agent task...")
+        self.agent_status = "stopping"
+        self.agent_last_message = "Agent stop requested."
+
+        # Signal the AgentMasterLoop to shut down first
+        if self.agent_loop_instance:
+            await self.agent_loop_instance.shutdown() # This sets its internal _shutdown_event
+
+        # Then, cancel the wrapper task in MCPClient
+        self.agent_task.cancel()
+        try:
+            await asyncio.wait_for(self.agent_task, timeout=15.0) # Give it time to clean up
+        except asyncio.CancelledError:
+            log.info("MCPC: Agent task successfully cancelled.")
+            self.agent_status = "stopped"
+            self.agent_last_message = "Agent task stopped successfully."
+        except asyncio.TimeoutError:
+            log.warning("MCPC: Timeout waiting for agent task to stop after cancellation. It might be stuck.")
+            self.agent_status = "stopping_timeout" # A special status
+            self.agent_last_message = "Agent task stop timed out."
+        except Exception as e:
+            log.error(f"MCPC: Error during agent task stop: {e}", exc_info=True)
+            self.agent_status = "error_stopping"
+            self.agent_last_message = f"Error stopping agent: {str(e)[:100]}"
+
+        return {"success": True, "message": self.agent_last_message, "status": self.agent_status}
+
+
+    def get_agent_status(self) -> Dict[str, Any]:
+        """
+        Returns the current status of the self-driving agent, including
+        details about its current plan and operational goal stack.
+        """
+        # Default values if agent_loop_instance is not available
+        current_loop = 0
+        max_loops_for_status = self.agent_max_loops # Use MCPClient's tracked max_loops
+        last_action_summary = "N/A"
+        current_plan_step_summary = "N/A"
+        current_plan_step_full = "N/A"
+        current_plan_step_dependencies = []
+        current_operational_goal_desc = "N/A"
+        current_operational_goal_id = None
+        agent_target_model_name = "N/A"
+        
+        current_plan_from_agent_for_api: List[Dict[str, Any]] = []
+        agent_operational_goal_stack_summary_for_api: List[Dict[str, Any]] = []
+
+        # Determine a base status_display from self.agent_status (MCPClient's view)
+        status_display_from_mcpc = "Idle" # Default display
+        if isinstance(self.agent_status, str): # Check if self.agent_status is a string
+            status_display_from_mcpc = self.agent_status.replace('_', ' ').title()
+        elif self.agent_status is not None: # If not a string but not None, stringify
+            status_display_from_mcpc = str(self.agent_status).replace('_', ' ').title()
+
+
+        if self.agent_loop_instance:
+            agent_state = self.agent_loop_instance.state
+            
+            current_loop = agent_state.current_loop
+            last_action_summary = agent_state.last_action_summary
+            agent_target_model_name = self.agent_loop_instance.agent_llm_model
+
+            if agent_state.current_plan:
+                current_plan_from_agent_for_api = [
+                    step.model_dump(exclude_none=True) for step in agent_state.current_plan
+                ]
+                if current_plan_from_agent_for_api: # Ensure plan is not empty before accessing index 0
+                    current_step_obj = agent_state.current_plan[0]
+                    current_plan_step_full = current_step_obj.description
+                    current_plan_step_summary = current_step_obj.description[:100] + ("..." if len(current_step_obj.description) > 100 else "")
+                    current_plan_step_dependencies = current_step_obj.depends_on
+                else: # Handle empty plan case
+                    current_plan_step_summary = "No current plan steps."
+                    current_plan_step_full = "No current plan steps."
+
+            if agent_state.current_goal_id and agent_state.goal_stack:
+                current_operational_goal_id = agent_state.current_goal_id
+                for goal_dict in reversed(agent_state.goal_stack): 
+                    if goal_dict.get("goal_id") == current_operational_goal_id:
+                        raw_desc = (goal_dict.get("description") or "Unnamed Operational Goal")
+                        current_operational_goal_desc = raw_desc # Keep full for title attribute, UI can truncate if needed
+                        break
+                
+                GOAL_STACK_SUMMARY_LIMIT_FOR_API = 5 
+                goals_to_summarize = agent_state.goal_stack[-GOAL_STACK_SUMMARY_LIMIT_FOR_API:]
+                for goal_dict in goals_to_summarize: 
+                    agent_operational_goal_stack_summary_for_api.append({
+                        "goal_id": goal_dict.get("goal_id", ""),
+                        "description": (goal_dict.get("description", "N/A")), # Send full, UI can truncate
+                        "status": goal_dict.get("status", "N/A")
+                    })
+            
+            # Refine status_display based on agent_loop_instance state if it's active
+            if bool(self.agent_task and not self.agent_task.done()):
+                 status_display_from_mcpc = f"Running (Loop {current_loop or 0}/{max_loops_for_status or 0})"
+            elif self.agent_status == 'completed': # Check MCPClient's agent_status
+                 status_display_from_mcpc = 'Goal Achieved!'
+            # Add other specific display statuses as needed based on self.agent_status
+
+        status_to_return = {
+            "agent_running": bool(self.agent_task and not self.agent_task.done()),
+            "status": self.agent_status, 
+            "status_display": status_display_from_mcpc, # Use the refined status_display
+
+            "current_goal_description_from_agent": self.agent_goal, 
+            
+            "agent_current_operational_goal_id": current_operational_goal_id,
+            "agent_current_operational_goal_description": current_operational_goal_desc, # Now full description
+            "agent_current_operational_goal_stack_summary": agent_operational_goal_stack_summary_for_api,
+
+            "current_loop": current_loop,
+            "max_loops": max_loops_for_status,
+            
+            "last_message": self.agent_last_message, 
+            "last_action_summary_from_agent": last_action_summary,
+            
+            "current_plan_step_from_agent": current_plan_step_summary, 
+            "current_plan_step_from_agent_full": current_plan_step_full, 
+            "current_plan_step_dependencies": current_plan_step_dependencies, 
+            "current_plan_from_agent": current_plan_from_agent_for_api,
+
+            "agent_target_model": agent_target_model_name
+        }
+        
+        return status_to_return
+
+    async def run_self_driving_agent(self, agent_loop: AgentMasterLoop, overall_goal: str, max_agent_loops: int, ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None):
+        """
+        Runs the agent in a self-driving (autonomous) mode.
+        This method orchestrates the interaction with AgentMasterLoop by preparing data,
+        invoking the LLM via the client's streaming mechanism, and passing the
+        decision back to the agent for execution.
+
+        Args:
+            agent_loop: An initialized instance of AgentMasterLoop.
+            overall_goal: The high-level goal for the agent to achieve.
+            max_agent_loops: The maximum number of turns the agent will run.
+        """
+        self.safe_print(f"\n[bold cyan]{EMOJI_MAP.get('robot', '🤖')} MCPC Driving Agent...[/]")
+        self.safe_print(f"Overall Goal (from MCPC): [yellow]{overall_goal}[/]")
+        self.safe_print(f"Max Loops (from MCPC): {max_agent_loops}")
+        log.info(f"MCPC: Orchestrating self-driving agent. Goal: '{overall_goal}', Max Loops: {max_agent_loops}")
+
+        if not agent_loop: # Simply check if the agent_loop instance itself is valid
+            self.safe_print("[bold red]Error: AgentMasterLoop instance is not valid for self-driving mode.[/]")
+            log.critical("MCPC: AgentMasterLoop instance is None or invalid in run_self_driving_agent.")
+            # Update MCPClient's view of the agent status if this happens
+            self.agent_status = "failed"
+            self.agent_last_message = "Agent loop instance was invalid."
+            return
+
+        # Main loop for agent turns, managed by MCPClient
+        for loop_num_mcp_managed in range(max_agent_loops):
+            # Check agent's internal shutdown/completion flags first
+            # Access agent_loop.state directly (it's the AgentMasterLoop instance)
+            if agent_loop._shutdown_event.is_set(): # agent_loop is the AgentMasterLoop instance
+                self.safe_print(f"MCPC: Agent shutdown signal detected at start of turn {loop_num_mcp_managed + 1}. Stopping agent.")
+                log.info(f"MCPC: Agent shutdown signal detected. Loop {loop_num_mcp_managed + 1}/{max_agent_loops}.")
+                self.agent_status = "stopped" # Update MCPClient's status
+                self.agent_last_message = "Agent shutdown signal."
+                break
+            if agent_loop.state.goal_achieved_flag: # agent_loop is the AgentMasterLoop instance
+                self.safe_print(f"MCPC: Agent signaled overall goal achievement at start of turn {loop_num_mcp_managed + 1}. Stopping agent.")
+                log.info(f"MCPC: Agent goal_achieved_flag is true. Loop {loop_num_mcp_managed + 1}/{max_agent_loops}.")
+                self.agent_status = "completed" # Update MCPClient's status
+                self.agent_last_message = "Agent achieved overall goal."
+                break
+
+            # Sync MCPClient's loop count view for agentStatus API (agent_loop manages its own internal state.current_loop)
+            self.agent_current_loop = loop_num_mcp_managed
+            current_aml_loop = agent_loop.state.current_loop + 1 # Get AML's internal next loop number
+            self.safe_print(f"\n--- MCPC: Starting Agent Turn {loop_num_mcp_managed + 1}/{max_agent_loops} (AML Internal Loop: {current_aml_loop}) ---")
+            log.info(f"MCPC: Beginning agent turn {loop_num_mcp_managed + 1}. AML Internal Loop: {current_aml_loop}.")
+            self.agent_status = "running" # Update MCPClient's status
+            self.agent_last_message = f"Executing turn {current_aml_loop}."
+
+            # 1. Agent prepares data for the LLM turn.
+            try:
+                # Call prepare_next_turn_data directly on the agent_loop instance
+                turn_data_for_llm = await agent_loop.prepare_next_turn_data(overall_goal)
+                if turn_data_for_llm is None: # This means agent decided to stop
+                    self.safe_print("MCPC: Agent signaled termination during its data preparation phase.")
+                    log.info("MCPC: AgentMasterLoop.prepare_next_turn_data returned None, signaling stop.")
+                    self.agent_status = "stopped" # Update MCPClient's status
+                    self.agent_last_message = "Agent preparation phase signaled stop."
+                    break
+            except asyncio.CancelledError:
+                self.safe_print("MCPC: Agent data preparation was cancelled. Stopping agent.")
+                log.info("MCPC: AgentMasterLoop.prepare_next_turn_data was cancelled.")
+                if not agent_loop._shutdown_event.is_set():
+                    await agent_loop.shutdown()
+                self.agent_status = "stopped" # Update MCPClient's status
+                self.agent_last_message = "Agent preparation cancelled."
+                break
+            except Exception as prep_err:
+                self.safe_print(f"[bold red]MCPC: Error during agent data preparation: {str(prep_err)[:200]}[/]")
+                log.error(f"MCPC: Critical error in agent_loop.prepare_next_turn_data: {prep_err}", exc_info=True)
+                self.agent_status = "failed" # Update MCPClient's status
+                self.agent_last_message = f"Preparation error: {str(prep_err)[:100]}"
+                if not agent_loop._shutdown_event.is_set():
+                    await agent_loop.shutdown()
+                break
+
+            prompt_messages = turn_data_for_llm[0]
+            tool_schemas = turn_data_for_llm[1]
+
+            # 2. MCPClient makes the LLM call
+            self.safe_print(f"MCPC: Requesting LLM decision (Model: {agent_loop.agent_llm_model})...")
+            self.agent_last_message = f"Requesting LLM decision for turn {current_aml_loop}..."
+            try:
+                llm_decision = await self.process_agent_llm_turn(
+                    prompt_messages=prompt_messages,
+                    tool_schemas=tool_schemas,
+                    model_name=agent_loop.agent_llm_model,
+                    ui_websocket_sender=ui_websocket_sender
+                )
+            except Exception as llm_call_err:
+                self.safe_print(f"[bold red]MCPC: Critical error calling LLM for agent: {str(llm_call_err)[:200]}[/]")
+                log.error(f"MCPC: Unhandled exception in self.process_agent_llm_turn: {llm_call_err}", exc_info=True)
+                llm_decision = {"decision": "error", "message": f"MCPClient failed to get LLM decision: {llm_call_err}", "error_type_for_agent": "MCPClientError"}
+                self.agent_status = "failed" # Update MCPClient's status
+                self.agent_last_message = f"LLM call error: {str(llm_call_err)[:100]}"
+                if not agent_loop._shutdown_event.is_set():
+                    await agent_loop.shutdown()
+                break
+
+            # 3. Agent executes the LLM decision.
+            decision_type_log = llm_decision.get('decision', 'unknown')
+            self.safe_print(f"MCPC: Passing LLM decision (type: {decision_type_log}) to agent for execution...")
+            log.debug(f"MCPC: LLM decision for agent: {str(llm_decision)[:300]}")
+            self.agent_last_message = f"Executing LLM decision (type: {decision_type_log}) for turn {current_aml_loop}..."
+            try:
+                # Call execute_llm_decision directly on the agent_loop instance
+                should_continue_loop = await agent_loop.execute_llm_decision(llm_decision)
+                
+                # Relay agent's internal action summary if sender available (AFTER execution)
+                if ui_websocket_sender and agent_loop and agent_loop.state.last_action_summary:
+                    activity_summary = agent_loop.state.last_action_summary
+                    await ui_websocket_sender("agent_activity_log", {
+                        "summary": activity_summary,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+
+                if not should_continue_loop:
+                    self.safe_print("MCPC: Agent signaled loop termination after executing decision.")
+                    log.info("MCPC: AgentMasterLoop.execute_llm_decision returned False (stop).")
+                    if not agent_loop.state.goal_achieved_flag:
+                        self.agent_status = "stopped"
+                        self.agent_last_message = "Agent decided to stop."
+                    # If goal_achieved_flag is true, status will be set later based on it.
+                    break
+            except asyncio.CancelledError:
+                self.safe_print("MCPC: Agent decision execution was cancelled. Stopping agent.")
+                log.info("MCPC: AgentMasterLoop.execute_llm_decision was cancelled.")
+                if not agent_loop._shutdown_event.is_set():
+                    await agent_loop.shutdown()
+                self.agent_status = "stopped"
+                self.agent_last_message = "Agent execution cancelled."
+                break
+            except Exception as exec_err:
+                self.safe_print(f"[bold red]MCPC: Error during agent decision execution: {str(exec_err)[:200]}[/]")
+                log.error(f"MCPC: Critical error in agent_loop.execute_llm_decision: {exec_err}", exc_info=True)
+                self.agent_status = "failed"
+                self.agent_last_message = f"Execution error: {str(exec_err)[:100]}"
+                if not agent_loop._shutdown_event.is_set():
+                    await agent_loop.shutdown()
+                break
+            
+            # Note: AgentMasterLoop.state.current_loop is incremented internally by agent_loop.execute_llm_decision upon success.
+
+            if agent_loop.state.goal_achieved_flag:
+                self.safe_print("MCPC: Agent goal_achieved_flag is now true after decision execution. Stopping.")
+                log.info("MCPC: Agent goal_achieved_flag became true. Loop will terminate.")
+                self.agent_status = "completed"
+                self.agent_last_message = "Agent achieved overall goal."
+                break
+
+            await asyncio.sleep(0.1) 
+
+        # --- Loop End ---
+        final_aml_loop_count = agent_loop.state.current_loop if agent_loop else 0
+        self.agent_current_loop = final_aml_loop_count # Ensure final sync for agentStatus API
+
+        # Update final status based on how the loop exited
+        if self.agent_status == "running": # If loop finished due to max_agent_loops
+            self.agent_status = "max_loops_reached"
+            self.agent_last_message = f"Agent reached max MCPC-driven loops ({max_agent_loops})."
+        
+        # Print final summary message
+        if self.agent_status == "completed":
+            self.safe_print(f"[bold green]{EMOJI_MAP.get('party_popper', '🎉')} Agent achieved its overall goal after {final_aml_loop_count} internal loops![/]")
+            log.info(f"MCPC: Agent run finished - goal achieved after {final_aml_loop_count} internal loops.")
+        elif self.agent_status == "stopped":
+            self.safe_print(f"[yellow]{EMOJI_MAP.get('cancel', '🛑')} Agent task stopped/cancelled after {final_aml_loop_count} internal loops.[/]")
+            log.info(f"MCPC: Agent run finished - stopped/cancelled after {final_aml_loop_count} internal loops.")
+        elif self.agent_status == "failed":
+            self.safe_print(f"[bold red]{EMOJI_MAP.get('collision', '💥')} Agent task failed after {final_aml_loop_count} internal loops.[/]")
+            log.info(f"MCPC: Agent run finished - failed after {final_aml_loop_count} internal loops.")
+        else: # Max loops reached or other states
+            self.safe_print(f"[yellow]{EMOJI_MAP.get('warning', '⚠️')} Agent run concluded after {final_aml_loop_count} internal loops. Final status: {self.agent_status}[/]")
+            log.info(f"MCPC: Agent run finished - {final_aml_loop_count} internal loops. Status: {self.agent_status}")
+
+        if agent_loop and not agent_loop._shutdown_event.is_set():
+            self.safe_print("MCPC: Ensuring final agent shutdown process...")
+            await agent_loop.shutdown()
+        elif not agent_loop:
+            log.warning("MCPC: Agent loop instance was None at end of run_self_driving_agent.")
+        else:
+            self.safe_print("MCPC: Agent already processing shutdown.")
+
+        self.safe_print(f"[bold cyan]{EMOJI_MAP.get('robot','🤖')} Self-Driving Agent Orchestration Concluded by MCPC.[/]")
+
 
     async def interactive_loop(self):
         """Runs the main interactive command loop with direct stream handling."""
@@ -11085,6 +11704,90 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     mcp_client.safe_print(f"{EMOJI_MAP['failure']} API Tool Execution Failed [bold]{tool_short_name}[/]: {str(e)}")
                     log.error(f"Error executing tool '{req.tool_name}' via API: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Tool execution failed: {str(e)}") from e
+
+            @app.post("/api/agent/start", status_code=202) # 202 Accepted for background task
+            async def start_agent_api(req: AgentStartRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
+                """Starts the self-driving agent with a given goal."""
+                if not hasattr(mcp_client, 'start_agent_task'): # Ensure method exists
+                    log.error("API: start_agent_task method not found on mcp_client.")
+                    raise HTTPException(status_code=501, detail="Agent functionality not fully implemented in server.")
+
+                log.info(f"API: Request to start agent. Goal: '{req.goal}', Max Loops: {req.max_loops}, Model: {req.llm_model or 'default'}")
+                result = await mcp_client.start_agent_task(
+                    goal=req.goal,
+                    max_loops=req.max_loops,
+                    llm_model_override=req.llm_model
+                )
+                if not result.get("success"):
+                    # Determine appropriate status code based on message
+                    status_code = 409 if "already running" in result.get("message","").lower() else 500
+                    log.warning(f"API: Failed to start agent: {result.get('message')}")
+                    raise HTTPException(status_code=status_code, detail=result.get("message", "Failed to start agent."))
+                log.info(f"API: Agent task successfully initiated. Current status: {result.get('status')}")
+                # Return current agent status along with success message
+                return {"message": result.get("message"), "agent_status": mcp_client.get_agent_status()}
+
+            @app.post("/api/agent/stop", status_code=200)
+            async def stop_agent_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                """Stops the currently running agent task."""
+                if not hasattr(mcp_client, 'stop_agent_task'):
+                    log.error("API: stop_agent_task method not found on mcp_client.")
+                    raise HTTPException(status_code=501, detail="Agent functionality not fully implemented.")
+
+                log.info("API: Request to stop agent.")
+                result = await mcp_client.stop_agent_task()
+                # stop_agent_task returns success even if no task was running to stop.
+                # The message indicates the outcome.
+                log.info(f"API: Agent stop process finished. Result message: {result.get('message')}")
+                return {"message": result.get("message"), "agent_status": mcp_client.get_agent_status()}
+
+
+            @app.post("/api/agent/inject_thought", status_code=202)
+            async def inject_thought_into_agent_api(
+                req: AgentInjectThoughtRequest,
+                mcp_client: MCPClient = Depends(get_mcp_client)
+            ):
+                """Injects a thought (guidance/observation) into a running agent."""
+                if not mcp_client.agent_loop_instance or \
+                   not mcp_client.agent_task or \
+                   mcp_client.agent_task.done():
+                    raise HTTPException(status_code=409, detail="Agent is not currently running or available.")
+
+                if not hasattr(mcp_client.agent_loop_instance, 'inject_manual_thought'):
+                    log.error("API: AgentMasterLoop instance is missing 'inject_manual_thought' method.")
+                    raise HTTPException(status_code=501, detail="Agent guidance injection not supported by current agent version.")
+
+                log.info(f"API: Injecting thought into agent: '{req.content[:50]}...' (Type: {req.thought_type})")
+                try:
+                    # The inject_manual_thought method in AML should handle UMS calls and potentially update agent's state or plan.
+                    success_inject = await mcp_client.agent_loop_instance.inject_manual_thought(
+                        content=req.content,
+                        thought_type=req.thought_type if req.thought_type else "user_guidance" # AML defaults if not provided
+                    )
+                    if success_inject:
+                        return {"success": True, "message": "Guidance injected into agent's reasoning process."}
+                    else:
+                        # This else implies inject_manual_thought returned False explicitly
+                        raise HTTPException(status_code=500, detail="Agent failed to process injected thought.")
+                except AttributeError as ae: # If method doesn't exist on old agent state
+                    log.error(f"API: Missing 'inject_manual_thought' on agent loop: {ae}")
+                    raise HTTPException(status_code=501, detail="Agent version does not support thought injection.") from ae
+                except Exception as e:
+                    log.error(f"API: Error injecting thought into agent: {e}", exc_info=True)
+                    raise HTTPException(status_code=500, detail=f"Error injecting thought: {str(e)}") from e
+                
+            @app.get("/api/agent/status") # No response_model needed here as it's dynamic
+            async def get_agent_status_api(mcp_client: MCPClient = Depends(get_mcp_client)):
+                """Gets the current status of the self-driving agent, including plan and goal stack."""
+                if not hasattr(mcp_client, 'get_agent_status'):
+                    log.error("API: get_agent_status method not found on mcp_client.")
+                    raise HTTPException(status_code=501, detail="Agent functionality not fully implemented.")
+                
+                # get_agent_status in MCPClient should now be expanded to include
+                # current_plan_from_agent and agent_current_operational_goal_stack_summary
+                status = mcp_client.get_agent_status()
+                log.debug(f"API: Polled agent status. Status: {status.get('status')}, Loop: {status.get('current_loop')}/{status.get('max_loops')}, Plan steps: {len(status.get('current_plan_from_agent',[]))}, Goal Stack Depth: {len(status.get('agent_current_operational_goal_stack_summary',[]))}")
+                return status
 
             @app.get("/api/conversation")
             async def get_conversation_api(mcp_client: MCPClient = Depends(get_mcp_client)):
@@ -12117,6 +12820,90 @@ async def _import_conv_async(file_path_str: str):
             await client.close()  # Close client if setup was performed
 
 
+
+async def main_async_agent_mode(initial_goal: str, max_loops: int, llm_model_for_agent: Optional[str], server_to_connect: Optional[str], verbose_logging_flag: bool, cleanup_servers_flag: bool):
+    """
+    Async entry point specifically for running the self-driving agent mode.
+    """
+    client = None
+    safe_console = get_safe_console()
+    max_shutdown_timeout = 10
+
+    try:
+        log.info("Initializing MCPClient for Agent Mode...")
+        client = MCPClient()
+        # Perform essential MCPClient setup (connect to UMS server, etc.)
+        # Interactive_mode=False as agent is self-driving
+        await client.setup(interactive_mode=False)
+
+        # Connect to a specific server if requested (e.g., the UMS server)
+        if server_to_connect:
+            log.info(f"Agent Mode: Attempting specific connection to server '{server_to_connect}'...")
+            if server_to_connect in client.config.servers:
+                if server_to_connect not in client.server_manager.active_sessions:
+                    connected = await client.connect_server(server_to_connect)
+                    if not connected:
+                        safe_console.print(f"[bold red]Agent Mode Error: Failed to connect to specified server '{server_to_connect}'. Aborting.[/]")
+                        return # Cannot proceed if essential server connection fails
+                else:
+                    log.info(f"Agent Mode: Specified server '{server_to_connect}' is already connected.")
+            else:
+                safe_console.print(f"[bold red]Agent Mode Error: Specified server '{server_to_connect}' not found in configuration. Aborting.[/]")
+                return
+
+        # Initialize the agent loop instance (now done within start_agent_task)
+        # Start the agent task using the MCPClient method
+        start_result = await client.start_agent_task(
+            goal=initial_goal,
+            max_loops=max_loops,
+            llm_model_override=llm_model_for_agent # Pass model if specified
+        )
+
+        if not start_result.get("success"):
+            safe_console.print(f"[bold red]Failed to start agent: {start_result.get('message')}[/]")
+            return
+
+        safe_console.print(f"[green]Agent task started for goal: '{initial_goal}'. Max loops: {max_loops}. Check logs/API for progress.[/]")
+
+        # Keep the main_async_agent_mode alive while the agent_task runs,
+        # allowing for graceful shutdown via Ctrl+C or API stop.
+        if client.agent_task:
+            try:
+                await client.agent_task # Wait for the agent task to complete
+                log.info("Agent task completed its run.")
+            except asyncio.CancelledError:
+                log.info("Agent task wait was cancelled (likely due to client.stop_agent_task or main shutdown).")
+            except Exception as e:
+                log.error(f"Agent task finished with an unexpected error: {e}", exc_info=True)
+        else:
+            log.error("Agent task was not successfully created or started.")
+
+
+    except KeyboardInterrupt:
+        safe_console.print("\n[yellow]Agent Mode Interrupted, shutting down...[/]")
+        if client and client.agent_task and not client.agent_task.done():
+            log.info("KeyboardInterrupt: Stopping agent task...")
+            await client.stop_agent_task()
+    except Exception as main_agent_err:
+        safe_console.print(f"[bold red]An unexpected error occurred in agent mode: {main_agent_err}[/]")
+        # Log full traceback for unexpected errors
+        log.error(f"Unexpected error in main_async_agent_mode: {main_agent_err}", exc_info=True)
+    finally:
+        if client:
+            log.info("Performing final cleanup for agent mode...")
+            try:
+                # Ensure agent is stopped if it was running and client is shutting down
+                if client.agent_task and not client.agent_task.done():
+                    log.warning("Client shutting down, ensuring agent task is stopped...")
+                    await client.stop_agent_task()
+                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout -1)
+            except asyncio.TimeoutError:
+                safe_console.print("[red]Agent mode shutdown timed out. Some processes may still be running.[/]")
+            except Exception as close_error:
+                log.error(f"Error during final agent mode cleanup: {close_error}", exc_info=True)
+        log.info("Agent mode application shutdown complete.")
+
+
 # =============================================================================
 # Typer Commands
 # =============================================================================
@@ -12135,11 +12922,14 @@ def run(
     webui_port: Annotated[int, typer.Option("--port", "-p", help="Port for the Web UI server.")] = 8880,
     serve_ui_file: Annotated[bool, typer.Option("--serve-ui", help="Serve the default HTML UI file from the current directory.")] = True,
     cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers on startup.")] = False,
+    agent_mode: Annotated[bool, typer.Option("--agent", "-a", help="Run in self-driving agent mode.")] = False,
+    agent_goal: Annotated[Optional[str], typer.Option("--agent-goal", "-g", help="The overall goal for the agent.")] = None,
+    agent_max_loops: Annotated[int, typer.Option("--agent-max-loops", "-l", help="Max loops for the agent to run.")] = 50, # Default to 50    
 ):
     """
-    Run the MCP client (Interactive, Single Query, Web UI, or Dashboard).
-
-    If no mode flag (--interactive, --query, --dashboard, --webui) is provided, defaults to interactive mode.
+    Run the MCP client (Interactive, Single Query, Web UI, Dashboard, or Self-Driving Agent).
+    If no mode flag is provided, defaults to interactive mode.
+    For agent mode, --agent-goal is required.
     """
     global USE_VERBOSE_SESSION_LOGGING
     if verbose_logging:
@@ -12147,31 +12937,51 @@ def run(
         log.setLevel(logging.DEBUG)
         stderr_console.print("[dim]Verbose logging enabled.[/dim]")
 
-    modes_selected = sum([dashboard, interactive, webui_flag, query is not None])
+    modes_selected = sum([dashboard, interactive, webui_flag, query is not None, agent_mode])
     actual_interactive = interactive
 
     if modes_selected > 1:
-        stderr_console.print("[bold red]Error: Please specify only one mode: --interactive, --query, --dashboard, or --webui.[/bold red]")
+        stderr_console.print("[bold red]Error: Please specify only one primary mode: --interactive, --query, --dashboard, --webui, or --agent.[/bold red]")
         raise typer.Exit(code=1)
     elif modes_selected == 0:
         stderr_console.print("[dim]No mode specified, defaulting to interactive mode.[/dim]")
-        actual_interactive = True
+        actual_interactive = True # Set interactive if no other mode chosen
 
-    # Always call main_async, it will handle the mode internally
-    asyncio.run(
-        main_async(
-            query=query,
-            model=model,
-            server=server,
-            dashboard=dashboard,
-            interactive=actual_interactive,
-            webui_flag=webui_flag,
-            webui_host=webui_host,
-            webui_port=webui_port,
-            serve_ui_file=serve_ui_file,
-            cleanup_servers=cleanup_servers,
+    if agent_mode and not agent_goal:
+        stderr_console.print("[bold red]Error: --agent-goal is required when using --agent mode.[/bold red]")
+        raise typer.Exit(code=1)
+
+    # Determine if we should run the agent_master_loop variant of main_async
+    if agent_mode:
+        # Call a new async entry point for agent mode
+        asyncio.run(
+            main_async_agent_mode(
+                initial_goal=agent_goal, # Will not be None due to check above
+                max_loops=agent_max_loops,
+                llm_model_for_agent=model, # Pass the --model if specified
+                # Pass other relevant flags if agent_master_loop needs them indirectly
+                # For now, these are mainly for MCPClient setup
+                server_to_connect=server,
+                verbose_logging_flag=verbose_logging,
+                cleanup_servers_flag=cleanup_servers,
+            )
         )
-    )
+    else:
+        # Call the existing main_async for other modes
+        asyncio.run(
+            main_async(
+                query=query,
+                model=model,
+                server=server,
+                dashboard=dashboard,
+                interactive=actual_interactive,
+                webui_flag=webui_flag,
+                webui_host=webui_host,
+                webui_port=webui_port,
+                serve_ui_file=serve_ui_file,
+                cleanup_servers=cleanup_servers,
+            )
+        )
 
 
 @app.command()
