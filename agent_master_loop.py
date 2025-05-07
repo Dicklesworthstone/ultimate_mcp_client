@@ -69,6 +69,7 @@ import logging
 import math
 import os
 import random
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -87,6 +88,16 @@ if TYPE_CHECKING:
 else:
     MCPClient = "MCPClient"
 
+class Provider(str, Enum):
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+    DEEPSEEK = "deepseek"
+    GEMINI = "gemini"
+    OPENROUTER = "openrouter"
+    GROK = "grok"
+    MISTRAL = "mistral"
+    GROQ = "groq"
+    CEREBRAS = "cerebras"
 
 # --- Workflow & Action Status (from UMS) ---
 class WorkflowStatus(str, Enum):
@@ -263,8 +274,8 @@ MAX_CONSECUTIVE_ERRORS = 3
 
 # UMS Tool constants (agent uses these to call specific UMS functions)
 TOOL_GET_WORKFLOW_DETAILS = "unified_memory:get_workflow_details"
-TOOL_GET_CONTEXT = "unified_memory:get_workflow_context"  # DEPRECATED IN FAVOR OF get_rich_context_package
-TOOL_GET_RICH_CONTEXT_PACKAGE = "unified_memory:get_rich_context_package"  # Main context tool
+TOOL_GET_CONTEXT = "unified_memory:get_workflow_context"  # DEPRECATED
+TOOL_GET_RICH_CONTEXT_PACKAGE = "unified_memory:get_rich_context_package"
 TOOL_CREATE_WORKFLOW = "unified_memory:create_workflow"
 TOOL_UPDATE_WORKFLOW_STATUS = "unified_memory:update_workflow_status"
 TOOL_RECORD_ACTION_START = "unified_memory:record_action_start"
@@ -296,23 +307,77 @@ TOOL_GET_MEMORY_BY_ID = "unified_memory:get_memory_by_id"
 TOOL_GET_LINKED_MEMORIES = "unified_memory:get_linked_memories"
 TOOL_LIST_WORKFLOWS = "unified_memory:list_workflows"
 TOOL_SUMMARIZE_TEXT = "unified_memory:summarize_text"
+TOOL_SUMMARIZE_CONTEXT_BLOCK = "unified_memory:summarize_context_block"
 TOOL_GET_GOAL_DETAILS = "unified_memory:get_goal_details"
 TOOL_CREATE_GOAL = "unified_memory:create_goal"
 TOOL_UPDATE_GOAL_STATUS = "unified_memory:update_goal_status"
+TOOL_GET_RECENT_ACTIONS = "unified_memory:get_recent_actions"
+TOOL_VISUALIZE_REASONING_CHAIN = "unified_memory:visualize_reasoning_chain"
+TOOL_VISUALIZE_MEMORY_NETWORK = "unified_memory:visualize_memory_network"
+TOOL_GENERATE_WORKFLOW_REPORT = "unified_memory:generate_workflow_report"
+TOOL_SAVE_COGNITIVE_STATE = "unified_memory:save_cognitive_state"
+TOOL_LOAD_COGNITIVE_STATE = "unified_memory:load_cognitive_state"
+TOOL_SEARCH_SEMANTIC_MEMORIES = "unified_memory:search_semantic_memories"
+TOOL_FOCUS_MEMORY = "unified_memory:focus_memory"
+
 AGENT_TOOL_UPDATE_PLAN = "agent:update_plan"  # Agent's internal tool
 
 BACKGROUND_TASK_TIMEOUT_SECONDS = 60.0
 MAX_CONCURRENT_BG_TASKS = 10
 
+AML_UMS_FUNCTION_NAME_MAP = {
+    TOOL_CREATE_WORKFLOW: "create_workflow",
+    TOOL_UPDATE_WORKFLOW_STATUS: "update_workflow_status",
+    TOOL_RECORD_ACTION_START: "record_action_start",
+    TOOL_RECORD_ACTION_COMPLETION: "record_action_completion",
+    TOOL_GET_ACTION_DETAILS: "get_action_details",
+    TOOL_ADD_ACTION_DEPENDENCY: "add_action_dependency",
+    TOOL_GET_ACTION_DEPENDENCIES: "get_action_dependencies",
+    TOOL_RECORD_ARTIFACT: "record_artifact",
+    TOOL_GET_ARTIFACTS: "get_artifacts",
+    TOOL_GET_ARTIFACT_BY_ID: "get_artifact_by_id",
+    TOOL_RECORD_THOUGHT: "record_thought",
+    TOOL_CREATE_THOUGHT_CHAIN: "create_thought_chain",
+    TOOL_GET_THOUGHT_CHAIN: "get_thought_chain",
+    TOOL_STORE_MEMORY: "store_memory",
+    TOOL_GET_MEMORY_BY_ID: "get_memory_by_id",
+    TOOL_CREATE_LINK: "create_memory_link",
+    TOOL_SEARCH_SEMANTIC_MEMORIES: "search_semantic_memories",
+    TOOL_QUERY_MEMORIES: "query_memories",
+    TOOL_HYBRID_SEARCH: "hybrid_search_memories",
+    TOOL_UPDATE_MEMORY: "update_memory",
+    TOOL_GET_LINKED_MEMORIES: "get_linked_memories",
+    TOOL_GET_WORKING_MEMORY: "get_working_memory",
+    TOOL_FOCUS_MEMORY: "focus_memory",
+    TOOL_OPTIMIZE_WM: "optimize_working_memory",
+    TOOL_SAVE_COGNITIVE_STATE: "save_cognitive_state",
+    TOOL_LOAD_COGNITIVE_STATE: "load_cognitive_state",
+    TOOL_AUTO_FOCUS: "auto_update_focus",
+    TOOL_PROMOTE_MEM: "promote_memory_level",
+    TOOL_CONSOLIDATION: "consolidate_memories",
+    TOOL_REFLECTION: "generate_reflection",
+    TOOL_SUMMARIZE_TEXT: "summarize_text",
+    TOOL_SUMMARIZE_CONTEXT_BLOCK: "summarize_context_block",
+    TOOL_DELETE_EXPIRED_MEMORIES: "delete_expired_memories",
+    TOOL_COMPUTE_STATS: "compute_memory_statistics",
+    TOOL_LIST_WORKFLOWS: "list_workflows",
+    TOOL_GET_WORKFLOW_DETAILS: "get_workflow_details",
+    TOOL_GET_RECENT_ACTIONS: "get_recent_actions", 
+    TOOL_VISUALIZE_REASONING_CHAIN: "visualize_reasoning_chain",
+    TOOL_VISUALIZE_MEMORY_NETWORK: "visualize_memory_network", 
+    TOOL_GENERATE_WORKFLOW_REPORT: "generate_workflow_report", 
+    TOOL_GET_RICH_CONTEXT_PACKAGE: "get_rich_context_package",
+    TOOL_CREATE_GOAL: "create_goal", 
+    TOOL_UPDATE_GOAL_STATUS: "update_goal_status",
+    TOOL_GET_GOAL_DETAILS: "get_goal_details" 
+}
 
 # --- LOCAL CUSTOM EXCEPTIONS ---
 class ToolError(Exception):
     pass
 
-
 class ToolInputError(ToolError):
     pass
-
 
 # ==========================================================================
 # LOCAL UTILITY CLASSES & HELPERS
@@ -569,120 +634,153 @@ class AgentMasterLoop:
         await self._save_agent_state()
         self.logger.info("Agent loop shutdown complete.")
 
-    def _construct_agent_prompt(self, goal: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _construct_agent_prompt(self, current_task_goal_desc: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # current_task_goal_desc: This is the overall goal passed from MCPC for a new run,
+        #                         OR the description of the current operational UMS goal if one is active.
+        #                         The prepare_next_turn_data method should determine this correctly.
+        
         system_blocks: List[str] = [
             f"You are '{AGENT_NAME}', an AI agent orchestrator using a Unified Memory System.",
-            "",
-            f"Overall Goal: {goal}",
+            "", # Blank line for readability in the raw prompt
         ]
 
-        # Extract current goal details from context (agent_assembled_goal_context)
-        current_goal_block = context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
-        if current_goal_block and isinstance(current_goal_block, dict):
-            desc = current_goal_block.get("description", "N/A")
-            gid = _fmt_id(current_goal_block.get("goal_id"))
-            status = current_goal_block.get("status", "N/A")
-            system_blocks.append(f"Current Goal: {desc} (ID: {gid}, Status: {status})")
+        agent_status_message = context.get("status_message_from_agent", "")
+        if "No Active Workflow" in agent_status_message or not self.state.workflow_id:
+            system_blocks.append(f"Current State: NO ACTIVE UMS WORKFLOW. Your immediate primary objective is to establish one using the task description below.")
+            system_blocks.append(f"Initial Overall Task Description: {current_task_goal_desc}") # Use the passed parameter
+            system_blocks.append(f"**Action Required: You MUST first call the '{TOOL_CREATE_WORKFLOW}' tool.** Use the 'Initial Overall Task Description' above as the 'goal' parameter for this tool. Provide a suitable 'title' (e.g., based on the task description).")
         else:
-            system_blocks.append("Current Goal: None specified (Focus on Overall Goal or plan step)")
+            # Existing logic for when a workflow IS active
+            # Display the UMS workflow's overarching goal
+            ums_workflow_goal = context.get('ums_context_package', {}).get('core_context', {}).get('workflow_goal', 'N/A')
+            system_blocks.append(f"Overall UMS Workflow Goal: {ums_workflow_goal}")
+
+            # Display the agent's current operational UMS goal from its assembled context
+            current_operational_goal_details = context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
+            if current_operational_goal_details and isinstance(current_operational_goal_details, dict):
+                desc = current_operational_goal_details.get("description", "N/A")
+                gid = _fmt_id(current_operational_goal_details.get("goal_id"))
+                status = current_operational_goal_details.get("status", "N/A")
+                system_blocks.append(f"Current Operational UMS Goal: {desc} (ID: {gid}, Status: {status})")
+            else:
+                # If no specific operational UMS goal, refer to the task description passed to this function
+                system_blocks.append(f"Current Operational Goal: None specified in UMS goal stack. Focus on achieving: {current_task_goal_desc}")
 
         system_blocks.append("")
-        system_blocks.append("Available Unified Memory & Agent Tools (Use ONLY these):")
+        system_blocks.append(f"Available Tools (Use ONLY these for UMS/Agent actions; format arguments per schema):")
 
         if not self.tool_schemas:
-            system_blocks.append("- CRITICAL WARNING: No tools loaded. Cannot function.")
+            system_blocks.append("- CRITICAL WARNING: No tools loaded into agent's schema list. Cannot function effectively.")
         else:
-            essential_cognitive_tools = {
-                TOOL_ADD_ACTION_DEPENDENCY,
-                TOOL_RECORD_ARTIFACT,
-                TOOL_HYBRID_SEARCH,
-                TOOL_STORE_MEMORY,
-                TOOL_UPDATE_MEMORY,
-                TOOL_CREATE_LINK,
-                TOOL_CREATE_THOUGHT_CHAIN,
-                TOOL_GET_THOUGHT_CHAIN,
-                TOOL_RECORD_THOUGHT,
-                TOOL_REFLECTION,
-                TOOL_CONSOLIDATION,
-                TOOL_PROMOTE_MEM,
-                TOOL_OPTIMIZE_WM,
-                TOOL_AUTO_FOCUS,
-                TOOL_GET_WORKING_MEMORY,
-                TOOL_QUERY_MEMORIES,
-                TOOL_SEMANTIC_SEARCH,
-                AGENT_TOOL_UPDATE_PLAN,
-                TOOL_CREATE_GOAL,
-                TOOL_UPDATE_GOAL_STATUS,
-                TOOL_GET_GOAL_DETAILS,
+            # Define essential tools based on their AML constants
+            essential_aml_tool_constants = {
+                TOOL_ADD_ACTION_DEPENDENCY, TOOL_RECORD_ARTIFACT, TOOL_HYBRID_SEARCH,
+                TOOL_STORE_MEMORY, TOOL_UPDATE_MEMORY, TOOL_CREATE_LINK,
+                TOOL_CREATE_THOUGHT_CHAIN, TOOL_GET_THOUGHT_CHAIN, TOOL_RECORD_THOUGHT,
+                TOOL_REFLECTION, TOOL_CONSOLIDATION, TOOL_PROMOTE_MEM, TOOL_OPTIMIZE_WM,
+                TOOL_AUTO_FOCUS, TOOL_GET_WORKING_MEMORY, TOOL_QUERY_MEMORIES,
+                TOOL_SEMANTIC_SEARCH, AGENT_TOOL_UPDATE_PLAN, TOOL_CREATE_GOAL,
+                TOOL_UPDATE_GOAL_STATUS, TOOL_GET_GOAL_DETAILS, TOOL_CREATE_WORKFLOW, # Ensure create_workflow is essential
+                TOOL_GET_RICH_CONTEXT_PACKAGE, # Essential for context gathering by AML
             }
             for schema in self.tool_schemas:
-                sanitized = schema["name"]
-                original = self.mcp_client.server_manager.sanitized_to_original.get(sanitized, sanitized)
-                desc = schema.get("description", "No description.")
-                is_essential = original in essential_cognitive_tools
+                # Determine the sanitized name the LLM sees
+                llm_seen_name = schema.get("name") # Anthropic style
+                if not llm_seen_name and schema.get("type") == "function": # OpenAI style
+                    llm_seen_name = schema.get("function", {}).get("name")
+                
+                if not llm_seen_name: continue # Should not happen if schema is valid
+
+                # Get original MCP name to check against essential_aml_tool_constants
+                # This original name could be "ServerName:unified_memory:tool" or "agent:tool"
+                original_mcp_name = self.mcp_client.server_manager.sanitized_to_original.get(llm_seen_name, llm_seen_name)
+
+                # Determine if essential by checking if any part of the original_mcp_name matches our TOOL_* constants
+                is_essential = False
+                # For AGENT_TOOL_UPDATE_PLAN
+                if original_mcp_name == AGENT_TOOL_UPDATE_PLAN and AGENT_TOOL_UPDATE_PLAN in essential_aml_tool_constants:
+                    is_essential = True
+                # For UMS tools (constants like "unified_memory:create_workflow")
+                else:
+                    for essential_const in essential_aml_tool_constants:
+                        if original_mcp_name.endswith(essential_const): # Check if "Server:unified_memory:tool".endswith("unified_memory:tool")
+                            is_essential = True
+                            break
+                
                 prefix = "**" if is_essential else ""
-                input_schema_str = json.dumps(schema.get("input_schema", schema.get("parameters", {})))
+                desc = schema.get("description", "No description.")
+                # For input_schema, Anthropic uses "input_schema", OpenAI uses "parameters" inside "function"
+                input_schema_obj = schema.get("input_schema")
+                if not input_schema_obj and schema.get("type") == "function":
+                    input_schema_obj = schema.get("function", {}).get("parameters")
+                
+                input_schema_str = json.dumps(input_schema_obj or {}) # Ensure it's always a dict
+
                 system_blocks.append(
-                    f"\n- {prefix}Name: `{sanitized}` (Represents: `{original}`){prefix}\n  Desc: {desc}\n  Schema: {input_schema_str}"
+                    f"\n- {prefix}Name: `{llm_seen_name}` (Represents Original MCP: `{original_mcp_name}`){prefix}\n  Desc: {desc}\n  Schema: {input_schema_str}"
                 )
         system_blocks.append("")
         system_blocks.extend(
             [
                 "Your Process at each step:",
-                "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details`), **goal stack (`agent_assembled_goal_context` -> `goal_stack_summary_from_agent_state`) and the `current_goal_details_from_ums`**, UMS package (`ums_context_package` containing core_context, working_memory, proactive/procedural memories, links), `current_plan`, `current_thought_chain_id`, and `meta_feedback`. Pay attention to `retrieved_at` timestamps for freshness.",
+                "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details`), **goal stack (`agent_assembled_goal_context` -> `goal_stack_summary_from_agent_state`) and the `current_goal_details_from_ums`**, UMS package (`ums_context_package`), `current_plan`, `current_thought_chain_id`, and `meta_feedback`. Pay attention to `retrieved_at` timestamps for freshness.",
                 "2.  Error Handling: If `last_error_details` exists, **FIRST** reason about the error `type` and `message`. Propose a recovery strategy. Refer to 'Recovery Strategies'.",
                 "3.  Reasoning & Planning:",
-                "    a. State step-by-step reasoning towards the Current Goal. Record key thoughts using `record_thought`.",
-                "    b. Evaluate `current_plan`. Is it aligned with the Current Goal? Valid? Addresses errors? Dependencies met?",
-                "    c. **Goal Management:** If Current Goal is too complex, use `unified_memory:create_goal` (providing `parent_goal_id` as `current_goal_id`). When a goal is met/fails, use `unified_memory:update_goal_status` with the `goal_id` and status.",
-                '    d. Action Dependencies: If Step B needs output from Step A (ID \'a123\'), include `"depends_on": ["a123"]` in B\'s plan object. Then use `unified_memory:add_action_dependency` UMS tool.',
-                "    e. Artifacts: Plan `unified_memory:record_artifact` for creations. Use `unified_memory:get_artifacts` or `unified_memory:get_artifact_by_id` for existing.",
-                "    f. Memory: Use `unified_memory:store_memory` for new facts/insights. Use `unified_memory:update_memory` for corrections.",
-                "    g. Thought Chains: Use `unified_memory:create_thought_chain` for distinct sub-problems.",
-                "    h. Linking: Use `unified_memory:create_memory_link` for relationships.",
-                "    i. Search: Prefer `unified_memory:hybrid_search_memories`. Use `unified_memory:search_semantic_memories` for pure conceptual similarity.",
-                "    j. Plan Update Tool: Use `agent:update_plan` ONLY for significant changes, error recovery, or fixing validation issues. Do NOT use for simple step completion.",
-                "4.  Action Decision: Choose ONE action based on the *first planned step*:",
-                "    *   Call UMS Tool: (e.g., `unified_memory:create_goal`, `unified_memory:store_memory`). Provide args per schema. **Mandatory:** Call `unified_memory:create_workflow` if context shows 'No Active Workflow'.",
-                "    *   Record Thought: Use `unified_memory:record_thought`.",
-                "    *   Update Plan Tool: Call `agent:update_plan` with the **complete, repaired** plan.",
-                "    *   Signal Completion: If Current Goal is MET (use `unified_memory:update_goal_status`) OR Overall Goal is MET (respond ONLY with 'Goal Achieved: ...summary...').",
-                "5.  Output Format: Respond ONLY with the valid JSON for the chosen tool call OR 'Goal Achieved: ...summary...' text.",
+                "    a. State step-by-step reasoning towards the Current Operational UMS Goal (or the Initial Overall Task if no UMS goal is active). Record key thoughts using `record_thought`.",
+                "    b. Evaluate `current_plan`. Is it aligned? Valid? Addresses errors? Dependencies met?",
+                f"    c. **Goal Management:** If Current Operational UMS Goal is too complex, use `{TOOL_CREATE_GOAL}` (providing `parent_goal_id` as current UMS goal ID). When a goal is met/fails, use `{TOOL_UPDATE_GOAL_STATUS}` with the UMS `goal_id` and status.",
+                f"    d. Action Dependencies: For plan steps, use `depends_on` with step IDs. Then use UMS `{TOOL_ADD_ACTION_DEPENDENCY}` (with UMS action IDs) if inter-action dependencies are needed.",
+                f"    e. Artifacts: Plan `{TOOL_RECORD_ARTIFACT}` for creations. Use `{TOOL_GET_ARTIFACTS}` or `{TOOL_GET_ARTIFACT_BY_ID}` for existing.",
+                f"    f. Memory: Use `{TOOL_STORE_MEMORY}` for new facts/insights. Use `{TOOL_UPDATE_MEMORY}` for corrections.",
+                f"    g. Thought Chains: Use `{TOOL_CREATE_THOUGHT_CHAIN}` for distinct sub-problems.",
+                f"    h. Linking: Use `{TOOL_CREATE_LINK}` for relationships between UMS memories.",
+                f"    i. Search: Prefer `{TOOL_HYBRID_SEARCH}`. Use `{TOOL_SEMANTIC_SEARCH}` for pure conceptual similarity.",
+                f"    j. Plan Update Tool: Use `{AGENT_TOOL_UPDATE_PLAN}` ONLY for significant changes, error recovery, or fixing validation issues. Do NOT use for simple step completion.",
+                "4.  Action Decision:",
+                f"    *   If NO ACTIVE UMS WORKFLOW: Your ONLY action MUST be to call `{TOOL_CREATE_WORKFLOW}`. Use 'Initial Overall Task Description' from above as the 'goal' parameter.",
+                "    *   If a workflow IS active: Choose ONE action based on the *first step in Current Plan*:",
+                f"        - Call a UMS Tool (e.g., `{TOOL_CREATE_GOAL}`, `{TOOL_STORE_MEMORY}`). Provide args per schema.",
+                f"        - Record Thought: Use `{TOOL_RECORD_THOUGHT}`.",
+                f"        - Update Plan Tool: Call `{AGENT_TOOL_UPDATE_PLAN}` with the **complete, repaired** plan if replanning is necessary.",
+                f"        - Signal Completion: If Current Operational UMS Goal is MET (use `{TOOL_UPDATE_GOAL_STATUS}`) OR if the Overall UMS Workflow Goal is MET (respond ONLY with 'Goal Achieved: ...summary...').",
+                "5.  Output Format: Respond ONLY with the valid JSON for the chosen tool call OR the 'Goal Achieved: ...summary...' text.",
             ]
         )
         system_blocks.extend(
             [
                 "\nKey Considerations:",
-                "*   Goal Focus: Always work towards the Current Goal. Use UMS goal tools.",
-                "*   Mental Momentum: Prioritize current plan steps if progress is steady.",
-                "*   Dependencies & Cycles: Ensure `depends_on` actions are complete. Avoid cycles.",
-                "*   UMS Context: Leverage the `ums_context_package` provided by the UMS.",
-                "*   Errors: Prioritize error analysis based on `last_error_details.type`.",
-                "*   User Guidance: Pay close attention to thoughts of type 'user_guidance' or memories of type 'user_input'. These are direct inputs from the operator and will likely require plan adjustments.*"
+                "*   Goal Focus: Always work towards the Current Operational UMS Goal. Use UMS goal tools.",
+                "*   Mental Momentum: Prioritize current plan steps if progress is steady and no errors/replans needed.",
+                "*   Dependencies & Cycles: Ensure `depends_on` actions (in plan or UMS) are complete. Avoid cycles.",
+                "*   UMS Context: Leverage the `ums_context_package` (core, working, proactive, procedural memories, links).",
+                "*   Errors: Prioritize error analysis based on `last_error_details.type` and `last_action_summary`.",
+                "*   User Guidance: Pay close attention to thoughts of type 'user_guidance' or memories of type 'user_input'. These are direct inputs from the operator and will likely require plan adjustments.",
             ]
         )
         system_blocks.extend(
             [
-                "\nRecovery Strategies based on `last_error_details.type`:",
-                "*   `InvalidInputError`: Review tool schema, args, context. Correct args and retry OR choose different tool/step.",
-                "*   `DependencyNotMetError`: Use `unified_memory:get_action_details` on dependency IDs. Adjust plan order (`agent:update_plan`) or wait.",
-                "*   `ServerUnavailable` / `NetworkError`: Tool's server might be down. Try different tool, wait, or adjust plan.",
-                "*   `APILimitError` / `RateLimitError`: External API busy. Plan to wait (record thought) before retry.",
-                "*   `ToolExecutionError` / `ToolInternalError`: Tool failed. Analyze message. Try different args, alternative tool, or adjust plan.",
-                "*   `PlanUpdateError`: Proposed plan structure was invalid. Re-examine plan and dependencies, try `agent:update_plan` again.",
-                "*   `PlanValidationError`: Proposed plan has logical issues (e.g., cycles). Debug dependencies, propose corrected plan using `agent:update_plan`.",
-                "*   `CancelledError`: Previous action cancelled. Re-evaluate current step.",
-                "*   `GoalManagementError`: Error managing UMS goal stack (e.g., marking non-existent goal). Review `agent_assembled_goal_context` and goal logic.",
-                "*   `UnknownError` / `UnexpectedExecutionError`: Analyze error message carefully. Simplify step, use different approach, or record_thought if stuck.",
+                # ... (Your existing Recovery Strategies section, ensuring tool names like unified_memory:get_action_details are correct based on TOOL_* constants) ...
+                 "\nRecovery Strategies based on `last_error_details.type`:",
+                f"*   `InvalidInputError`: Review tool schema, args, context. Correct args and retry OR choose different tool/step.",
+                f"*   `DependencyNotMetError`: Use `{TOOL_GET_ACTION_DETAILS}` on dependency IDs. Adjust plan order (`{AGENT_TOOL_UPDATE_PLAN}`) or wait.",
+                f"*   `ServerUnavailable` / `NetworkError`: Tool's server might be down. Try different tool, wait, or adjust plan.",
+                f"*   `APILimitError` / `RateLimitError`: External API busy. Plan to wait (record thought) before retry.",
+                f"*   `ToolExecutionError` / `ToolInternalError`: Tool failed. Analyze message. Try different args, alternative tool, or adjust plan.",
+                f"*   `PlanUpdateError`: Proposed plan structure was invalid. Re-examine plan and dependencies, try `{AGENT_TOOL_UPDATE_PLAN}` again.",
+                f"*   `PlanValidationError`: Proposed plan has logical issues (e.g., cycles). Debug dependencies, propose corrected plan using `{AGENT_TOOL_UPDATE_PLAN}`.",
+                f"*   `CancelledError`: Previous action cancelled. Re-evaluate current step.",
+                f"*   `GoalManagementError`: Error managing UMS goal stack (e.g., marking non-existent goal). Review `agent_assembled_goal_context` and goal logic.",
+                f"*   `UnknownError` / `UnexpectedExecutionError`: Analyze error message carefully. Simplify step, use different approach, or record_thought if stuck.",
             ]
         )
-        system_prompt = "\n".join(system_blocks)
+        system_prompt_str = "\n".join(system_blocks)
 
-        context_json = _truncate_context(context)
-        user_blocks = [
+        # User prompt construction
+        context_json_str = _truncate_context(context) # Ensure this helper is defined
+        user_prompt_blocks = [
             "Current Context:",
             "```json",
-            context_json,
+            context_json_str,
             "```",
             "",
             "Current Plan:",
@@ -693,30 +791,41 @@ class AgentMasterLoop:
             f"Last Action Summary:\n{self.state.last_action_summary}\n",
         ]
         if self.state.last_error_details:
-            user_blocks += [
+            user_prompt_blocks.extend([
                 "**CRITICAL: Address Last Error Details**:",
                 "```json",
                 json.dumps(self.state.last_error_details, indent=2, default=str),
                 "```",
                 "",
-            ]
+            ])
         if self.state.last_meta_feedback:
-            user_blocks += ["**Meta-Cognitive Feedback**:", self.state.last_meta_feedback, ""]
+            user_prompt_blocks.extend(["**Meta-Cognitive Feedback**:", self.state.last_meta_feedback, ""])
 
-        # Reiterate current goal from agent's assembled context for emphasis
-        current_goal_desc_for_prompt = "Overall Goal"
-        if context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums"):
-            cg_details = context["agent_assembled_goal_context"]["current_goal_details_from_ums"]
-            if isinstance(cg_details, dict) and cg_details.get("description"):
-                current_goal_desc_for_prompt = cg_details["description"]
+        # Reiterate current goal for emphasis, using the appropriately determined description
+        current_goal_desc_for_reminder = "Overall UMS Workflow Goal or Initial Task" # Default
+        if self.state.workflow_id: # If a workflow exists
+            current_op_goal_details_reminder = context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
+            if current_op_goal_details_reminder and isinstance(current_op_goal_details_reminder, dict) and current_op_goal_details_reminder.get("description"):
+                current_goal_desc_for_reminder = current_op_goal_details_reminder["description"]
+            elif context.get('ums_context_package', {}).get('core_context', {}).get('workflow_goal'): # Fallback to overall workflow goal
+                current_goal_desc_for_reminder = context['ums_context_package']['core_context']['workflow_goal']
+        else: # No workflow yet, use the initial task description
+            current_goal_desc_for_reminder = current_task_goal_desc
+        
+        user_prompt_blocks.append(f"Current Goal Reminder: {current_goal_desc_for_reminder}")
+        user_prompt_blocks.append("")
 
-        user_blocks += [
-            f"Current Goal Reminder: {current_goal_desc_for_prompt}",
-            "",
-            "Instruction: Analyze context & errors (use recovery strategies if needed). Reason step-by-step towards the Current Goal. Evaluate and **REPAIR** the plan if `needs_replan` is true or errors indicate plan issues (use `agent:update_plan`). Manage goals using UMS tools (`unified_memory:create_goal` or `unified_memory:update_goal_status`) if needed. Otherwise, decide ONE action based on the *first planned step*: call a UMS tool (output tool_use JSON), record a thought (`unified_memory:record_thought`), or signal completion (use `unified_memory:update_goal_status` for sub-goals or output 'Goal Achieved: ...' for overall goal).",
-        ]
-        user_prompt = "\n".join(user_blocks)
-        return [{"role": "user", "content": system_prompt + "\n---\n" + user_prompt}]
+        # Append the correct instruction text (already defined in your previous version, just ensure it's used)
+        final_instruction_text = ""
+        if not self.state.workflow_id:
+            final_instruction_text = f"Instruction: NO ACTIVE UMS WORKFLOW. Your first action MUST be to call '{TOOL_CREATE_WORKFLOW}'. Use the 'Initial Overall Task Description' from the system prompt as the 'goal' for this tool. Provide a suitable 'title'."
+        else:
+            final_instruction_text = f"Instruction: Analyze context & errors. Reason towards the Current Operational UMS Goal. Evaluate/repair plan if needed (`{AGENT_TOOL_UPDATE_PLAN}`). Manage UMS goals (`{TOOL_CREATE_GOAL}` or `{TOOL_UPDATE_GOAL_STATUS}`). Else, act on first plan step: call UMS tool, record thought (`{TOOL_RECORD_THOUGHT}`), or signal completion."
+        
+        user_prompt_blocks.append(final_instruction_text)
+        user_prompt_str = "\n".join(user_prompt_blocks)
+
+        return [{"role": "user", "content": system_prompt_str + "\n---\n" + user_prompt_str}]
 
     def _background_task_done(self, task: asyncio.Task) -> None:
         asyncio.create_task(self._background_task_done_safe(task))
@@ -1048,130 +1157,147 @@ class AgentMasterLoop:
         except Exception as e:
             self.logger.error(f"AML: Exception while injecting manual thought: {e}", exc_info=True)
             return False
-        
 
     async def initialize(self) -> bool:
-        self.logger.info("Initializing Agent loop …")
+        self.logger.info("🤖 AML: Initializing Agent Master Loop...")
         await self._load_agent_state()
+
         if self.state.workflow_id and not self.state.context_id:
             self.state.context_id = self.state.workflow_id
-            self.logger.info(f"Initialized context_id from workflow_id: {_fmt_id(self.state.workflow_id)}")
+            self.logger.info(f"🤖 AML: Initialized context_id from workflow_id: {_fmt_id(self.state.workflow_id)}")
+
         try:
-            if not self.mcp_client.server_manager:
-                self.logger.error("MCP Client server manager not init.")
+            if not self.mcp_client or not hasattr(self.mcp_client, 'server_manager') or not self.mcp_client.server_manager:
+                self.logger.error("🤖 AML ERROR: MCPClient or its ServerManager is not initialized.")
                 return False
 
-            # Determine the provider for the agent's LLM model
-            agent_provider = self.mcp_client.get_provider_from_model(self.agent_llm_model)
-            if not agent_provider:
-                self.logger.error(f"Could not determine provider for agent's model '{self.agent_llm_model}'. Cannot format tools.")
+            agent_provider_str = self.mcp_client.get_provider_from_model(self.agent_llm_model)
+            if not agent_provider_str:
+                self.logger.error(f"🤖 AML ERROR: Could not determine provider for agent's model '{self.agent_llm_model}'. Cannot format tools.")
                 return False
+            self.logger.debug(f"🤖 AML: Agent's LLM provider: '{agent_provider_str}' for model '{self.agent_llm_model}'.")
 
-            # Call MCPClient's method to get tools formatted for the agent's provider
-            # _format_tools_for_provider is a method of MCPClient, not ServerManager
-            all_formatted_tools = self.mcp_client._format_tools_for_provider(agent_provider) # Pass the determined provider
+            all_llm_formatted_tools = self.mcp_client._format_tools_for_provider(agent_provider_str)
+            if all_llm_formatted_tools is None: all_llm_formatted_tools = []
+            
+            self.logger.debug(f"🤖 AML: Received {len(all_llm_formatted_tools)} LLM-formatted tools from MCPClient.")
+            if all_llm_formatted_tools: self.logger.debug(f"🤖 AML: Sample LLM tool from MCPClient: {str(all_llm_formatted_tools[0])[:500]}")
 
-            if all_formatted_tools is None: # Can be None if no tools or formatting fails
-                all_formatted_tools = [] 
-                self.logger.warning(f"No tools formatted by MCPClient for provider '{agent_provider}'. Agent might have limited capabilities.")
+            s_to_o_map = self.mcp_client.server_manager.sanitized_to_original
+            self.logger.debug(f"🤖 AML: MCPClient's sanitized_to_original map (size {len(s_to_o_map)}). Sample: {dict(list(s_to_o_map.items())[:3])}")
 
             self.tool_schemas = [] 
-            loaded_tool_names = set() # This will store ORIGINAL MCP tool names that are kept
+            loaded_tool_constants = set() # Stores the TOOL_* CONSTANTS that are loaded
 
-            if all_formatted_tools: # Ensure it's not None
-                for llm_tool_schema in all_formatted_tools: # llm_tool_schema is what the LLM will see
-                    sanitized_name_for_llm = ""
+            if all_llm_formatted_tools:
+                self.logger.info(f"🤖 AML: Iterating {len(all_llm_formatted_tools)} LLM-formatted tools to identify UMS tools...")
+                for i, llm_tool_schema in enumerate(all_llm_formatted_tools):
+                    sanitized_name_llm_sees = ""
+                    # Extract sanitized name based on provider's schema structure
                     if isinstance(llm_tool_schema, dict):
-                        if "name" in llm_tool_schema: # Anthropic format
-                            sanitized_name_for_llm = llm_tool_schema["name"]
-                        elif "function" in llm_tool_schema and \
-                            isinstance(llm_tool_schema["function"], dict) and \
-                            "name" in llm_tool_schema["function"]: # OpenAI format
-                            sanitized_name_for_llm = llm_tool_schema["function"]["name"]
+                        if agent_provider_str == "anthropic":
+                            sanitized_name_llm_sees = llm_tool_schema.get("name", "")
+                        elif agent_provider_str in ["openai", "grok", "deepseek", "groq", "mistral", "cerebras", "gemini", "openrouter"]: # OpenAI compatible
+                            func_dict = llm_tool_schema.get("function")
+                            if isinstance(func_dict, dict): sanitized_name_llm_sees = func_dict.get("name", "")
+                            elif llm_tool_schema.get("type") == "function": sanitized_name_llm_sees = llm_tool_schema.get("name", "")
+                        else: # Fallback for unknown provider style
+                            sanitized_name_llm_sees = llm_tool_schema.get("name", "") 
                     
-                    if not sanitized_name_for_llm:
-                        self.logger.warning(f"AML Initialize: Skipping tool schema with unexpected structure or missing name: {str(llm_tool_schema)[:200]}")
+                    if not sanitized_name_llm_sees:
+                        self.logger.warning(f"🤖 AML (Schema {i+1}): Could not extract LLM tool name from schema. Skipping. Schema: {str(llm_tool_schema)[:200]}")
+                        continue
+                    
+                    original_mcp_name_from_map = s_to_o_map.get(sanitized_name_llm_sees)
+                    if not original_mcp_name_from_map:
+                        self.logger.warning(f"🤖 AML (Schema {i+1}): Original MCP name NOT FOUND in map for LLM tool name '{sanitized_name_llm_sees}'. Tool will be missed if it's a UMS tool.")
                         continue
 
-                    # Look up the original MCP name using the sanitized name from the LLM schema
-                    original_mcp_tool_name = self.mcp_client.server_manager.sanitized_to_original.get(sanitized_name_for_llm)
+                    # Extract the base function name from original_mcp_name_from_map (e.g., "create_workflow" from "ServerName:create_workflow")
+                    base_function_name = original_mcp_name_from_map.split(":")[-1]
 
-                    if original_mcp_tool_name:
-                        # Check the prefix of the ORIGINAL MCP name
-                        if original_mcp_tool_name.startswith("unified_memory:"):
-                            self.tool_schemas.append(llm_tool_schema) # Add the LLM-formatted schema
-                            loaded_tool_names.add(original_mcp_tool_name) # Track by original name
-                    # We will add AGENT_TOOL_UPDATE_PLAN separately as it's not from MCP server_manager
-                    # else: # If not found in map, it might be a tool not originating from MCP server (like agent:update_plan later)
-                    #    self.logger.debug(f"AML Initialize: Sanitized name '{sanitized_name_for_llm}' not in MCPClient's original name map. Likely an agent-internal tool or new.")
+                    # Check if this base_function_name corresponds to any UMS tool we care about
+                    found_aml_tool_constant = None
+                    for aml_const, ums_func_name in AML_UMS_FUNCTION_NAME_MAP.items():
+                        if ums_func_name == base_function_name:
+                            found_aml_tool_constant = aml_const
+                            break
+                    
+                    if found_aml_tool_constant:
+                        self.tool_schemas.append(llm_tool_schema) # Add the schema the LLM uses
+                        loaded_tool_constants.add(found_aml_tool_constant) # Add the AML's internal constant name
+                        self.logger.debug(f"🤖 AML: ADDED UMS Tool: '{found_aml_tool_constant}' (Original MCP: '{original_mcp_name_from_map}', LLM sees: '{sanitized_name_llm_sees}')")
+                    else:
+                        self.logger.debug(f"🤖 AML: SKIPPED non-mapped tool. Original MCP: '{original_mcp_name_from_map}', Base func: '{base_function_name}', LLM sees: '{sanitized_name_llm_sees}'")
+            else:
+                self.logger.info("🤖 AML: No LLM-formatted tools from MCPClient to process.")
 
-            # Now, add AGENT_TOOL_UPDATE_PLAN if it wasn't already processed (it shouldn't be in all_formatted_tools from MCPC)
-            # Construct its schema as the LLM needs to see it (this depends on the agent_provider)
-            plan_tool_llm_schema = { # Generic structure, adapt if provider needs specific 'type: function' wrapper
-                "name": AGENT_TOOL_UPDATE_PLAN,
-                "description": "Replace agent's current plan. Use for significant replanning, error recovery, or fixing validation issues.",
-                "input_schema": { # For Anthropic style
-                    "type": "object",
-                    "properties": {
-                        "plan": {
-                            "type": "array",
-                            "items": PlanStep.model_json_schema(), # Get Pydantic schema
-                            "description": "The new complete list of plan steps."
-                        }
-                    },
-                    "required": ["plan"],
-                }
+            # --- Add AGENT_TOOL_UPDATE_PLAN (Agent-internal tool) ---
+            plan_step_base_schema = PlanStep.model_json_schema()
+            if "title" in plan_step_base_schema: del plan_step_base_schema["title"]
+            update_plan_input_schema = {
+                "type": "object",
+                "properties": {"plan": {"type": "array", "items": plan_step_base_schema, "description": "The new complete list of plan steps for the agent."}},
+                "required": ["plan"],
             }
-            # If OpenAI provider, wrap in "function" and "parameters"
-            if agent_provider == "openai": # Assuming Provider.OPENAI.value is 'openai'
-                plan_tool_llm_schema = {
-                    "type": "function",
-                    "function": {
-                        "name": AGENT_TOOL_UPDATE_PLAN, # OpenAI sanitization rules apply
-                        "description": plan_tool_llm_schema["description"],
-                        "parameters": plan_tool_llm_schema["input_schema"]
-                    }
-                }
-            # Add other provider specific formatting for AGENT_TOOL_UPDATE_PLAN if necessary
+            agent_update_plan_sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", AGENT_TOOL_UPDATE_PLAN)[:64]
+            plan_tool_llm_schema_final = {}
+            plan_tool_description = "Replace agent's current plan. Use for significant replanning, error recovery, or fixing validation issues."
 
-            self.tool_schemas.append(plan_tool_llm_schema)
-            loaded_tool_names.add(AGENT_TOOL_UPDATE_PLAN) # Track it as loaded
+            if agent_provider_str == "anthropic":
+                plan_tool_llm_schema_final = {"name": agent_update_plan_sanitized_name, "description": plan_tool_description, "input_schema": update_plan_input_schema}
+            elif agent_provider_str in ["openai", "grok", "deepseek", "groq", "mistral", "cerebras", "gemini", "openrouter"]:
+                plan_tool_llm_schema_final = {"type": "function", "function": {"name": agent_update_plan_sanitized_name, "description": plan_tool_description, "parameters": update_plan_input_schema}}
+            else: 
+                self.logger.warning(f"🤖 AML WARNING: Unknown agent_provider '{agent_provider_str}' for AGENT_TOOL_UPDATE_PLAN schema. Defaulting to Anthropic style.")
+                plan_tool_llm_schema_final = {"name": agent_update_plan_sanitized_name, "description": plan_tool_description, "input_schema": update_plan_input_schema}
+            
+            self.tool_schemas.append(plan_tool_llm_schema_final)
+            loaded_tool_constants.add(AGENT_TOOL_UPDATE_PLAN) 
+            self.logger.debug(f"🤖 AML: ADDED agent-internal tool: '{AGENT_TOOL_UPDATE_PLAN}' (LLM sees: '{agent_update_plan_sanitized_name}')")
+            
+            self.logger.info(f"🤖 AML: Final {len(self.tool_schemas)} tool schemas prepared for LLM. Loaded AML tool constants: {sorted(loaded_tool_constants)}")
 
-            self.logger.info(f"AML: Loaded {len(self.tool_schemas)} relevant tool schemas for agent's LLM ({self.agent_llm_model} / {agent_provider}): {sorted(loaded_tool_names)}")
-
-            essential = [ # These are ORIGINAL MCP tool names
+            # --- Essential Tools Check (uses AML's TOOL_* constants) ---
+            essential_tool_constants = [ 
                 TOOL_CREATE_WORKFLOW, TOOL_RECORD_ACTION_START, TOOL_RECORD_ACTION_COMPLETION,
                 TOOL_RECORD_THOUGHT, TOOL_STORE_MEMORY, TOOL_GET_WORKING_MEMORY,
                 TOOL_HYBRID_SEARCH, TOOL_GET_RICH_CONTEXT_PACKAGE, TOOL_REFLECTION,
                 TOOL_CONSOLIDATION, TOOL_GET_WORKFLOW_DETAILS, TOOL_CREATE_GOAL,
                 TOOL_UPDATE_GOAL_STATUS, TOOL_GET_GOAL_DETAILS, AGENT_TOOL_UPDATE_PLAN,
             ]
-            missing = [t for t in essential if t not in loaded_tool_names] # Check against original names
+            missing_essential = [tc for tc in essential_tool_constants if tc not in loaded_tool_constants]
 
-            if missing:
-                self.logger.error(f"AML: Missing essential tools from available schemas: {missing}. Functionality WILL BE impaired.")
+            if missing_essential:
+                self.logger.error(f"🤖 AML ERROR: Missing essential tools (by AML constant name): {missing_essential}. Functionality WILL BE impaired.")
+                self.logger.error(f"🤖 AML INFO: AML tool constants that WERE successfully loaded: {loaded_tool_constants}")
+            else:
+                self.logger.info("🤖 AML: All essential tools (by AML constant name) appear to be loaded.")
 
-            # Rest of the initialization (workflow check, goal stack validation, default thought chain)
+            # ... (rest of your existing initialize method: top_wf check, _validate_goal_stack_on_load, _set_default_thought_chain_id) ...
             top_wf = (self.state.workflow_stack[-1] if self.state.workflow_stack else None) or self.state.workflow_id
             if top_wf and not await self._check_workflow_exists(top_wf):
-                self.logger.warning(f"AML: Stored workflow '{_fmt_id(top_wf)}' not found; resetting workflow state.")
+                self.logger.warning(f"🤖 AML WARNING: Stored workflow '{_fmt_id(top_wf)}' not found in UMS; resetting agent's workflow state.")
                 preserved_stats = self.state.tool_usage_stats
                 pres_ref_thresh = self.state.current_reflection_threshold
                 pres_con_thresh = self.state.current_consolidation_threshold
                 self.state = AgentState(
-                    tool_usage_stats=preserved_stats, current_reflection_threshold=pres_ref_thresh, current_consolidation_threshold=pres_con_thresh
+                    tool_usage_stats=preserved_stats, 
+                    current_reflection_threshold=pres_ref_thresh, 
+                    current_consolidation_threshold=pres_con_thresh
                 )
-                await self._save_agent_state()
+                await self._save_agent_state() 
             
             await self._validate_goal_stack_on_load()
             
             if self.state.workflow_id and not self.state.current_thought_chain_id:
                 await self._set_default_thought_chain_id()
             
-            self.logger.info("Agent loop initialization complete.")
+            self.logger.info("🤖 AML: Agent Master Loop initialization complete.")
             return True
+            
         except Exception as e:
-            self.logger.critical(f"Agent loop init failed: {e}", exc_info=True)
+            self.logger.critical(f"🤖 AML CRITICAL: Agent loop initialization failed with an unhandled exception: {e}", exc_info=True)
             return False
 
 
@@ -2691,33 +2817,45 @@ class AgentMasterLoop:
             - agent_context_snapshot (Dict): The full context dictionary that was used to build the prompt.
                                             (MCPClient might use this for logging or its own UI).
         """
-        self.logger.info(
-            f"AML: Preparing next turn data for Loop {self.state.current_loop} (WF: {_fmt_id(self.state.workflow_id)}, Goal: {_fmt_id(self.state.current_goal_id)})"
-        )
-
-        # 1. Periodic Cognitive Tasks (Run before gathering context for the turn)
-        #    This ensures meta-cognitive outputs can influence the current turn.
+        # 1. Periodic Cognitive Tasks
         try:
             await self._run_periodic_tasks()
         except Exception as e:
             self.logger.error(f"AML: Error during periodic tasks: {e}", exc_info=True)
         if self._shutdown_event.is_set():
-            # If shutdown, return empty/signal to stop
             raise asyncio.CancelledError("AML shutdown during periodic tasks in prepare_next_turn_data")
 
-
         # 2. Gather Context
-        agent_context_snapshot = await self._gather_context()
-        if not self.state.workflow_id: # Check if workflow ended
-            self.logger.info("AML: No active workflow after context gathering. Signaling to stop.")
-            raise asyncio.CancelledError("AML: No active workflow, cannot prepare turn.") # Or a custom exception
+        agent_context_snapshot = await self._gather_context() # _gather_context will set a status if no WF
+
+        # DO NOT raise CancelledError here if workflow_id is None.
+        # The LLM needs to be prompted to create one if it's the first turn.
+        if not self.state.workflow_id:
+            self.logger.info("AML: No active workflow ID in state. Agent will be prompted to create one.")
+            # The agent_context_snapshot will contain "status_message_from_agent": "No Active Workflow."
+            # which _construct_agent_prompt should use.
 
         # 3. Construct Prompt
-        if not self.state.needs_replan: # Clear previous error if not actively replanning for it
+        # Clear previous error only if not actively replanning for it AND a workflow exists.
+        # If no workflow, there's no plan yet to need replanning for.
+        if not self.state.needs_replan and self.state.workflow_id: 
             self.state.last_error_details = None
-        prompt_messages_for_llm = self._construct_agent_prompt(overall_goal, agent_context_snapshot)
+        
+        # Pass the overall_goal from the MCPClient to be used if it's the first run.
+        # The _construct_agent_prompt should use self.state.current_goal_id if available,
+        # otherwise, it might use this overall_goal.
+        prompt_goal_to_use = overall_goal 
+        if self.state.current_goal_id and self.state.goal_stack:
+            # Try to get the description of the current operational goal
+            current_op_goal_obj = next((g for g in reversed(self.state.goal_stack) if g.get("goal_id") == self.state.current_goal_id), None)
+            if current_op_goal_obj and current_op_goal_obj.get("description"):
+                prompt_goal_to_use = current_op_goal_obj.get("description")
+            elif self.state.workflow_id: # If current_goal_id exists but not in stack, use overall_goal
+                 self.logger.warning(f"AML: Current goal ID {_fmt_id(self.state.current_goal_id)} not found in stack for prompt. Using overall_goal.")
+        elif not self.state.workflow_id:
+            self.logger.info(f"AML: No workflow, using initial overall_goal for prompt: '{overall_goal[:50]}...'")
 
-        # Tool schemas are already loaded in self.tool_schemas during agent.initialize()
+        prompt_messages_for_llm = self._construct_agent_prompt(prompt_goal_to_use, agent_context_snapshot)
         return prompt_messages_for_llm, self.tool_schemas, agent_context_snapshot
 
 
@@ -2920,24 +3058,6 @@ class AgentMasterLoop:
             # Potentially set error state and allow MCPClient to decide if it retries or stops agent
             self.state.last_error_details = {"error": f"Context/Prompt prep error: {e}", "type": "AgentError"}
             return # Stop this turn
-
-        # 2. MCPClient makes the LLM call and gets a decision
-        # This step is now OUTSIDE AgentMasterLoop.run_main_loop.
-        # MCPClient will call:
-        #   llm_decision = await self.mcp_client.process_agent_llm_turn(prompt_messages, tool_schemas, self.agent_llm_model)
-
-        # 3. AgentMasterLoop executes the decision (this part is called by MCPClient after it gets LLM decision)
-        # For now, this method `run_main_loop` will effectively *return* the necessary data
-        # to `MCPClient` so that `MCPClient` can make the LLM call.
-        # The result of the LLM call would then be passed back to a different method like `execute_llm_decision`.
-
-        # So, `run_main_loop` should now probably be split or its responsibility changed.
-        # Let's assume MCPClient calls:
-        #   `prompt_messages, tool_schemas, agent_context = await agent_loop.prepare_next_turn_data(initial_goal)`
-        # Then MCPClient does its LLM call.
-        # Then MCPClient calls:
-        #   `should_continue = await agent_loop.execute_llm_decision(llm_decision)`
-        # And MCPClient uses `should_continue` to decide whether to call `prepare_next_turn_data` again.
 
         # For the purpose of this refactoring, `run_main_loop` will just prepare and return.
         self.logger.info(f"AML: Data prepared for MCPClient to make LLM call for loop {self.state.current_loop}.")

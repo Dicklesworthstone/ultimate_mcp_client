@@ -3972,7 +3972,11 @@ class ServerManager:
                 except Exception as e:
                     log.warning(f"Failed to start trace span: {e}")
                     span = span_context_manager = None
-
+                finally:
+                    if span_context_manager and hasattr(span_context_manager, "__exit__"):
+                        with suppress(Exception): 
+                            span_context_manager.__exit__(*sys.exc_info())
+                            
                 try:
                     # --- Main Connection Attempt ---
                     self._safe_printer(
@@ -6372,7 +6376,8 @@ class MCPClient:
 
     async def set_active_model(self, model_name: str, source: str = "CLI") -> bool:
         """
-        Sets the active model AND provider, updates the default config, and saves.
+        Sets the active model AND 
+        , updates the default config, and saves.
 
         Args:
             model_name: The name of the model to set.
@@ -9601,7 +9606,7 @@ class MCPClient:
                             "tools": formatted_tools,
                             "max_tokens": max_tokens or self.config.default_max_tokens, # Use correct default
                             "temperature": self.config.temperature,
-                            "stream": True, # Anthropic SDK uses stream=True in messages.stream
+                            # "stream": True, # Anthropic SDK uses stream=True in messages.stream
                         }
                         if system_prompt: stream_params["system"] = system_prompt
                         stream_manager = anthropic_client.messages.stream(**stream_params)
@@ -11573,29 +11578,49 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     log.error(f"Data validation error for server '{decoded_server_name}' details: {e}")
                     raise HTTPException(status_code=500, detail="Internal error retrieving server details.") from e
 
-            @app.get("/api/tools")
+            @app.get("/api/tools") # Keep the original endpoint for now
             async def list_tools_api(
-                server_name: Optional[str] = None,  # Add optional query parameter
+                server_name: Optional[str] = None,
+                provider_for_format: Optional[str] = None, # ADD THIS QUERY PARAM
                 mcp_client: MCPClient = Depends(get_mcp_client),
             ):
-                """Lists available tools, optionally filtered by server_name."""
-                tools_list = []
-                # Sort tools by name before potential filtering
-                sorted_tools = sorted(mcp_client.server_manager.tools.values(), key=lambda t: t.name)
-                for tool in sorted_tools:
-                    # Apply filter if provided
-                    if server_name is None or tool.server_name == server_name:
-                        tool_data = {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "server_name": tool.server_name,
-                            "input_schema": tool.input_schema,
-                            "call_count": tool.call_count,
-                            "avg_execution_time": tool.avg_execution_time,
-                            "last_used": tool.last_used.isoformat() if isinstance(tool.last_used, datetime) else None,
-                        }
-                        tools_list.append(tool_data)
-                return tools_list  # Return the filtered list
+                """Lists available tools, optionally filtered by server_name.
+                If provider_for_format is given, returns tools formatted for that provider."""
+                
+                if provider_for_format: # If a provider is specified for formatting
+                    log.info(f"API: Request to list tools formatted for provider: {provider_for_format}")
+                    # Ensure provider_for_format is a valid provider string if necessary
+                    try:
+                        Provider(provider_for_format.lower()) # Validate
+                    except ValueError as e:
+                        raise HTTPException(status_code=400, detail=f"Invalid provider_for_format: {provider_for_format}") from e
+                    
+                    formatted_tools = mcp_client._format_tools_for_provider(provider_for_format.lower())
+                    if formatted_tools is None:
+                        return [] # Or an appropriate empty response
+                    # Log a sample of what's being returned for verification
+                    log.debug(f"API: Returning {len(formatted_tools)} tools formatted for '{provider_for_format}'. Sample: {str(formatted_tools[:2])[:500]}")
+                    # Also log the sanitized_to_original map that was just populated
+                    s_to_o_map_snapshot = mcp_client.server_manager.sanitized_to_original.copy()
+                    log.debug(f"API: Current sanitized_to_original map (size {len(s_to_o_map_snapshot)}): {str(s_to_o_map_snapshot)[:1000]}...")
+                    return formatted_tools # Return the directly formatted list
+                else:
+                    # Original logic for generic tool listing
+                    tools_list = []
+                    sorted_tools = sorted(mcp_client.server_manager.tools.values(), key=lambda t: t.name)
+                    for tool in sorted_tools:
+                        if server_name is None or tool.server_name == server_name:
+                            tool_data = { # ... existing generic tool_data ... }
+                                "name": tool.name, # Original MCP name
+                                "description": tool.description,
+                                "server_name": tool.server_name,
+                                "input_schema": tool.input_schema,
+                                "call_count": tool.call_count,
+                                "avg_execution_time": tool.avg_execution_time,
+                                "last_used": tool.last_used.isoformat() if isinstance(tool.last_used, datetime) else None,
+                            }
+                            tools_list.append(tool_data)
+                    return tools_list
 
             @app.get("/api/tools/{tool_name:path}/schema")
             async def get_tool_schema_api(tool_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):
