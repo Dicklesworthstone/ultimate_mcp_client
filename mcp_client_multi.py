@@ -744,6 +744,9 @@ sigint_handler.counter = 0
 signal.signal(signal.SIGINT, sigint_handler)
 atexit.register(atexit_handler)
 
+def _fmt_id(val: Any, length: int = 8) -> str:
+    s = str(val) if val is not None else "?"
+    return s[:length] if len(s) >= length else s
 
 # --- Pydantic Models (ServerAddRequest, ConfigUpdateRequest, etc. - Update ConfigUpdateRequest) ---
 class WebSocketMessage(BaseModel):
@@ -3976,7 +3979,7 @@ class ServerManager:
                     if span_context_manager and hasattr(span_context_manager, "__exit__"):
                         with suppress(Exception): 
                             span_context_manager.__exit__(*sys.exc_info())
-                            
+
                 try:
                     # --- Main Connection Attempt ---
                     self._safe_printer(
@@ -9446,9 +9449,27 @@ class MCPClient:
             log.error(f"Error during auto-pruning: {e}", exc_info=True)
             self.safe_print(f"[red]Error during automatic context pruning: {e}[/]")
 
+    async def _relay_agent_llm_event_to_ui(self, sender: Callable[[str, Any], Coroutine], event_type: str, event_data: Any):
+        """Safely sends an agent's LLM event to the UI via the provided sender."""
+        if not sender: return
+        try:
+            # Prefix event types for agent's LLM stream to distinguish from user's query stream
+            prefixed_event_type = f"agent_llm_{event_type}" if not event_type.startswith("agent_llm_") else event_type
+            
+            # For 'status' events, ensure data is a string or simple dict for JSON serialization
+            payload_to_send = event_data
+            if prefixed_event_type == "agent_llm_status" and not isinstance(event_data, (str, dict)):
+                payload_to_send = {"text": str(event_data)}
+            elif prefixed_event_type == "agent_llm_error" and not isinstance(event_data, (str, dict)):
+                 payload_to_send = {"message": str(event_data)}
+
+
+            await sender(prefixed_event_type, payload_to_send)
+        except Exception as e:
+            log.warning(f"MCPC: Error relaying agent LLM event '{prefixed_event_type}' to UI: {e}", exc_info=False)
 
     async def process_streaming_query(
-        self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None
+        self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None, ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None
     ) -> AsyncGenerator[Tuple[str, Any], None]:
         """
         Process a query using the specified model and available tools with streaming.
@@ -9582,6 +9603,26 @@ class MCPClient:
                 tools_len_str = str(len(formatted_tools)) if formatted_tools else "0"
                 log.debug(f"[{provider_name}] Turn Start: Msgs={len(formatted_messages)}, Tools={tools_len_str}")
 
+                # +++++ ADDED DETAILED PROMPT LOGGING HERE +++++
+                log.info(f"MCPC: Sending to LLM Provider '{provider_name}', Model '{actual_model_name_string}'.")
+                log.debug(f"MCPC: SYSTEM PROMPT FOR LLM:\n----\n{system_prompt}\n----")
+                try:
+                    messages_json_for_log = json.dumps(formatted_messages, indent=2, ensure_ascii=False)
+                    log.debug(f"MCPC: MESSAGES FOR LLM (length {len(formatted_messages)}):\n----\n{messages_json_for_log}\n----")
+                except Exception as json_err:
+                    log.error(f"MCPC: Could not serialize messages for LLM logging: {json_err}")
+                    log.debug(f"MCPC: MESSAGES FOR LLM (raw object, length {len(formatted_messages)}):\n----\n{formatted_messages}\n----")
+                
+                if formatted_tools:
+                    try:
+                        tools_json_for_log = json.dumps(formatted_tools, indent=2, ensure_ascii=False)
+                        log.debug(f"MCPC: TOOLS FOR LLM (count {len(formatted_tools)}):\n----\n{tools_json_for_log[:2000]}...\n----") # Log first 2000 chars
+                    except Exception as json_err:
+                         log.error(f"MCPC: Could not serialize tools for LLM logging: {json_err}")
+                else:
+                    log.debug("MCPC: No tools sent to LLM for this turn.")
+                # +++++ END DETAILED PROMPT LOGGING +++++
+
                 if not formatted_messages and provider_name != Provider.ANTHROPIC.value:
                      log.error(f"Error preparing API call for {provider_name}: Formatted messages list is empty.")
                      yield "error", "Internal Error: No messages to send to the LLM after formatting."
@@ -9614,6 +9655,7 @@ class MCPClient:
                             stream_iterator = self._handle_anthropic_stream(api_stream)
                             async for std_event_type, std_event_data in stream_iterator:
                                 if current_task.cancelled(): raise asyncio.CancelledError("Query cancelled during stream")
+                                if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "anthropic_stream_event", {"type": std_event_type, "data": std_event_data})
                                 if std_event_type == "error": turn_api_error = str(std_event_data); break
                                 # --- Event Processing (Anthropic) ---
                                 elif std_event_type == "text_chunk": accumulated_text_this_turn += std_event_data; yield "text_chunk", std_event_data
@@ -9677,6 +9719,7 @@ class MCPClient:
                         stream_iterator = self._handle_openai_compatible_stream(api_stream, provider_name)
                         async for std_event_type, std_event_data in stream_iterator:
                             if current_task.cancelled(): raise asyncio.CancelledError("Query cancelled during stream")
+                            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, f"{provider_name}_stream_event", {"type": std_event_type, "data": std_event_data})
                             if std_event_type == "error": turn_api_error = str(std_event_data); break
                             # --- Event Processing (OpenAI Compatible) ---
                             elif std_event_type == "text_chunk": accumulated_text_this_turn += std_event_data; yield "text_chunk", std_event_data
@@ -9762,6 +9805,8 @@ class MCPClient:
                              self.tool_blacklist_manager.add_to_blacklist(provider_name, list(set(tools_to_blacklist_now))) # Use set to avoid duplicates
                              retrying_without_tools = True # Set flag to retry without tools
                              yield "status", f"[yellow]Tool error detected for {provider_name}. Retrying without blacklisted tool(s)...[/]"
+                             if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] Tool error for {provider_name}. Retrying without tool(s)..."})
+                             await asyncio.sleep(0.1) # Brief pause before retry
                              continue # Go to start of while loop for retry
                         else:
                              # Couldn't identify tools to blacklist, treat as normal error
@@ -9854,6 +9899,7 @@ class MCPClient:
                                     tool_result_content = f"Error: {error_text}"
                                     log_content_for_history = {"error": error_text}
                                     yield "status", f"{EMOJI_MAP['failure']} Tool Error: Tool '[bold]{original_tool_name}[/]' not found."
+                                    if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] Tool Error: Tool '{original_tool_name}' not found."})
                                 else:
                                     # Tool exists, proceed with cache check and execution
                                     server_name = mcp_tool_obj.server_name
@@ -9879,7 +9925,9 @@ class MCPClient:
                                             content_str_tokens = self._stringify_content(cached_result)
                                             cached_tokens = self._estimate_string_tokens(content_str_tokens)
                                             self.tokens_saved_by_cache += cached_tokens
-                                            yield "status", f"{EMOJI_MAP['cached']} Using cache [bold]{tool_short_name}[/] ({cached_tokens:,} tokens saved)"
+                                            status_msg_cache = f"{EMOJI_MAP['cached']} Using cache for tool [bold]{tool_short_name}[/] ({cached_tokens:,} tokens saved)"
+                                            yield "status", status_msg_cache
+                                            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_cache}"})
                                             log.info(f"Using cached result for {original_tool_name}")
                                         elif cached_result is not None:
                                             # We found a cached *error* result, ignore it and execute fresh
@@ -9888,7 +9936,9 @@ class MCPClient:
 
                                     # Execute Tool if not cached or cache was error
                                     if not cache_used_flag:
-                                        yield "status", f"{EMOJI_MAP['server']} Executing [bold]{tool_short_name}[/] via {server_name}..."
+                                        status_msg_exec = f"{EMOJI_MAP['server']} Executing LLM-decided tool [bold]{tool_short_name}[/] via {server_name}..."
+                                        yield "status", status_msg_exec
+                                        if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_exec}"})
                                         log.info(f"Executing tool '{original_tool_name}' via server '{server_name}'...")
                                         try:
                                             if current_task.cancelled(): raise asyncio.CancelledError("Cancelled before tool execution")
@@ -9903,7 +9953,9 @@ class MCPClient:
                                                 tool_result_content = f"Error: Tool execution failed: {error_detail}"
                                                 # Store structured error info for history if possible
                                                 log_content_for_history = {"error": error_detail, "raw_content": mcp_result.content}
-                                                yield "status", f"{EMOJI_MAP['failure']} Error [bold]{tool_short_name}[/] ({tool_latency:.1f}s): {error_detail[:100]}..."
+                                                status_msg_err = f"{EMOJI_MAP['failure']} Error from tool [bold]{tool_short_name}[/] ({tool_latency:.1f}s): {error_detail[:100]}..."
+                                                yield "status", status_msg_err
+                                                if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_err}"})
                                                 log.warning(f"Tool '{original_tool_name}' failed on '{server_name}': {error_detail}")
                                                 # Note: is_error_flag remains True
                                             else:
@@ -9913,7 +9965,9 @@ class MCPClient:
                                                 is_error_flag = False
                                                 content_str_tokens = self._stringify_content(tool_result_content)
                                                 result_tokens = self._estimate_string_tokens(content_str_tokens)
-                                                yield "status", f"{EMOJI_MAP['success']} Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {tool_latency:.1f}s)"
+                                                status_msg_ok = f"{EMOJI_MAP['success']} Result from tool [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {tool_latency:.1f}s)"
+                                                yield "status", status_msg_ok
+                                                if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_ok}"})
                                                 log.info(f"Tool '{original_tool_name}' OK ({result_tokens:,} tokens, {tool_latency:.1f}s)")
                                                 # Cache the successful result
                                                 if self.tool_cache and self.config.enable_caching and not is_error_flag:
@@ -9927,14 +9981,14 @@ class MCPClient:
                                             yield "status", f"[yellow]Tool [bold]{tool_short_name}[/] aborted.[/]"
                                             raise # Re-raise cancellation to stop the query
                                         except Exception as exec_err:
-                                            # Catch client-side errors during execute_tool call
                                             tool_latency = time.time() - tool_start_time
-                                            error_text = f"Client error during execution: {str(exec_err)}"
+                                            error_text = f"Client error during LLM-decided tool execution: {str(exec_err)}"
                                             tool_result_content = f"Error: {error_text}"
                                             log_content_for_history = {"error": error_text}
-                                            is_error_flag = True # Ensure error flag is set
-                                            yield "status", f"{EMOJI_MAP['failure']} Client Error [bold]{tool_short_name}[/] ({tool_latency:.2f}s): {str(exec_err)}"
-                                            log.error(f"Client error executing {original_tool_name}: {exec_err}", exc_info=True)
+                                            status_msg_client_err = f"{EMOJI_MAP['failure']} Client Error for tool [bold]{tool_short_name}[/] ({tool_latency:.2f}s): {str(exec_err)}"
+                                            yield "status", status_msg_client_err
+                                            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_client_err}"})
+                                            log.error(f"Client error executing LLM-decided tool {original_tool_name}: {exec_err}", exc_info=True)
 
                             # Construct the tool result block for the API call and history
                             tool_result_block: ToolResultContentBlock = {
@@ -9973,6 +10027,7 @@ class MCPClient:
                 elif stop_reason == "error":
                     log.error(f"Exiting interaction loop due to error during turn for {provider_name}.")
                     yield "status", "[bold red]Exiting due to turn error.[/]"
+                    if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": "[Agent LLM] Exiting due to turn error."})
                     error_occurred = True
                     break
                 else:
@@ -9984,6 +10039,7 @@ class MCPClient:
         except asyncio.CancelledError:
             log.info("Query processing was cancelled.")
             yield "status", "[yellow]Request cancelled by user.[/]"
+            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text":"[Agent LLM] Request cancelled."})
             if span: span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
             stop_reason = "cancelled"; error_occurred = True
         except Exception as e:
@@ -9993,6 +10049,7 @@ class MCPClient:
                 span.set_status(trace.StatusCode.ERROR, description=error_msg)
                 if hasattr(span, "record_exception"): span.record_exception(e)
             yield "error", f"Unexpected Error: {error_msg}"
+            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "error", {"message": f"[Agent LLM] Unexpected Error: {error_msg}"})
             stop_reason = "error"; error_occurred = True
 
         # --- Final Updates ---
@@ -10456,97 +10513,145 @@ class MCPClient:
         """
         Returns the current status of the self-driving agent, including
         details about its current plan and operational goal stack.
+        This method is designed to be called by the API or UI to get a snapshot.
         """
-        # Default values if agent_loop_instance is not available
-        current_loop = 0
-        max_loops_for_status = self.agent_max_loops # Use MCPClient's tracked max_loops
-        last_action_summary = "N/A"
-        current_plan_step_summary = "N/A"
-        current_plan_step_full = "N/A"
-        current_plan_step_dependencies = []
-        current_operational_goal_desc = "N/A"
-        current_operational_goal_id = None
-        agent_target_model_name = "N/A"
+        # --- Initialize with default/fallback values ---
+        is_agent_task_active = bool(self.agent_task and not self.agent_task.done())
         
-        current_plan_from_agent_for_api: List[Dict[str, Any]] = []
-        agent_operational_goal_stack_summary_for_api: List[Dict[str, Any]] = []
+        # MCPClient's high-level status (this is set by start/stop_agent_task etc.)
+        mcpc_agent_status_str = self.agent_status if isinstance(self.agent_status, str) else "unknown"
+        
+        # Defaults for when agent_loop_instance is not available or state is minimal
+        agent_internal_loop_count = 0
+        agent_max_loops_from_mcp = self.agent_max_loops # Max loops set by MCPC when starting
+        agent_last_action_summary = "Agent not initialized or no actions yet."
+        agent_current_plan_steps_for_api: List[Dict[str, Any]] = []
+        agent_current_plan_step_summary = "No active plan."
+        agent_current_plan_step_full_desc = "No active plan."
+        agent_current_plan_step_dependencies: List[str] = []
+        
+        agent_current_ums_goal_id: Optional[str] = None
+        agent_current_ums_goal_desc = "No active UMS goal."
+        agent_local_ums_goal_stack_summary_for_api: List[Dict[str, Any]] = []
+        
+        agent_target_model_name = "Not set."
+        agent_workflow_id : Optional[str] = None
+        agent_thought_chain_id: Optional[str] = None
 
-        # Determine a base status_display from self.agent_status (MCPClient's view)
-        status_display_from_mcpc = "Idle" # Default display
-        if isinstance(self.agent_status, str): # Check if self.agent_status is a string
-            status_display_from_mcpc = self.agent_status.replace('_', ' ').title()
-        elif self.agent_status is not None: # If not a string but not None, stringify
-            status_display_from_mcpc = str(self.agent_status).replace('_', ' ').title()
+        # --- Derive a user-friendly display status ---
+        # Start with MCPClient's view, then refine if agent_loop_instance is active
+        status_display = mcpc_agent_status_str.replace('_', ' ').title()
+        if is_agent_task_active and mcpc_agent_status_str == "running": # Check both
+            status_display = f"Running (Loop .../...)" # Placeholder, will be updated if agent_loop_instance exists
+        elif mcpc_agent_status_str == "completed":
+             status_display = "Goal Achieved!"
 
 
+        # --- If AgentMasterLoop instance exists, get more detailed state ---
         if self.agent_loop_instance:
-            agent_state = self.agent_loop_instance.state
-            
-            current_loop = agent_state.current_loop
-            last_action_summary = agent_state.last_action_summary
-            agent_target_model_name = self.agent_loop_instance.agent_llm_model
+            agent_state = self.agent_loop_instance.state # Shortcut to agent's internal state
+            agent_internal_loop_count = agent_state.current_loop
+            agent_last_action_summary = agent_state.last_action_summary
+            agent_target_model_name = self.agent_loop_instance.agent_llm_model # Get the model AML is configured with
+            agent_workflow_id = agent_state.workflow_id
+            agent_thought_chain_id = agent_state.current_thought_chain_id
 
+            # Update status_display if agent is actively running its loops
+            if is_agent_task_active and mcpc_agent_status_str == "running":
+                status_display = f"Running (Loop {agent_internal_loop_count}/{agent_max_loops_from_mcp})"
+
+            # Get current plan from agent's state
             if agent_state.current_plan:
-                current_plan_from_agent_for_api = [
-                    step.model_dump(exclude_none=True) for step in agent_state.current_plan
-                ]
-                if current_plan_from_agent_for_api: # Ensure plan is not empty before accessing index 0
-                    current_step_obj = agent_state.current_plan[0]
-                    current_plan_step_full = current_step_obj.description
-                    current_plan_step_summary = current_step_obj.description[:100] + ("..." if len(current_step_obj.description) > 100 else "")
-                    current_plan_step_dependencies = current_step_obj.depends_on
-                else: # Handle empty plan case
-                    current_plan_step_summary = "No current plan steps."
-                    current_plan_step_full = "No current plan steps."
+                try:
+                    agent_current_plan_steps_for_api = [
+                        step.model_dump(exclude_none=True) for step in agent_state.current_plan
+                    ]
+                    if agent_current_plan_steps_for_api: # Ensure plan is not empty
+                        current_step_obj = agent_state.current_plan[0]
+                        agent_current_plan_step_full_desc = current_step_obj.description
+                        agent_current_plan_step_summary = current_step_obj.description[:100] + ("..." if len(current_step_obj.description) > 100 else "")
+                        agent_current_plan_step_dependencies = current_step_obj.depends_on
+                    else:
+                        agent_current_plan_step_summary = "Plan is empty."
+                        agent_current_plan_step_full_desc = "Plan is empty."
+                except Exception as e:
+                    log.warning(f"MCPC: Error serializing agent plan for status: {e}")
+                    agent_current_plan_step_summary = "Error getting plan."
+                    agent_current_plan_step_full_desc = "Error getting plan."
+                    agent_current_plan_steps_for_api = [{"error": "Could not serialize plan"}]
 
+
+            # Get current UMS goal and stack summary from agent's state
+            # The agent's `self.state.goal_stack` should contain full UMS goal dictionaries
+            # The agent's `self.state.current_goal_id` is the ID of its current operational UMS goal
+            agent_current_ums_goal_id = agent_state.current_goal_id
+            
             if agent_state.current_goal_id and agent_state.goal_stack:
-                current_operational_goal_id = agent_state.current_goal_id
-                for goal_dict in reversed(agent_state.goal_stack): 
-                    if goal_dict.get("goal_id") == current_operational_goal_id:
-                        raw_desc = (goal_dict.get("description") or "Unnamed Operational Goal")
-                        current_operational_goal_desc = raw_desc # Keep full for title attribute, UI can truncate if needed
-                        break
-                
-                GOAL_STACK_SUMMARY_LIMIT_FOR_API = 5 
-                goals_to_summarize = agent_state.goal_stack[-GOAL_STACK_SUMMARY_LIMIT_FOR_API:]
-                for goal_dict in goals_to_summarize: 
-                    agent_operational_goal_stack_summary_for_api.append({
-                        "goal_id": goal_dict.get("goal_id", ""),
-                        "description": (goal_dict.get("description", "N/A")), # Send full, UI can truncate
-                        "status": goal_dict.get("status", "N/A")
-                    })
-            
-            # Refine status_display based on agent_loop_instance state if it's active
-            if bool(self.agent_task and not self.agent_task.done()):
-                 status_display_from_mcpc = f"Running (Loop {current_loop or 0}/{max_loops_for_status or 0})"
-            elif self.agent_status == 'completed': # Check MCPClient's agent_status
-                 status_display_from_mcpc = 'Goal Achieved!'
-            # Add other specific display statuses as needed based on self.agent_status
+                # Find the current operational goal object in the stack
+                current_op_goal_obj_from_stack = next(
+                    (g for g in reversed(agent_state.goal_stack) if isinstance(g, dict) and g.get("goal_id") == agent_state.current_goal_id),
+                    None
+                )
+                if current_op_goal_obj_from_stack:
+                    agent_current_ums_goal_desc = current_op_goal_obj_from_stack.get("description", "Unnamed UMS Operational Goal")
+                else:
+                    agent_current_ums_goal_desc = f"UMS Goal ID '{_fmt_id(agent_state.current_goal_id)}' (Details not in local stack)"
+                    log.warning(f"MCPC: Agent's current_goal_id {_fmt_id(agent_state.current_goal_id)} not found in its local goal_stack of {len(agent_state.goal_stack)} items.")
 
+                # Summarize the agent's local view of the UMS goal stack for the API
+                # The stack in agent_state.goal_stack is already ordered root-to-leaf
+                # Take the last N items for summary (leaf-most)
+                GOAL_STACK_SUMMARY_LIMIT_FOR_API = 5 # Defined in AML, copied for consistency
+                goals_to_summarize_for_api = agent_state.goal_stack[-GOAL_STACK_SUMMARY_LIMIT_FOR_API:]
+                for goal_dict_from_agent_stack in goals_to_summarize_for_api:
+                    if isinstance(goal_dict_from_agent_stack, dict): # Ensure it's a dict
+                        agent_local_ums_goal_stack_summary_for_api.append({
+                            "goal_id": goal_dict_from_agent_stack.get("goal_id", "UnknownID"),
+                            "description": goal_dict_from_agent_stack.get("description", "No description provided"), # Full description
+                            "status": goal_dict_from_agent_stack.get("status", "unknown")
+                        })
+            elif not agent_state.current_goal_id and agent_state.workflow_id:
+                # Workflow is active, but no specific UMS goal is the current focus (e.g., between root goals, or if root failed to set)
+                agent_current_ums_goal_desc = "Workflow active, UMS operational goal not set."
+                if agent_state.goal_stack: # Should be empty if current_goal_id is None
+                     log.warning("MCPC: Agent has goal_stack items but no current_goal_id. Inconsistent state.")
+
+        # --- Construct the final status dictionary for the API ---
         status_to_return = {
-            "agent_running": bool(self.agent_task and not self.agent_task.done()),
-            "status": self.agent_status, 
-            "status_display": status_display_from_mcpc, # Use the refined status_display
+            "agent_running": is_agent_task_active,
+            "status": mcpc_agent_status_str, # MCPClient's high-level status
+            "status_display": status_display, # User-friendly display string
 
-            "current_goal_description_from_agent": self.agent_goal, 
-            
-            "agent_current_operational_goal_id": current_operational_goal_id,
-            "agent_current_operational_goal_description": current_operational_goal_desc, # Now full description
-            "agent_current_operational_goal_stack_summary": agent_operational_goal_stack_summary_for_api,
+            "overall_goal_from_mcp_client": self.agent_goal, # The goal MCPClient was asked to start the agent with
 
-            "current_loop": current_loop,
-            "max_loops": max_loops_for_status,
+            # Details from AgentMasterLoop's state
+            "agent_workflow_id": agent_workflow_id,
+            "agent_thought_chain_id": agent_thought_chain_id,
+            "agent_target_model": agent_target_model_name,
+            "agent_internal_loop_count": agent_internal_loop_count,
+            "agent_max_loops_from_mcp_config": agent_max_loops_from_mcp, # Max loops MCPC is running the agent for
             
-            "last_message": self.agent_last_message, 
-            "last_action_summary_from_agent": last_action_summary,
-            
-            "current_plan_step_from_agent": current_plan_step_summary, 
-            "current_plan_step_from_agent_full": current_plan_step_full, 
-            "current_plan_step_dependencies": current_plan_step_dependencies, 
-            "current_plan_from_agent": current_plan_from_agent_for_api,
+            "agent_current_ums_goal_id": agent_current_ums_goal_id,
+            "agent_current_ums_goal_description": agent_current_ums_goal_desc, # Full description
+            "agent_local_ums_goal_stack_summary": agent_local_ums_goal_stack_summary_for_api, # Summary of agent's view
 
-            "agent_target_model": agent_target_model_name
+            "agent_last_action_summary": agent_last_action_summary,
+            "agent_last_general_message": self.agent_last_message, # General message from MCPClient about agent task
+            
+            "agent_current_plan_step_summary": agent_current_plan_step_summary, # Truncated
+            "agent_current_plan_step_full_description": agent_current_plan_step_full_desc, # Full
+            "agent_current_plan_step_dependencies": agent_current_plan_step_dependencies,
+            "agent_current_full_plan": agent_current_plan_steps_for_api, # List of all plan step dicts
         }
+        
+        # Log a summary of what's being returned by this status check
+        log.debug(
+            f"MCPC Agent Status: Running={status_to_return['agent_running']}, "
+            f"MCPC Status='{status_to_return['status']}', "
+            f"AML Loop={status_to_return['agent_internal_loop_count']}, "
+            f"UMS Goal='{_fmt_id(status_to_return['agent_current_ums_goal_id'])}', "
+            f"Plan Steps={len(status_to_return['agent_current_full_plan'])}"
+        )
         
         return status_to_return
 

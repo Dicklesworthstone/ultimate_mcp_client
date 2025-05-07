@@ -1158,140 +1158,207 @@ class AgentMasterLoop:
             self.logger.error(f"AML: Exception while injecting manual thought: {e}", exc_info=True)
             return False
 
+
     async def initialize(self) -> bool:
         self.logger.info("🤖 AML: Initializing Agent Master Loop...")
-        await self._load_agent_state()
+        await self._load_agent_state() # Loads self.state
 
         if self.state.workflow_id and not self.state.context_id:
-            self.state.context_id = self.state.workflow_id
+            self.state.context_id = self.state.workflow_id # Default context_id to workflow_id if not set
             self.logger.info(f"🤖 AML: Initialized context_id from workflow_id: {_fmt_id(self.state.workflow_id)}")
 
         try:
-            if not self.mcp_client or not hasattr(self.mcp_client, 'server_manager') or not self.mcp_client.server_manager:
-                self.logger.error("🤖 AML ERROR: MCPClient or its ServerManager is not initialized.")
+            # --- 1. Validate MCPClient and its ServerManager ---
+            if not self.mcp_client or \
+               not hasattr(self.mcp_client, 'server_manager') or \
+               not self.mcp_client.server_manager:
+                self.logger.critical("🤖 AML CRITICAL: MCPClient or its ServerManager is not initialized. Agent cannot function.")
                 return False
 
-            agent_provider_str = self.mcp_client.get_provider_from_model(self.agent_llm_model)
-            if not agent_provider_str:
-                self.logger.error(f"🤖 AML ERROR: Could not determine provider for agent's model '{self.agent_llm_model}'. Cannot format tools.")
+            # --- 2. Determine Agent's LLM Provider and Format Tools ---
+            agent_llm_provider_str = self.mcp_client.get_provider_from_model(self.agent_llm_model)
+            if not agent_llm_provider_str:
+                self.logger.critical(
+                    f"🤖 AML CRITICAL: Could not determine LLM provider for agent's model '{self.agent_llm_model}'. Cannot format tools for LLM."
+                )
                 return False
-            self.logger.debug(f"🤖 AML: Agent's LLM provider: '{agent_provider_str}' for model '{self.agent_llm_model}'.")
+            self.logger.info(f"🤖 AML: Agent's LLM is '{self.agent_llm_model}', determined provider: '{agent_llm_provider_str}'.")
 
-            all_llm_formatted_tools = self.mcp_client._format_tools_for_provider(agent_provider_str)
-            if all_llm_formatted_tools is None: all_llm_formatted_tools = []
-            
-            self.logger.debug(f"🤖 AML: Received {len(all_llm_formatted_tools)} LLM-formatted tools from MCPClient.")
-            if all_llm_formatted_tools: self.logger.debug(f"🤖 AML: Sample LLM tool from MCPClient: {str(all_llm_formatted_tools[0])[:500]}")
+            # Get all tools formatted for the agent's LLM provider
+            # _format_tools_for_provider in MCPClient should handle sanitization and return schemas the LLM expects.
+            # It should also populate its own mcp_client.server_manager.sanitized_to_original map.
+            all_llm_formatted_tools_from_mcpc = self.mcp_client._format_tools_for_provider(agent_llm_provider_str)
+            if all_llm_formatted_tools_from_mcpc is None:
+                all_llm_formatted_tools_from_mcpc = [] # Ensure it's a list
 
-            s_to_o_map = self.mcp_client.server_manager.sanitized_to_original
-            self.logger.debug(f"🤖 AML: MCPClient's sanitized_to_original map (size {len(s_to_o_map)}). Sample: {dict(list(s_to_o_map.items())[:3])}")
+            self.logger.debug(f"🤖 AML: Received {len(all_llm_formatted_tools_from_mcpc)} LLM-formatted tools from MCPClient for provider '{agent_llm_provider_str}'.")
+            if all_llm_formatted_tools_from_mcpc:
+                 self.logger.debug(f"🤖 AML: Sample LLM tool schema from MCPClient: {str(all_llm_formatted_tools_from_mcpc[0])[:500]}")
 
-            self.tool_schemas = [] 
-            loaded_tool_constants = set() # Stores the TOOL_* CONSTANTS that are loaded
-
-            if all_llm_formatted_tools:
-                self.logger.info(f"🤖 AML: Iterating {len(all_llm_formatted_tools)} LLM-formatted tools to identify UMS tools...")
-                for i, llm_tool_schema in enumerate(all_llm_formatted_tools):
-                    sanitized_name_llm_sees = ""
-                    # Extract sanitized name based on provider's schema structure
-                    if isinstance(llm_tool_schema, dict):
-                        if agent_provider_str == "anthropic":
-                            sanitized_name_llm_sees = llm_tool_schema.get("name", "")
-                        elif agent_provider_str in ["openai", "grok", "deepseek", "groq", "mistral", "cerebras", "gemini", "openrouter"]: # OpenAI compatible
-                            func_dict = llm_tool_schema.get("function")
-                            if isinstance(func_dict, dict): sanitized_name_llm_sees = func_dict.get("name", "")
-                            elif llm_tool_schema.get("type") == "function": sanitized_name_llm_sees = llm_tool_schema.get("name", "")
-                        else: # Fallback for unknown provider style
-                            sanitized_name_llm_sees = llm_tool_schema.get("name", "") 
-                    
-                    if not sanitized_name_llm_sees:
-                        self.logger.warning(f"🤖 AML (Schema {i+1}): Could not extract LLM tool name from schema. Skipping. Schema: {str(llm_tool_schema)[:200]}")
-                        continue
-                    
-                    original_mcp_name_from_map = s_to_o_map.get(sanitized_name_llm_sees)
-                    if not original_mcp_name_from_map:
-                        self.logger.warning(f"🤖 AML (Schema {i+1}): Original MCP name NOT FOUND in map for LLM tool name '{sanitized_name_llm_sees}'. Tool will be missed if it's a UMS tool.")
-                        continue
-
-                    # Extract the base function name from original_mcp_name_from_map (e.g., "create_workflow" from "ServerName:create_workflow")
-                    base_function_name = original_mcp_name_from_map.split(":")[-1]
-
-                    # Check if this base_function_name corresponds to any UMS tool we care about
-                    found_aml_tool_constant = None
-                    for aml_const, ums_func_name in AML_UMS_FUNCTION_NAME_MAP.items():
-                        if ums_func_name == base_function_name:
-                            found_aml_tool_constant = aml_const
-                            break
-                    
-                    if found_aml_tool_constant:
-                        self.tool_schemas.append(llm_tool_schema) # Add the schema the LLM uses
-                        loaded_tool_constants.add(found_aml_tool_constant) # Add the AML's internal constant name
-                        self.logger.debug(f"🤖 AML: ADDED UMS Tool: '{found_aml_tool_constant}' (Original MCP: '{original_mcp_name_from_map}', LLM sees: '{sanitized_name_llm_sees}')")
-                    else:
-                        self.logger.debug(f"🤖 AML: SKIPPED non-mapped tool. Original MCP: '{original_mcp_name_from_map}', Base func: '{base_function_name}', LLM sees: '{sanitized_name_llm_sees}'")
+            # Get the mapping from sanitized names (LLM sees) to original MCP names (Agent uses)
+            sanitized_to_original_map_from_mcpc = self.mcp_client.server_manager.sanitized_to_original
+            if not sanitized_to_original_map_from_mcpc:
+                self.logger.warning("🤖 AML WARNING: MCPClient's sanitized_to_original map is empty. Tool name resolution might fail.")
             else:
-                self.logger.info("🤖 AML: No LLM-formatted tools from MCPClient to process.")
+                self.logger.debug(f"🤖 AML: MCPClient's sanitized_to_original map (size {len(sanitized_to_original_map_from_mcpc)}). Sample: {dict(list(sanitized_to_original_map_from_mcpc.items())[:3])}")
+
+
+            # --- 3. Populate self.tool_schemas and track loaded AML constants ---
+            self.tool_schemas = [] # This list stores schemas for the LLM
+            loaded_aml_tool_constants = set() # Stores the agent's internal TOOL_* constants that are successfully loaded
+
+            for llm_tool_schema in all_llm_formatted_tools_from_mcpc:
+                sanitized_name_llm_sees = ""
+                if isinstance(llm_tool_schema, dict):
+                    if agent_llm_provider_str == Provider.ANTHROPIC.value: # Using your Provider enum
+                        sanitized_name_llm_sees = llm_tool_schema.get("name", "")
+                    elif agent_llm_provider_str in [
+                        Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
+                        Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value,
+                        Provider.GEMINI.value, Provider.OPENROUTER.value
+                    ]: # OpenAI compatible
+                        func_dict = llm_tool_schema.get("function")
+                        if isinstance(func_dict, dict): sanitized_name_llm_sees = func_dict.get("name", "")
+                        elif llm_tool_schema.get("type") == "function": # Some providers might use this structure directly
+                             sanitized_name_llm_sees = llm_tool_schema.get("name", "")
+                    else: # Fallback for unknown provider style (less likely if get_provider_from_model is robust)
+                        sanitized_name_llm_sees = llm_tool_schema.get("name", "")
+                
+                if not sanitized_name_llm_sees:
+                    self.logger.warning(f"🤖 AML: Could not extract LLM tool name from schema. Skipping. Schema: {str(llm_tool_schema)[:200]}")
+                    continue
+                
+                original_mcp_name = sanitized_to_original_map_from_mcpc.get(sanitized_name_llm_sees)
+                if not original_mcp_name:
+                    self.logger.warning(f"🤖 AML: Original MCP name NOT FOUND in MCPClient's map for LLM tool name '{sanitized_name_llm_sees}'. This tool (if UMS/Agent) will be unusable.")
+                    continue # Cannot map this tool back for execution
+
+                # Determine the base function name (e.g., "create_workflow" from "ServerName:unified_memory:create_workflow")
+                # This is what AML_UMS_FUNCTION_NAME_MAP uses.
+                base_function_name_for_map = original_mcp_name.split(':')[-1]
+
+                found_aml_constant_for_tool = None
+                for aml_const, ums_tool_func_name_in_map in AML_UMS_FUNCTION_NAME_MAP.items():
+                    if ums_tool_func_name_in_map == base_function_name_for_map:
+                        found_aml_constant_for_tool = aml_const
+                        break
+                
+                if found_aml_constant_for_tool:
+                    self.tool_schemas.append(llm_tool_schema)
+                    loaded_aml_tool_constants.add(found_aml_constant_for_tool)
+                    self.logger.debug(f"🤖 AML: MAPPED & ADDED UMS Tool for LLM: '{found_aml_constant_for_tool}' (Original MCP: '{original_mcp_name}', LLM sees: '{sanitized_name_llm_sees}')")
+                else:
+                    self.logger.debug(f"🤖 AML: SKIPPED non-UMS/non-mapped tool from MCPC. Original MCP: '{original_mcp_name}', Base func: '{base_function_name_for_map}', LLM sees: '{sanitized_name_llm_sees}'")
 
             # --- Add AGENT_TOOL_UPDATE_PLAN (Agent-internal tool) ---
             plan_step_base_schema = PlanStep.model_json_schema()
-            if "title" in plan_step_base_schema: del plan_step_base_schema["title"]
+            if "title" in plan_step_base_schema: del plan_step_base_schema["title"] # Pydantic v2 might not have title by default
+            
             update_plan_input_schema = {
                 "type": "object",
                 "properties": {"plan": {"type": "array", "items": plan_step_base_schema, "description": "The new complete list of plan steps for the agent."}},
                 "required": ["plan"],
             }
+            # Sanitize AGENT_TOOL_UPDATE_PLAN for the LLM
             agent_update_plan_sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", AGENT_TOOL_UPDATE_PLAN)[:64]
             plan_tool_llm_schema_final = {}
-            plan_tool_description = "Replace agent's current plan. Use for significant replanning, error recovery, or fixing validation issues."
+            plan_tool_description = "Replace agent's current plan. Use for significant replanning, error recovery, or fixing validation issues. Submit the ENTIRE new plan."
 
-            if agent_provider_str == "anthropic":
+            if agent_llm_provider_str == Provider.ANTHROPIC.value:
                 plan_tool_llm_schema_final = {"name": agent_update_plan_sanitized_name, "description": plan_tool_description, "input_schema": update_plan_input_schema}
-            elif agent_provider_str in ["openai", "grok", "deepseek", "groq", "mistral", "cerebras", "gemini", "openrouter"]:
+            elif agent_llm_provider_str in [
+                Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
+                Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value,
+                Provider.GEMINI.value, Provider.OPENROUTER.value
+            ]:
                 plan_tool_llm_schema_final = {"type": "function", "function": {"name": agent_update_plan_sanitized_name, "description": plan_tool_description, "parameters": update_plan_input_schema}}
             else: 
-                self.logger.warning(f"🤖 AML WARNING: Unknown agent_provider '{agent_provider_str}' for AGENT_TOOL_UPDATE_PLAN schema. Defaulting to Anthropic style.")
+                self.logger.warning(f"🤖 AML WARNING: Unknown agent_provider '{agent_llm_provider_str}' for AGENT_TOOL_UPDATE_PLAN schema. Defaulting to Anthropic style.")
                 plan_tool_llm_schema_final = {"name": agent_update_plan_sanitized_name, "description": plan_tool_description, "input_schema": update_plan_input_schema}
             
             self.tool_schemas.append(plan_tool_llm_schema_final)
-            loaded_tool_constants.add(AGENT_TOOL_UPDATE_PLAN) 
-            self.logger.debug(f"🤖 AML: ADDED agent-internal tool: '{AGENT_TOOL_UPDATE_PLAN}' (LLM sees: '{agent_update_plan_sanitized_name}')")
+            loaded_aml_tool_constants.add(AGENT_TOOL_UPDATE_PLAN)
+            # Crucially, map this agent-internal tool's sanitized name back to its original constant for _execute_tool_call_internal
+            sanitized_to_original_map_from_mcpc[agent_update_plan_sanitized_name] = AGENT_TOOL_UPDATE_PLAN
+            self.logger.debug(f"🤖 AML: ADDED agent-internal tool for LLM: '{AGENT_TOOL_UPDATE_PLAN}' (LLM sees: '{agent_update_plan_sanitized_name}')")
             
-            self.logger.info(f"🤖 AML: Final {len(self.tool_schemas)} tool schemas prepared for LLM. Loaded AML tool constants: {sorted(loaded_tool_constants)}")
+            self.logger.info(f"🤖 AML: Final {len(self.tool_schemas)} tool schemas prepared for LLM. Loaded AML tool constants: {sorted(loaded_aml_tool_constants)}")
 
-            # --- Essential Tools Check (uses AML's TOOL_* constants) ---
-            essential_tool_constants = [ 
+            # --- 4. Essential Tools Check (uses AML's TOOL_* constants) ---
+            essential_aml_tool_constants_list = [ 
                 TOOL_CREATE_WORKFLOW, TOOL_RECORD_ACTION_START, TOOL_RECORD_ACTION_COMPLETION,
                 TOOL_RECORD_THOUGHT, TOOL_STORE_MEMORY, TOOL_GET_WORKING_MEMORY,
                 TOOL_HYBRID_SEARCH, TOOL_GET_RICH_CONTEXT_PACKAGE, TOOL_REFLECTION,
-                TOOL_CONSOLIDATION, TOOL_GET_WORKFLOW_DETAILS, TOOL_CREATE_GOAL,
-                TOOL_UPDATE_GOAL_STATUS, TOOL_GET_GOAL_DETAILS, AGENT_TOOL_UPDATE_PLAN,
+                TOOL_CONSOLIDATION, TOOL_GET_WORKFLOW_DETAILS, 
+                TOOL_CREATE_GOAL, TOOL_UPDATE_GOAL_STATUS, TOOL_GET_GOAL_DETAILS, 
+                AGENT_TOOL_UPDATE_PLAN,
             ]
-            missing_essential = [tc for tc in essential_tool_constants if tc not in loaded_tool_constants]
+            missing_essential = [tc for tc in essential_aml_tool_constants_list if tc not in loaded_aml_tool_constants]
 
             if missing_essential:
-                self.logger.error(f"🤖 AML ERROR: Missing essential tools (by AML constant name): {missing_essential}. Functionality WILL BE impaired.")
-                self.logger.error(f"🤖 AML INFO: AML tool constants that WERE successfully loaded: {loaded_tool_constants}")
+                self.logger.error(f"🤖 AML CRITICAL ERROR: Missing essential tools (by AML constant name): {missing_essential}. Agent functionality WILL BE severely impaired.")
+                self.logger.error(f"🤖 AML INFO: AML tool constants that WERE successfully loaded: {sorted(loaded_aml_tool_constants)}")
+                # Optionally, you might want to return False here if core functionality is impossible.
+                # return False 
             else:
-                self.logger.info("🤖 AML: All essential tools (by AML constant name) appear to be loaded.")
+                self.logger.info("🤖 AML: All essential tools (by AML constant name) appear to be loaded and mapped.")
 
-            # ... (rest of your existing initialize method: top_wf check, _validate_goal_stack_on_load, _set_default_thought_chain_id) ...
-            top_wf = (self.state.workflow_stack[-1] if self.state.workflow_stack else None) or self.state.workflow_id
-            if top_wf and not await self._check_workflow_exists(top_wf):
-                self.logger.warning(f"🤖 AML WARNING: Stored workflow '{_fmt_id(top_wf)}' not found in UMS; resetting agent's workflow state.")
-                preserved_stats = self.state.tool_usage_stats
-                pres_ref_thresh = self.state.current_reflection_threshold
-                pres_con_thresh = self.state.current_consolidation_threshold
-                self.state = AgentState(
-                    tool_usage_stats=preserved_stats, 
-                    current_reflection_threshold=pres_ref_thresh, 
-                    current_consolidation_threshold=pres_con_thresh
-                )
-                await self._save_agent_state() 
-            
-            await self._validate_goal_stack_on_load()
-            
-            if self.state.workflow_id and not self.state.current_thought_chain_id:
-                await self._set_default_thought_chain_id()
+            # --- 5. Workflow and Goal Stack Validation after loading state ---
+            top_wf_from_state = (self.state.workflow_stack[-1] if self.state.workflow_stack else None) or self.state.workflow_id
+            if top_wf_from_state:
+                if not await self._check_workflow_exists(top_wf_from_state):
+                    self.logger.warning(f"🤖 AML WARNING: Stored workflow '{_fmt_id(top_wf_from_state)}' not found in UMS; resetting agent's workflow state.")
+                    preserved_stats = self.state.tool_usage_stats # Preserve some state if needed
+                    pres_ref_thresh = self.state.current_reflection_threshold
+                    pres_con_thresh = self.state.current_consolidation_threshold
+                    self.state = AgentState( # Reset to a clean state
+                        tool_usage_stats=preserved_stats, 
+                        current_reflection_threshold=pres_ref_thresh, 
+                        current_consolidation_threshold=pres_con_thresh
+                    )
+                    await self._save_agent_state() 
+                else: # Workflow exists, now validate/set UMS goals and thought chain
+                    await self._validate_goal_stack_on_load() # Validates current_goal_id and rebuilds stack if needed
+
+                    # Ensure current_goal_id is set if workflow is active but goal_stack might have been cleared
+                    if self.state.workflow_id and not self.state.current_goal_id and not self.state.goal_stack:
+                        self.logger.info(f"AML: Active workflow {_fmt_id(self.state.workflow_id)} but no current UMS goal. Attempting to set/create root UMS goal.")
+                        wf_details_res = await self._execute_tool_call_internal(
+                            TOOL_GET_WORKFLOW_DETAILS, 
+                            {"workflow_id": self.state.workflow_id, "include_thoughts": False}, 
+                            record_action=False
+                        )
+                        if wf_details_res.get("success") and wf_details_res.get("goal"):
+                            root_goal_desc = wf_details_res.get("goal")
+                            root_goal_title = wf_details_res.get("title", "Workflow Root Goal")
+                            
+                            # Call the _handle_workflow_and_goal_side_effects's logic for root goal creation
+                            # This is a bit indirect, but reuses the logic.
+                            # We simulate the UMS tool `create_workflow` result to trigger it.
+                            simulated_create_wf_result = {
+                                "success": True,
+                                "workflow_id": self.state.workflow_id,
+                                "primary_thought_chain_id": self.state.current_thought_chain_id, # Keep existing if any
+                                "goal": root_goal_desc,
+                                "title": root_goal_title
+                            }
+                            simulated_create_wf_args = {
+                                "goal": root_goal_desc, # Pass the goal description
+                                "title": root_goal_title
+                            }
+                            await self._handle_workflow_and_goal_side_effects(
+                                TOOL_CREATE_WORKFLOW, # Simulate this tool call
+                                simulated_create_wf_args,
+                                simulated_create_wf_result
+                            )
+                            if not self.state.current_goal_id:
+                                self.logger.error(f"AML: Failed to establish root UMS goal for existing workflow {_fmt_id(self.state.workflow_id)} during init.")
+                        else:
+                            self.logger.error(f"AML: Could not get workflow details to establish root UMS goal for {_fmt_id(self.state.workflow_id)}.")
+                    
+                    # Ensure thought chain is set
+                    if not self.state.current_thought_chain_id:
+                        await self._set_default_thought_chain_id()
             
             self.logger.info("🤖 AML: Agent Master Loop initialization complete.")
             return True
@@ -1299,7 +1366,6 @@ class AgentMasterLoop:
         except Exception as e:
             self.logger.critical(f"🤖 AML CRITICAL: Agent loop initialization failed with an unhandled exception: {e}", exc_info=True)
             return False
-
 
     async def _set_default_thought_chain_id(self):
         current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
@@ -1968,140 +2034,226 @@ class AgentMasterLoop:
             await self._record_action_completion_internal(action_id, res)
         await self._handle_workflow_and_goal_side_effects(tool_name, final_arguments, res)  # Pass original arguments
         return res
+    
 
     async def _handle_workflow_and_goal_side_effects(self, tool_name: str, arguments: Dict, result_content: Dict):
         """
         Handles agent state changes triggered by specific tool outcomes,
         especially workflow creation/termination and UMS-driven goal stack updates.
         """
+        current_wf_id_before_effect = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+        current_goal_id_before_effect = self.state.current_goal_id
+
         # --- Side effects for Workflow Creation ---
         if tool_name == TOOL_CREATE_WORKFLOW and result_content.get("success"):
             new_wf_id = result_content.get("workflow_id")
             primary_chain_id = result_content.get("primary_thought_chain_id")
             parent_wf_id_arg = arguments.get("parent_workflow_id")
+            # Get the goal description used for creating the workflow from the UMS result or arguments
+            wf_goal_desc_from_result = result_content.get("goal")
+            wf_goal_desc_from_args = arguments.get("goal", "Achieve objectives for this new workflow")
+            final_wf_goal_desc = wf_goal_desc_from_result or wf_goal_desc_from_args
+
             wf_title = result_content.get("title", "Untitled Workflow")
-            wf_goal_desc = result_content.get("goal", "Achieve objectives for this workflow")  # Use UMS goal desc
 
             if new_wf_id:
                 self.state.workflow_id = new_wf_id
                 self.state.context_id = new_wf_id
                 is_sub_workflow = parent_wf_id_arg and parent_wf_id_arg in self.state.workflow_stack
                 log_prefix = "sub-" if is_sub_workflow else "new "
+                
                 if is_sub_workflow:
                     self.state.workflow_stack.append(new_wf_id)
                 else:
-                    self.state.workflow_stack = [new_wf_id]
+                    # This is a new root workflow, or a sub-workflow of something not managed by this agent's stack
+                    self.state.workflow_stack = [new_wf_id] 
+                
                 self.state.current_thought_chain_id = primary_chain_id
 
-                # Create the root goal for this new workflow in UMS
+                # --- CRITICAL: Create the root UMS goal for this new workflow ---
                 self.state.goal_stack = []  # Reset local stack for new/root workflow
-                self.state.current_goal_id = None
+                self.state.current_goal_id = None # Will be set if UMS goal creation succeeds
+
                 if self._find_tool_server(TOOL_CREATE_GOAL):
                     try:
+                        root_goal_description_for_ums = final_wf_goal_desc if final_wf_goal_desc else f"Fulfill workflow: {wf_title}"
                         goal_creation_args = {
                             "workflow_id": new_wf_id,
-                            "description": wf_goal_desc,
-                            # parent_goal_id is None for a root goal of a new workflow
+                            "description": root_goal_description_for_ums,
+                            "title": f"Root Goal for {log_prefix}workflow: {wf_title}",
+                            "parent_goal_id": None, # Explicitly None for a root goal
+                            "initial_status": GoalStatus.ACTIVE.value 
                         }
-                        self.logger.info(f"Attempting to create UMS root goal for {log_prefix}workflow {_fmt_id(new_wf_id)}: '{wf_goal_desc}'")
-                        goal_res = await self._execute_tool_call_internal(TOOL_CREATE_GOAL, goal_creation_args, record_action=False)
-                        # UMS create_goal should return the full goal object under a "goal" key
-                        created_ums_goal = goal_res.get("goal") if goal_res.get("success") else None
+                        self.logger.info(f"AML: Attempting to create UMS root goal for {log_prefix}workflow '{_fmt_id(new_wf_id)}': '{root_goal_description_for_ums[:70]}...'")
+                        
+                        goal_res = await self._execute_tool_call_internal(
+                            TOOL_CREATE_GOAL, 
+                            goal_creation_args, 
+                            record_action=False 
+                        )
+                        
+                        # UMS create_goal returns the full created goal object under the "goal" key
+                        created_ums_goal_obj = goal_res.get("goal") if isinstance(goal_res, dict) and goal_res.get("success") else None
 
-                        if isinstance(created_ums_goal, dict) and created_ums_goal.get("goal_id"):
-                            self.state.goal_stack.append(created_ums_goal)  # Add full UMS goal object
-                            self.state.current_goal_id = created_ums_goal.get("goal_id")
+                        if isinstance(created_ums_goal_obj, dict) and created_ums_goal_obj.get("goal_id"):
+                            self.state.goal_stack = [created_ums_goal_obj] # Initialize stack with the root UMS goal
+                            self.state.current_goal_id = created_ums_goal_obj.get("goal_id")
                             self.logger.info(
-                                f"Created UMS root goal {_fmt_id(self.state.current_goal_id)} for {log_prefix}workflow {_fmt_id(new_wf_id)}."
+                                f"AML: Successfully created and set UMS root goal {_fmt_id(self.state.current_goal_id)} for {log_prefix}workflow '{_fmt_id(new_wf_id)}'."
                             )
                         else:
-                            self.logger.warning(
-                                f"Failed to create UMS root goal for new workflow {_fmt_id(new_wf_id)}: {goal_res.get('error', 'UMS tool did not return valid goal data')}"
+                            error_msg_goal_create = goal_res.get('error', 'UMS tool did not return valid goal data') if isinstance(goal_res, dict) else "Unknown error from create_goal"
+                            self.logger.error(
+                                f"AML CRITICAL: Failed to create UMS root goal for {log_prefix}workflow '{_fmt_id(new_wf_id)}'. Error: {error_msg_goal_create}. Agent may not function correctly."
                             )
+                            self.state.last_error_details = {
+                                "tool": TOOL_CREATE_GOAL,
+                                "args_sent": goal_creation_args,
+                                "error": f"Failed to establish root UMS goal for new workflow: {error_msg_goal_create}",
+                                "type": "GoalManagementError"
+                            }
+                            self.state.needs_replan = True
                     except Exception as goal_err:
-                        self.logger.error(f"Error creating UMS root goal for new workflow {_fmt_id(new_wf_id)}: {goal_err}", exc_info=True)
+                        self.logger.error(f"AML CRITICAL: Exception creating UMS root goal for new workflow {_fmt_id(new_wf_id)}: {goal_err}", exc_info=True)
+                        self.state.last_error_details = {
+                            "tool": TOOL_CREATE_GOAL,
+                            "error": f"Exception establishing root UMS goal: {goal_err}",
+                            "type": "GoalManagementError"
+                        }
+                        self.state.needs_replan = True
                 else:
-                    self.logger.warning(f"Cannot create root goal for new workflow: UMS Tool {TOOL_CREATE_GOAL} unavailable.")
+                    self.logger.error(f"AML CRITICAL: Cannot create root goal for new workflow: UMS Tool {TOOL_CREATE_GOAL} unavailable.")
+                    self.state.last_error_details = {"tool": TOOL_CREATE_GOAL, "error": "Tool unavailable", "type": "ToolUnavailable"}
+                    self.state.needs_replan = True
 
                 self.logger.info(
-                    f"🏷️ Switched to {log_prefix}workflow: {_fmt_id(new_wf_id)}. Chain: {_fmt_id(primary_chain_id)}. Current Goal: {_fmt_id(self.state.current_goal_id)}"
+                    f"🏷️ Switched to {log_prefix}workflow: '{_fmt_id(new_wf_id)}'. Chain: '{_fmt_id(primary_chain_id)}'. Current UMS Goal: '{_fmt_id(self.state.current_goal_id)}'"
                 )
-                self.state.current_plan = [PlanStep(description=f"Start {log_prefix}workflow: '{wf_title}'. Goal: {wf_goal_desc}.")]
-                self.state.consecutive_error_count = 0
-                self.state.needs_replan = False
-                self.state.last_error_details = None
+                plan_desc_root_goal = final_wf_goal_desc[:60] if final_wf_goal_desc else wf_title
+                plan_desc = f"Start {log_prefix}workflow: '{wf_title}'. Initial UMS Goal: {plan_desc_root_goal}... ({_fmt_id(self.state.current_goal_id)})"
+                self.state.current_plan = [PlanStep(description=plan_desc)]
+                self.state.consecutive_error_count = 0 
+                self.state.last_error_details = None 
+                
+                if self.state.current_goal_id: # If root goal successfully set
+                     self.state.needs_replan = False # LLM can proceed with initial plan for the new goal
+                else: # Root goal creation failed
+                     self.state.needs_replan = True # LLM needs to address the failure to set a root goal
 
-        # --- Side effects for Creating a New Goal (typically a sub-goal) ---
+
+        # --- Side effects for LLM explicitly Creating a New UMS Goal (typically a sub-goal) ---
         elif tool_name == TOOL_CREATE_GOAL and result_content.get("success"):
-            # This case handles when the LLM decides to call create_goal, usually for a sub-goal
-            created_ums_goal = result_content.get("goal")  # UMS tool returns the created goal object
-            if isinstance(created_ums_goal, dict) and created_ums_goal.get("goal_id"):
+            created_ums_goal_obj = result_content.get("goal") # UMS tool returns the created goal object
+            
+            if isinstance(created_ums_goal_obj, dict) and created_ums_goal_obj.get("goal_id"):
+                # Validate that the new goal belongs to the current workflow
+                if created_ums_goal_obj.get("workflow_id") != self.state.workflow_id:
+                    self.logger.error(
+                        f"AML: LLM created UMS goal {_fmt_id(created_ums_goal_obj.get('goal_id'))} for workflow {_fmt_id(created_ums_goal_obj.get('workflow_id'))}, "
+                        f"but current agent workflow is {_fmt_id(self.state.workflow_id)}. This is unexpected. Goal will not be added to local stack."
+                    )
+                    self.state.last_error_details = {
+                        "tool": TOOL_CREATE_GOAL,
+                        "error": "LLM created UMS goal for an incorrect workflow.",
+                        "type": "GoalManagementError"
+                    }
+                    self.state.needs_replan = True
+                    return # Do not proceed with inconsistent state
+
                 # Add the new UMS goal to the agent's local stack representation
-                self.state.goal_stack.append(created_ums_goal)
+                self.state.goal_stack.append(created_ums_goal_obj)
                 # Set the new goal as the current focus
-                self.state.current_goal_id = created_ums_goal["goal_id"]
+                self.state.current_goal_id = created_ums_goal_obj["goal_id"]
                 self.logger.info(
-                    f"📌 Pushed new UMS goal {_fmt_id(self.state.current_goal_id)} to local stack: '{created_ums_goal.get('description', '')[:50]}...'. Stack depth: {len(self.state.goal_stack)}"
+                    f"📌 Pushed new UMS goal {_fmt_id(self.state.current_goal_id)} to local stack: '{created_ums_goal_obj.get('description', '')[:50]}...'. Stack depth: {len(self.state.goal_stack)}"
                 )
                 self.state.needs_replan = True
-                self.state.current_plan = [PlanStep(description=f"Start new goal: '{created_ums_goal.get('description', '')[:50]}...'")]
-                self.state.last_error_details = None
+                plan_desc = f"Start new UMS sub-goal: '{created_ums_goal_obj.get('description', '')[:50]}...' ({_fmt_id(self.state.current_goal_id)})"
+                self.state.current_plan = [PlanStep(description=plan_desc)]
+                self.state.last_error_details = None 
             else:
-                self.logger.warning(f"UMS Tool {TOOL_CREATE_GOAL} succeeded but did not return valid goal data: {result_content}")
+                self.logger.warning(f"AML: UMS Tool {TOOL_CREATE_GOAL} called by LLM succeeded but did not return valid goal data: {result_content}")
+                self.state.last_error_details = {
+                    "tool": TOOL_CREATE_GOAL,
+                    "error": "UMS create_goal (called by LLM) returned invalid data.",
+                    "type": "GoalManagementError"
+                }
+                self.state.needs_replan = True
 
-        # --- Side effects for Updating Goal Status ---
+
+        # --- Side effects for Updating UMS Goal Status ---
         elif tool_name == TOOL_UPDATE_GOAL_STATUS and result_content.get("success"):
-            goal_id_marked_in_ums = arguments.get("goal_id")  # The goal ID passed to the UMS tool
-            new_status_in_ums = arguments.get("status")  # The new status passed to the UMS tool
+            goal_id_marked_in_ums = arguments.get("goal_id")
+            new_status_in_ums_str = arguments.get("status") # This is the status string sent to UMS
+            
+            # Validate the status string
+            try:
+                new_status_in_ums = GoalStatus(new_status_in_ums_str.lower())
+            except ValueError:
+                self.logger.error(f"AML: Invalid status '{new_status_in_ums_str}' provided to {TOOL_UPDATE_GOAL_STATUS}. Aborting side-effects.")
+                self.state.last_error_details = {"tool": TOOL_UPDATE_GOAL_STATUS, "error": f"Invalid goal status '{new_status_in_ums_str}' used.", "type": "GoalManagementError"}
+                self.state.needs_replan = True
+                return
 
-            # Get data returned by the UMS tool
-            updated_goal_details_from_ums = result_content.get("updated_goal_details")
-            parent_goal_id_from_ums = result_content.get("parent_goal_id")  # Parent of the *marked* goal
-            is_root_finished_from_ums = result_content.get("is_root_finished", False)
+            updated_goal_details_from_ums = result_content.get("updated_goal_details") # Full UMS Goal object
+            parent_goal_id_from_ums = result_content.get("parent_goal_id") # ID of the parent of the goal that was just marked
+            is_root_finished_from_ums = result_content.get("is_root_finished", False) # Boolean from UMS
 
-            # Validate the UMS response
             if not isinstance(updated_goal_details_from_ums, dict) or updated_goal_details_from_ums.get("goal_id") != goal_id_marked_in_ums:
                 self.logger.error(
-                    f"UMS {TOOL_UPDATE_GOAL_STATUS} returned inconsistent 'updated_goal_details' for {goal_id_marked_in_ums}. Aborting side-effects for this update."
+                    f"AML: UMS Tool {TOOL_UPDATE_GOAL_STATUS} returned inconsistent 'updated_goal_details' for goal {_fmt_id(goal_id_marked_in_ums)}. Aborting side-effects."
                 )
+                self.state.last_error_details = {"tool": TOOL_UPDATE_GOAL_STATUS, "error": "UMS update_goal_status returned inconsistent data.", "type": "GoalManagementError"}
+                self.state.needs_replan = True
                 return
 
             # 1. Update the specific goal in the agent's local stack with fresh UMS data
             goal_found_in_local_stack_and_updated = False
             for i, local_goal_dict in enumerate(self.state.goal_stack):
                 if local_goal_dict.get("goal_id") == goal_id_marked_in_ums:
-                    self.state.goal_stack[i] = updated_goal_details_from_ums  # Replace with fresh full object
+                    self.state.goal_stack[i] = updated_goal_details_from_ums # Replace with the full, fresh UMS goal object
                     goal_found_in_local_stack_and_updated = True
-                    self.logger.info(f"Updated goal {_fmt_id(goal_id_marked_in_ums)} in local stack with UMS data (new status: {new_status_in_ums}).")
+                    self.logger.info(f"AML: Updated goal {_fmt_id(goal_id_marked_in_ums)} in local stack with UMS data (new status: {new_status_in_ums.value}).")
                     break
             if not goal_found_in_local_stack_and_updated:
                 self.logger.warning(
-                    f"Goal {_fmt_id(goal_id_marked_in_ums)} (marked {new_status_in_ums} in UMS) not found in current agent goal stack for update. Local stack: {[_fmt_id(g.get('goal_id')) for g in self.state.goal_stack]}"
+                    f"AML: Goal {_fmt_id(goal_id_marked_in_ums)} (marked {new_status_in_ums.value} in UMS) not found in current agent goal stack. Local stack may be outdated or inconsistent."
                 )
+                # If the marked goal wasn't in our stack, but it was our current_goal_id, this is a problem.
+                if goal_id_marked_in_ums == self.state.current_goal_id:
+                     self.logger.error(f"AML: Discrepancy! Current goal {_fmt_id(self.state.current_goal_id)} marked in UMS but not found in local stack to update.")
+
 
             # 2. If the goal that was just marked in UMS was our *current* active goal, and it's now terminal...
-            if goal_id_marked_in_ums == self.state.current_goal_id and new_status_in_ums in ["completed", "failed", "abandoned"]:
-                self.logger.info(f"Current active goal {_fmt_id(self.state.current_goal_id)} reached terminal state '{new_status_in_ums}'.")
+            is_terminal_status = new_status_in_ums in [GoalStatus.COMPLETED, GoalStatus.FAILED, GoalStatus.ABANDONED]
+            if goal_id_marked_in_ums == self.state.current_goal_id and is_terminal_status:
+                self.logger.info(f"AML: Current active UMS goal {_fmt_id(self.state.current_goal_id)} reached terminal state '{new_status_in_ums.value}'.")
 
-                # Set the new current_goal_id based on what UMS returned for the parent of the marked goal.
-                self.state.current_goal_id = parent_goal_id_from_ums  # This could be None if root was marked
-                self.logger.info(f"Agent's current_goal_id updated to parent: {_fmt_id(self.state.current_goal_id)}")
+                # The agent's new current_goal_id is the parent_goal_id returned by UMS
+                # This parent_goal_id is the parent of the goal that was *just marked terminal*.
+                self.state.current_goal_id = parent_goal_id_from_ums 
+                self.logger.info(f"AML: Agent's current_goal_id updated to parent: '{_fmt_id(self.state.current_goal_id)}' (returned by UMS).")
 
-                # Rebuild the local goal stack view from UMS, anchored by the new current_goal_id (or empty if it's None)
-                if self.state.current_goal_id:
+                # Rebuild the local goal stack view from UMS, anchored by the new current_goal_id
+                if self.state.current_goal_id: # If there's a parent to focus on
                     self.state.goal_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
-                else:  # Current goal became None (meaning root goal was likely finished)
-                    self.state.goal_stack = []  # Clear local stack
-
+                    if not self.state.goal_stack: # If fetching stack for parent failed
+                        self.logger.warning(f"AML: Failed to fetch UMS stack for new current_goal_id '{_fmt_id(self.state.current_goal_id)}'. Clearing local stack and current_goal_id.")
+                        self.state.current_goal_id = None # Important: ensure current_goal_id is also cleared if stack fetch fails
+                else:  # Current goal became None (meaning root goal was likely finished OR the parent_goal_id_from_ums was None)
+                    self.state.goal_stack = []
+                    self.logger.info("AML: current_goal_id became None after UMS update (likely root goal finished or no parent). Clearing local goal stack.")
+                
                 self.logger.info(
-                    f"🎯 Focus shifted. New current goal: {_fmt_id(self.state.current_goal_id) if self.state.current_goal_id else 'Overall Goal (stack empty)'}. Local stack depth: {len(self.state.goal_stack)}"
+                    f"🎯 Focus shifted. New current UMS goal: '{_fmt_id(self.state.current_goal_id) if self.state.current_goal_id else 'Overall Workflow Goal (stack empty/root finished)'}'. Local stack depth: {len(self.state.goal_stack)}"
                 )
 
-                # 3. Check if the overall workflow/root goal is finished based on UMS
-                if is_root_finished_from_ums:  # UMS explicitly said a root goal is now terminal
-                    self.logger.info("UMS indicated a root goal is finished. Overall goal/workflow presumed finished.")
-                    self.state.goal_achieved_flag = new_status_in_ums == "completed"  # Overall success depends on status of this root goal
-                    # Update UMS workflow status
+                # 3. Check if the overall workflow/root goal is finished based on UMS `is_root_finished` flag
+                if is_root_finished_from_ums: # UMS tool explicitly tells us if a root goal finished
+                    self.logger.info("AML: UMS indicated a root goal was terminally finished. Overall workflow goal presumed finished.")
+                    # Overall success depends on the status of this root goal
+                    self.state.goal_achieved_flag = (new_status_in_ums == GoalStatus.COMPLETED) 
+                    
                     if self.state.workflow_id and self._find_tool_server(TOOL_UPDATE_WORKFLOW_STATUS):
                         final_wf_status = WorkflowStatus.COMPLETED.value if self.state.goal_achieved_flag else WorkflowStatus.FAILED.value
                         await self._execute_tool_call_internal(
@@ -2109,69 +2261,122 @@ class AgentMasterLoop:
                             {
                                 "workflow_id": self.state.workflow_id,
                                 "status": final_wf_status,
-                                "completion_message": f"Overall root goal marked {new_status_in_ums} via UMS.",
+                                "completion_message": f"Overall root UMS goal '{_fmt_id(goal_id_marked_in_ums)}' marked '{new_status_in_ums.value}'.",
                             },
                             record_action=False,
                         )
-                    self.state.current_plan = []  # Clear plan as workflow is done
-                elif self.state.current_goal_id:  # If not root finished, but shifted to a new current goal
+                    self.state.current_plan = [] # Clear plan as workflow (root goal) is done
+                elif self.state.current_goal_id: # Shifted to a new parent UMS goal that is not the root finishing
                     self.state.needs_replan = True
                     current_goal_desc_for_plan = "Unknown Goal"
                     # Find description for the new current goal from the (rebuilt) stack
-                    for g_dict in self.state.goal_stack:
+                    for g_dict in self.state.goal_stack: # Stack is now rebuilt for the parent
                         if g_dict.get("goal_id") == self.state.current_goal_id:
                             current_goal_desc_for_plan = g_dict.get("description", "Unknown Goal")[:50]
                             break
-                    self.state.current_plan = [
-                        PlanStep(
-                            description=f"Returned from sub-goal {_fmt_id(goal_id_marked_in_ums)} (status: {new_status_in_ums}). Re-assess current goal: '{current_goal_desc_for_plan}...' ({_fmt_id(self.state.current_goal_id)})."
-                        )
-                    ]
-                self.state.last_error_details = None  # Clear error details when goal status changes
+                    plan_desc = f"Returned from UMS sub-goal {_fmt_id(goal_id_marked_in_ums)} (status: {new_status_in_ums.value}). Re-assess current UMS goal: '{current_goal_desc_for_plan}...' ({_fmt_id(self.state.current_goal_id)})."
+                    self.state.current_plan = [PlanStep(description=plan_desc)]
+                elif not self.state.current_goal_id and not is_root_finished_from_ums:
+                    # This case: parent_goal_id_from_ums was None, but UMS didn't say it was a root finishing.
+                    # This means the marked goal was a root goal, but UMS's `is_root_finished` logic is specific.
+                    # Agent should treat this as the end of its current goal hierarchy.
+                    self.logger.info(f"AML: Completed UMS root goal {_fmt_id(goal_id_marked_in_ums)}. No further parent. Agent needs to re-evaluate overall workflow status.")
+                    self.state.goal_achieved_flag = (new_status_in_ums == GoalStatus.COMPLETED) # Set based on this root goal.
+                    # If goal_achieved_flag is true, main loop will handle workflow completion.
+                    # If false, the LLM needs to decide if the workflow failed or if there's another top-level goal.
+                    self.state.needs_replan = True # LLM needs to decide next steps for the workflow
+                    self.state.current_plan = [PlanStep(description=f"Completed UMS root goal {_fmt_id(goal_id_marked_in_ums)}. Re-evaluating overall workflow objectives.")]
+
+
+                self.state.last_error_details = None # Clear error details when goal status changes
+            
+            # Else (the goal marked in UMS was *not* the agent's current_goal_id):
+            # The UMS state changed for a different goal (e.g., a parallel goal or an ancestor).
+            # The agent's local view of *that specific goal* in its stack (if present) has been updated.
+            # The agent's `current_goal_id` and active plan do not change automatically here.
+            # The LLM might notice this change in the goal stack context (`agent_assembled_goal_context`)
+            # and decide if a replan or focus shift is necessary.
+            elif goal_found_in_local_stack_and_updated:
+                 self.logger.info(f"AML: UMS Goal '{_fmt_id(goal_id_marked_in_ums)}' (not current agent focus) updated to '{new_status_in_ums.value}'. Local stack view of this goal is updated.")
+            # No specific plan change or `needs_replan` flag set here by default.
+
 
         # --- Side effects for Workflow Status Update (Completion/Failure/Abandonment) ---
         elif tool_name == TOOL_UPDATE_WORKFLOW_STATUS and result_content.get("success"):
-            status = arguments.get("status")  # Status requested in the tool call
-            wf_id_updated = arguments.get("workflow_id")  # Workflow that was updated
+            requested_status_str = arguments.get("status")
+            wf_id_updated = arguments.get("workflow_id")
 
+            try:
+                requested_status_enum = WorkflowStatus(requested_status_str.lower())
+            except ValueError:
+                self.logger.error(f"AML: Invalid workflow status '{requested_status_str}' used in {TOOL_UPDATE_WORKFLOW_STATUS} call.")
+                return # Cannot proceed with invalid status
+
+            # Check if the workflow being updated is the one at the top of the agent's stack
             if wf_id_updated and self.state.workflow_stack and wf_id_updated == self.state.workflow_stack[-1]:
-                is_terminal = status in [WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value, WorkflowStatus.ABANDONED.value]
-                if is_terminal:
-                    finished_wf = self.state.workflow_stack.pop()
+                is_terminal_wf_status = requested_status_enum in [WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.ABANDONED]
+                
+                if is_terminal_wf_status:
+                    finished_wf = self.state.workflow_stack.pop() # Remove from stack
                     parent_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else None
-                    if parent_wf_id:
+                    
+                    if parent_wf_id: # Returning to a parent workflow
                         self.state.workflow_id = parent_wf_id
-                        self.state.context_id = self.state.workflow_id
-                        await self._set_default_thought_chain_id()
-                        # If returning to a parent workflow, its goal stack should be re-established
-                        # The current_goal_id for the parent workflow should be the goal that *spawned* the sub-workflow.
-                        # This requires the agent to have stored this initiating_goal_id when it created the sub-workflow.
-                        # For now, we'll assume the agent needs to re-evaluate its goals in the parent context.
-                        # A robust way is to re-fetch the parent's current/leaf goal from UMS if its ID is known.
-                        # As a simpler heuristic for now, if goal_stack has items and top one is for parent_wf_id, use it.
-                        if self.state.goal_stack and self.state.goal_stack[-1].get("workflow_id") == parent_wf_id:
-                            self.state.current_goal_id = self.state.goal_stack[-1].get("goal_id")
-                        else:  # Fallback: clear stack and let agent figure it out, or try to find parent's leaf goal
-                            self.state.goal_stack = []  # Clear local stack, agent needs to re-evaluate in parent WF
-                            self.state.current_goal_id = None  # Or try to find active goal for parent_wf_id in UMS
+                        self.state.context_id = self.state.workflow_id # Align context ID
+                        await self._set_default_thought_chain_id() # For parent
+                        
+                        # Goal Stack Handling for Parent Workflow:
+                        # This is complex. The ideal way is if the agent recorded which parent goal
+                        # initiated this sub-workflow. Lacking that, we clear the stack.
+                        # The LLM will need to re-evaluate the parent workflow's goals from fresh UMS context.
+                        self.logger.info(
+                            f"AML: Sub-workflow '{_fmt_id(finished_wf)}' ({requested_status_enum.value}) finished. "
+                            f"Returning to parent workflow '{_fmt_id(parent_wf_id)}'. "
+                            "Current goal stack will be cleared for parent context re-evaluation by LLM."
+                        )
+                        self.state.goal_stack = [] 
+                        self.state.current_goal_id = None 
+                        # The next call to _gather_context -> _fetch_goal_stack_from_ums will attempt to get the
+                        # current operational goal for the parent_wf_id if the LLM requests it,
+                        # or the agent will need to be prompted to establish a goal.
 
                         self.logger.info(
-                            f"⬅️ Sub-workflow {_fmt_id(finished_wf)} finished ({status}). Returning to parent {_fmt_id(self.state.workflow_id)}. Chain: {_fmt_id(self.state.current_thought_chain_id)}. Goal: {_fmt_id(self.state.current_goal_id)}"
+                            f"⬅️ Popped sub-workflow '{_fmt_id(finished_wf)}' (status: {requested_status_enum.value}). "
+                            f"Active workflow now: '{_fmt_id(self.state.workflow_id)}'. "
+                            f"Chain: '{_fmt_id(self.state.current_thought_chain_id)}'. Current UMS Goal for parent needs re-evaluation."
                         )
                         self.state.needs_replan = True
                         self.state.current_plan = [
-                            PlanStep(description=f"Sub-workflow {_fmt_id(finished_wf)} ({status}) finished. Re-assess current context.")
+                            PlanStep(description=f"Sub-workflow '{_fmt_id(finished_wf)}' ({requested_status_enum.value}) finished. Re-assess current context and goals for parent workflow '{_fmt_id(self.state.workflow_id)}'.")
                         ]
                         self.state.last_error_details = None
                     else:  # Root workflow finished
-                        self.logger.info(f"Root workflow {_fmt_id(finished_wf)} finished ({status}).")
+                        self.logger.info(f"AML: Root workflow '{_fmt_id(finished_wf)}' finished ({requested_status_enum.value}). No parent workflow on stack.")
                         self.state.workflow_id = None
                         self.state.context_id = None
                         self.state.current_thought_chain_id = None
-                        self.state.current_plan = []
-                        self.state.goal_stack = []
+                        self.state.current_plan = [] # Clear plan
+                        self.state.goal_stack = [] # Clear goal stack
                         self.state.current_goal_id = None
-                        self.state.goal_achieved_flag = status == WorkflowStatus.COMPLETED.value
+                        self.state.goal_achieved_flag = (requested_status_enum == WorkflowStatus.COMPLETED)
+                        # Agent will stop due to goal_achieved_flag or no workflow_id
+            else:
+                # The workflow updated was not the top of our stack, or stack is empty.
+                # This could be a concurrent update or an update to an old workflow.
+                # Agent's current operational state (workflow_id, context_id, goal_stack) remains unchanged.
+                self.logger.info(
+                    f"AML: UMS Workflow '{_fmt_id(wf_id_updated)}' status changed to '{requested_status_enum.value}'. "
+                    "This was not the agent's current active workflow. No change to agent's primary focus."
+                )
+
+        # If any significant state change occurred, log it for debugging
+        if (current_wf_id_before_effect != (self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id) or
+            current_goal_id_before_effect != self.state.current_goal_id):
+            self.logger.debug(
+                f"AML Side-Effect Summary: WF: {_fmt_id(current_wf_id_before_effect)} -> {_fmt_id(self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id)}, "
+                f"Goal: {_fmt_id(current_goal_id_before_effect)} -> {_fmt_id(self.state.current_goal_id)}, "
+                f"Stack Depth: {len(self.state.goal_stack)}"
+            )
 
     async def _fetch_goal_stack_from_ums(self, leaf_goal_id: Optional[str]) -> List[Dict[str, Any]]:
         """

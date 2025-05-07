@@ -1837,6 +1837,36 @@
             overflow-x: hidden;
         }
 
+        /* General Tabulator styling for Agent Plan Table */
+        #agent-current-plan-table .tabulator-header {
+            background-color: hsl(var(--b2) / 0.7); /* Lighter header */
+            border-bottom: 1px solid hsl(var(--b3) / 0.4);
+            font-size: 0.7rem; /* Smaller header font */
+            font-weight: 500;
+        }
+        #agent-current-plan-table .tabulator-col-title {
+            padding: 0.3rem 0.5rem; /* Adjust header cell padding */
+        }
+        #agent-current-plan-table .tabulator-row .tabulator-cell {
+            padding: 0.25rem 0.5rem; /* Adjust data cell padding */
+            font-size: 0.7rem; /* Smaller cell font */
+            line-height: 1.3;
+            border-right: 1px solid hsl(var(--b1) / 0.5); /* Subtle vertical cell borders */
+        }
+        #agent-current-plan-table .tabulator-row .tabulator-cell:last-child {
+            border-right: none;
+        }
+        #agent-current-plan-table .tabulator-placeholder {
+            font-size: 0.75rem;
+            padding: 1rem;
+        }
+        /* Specific styling for the description column in agent plan to allow wrapping */
+        #agent-current-plan-table .tabulator-cell[tabulator-field="description"] {
+            white-space: normal !important; /* Allow text wrapping */
+            max-width: 300px; /* Or whatever max width fits your layout */
+            overflow-wrap: break-word;
+        }
+
         [x-cloak] {
             display: none;
         }
@@ -3121,143 +3151,183 @@
                 </div>
                 <!-- End Dashboard Tab -->
                 <!-- Agent Tab -->
-                <div x-show="activeTab === 'agent'" x-transition.opacity>
-                    <h2 class="text-base font-semibold mb-3 flex items-center">
-                        <i class="fas fa-robot mr-2 text-primary"></i>Agent Self-Driving Mode
+                <div x-show="activeTab === 'agent'" x-transition.opacity class="space-y-4">
+                    <h2 class="text-lg font-semibold mb-4 flex items-center text-base-content">
+                        <i class="fas fa-robot mr-2 text-primary text-xl"></i>Agent Self-Driving Mode
                     </h2>
 
-                    <!-- Agent Status Display (read-only) -->
-                    <div class="card card-compact bg-base-200/60 shadow-sm p-3 mb-4 text-xs space-y-1">
-                        <div class="flex justify-between items-center">
-                            <span class="font-medium">Status:</span>
-                            <span class="badge badge-sm"
-                                  :class="{
-                                      'badge-success animate-pulse': agentStatus.status === 'running',
-                                      'badge-success': agentStatus.status === 'completed',
-                                      'badge-warning': agentStatus.status === 'starting' || agentStatus.status === 'stopping' || agentStatus.status === 'stopping_timeout',
-                                      'badge-error': agentStatus.status === 'failed' || agentStatus.status === 'error_stopping',
-                                      'badge-ghost': agentStatus.status === 'idle' || agentStatus.status === 'stopped' || agentStatus.status === 'max_loops_reached'
-                                  }"
-                                  x-text="agentStatus.status_display || agentStatus.status || 'Idle'">
-                            </span>
-                        </div>
-                        <div><span class="font-medium">Overall Goal:</span> <span class="opacity-80 truncate block" x-text="agentStatus.current_goal_description_from_agent || 'Not Set'" :title="agentStatus.current_goal_description_from_agent"></span></div>
-                        <div><span class="font-medium">Current Op Goal:</span> <span class="opacity-80 truncate block" x-text="agentStatus.agent_current_operational_goal_description || 'N/A'" :title="agentStatus.agent_current_operational_goal_description"></span></div>
-                        <div x-show="agentStatus.agent_running && agentStatus.max_loops > 0" class="pt-1">
-                            <div class="flex justify-between text-xs opacity-70 mb-0.5">
-                                <span>Loop Progress</span>
-                                <span class="font-mono" x-text="`${agentStatus.current_loop || 0} / ${agentStatus.max_loops || 0}`"></span>
-                            </div>
-                            <progress class="progress progress-primary w-full h-1.5"
-                                      :value="agentStatus.current_loop || 0"
-                                      :max="agentStatus.max_loops || 100"></progress>
-                        </div>
-                        <div><span class="font-medium">Last Action/Msg:</span> <span class="opacity-80 truncate block" x-text="agentStatus.last_action_summary_from_agent || agentStatus.last_message || 'N/A'" :title="agentStatus.last_action_summary_from_agent || agentStatus.last_message"></span></div>
-                        <div><span class="font-medium">Agent Model:</span> <span class="font-mono opacity-80" x-text="agentStatus.agent_target_model || 'N/A'"></span></div>
-
-                        <button class="btn btn-xs btn-ghost btn-block mt-1.5 text-info/80 hover:bg-info/10" @click="fetchAgentStatus">
-                            <i class="fas fa-sync fa-xs" :class="{'fa-spin': isLoadingAgentStatus}"></i> Refresh Status
-                        </button>
-                    </div>
-
-                    <!-- Current Goal Stack (Agent View) -->
-                    <div x-show="agentStatus.agent_current_operational_goal_stack_summary && agentStatus.agent_current_operational_goal_stack_summary.length > 0"
-                         class="my-3 p-3 bg-base-100/70 rounded-md shadow-sm border border-base-300/20">
-                        <h4 class="text-xs font-semibold mb-1.5 text-primary flex items-center">
-                            <i class="fas fa-tasks fa-fw mr-1.5"></i> Current Goal Stack (Agent View)
-                        </h4>
-                        <ul class="list-none pl-0 space-y-1 text-2xs">
-                            <template x-for="(goal, index) in agentStatus.agent_current_operational_goal_stack_summary" :key="goal.goal_id || index">
-                                <li class="flex items-center gap-1.5 p-1.5 rounded-md"
-                                    :class="index === agentStatus.agent_current_operational_goal_stack_summary.length - 1 ? 'bg-primary/10 ring-1 ring-primary/30' : 'bg-base-200/50'">
-                                    <i class="fas fa-flag text-xs opacity-60"
-                                       :class="index === agentStatus.agent_current_operational_goal_stack_summary.length - 1 ? '!text-primary !opacity-100' : 'text-base-content/50'"></i>
-                                    <div class="flex-1 min-w-0">
-                                        <p class="truncate font-medium" x-text="goal.description" :title="goal.description"></p>
-                                        <div class="flex items-center justify-between opacity-70 mt-0.5">
-                                            <span class="badge badge-xs badge-outline font-mono"
-                                                  :class="{
-                                                    'badge-success': goal.status === 'completed',
-                                                    'badge-error': goal.status === 'failed' || goal.status === 'abandoned',
-                                                    'badge-info': goal.status === 'active' || goal.status === 'in_progress',
-                                                    'badge-warning': goal.status === 'paused'
-                                                  }"
-                                                  x-text="goal.status"></span>
-                                            <span class="font-mono opacity-70" x-text="goal.goal_id ? '(...' + goal.goal_id.slice(-6) + ')' : 'Not Synced'"></span>
-                                        </div>
-                                    </div>
-                                </li>
-                            </template>
-                        </ul>
-                    </div>
-
-                    <!-- Current Plan Step Display -->
-                    <div x-show="agentStatus.agent_running && agentStatus.current_plan_from_agent && agentStatus.current_plan_from_agent.length > 0"
-                         class="my-3 p-3 bg-base-100/70 rounded-md shadow-sm border border-base-300/20">
-                        <h4 class="text-xs font-semibold mb-1.5 text-primary flex items-center">
-                            <i class="fas fa-clipboard-list fa-fw mr-1.5"></i> Agent's Current Plan Step
-                        </h4>
-                        <div id="agent-current-plan-table" class="text-xs">
-                            <!-- Tabulator will populate this -->
-                        </div>
-                    </div>
-
-
-                    <!-- Agent Start Controls -->
-                    <div class="space-y-3" x-show="!agentStatus.agent_running && !['starting', 'stopping', 'error_stopping', 'stopping_timeout'].includes(agentStatus.status)">
-                        <div>
-                            <label class="label py-1"><span class="label-text text-xs font-medium">Agent's Overall Goal</span></label>
-                            <textarea class="textarea textarea-bordered w-full text-sm leading-normal" rows="4"
-                                      placeholder="Enter the main objective for the agent... Be specific and actionable."
-                                      x-model.lazy="agentControl.goal"></textarea>
-                        </div>
-                        <div class="grid grid-cols-2 gap-2 items-end">
-                            <div>
-                                <label class="label py-1"><span class="label-text text-xs font-medium">Max Loops</span></label>
-                                <input type="number" class="input input-bordered input-sm w-full" min="1" max="1000"
-                                       x-model.number="agentControl.maxLoops">
-                            </div>
-                            <div>
-                                <label class="label py-1"><span class="label-text text-xs font-medium">LLM Model (Optional)</span></label>
-                                <input type="text" class="input input-bordered input-sm w-full"
-                                       placeholder="Current client default or override"
-                                       x-model.lazy="agentControl.llmModel"
-                                       list="agentModelDatalistShared"> <!-- Use a shared datalist ID if applicable -->
-                                <!-- Re-using datalist from header might be good, ensure ID is consistent or duplicate it here if needed -->
-                                <datalist id="agentModelDatalistShared">
-                                    <template x-for="providerName in Object.keys(modelsByProvider)" :key="providerName">
-                                        <template x-for="modelInfo in modelsByProvider[providerName]" :key="modelInfo.name">
-                                            <option :value="modelInfo.name" x-text="getFormattedModelName(modelInfo.name) + ' (' + providerName + ')'"></option>
-                                        </template>
-                                    </template>
-                                </datalist>
-                            </div>
-                        </div>
-                        <button class="btn btn-primary btn-block mt-2"
-                                @click="startAgent"
-                                :disabled="!agentControl.goal.trim() || agentControl.maxLoops <= 0 || isLoadingAgentAction || agentStatus.agent_running">
-                            <i class="fas fa-play mr-2"></i> Start Agent
-                        </button>
-                    </div>
-
-                    <!-- Agent Active Controls (Stop, Guidance) -->
-                    <div x-show="agentStatus.agent_running || ['starting', 'stopping', 'stopping_timeout'].includes(agentStatus.status)" class="space-y-3 mt-2">
-                        <button class="btn btn-error btn-block"
-                                @click="stopAgent"
-                                :disabled="isLoadingAgentAction || ['stopped', 'idle', 'failed', 'completed', 'error_stopping'].includes(agentStatus.status)">
-                            <i class="fas fa-stop mr-2"></i>
-                            <span x-text="agentStatus.status === 'stopping' || agentStatus.status === 'stopping_timeout' ? 'Stopping...' : 'Stop Agent'"></span>
-                        </button>
-
-                        <div class="mt-4 pt-3 border-t border-base-300/30" x-show="agentStatus.agent_running">
-                            <label class="label py-1"><span class="label-text text-xs font-medium">Provide Guidance / Observation to Agent:</span></label>
-                            <div class="flex gap-2">
-                                <input type="text" class="input input-sm input-bordered flex-grow" x-model="agentControl.guidanceText"
-                                       placeholder="e.g., 'Focus on analyzing the CSV file first.'">
-                                <button class="btn btn-sm btn-secondary" @click="sendAgentGuidance"
-                                        :disabled="!agentControl.guidanceText.trim() || isLoadingAgentAction">
-                                    Send Hint
+                    <!-- Agent Status & Overview Card -->
+                    <div class="card card-compact bg-base-100 shadow-md border border-base-300/30">
+                        <div class="card-body p-4 space-y-2.5 text-sm">
+                            <div class="flex justify-between items-center pb-2 border-b border-base-300/20">
+                                <h3 class="card-title !text-base !pb-0">
+                                    <i class="fas fa-tachometer-alt mr-2 text-secondary"></i>Agent Status
+                                </h3>
+                                <button class="btn btn-xs btn-ghost text-info/80 hover:text-info hover:bg-info/10 px-2" @click="fetchAgentStatus()">
+                                    <i class="fas fa-sync fa-xs" :class="{'fa-spin': isLoadingAgentStatus}"></i> Refresh
                                 </button>
+                            </div>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-2 text-xs">
+                                <div class="flex justify-between items-center">
+                                    <span class="font-medium text-base-content/70">Current State:</span>
+                                    <span class="badge badge-md font-semibold"
+                                          :class="{
+                                              'badge-success animate-pulse': agentStatus.status === 'running',
+                                              'badge-success': agentStatus.status === 'completed',
+                                              'badge-warning': agentStatus.status === 'starting' || agentStatus.status === 'stopping' || agentStatus.status === 'stopping_timeout',
+                                              'badge-error': agentStatus.status === 'failed' || agentStatus.status === 'error_stopping',
+                                              'badge-ghost': agentStatus.status === 'idle' || agentStatus.status === 'stopped' || agentStatus.status === 'max_loops_reached' || agentStatus.status === 'unknown'
+                                          }"
+                                          x-text="agentStatus.status_display || 'Idle'">
+                                    </span>
+                                </div>
+                                <div class="flex justify-between items-center" x-show="agentStatus.agent_running && agentStatus.agent_max_loops_from_mcp_config > 0">
+                                    <span class="font-medium text-base-content/70">Loop Progress:</span>
+                                    <span class="font-mono text-base-content/90" x-text="`${agentStatus.agent_internal_loop_count || 0} / ${agentStatus.agent_max_loops_from_mcp_config || 0}`"></span>
+                                </div>
+                            </div>
+                            
+                            <div x-show="agentStatus.agent_running && agentStatus.agent_max_loops_from_mcp_config > 0" class="pt-1">
+                                <progress class="progress progress-primary w-full h-2"
+                                          :value="agentStatus.agent_internal_loop_count || 0"
+                                          :max="agentStatus.agent_max_loops_from_mcp_config || 100"></progress>
+                            </div>
+
+                            <div>
+                                <span class="font-medium text-base-content/70 block mb-0.5">Overall Task (MCPC):</span>
+                                <p class="opacity-90 text-base-content/90 text-xs leading-snug p-2 bg-base-200/50 rounded-md min-h-[3em]" x-text="agentStatus.overall_goal_from_mcp_client || 'Not Set'" :title="agentStatus.overall_goal_from_mcp_client"></p>
+                            </div>
+
+                            <div>
+                                <span class="font-medium text-base-content/70 block mb-0.5">Current UMS Goal (Agent):</span>
+                                <p class="opacity-90 text-base-content/90 text-xs leading-snug p-2 bg-base-200/50 rounded-md min-h-[3em]" x-text="agentStatus.agent_current_ums_goal_description || 'N/A'" :title="agentStatus.agent_current_ums_goal_description"></p>
+                                <span class="text-2xs opacity-60 font-mono ml-1" x-show="agentStatus.agent_current_ums_goal_id" x-text="`(ID: ...${agentStatus.agent_current_ums_goal_id ? agentStatus.agent_current_ums_goal_id.slice(-8) : ''})`"></span>
+                            </div>
+
+                            <div>
+                                <span class="font-medium text-base-content/70 block mb-0.5">Last Action/Message (Agent):</span>
+                                <p class="opacity-90 text-base-content/90 text-xs leading-snug p-2 bg-base-200/50 rounded-md min-h-[2.5em]" x-text="agentStatus.agent_last_action_summary || agentStatus.agent_last_general_message || 'N/A'" :title="agentStatus.agent_last_action_summary || agentStatus.agent_last_general_message"></p>
+                            </div>
+                            
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs pt-1 border-t border-base-300/20 mt-2">
+                                <div><span class="font-medium text-base-content/70">Agent LLM:</span> <span class="font-mono opacity-90 text-base-content/90" x-text="agentStatus.agent_target_model || 'N/A'"></span></div>
+                                <div x-show="agentStatus.agent_workflow_id"><span class="font-medium text-base-content/70">UMS Workflow ID:</span> <span class="font-mono opacity-90 text-base-content/90" x-text="agentStatus.agent_workflow_id ? '...' + agentStatus.agent_workflow_id.slice(-8) : 'N/A'"></span></div>
+                                <div x-show="agentStatus.agent_thought_chain_id"><span class="font-medium text-base-content/70">UMS Thought Chain:</span> <span class="font-mono opacity-90 text-base-content/90" x-text="agentStatus.agent_thought_chain_id ? '...' + agentStatus.agent_thought_chain_id.slice(-8) : 'N/A'"></span></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Agent's UMS Goal Stack Card -->
+                    <div x-show="agentStatus.agent_local_ums_goal_stack_summary && agentStatus.agent_local_ums_goal_stack_summary.length > 0"
+                         class="card card-compact bg-base-100 shadow-md border border-base-300/30">
+                        <div class="card-body p-4">
+                            <h3 class="card-title !text-base !pb-0 mb-2 flex items-center text-base-content">
+                                <i class="fas fa-layer-group fa-fw mr-2 text-secondary"></i> Agent's UMS Goal Stack
+                            </h3>
+                            <ul class="list-none pl-0 space-y-1.5 text-xs max-h-60 overflow-y-auto pr-1">
+                                <template x-for="(goal, index) in agentStatus.agent_local_ums_goal_stack_summary" :key="goal.goal_id || index">
+                                    <li class="flex items-start gap-2 p-2 rounded-md transition-all duration-150"
+                                        :class="goal.goal_id === agentStatus.agent_current_ums_goal_id ? 'bg-primary/10 ring-2 ring-primary/50 shadow-sm' : 'bg-base-200/70 hover:bg-base-200'">
+                                        <i class="fas fa-flag mt-0.5 text-sm"
+                                           :class="goal.goal_id === agentStatus.agent_current_ums_goal_id ? 'text-primary' : 'text-base-content/40'"></i>
+                                        <div class="flex-1 min-w-0">
+                                            <p class="font-medium text-base-content/95 leading-snug" x-text="goal.description" :title="goal.description"></p>
+                                            <div class="flex items-center justify-between text-2xs opacity-70 mt-1">
+                                                <span class="badge badge-sm font-mono !py-0.5 !px-2 !text-2xs !leading-tight"
+                                                      :class="{
+                                                        'badge-success text-success-content': goal.status === 'completed',
+                                                        'badge-error text-error-content': goal.status === 'failed' || goal.status === 'abandoned',
+                                                        'badge-info text-info-content': goal.status === 'active' || goal.status === 'in_progress' || goal.status === 'planned',
+                                                        'badge-warning text-warning-content': goal.status === 'paused',
+                                                        'badge-ghost': !['completed', 'failed', 'abandoned', 'active', 'in_progress', 'planned', 'paused'].includes(goal.status)
+                                                      }"
+                                                      x-text="goal.status || 'unknown'"></span>
+                                                <span class="font-mono opacity-80" x-text="goal.goal_id ? `(...${goal.goal_id.slice(-7)})` : 'Not Synced'"></span>
+                                            </div>
+                                        </div>
+                                    </li>
+                                </template>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <!-- Agent's Current Plan Steps Card -->
+                    <div x-show="agentStatus.agent_running && agentStatus.agent_current_full_plan && agentStatus.agent_current_full_plan.length > 0"
+                         class="card card-compact bg-base-100 shadow-md border border-base-300/30">
+                        <div class="card-body p-0"> <!-- p-0 on card-body for Tabulator to control padding -->
+                            <h3 class="text-base font-semibold mb-0 text-base-content flex items-center p-3 border-b border-base-300/20">
+                                <i class="fas fa-tasks fa-fw mr-2 text-secondary"></i> Agent's Current Plan
+                            </h3>
+                            <div id="agent-current-plan-table" class="text-xs min-h-[100px] m-1"> 
+                                <!-- Tabulator styling might need table-xs or specific height -->
+                            </div>
+                        </div>
+                    </div>
+                    <div x-show="agentStatus.agent_running && (!agentStatus.agent_current_full_plan || agentStatus.agent_current_full_plan.length === 0)"
+                         class="my-3 p-4 text-center text-sm text-base-content/60 bg-base-100/50 rounded-md border border-base-300/20 italic shadow-sm">
+                        Agent has no active plan steps.
+                    </div>
+
+                    <!-- Agent Start Controls Card -->
+                    <div class="card card-compact bg-base-100 shadow-md border border-base-300/30" x-show="!agentStatus.agent_running && !['starting', 'stopping', 'error_stopping', 'stopping_timeout'].includes(agentStatus.status)">
+                        <div class="card-body p-4 space-y-3">
+                            <h3 class="card-title !text-base !pb-0">
+                                <i class="fas fa-rocket mr-2 text-success"></i> Launch Agent
+                            </h3>
+                            <div>
+                                <label class="label py-1"><span class="label-text text-xs font-medium">Agent's Overall Task / Goal</span></label>
+                                <textarea class="textarea textarea-bordered w-full text-sm leading-normal textarea-primary" rows="3"
+                                          placeholder="Enter the main objective for the agent... Be specific and actionable."
+                                          x-model.lazy="agentControl.goal"></textarea>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3 items-end">
+                                <div>
+                                    <label class="label py-1"><span class="label-text text-xs font-medium">Max Loops</span></label>
+                                    <input type="number" class="input input-bordered input-sm w-full" min="1" max="1000" step="1"
+                                           x-model.number="agentControl.maxLoops">
+                                </div>
+                                <div>
+                                    <label class="label py-1"><span class="label-text text-xs font-medium">LLM Model Override (Optional)</span></label>
+                                    <input type="text" class="input input-bordered input-sm w-full"
+                                           placeholder="Default from settings"
+                                           x-model.lazy="agentControl.llmModel"
+                                           list="agentModelDatalistShared">
+                                    <!-- Datalist is defined above in main layout -->
+                                </div>
+                            </div>
+                            <button class="btn btn-success btn-block mt-2 text-success-content"
+                                    @click="startAgent"
+                                    :disabled="!agentControl.goal.trim() || agentControl.maxLoops <= 0 || isLoadingAgentAction || agentStatus.agent_running">
+                                <i class="fas fa-play mr-2"></i> Start Agent
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Agent Active Controls (Stop, Guidance) Card -->
+                    <div class="card card-compact bg-base-100 shadow-md border border-base-300/30" x-show="agentStatus.agent_running || ['starting', 'stopping', 'stopping_timeout'].includes(agentStatus.status)">
+                        <div class="card-body p-4 space-y-3">
+                             <h3 class="card-title !text-base !pb-0">
+                                <i class="fas fa-gamepad mr-2 text-warning"></i> Active Controls
+                            </h3>
+                            <button class="btn btn-error btn-block"
+                                    @click="stopAgent"
+                                    :disabled="isLoadingAgentAction || ['stopped', 'idle', 'failed', 'completed', 'error_stopping'].includes(agentStatus.status)">
+                                <i class="fas fa-stop mr-2"></i>
+                                <span x-text="agentStatus.status === 'stopping' || agentStatus.status === 'stopping_timeout' ? 'Stopping...' : (agentStatus.status === 'error_stopping' ? 'Error Stopping' : 'Stop Agent')"></span>
+                            </button>
+
+                            <div class="mt-3 pt-3 border-t border-base-300/20" x-show="agentStatus.agent_running">
+                                <label class="label py-1"><span class="label-text text-xs font-medium">Provide Live Guidance / Observation:</span></label>
+                                <div class="flex gap-2">
+                                    <input type="text" class="input input-sm input-bordered flex-grow" x-model.lazy="agentControl.guidanceText"
+                                           placeholder="e.g., 'Prioritize searching the web for recent news.'">
+                                    <button class="btn btn-sm btn-secondary" @click="sendAgentGuidance"
+                                            :disabled="!agentControl.guidanceText.trim() || isLoadingAgentAction">
+                                        <i class="fas fa-comment-dots mr-1"></i> Send Hint
+                                    </button>
+                                </div>
+                                <p class="text-2xs opacity-60 mt-1">This will be injected as a high-priority thought/memory for the agent.</p>
                             </div>
                         </div>
                     </div>
@@ -4410,35 +4480,41 @@
 
                 agentStatus: {
                     agent_running: false,
-                    status: 'idle',
-                    status_display: 'Idle',
-                    current_goal_description_from_agent: '',        // Overall goal for this agent run
-                    agent_current_operational_goal_description: '', // Description of the current UMS goal the agent is focused on
-                    agent_current_operational_goal_id: null,        // ID of the current UMS goal
-                    current_loop: 0,
-                    max_loops: 0,
-                    last_message: '',                               // General last message from agent system
-                    last_action_summary_from_agent: '',             // Summary of last UMS action/thought
-                    current_plan_step_from_agent: '',               // Truncated description of current plan step
-                    current_plan_step_from_agent_full: '',          // Full description
-                    current_plan_step_dependencies: [],             // List of IDs it depends on
-                    agent_target_model: '',
-                    // New property to hold the goal stack summary from API
-                    agent_current_operational_goal_stack_summary: [],
-                    // New property to hold the full current plan from API
-                    current_plan_from_agent: [],
+                    status: 'idle', // MCPClient's high-level status (e.g., idle, running, completed)
+                    status_display: 'Idle', // User-friendly display string
+
+                    overall_goal_from_mcp_client: '', // The goal MCPClient started the agent with
+
+                    // Details from AgentMasterLoop's state
+                    agent_workflow_id: null,
+                    agent_thought_chain_id: null,
+                    agent_target_model: 'N/A',
+                    agent_internal_loop_count: 0,
+                    agent_max_loops_from_mcp_config: 0, // Max loops MCPC is running agent for
+
+                    agent_current_ums_goal_id: null,
+                    agent_current_ums_goal_description: 'No active UMS goal.', // Full description of current UMS goal
+                    agent_local_ums_goal_stack_summary: [], // List of {goal_id, description, status} for stack
+
+                    agent_last_action_summary: 'Agent not initialized or no actions yet.', // AML's last action summary
+                    agent_last_general_message: '', // MCPClient's general message about the agent task
+
+                    agent_current_plan_step_summary: 'No active plan.', // Truncated description of current plan step
+                    agent_current_plan_step_full_description: 'No active plan.', // Full description
+                    agent_current_plan_step_dependencies: [], // List of IDs current step depends on
+                    agent_current_full_plan: [], // List of all plan step objects {id, description, status, depends_on, assigned_tool, tool_args, result_summary}
                 },
                 agentControl: {
                     goal: '',
                     maxLoops: 50,
                     llmModel: '',
-                    guidanceText: '' // For the new guidance input
+                    guidanceText: ''
                 },
                 isLoadingAgentAction: false,
-                isLoadingAgentStatus: false, // For the refresh button spinner
+                isLoadingAgentStatus: false,
                 agentStatusInterval: null,
                 agentPlanTable: null, // To hold the Tabulator instance for the agent's plan
-                currentAgentLlmMessageId: null,
+                currentAgentLlmMessageId: null, // To track the agent's LLM response message ID
 
                 // --- COMPUTED PROPERTIES ---
                 get connectedServersCount() {
@@ -4732,39 +4808,42 @@
                         this.modelsByProvider = {}; // Reset on error
                     }
                 },
+
                 async fetchAgentStatus() {
                     if (this.isLoadingAgentStatus) return;
                     this.isLoadingAgentStatus = true;
-                    console.log("UI: Fetching agent status via API...");
+                    // console.log("UI: Fetching agent status via API..."); // Already logged by API call
                     try {
-                        const statusData = await this.apiFetch('/agent/status'); // This might throw if fetch itself fails
+                        const statusData = await this.apiFetch('/agent/status'); 
 
-                        if (statusData && typeof statusData === 'object') { // Ensure statusData is an object
-                            // Merge carefully, only updating if keys exist in statusData
-                            // This prevents accidentally wiping parts of agentStatus if API returns partial data
-                            for (const key in this.agentStatus) {
+                        if (statusData && typeof statusData === 'object') {
+                            const newAgentStatusState = { ...this.agentStatus }; 
+                            for (const key in statusData) {
                                 if (statusData.hasOwnProperty(key)) {
-                                    this.agentStatus[key] = statusData[key];
+                                    newAgentStatusState[key] = statusData[key];
                                 }
                             }
-
-                            // Ensure status_display is always sensible
-                            let display = this.agentStatus.status?.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Unknown';
-                            if (this.agentStatus.agent_running) {
-                                display = `Running (Loop ${this.agentStatus.current_loop || 0}/${this.agentStatus.max_loops || 0})`;
-                            } else if (this.agentStatus.status === 'completed') {
+                            let display = (newAgentStatusState.status || 'unknown').replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                            if (newAgentStatusState.agent_running && newAgentStatusState.status === 'running') {
+                                display = `Running (Loop ${newAgentStatusState.agent_internal_loop_count || 0}/${newAgentStatusState.agent_max_loops_from_mcp_config || 0})`;
+                            } else if (newAgentStatusState.status === 'completed') {
                                 display = 'Goal Achieved!';
-                            } else if (this.agentStatus.status === 'failed') {
-                                display = 'Failed';
-                            } else if (this.agentStatus.status === 'stopped') {
-                                display = 'Stopped';
-                            } else if (this.agentStatus.status === 'idle' && this.agentStatus.last_message?.includes("Agent task completed")) {
-                                display = 'Completed (Idle)';
                             }
-                            this.agentStatus.status_display = display;
+                            newAgentStatusState.status_display = display;
+                            this.agentStatus = newAgentStatusState; 
 
+                            console.log("UI: Agent status updated from API", JSON.parse(JSON.stringify(this.agentStatus)));
 
-                            console.log("UI: Agent status updated from API", JSON.parse(JSON.stringify(this.agentStatus))); // Deep copy for logging
+                            // Call initAgentPlanTable IF the agent tab is active and plan data is available
+                            if (this.activeTab === 'agent' && this.agentStatus.agent_current_full_plan) {
+                                this.initAgentPlanTable(this.agentStatus.agent_current_full_plan);
+                            } else if (this.activeTab !== 'agent' && this.agentPlanTable) {
+                                // If tab is not active, ensure table is destroyed
+                                console.log("UI: Agent tab not active, destroying plan table if it exists.");
+                                try { this.agentPlanTable.destroy(); } catch(e) { console.warn("Error destroying agent plan table (tab not active):", e); }
+                                this.agentPlanTable = null;
+                            }
+
 
                             if (!this.agentStatus.agent_running && this.agentStatusInterval) {
                                 this.stopAgentStatusPolling();
@@ -4772,34 +4851,30 @@
                                 this.startAgentStatusPolling();
                             }
 
-                            // Relay new agent action summaries to chat
                             if (this.uiSettings.showToolDataMessages &&
-                                statusData.last_action_summary_from_agent &&
-                                (!this.lastDisplayedAgentAction || this.lastDisplayedAgentAction !== statusData.last_action_summary_from_agent)) {
+                                this.agentStatus.agent_last_action_summary && 
+                                (!this.lastDisplayedAgentAction || this.lastDisplayedAgentAction !== this.agentStatus.agent_last_action_summary)) {
                                 this.addMessageToConversation(
-                                    'system',
-                                    statusData.last_action_summary_from_agent,
+                                    'system', 
+                                    this.agentStatus.agent_last_action_summary,
                                     {
-                                        is_agent_activity: true,
-                                        content_type: 'agent_log_summary',
-                                        timestamp: new Date().toISOString()
+                                        is_agent_activity: true, 
+                                        content_type: 'agent_log_summary', 
+                                        timestamp: new Date().toISOString() 
                                     }
                                 );
-                                this.lastDisplayedAgentAction = statusData.last_action_summary_from_agent;
+                                this.lastDisplayedAgentAction = this.agentStatus.agent_last_action_summary;
                             }
                         } else {
-                            // Handle cases where API returns 200 OK but body is not a valid object (e.g., null, empty string)
                             console.warn("UI: Received non-object or empty data from /api/agent/status:", statusData);
                             this.addNotification('Received invalid status data from server.', 'warning');
-                            // Potentially set a default error state for agentStatus here if needed
-                            this.agentStatus.status = 'error_fetching_data';
+                            this.agentStatus.status = 'error_fetching_data'; 
                             this.agentStatus.status_display = 'Error: Invalid Data';
                         }
-                    } catch (e) { // Catches errors from apiFetch (network, or if apiFetch re-throws HTTP errors)
+                    } catch (e) { 
                         this.addNotification(`Failed to fetch agent status: ${e.message || 'Unknown API error'}`, 'error');
                         console.error("UI: Error in fetchAgentStatus during apiFetch:", e);
-                        // Optionally set agentStatus to a default error state
-                        this.agentStatus.status = 'error_fetching_api';
+                        this.agentStatus.status = 'error_fetching_api'; 
                         this.agentStatus.status_display = 'Error: API Unreachable';
                     } finally {
                         this.isLoadingAgentStatus = false;
@@ -4914,71 +4989,134 @@
                         console.log("UI: Agent status polling stopped.");
                     }
                 },
+
                 initAgentPlanTable(planData) {
                     const tableId = 'agent-current-plan-table';
-                    // Defer execution slightly to ensure DOM is settled after tab switch or data load
+                    // Defer to ensure DOM is ready
                     this.$nextTick(() => {
                         const tableElement = document.getElementById(tableId);
 
                         if (this.activeTab !== 'agent' || !tableElement) {
                             if (this.agentPlanTable) {
-                                // If tab not active or element gone, destroy existing table
-                                console.log("UI: Agent tab not active or table element missing, destroying agent plan table if exists.");
-                                try { this.agentPlanTable.destroy(); } catch(e) { console.warn("Error destroying agent plan table:", e); }
+                                console.log("UI: Agent tab not active or table element missing. Destroying existing agent plan table.");
+                                try {
+                                    this.agentPlanTable.destroy();
+                                } catch (e) {
+                                    console.warn("Error destroying agent plan table:", e);
+                                }
                                 this.agentPlanTable = null;
                             }
                             return;
                         }
 
                         const validPlanData = Array.isArray(planData) ? planData : [];
-                        const columns = [ 
-                            { title: "ID", field: "id", width: 70, frozen:true, cssClass: "p-1 text-2xs font-mono", formatter: (cell) => cell.getValue() ? '...' + cell.getValue().slice(-6) : '' },
-                            { title: "Step Description", field: "description", hozAlign: "left", sorter: "string", minWidth: 250, tooltip: true, cssClass: "p-1 text-2xs whitespace-normal", formatter: "textarea" },
-                            { title: "Status", field: "status", width: 100, hozAlign: "center", cssClass: "p-1 text-2xs", formatter: (cell) => {
-                                const status = cell.getValue();
-                                let badgeClass = 'badge-ghost'; let icon = '';
-                                if (status === 'completed') { badgeClass = 'badge-success'; icon = '<i class="fas fa-check fa-xs mr-1"></i>'; }
-                                else if (status === 'failed') { badgeClass = 'badge-error'; icon = '<i class="fas fa-times fa-xs mr-1"></i>'; }
-                                else if (status === 'in_progress') { badgeClass = 'badge-info animate-pulse'; icon = '<i class="fas fa-spinner fa-spin fa-xs mr-1"></i>'; }
-                                else if (status === 'planned') { badgeClass = 'badge-outline'; icon = '<i class="fas fa-circle-notch fa-xs mr-1 opacity-50"></i>'; }
-                                else if (status === 'skipped') { badgeClass = 'badge-neutral opacity-60'; icon = '<i class="fas fa-forward fa-xs mr-1"></i>'; }
-                                return `<span class="badge badge-xs ${badgeClass} !text-2xs !leading-tight !h-auto !py-0.5 !px-1.5">${icon}${status}</span>`;
-                            }
+                        const columns = [
+                            { title: "ID", field: "id", width: 70, frozen: true, cssClass: "p-1 text-2xs font-mono", 
+                              formatter: (cell) => { const val = cell.getValue(); return val ? `...${val.slice(-6)}` : ''; },
+                              tooltip: (cell) => cell.getValue()
                             },
-                            { title: "Tool", field: "assigned_tool", width: 120, hozAlign: "left", cssClass: "p-1 text-2xs truncate", formatter: (cell) => cell.getValue() ? cell.getValue().split(':').pop() : '-', tooltip: (c) => c.getValue() },
-                            { title: "Depends On", field: "depends_on", width: 100, cssClass: "p-1 text-2xs", formatter: (cell) => (cell.getValue() || []).map(d => '...' + d.slice(-6)).join(', ') || '-' }
+                            { title: "Step Description", field: "description", hozAlign: "left", sorter: "string", 
+                              minWidth: 250, tooltip: true, cssClass: "p-1 text-xs whitespace-normal", // text-xs for slightly larger plan font
+                              formatter: "textarea"
+                            },
+                            { title: "Status", field: "status", width: 110, hozAlign: "center", cssClass: "p-1 text-2xs", 
+                              formatter: (cell) => { /* ... (status formatter from previous good version) ... */
+                                    const status = cell.getValue() || "unknown";
+                                    let badgeClass = 'badge-ghost'; 
+                                    let icon = '<i class="fas fa-question-circle fa-xs mr-1 opacity-50"></i>';
+                                    switch(status.toLowerCase()) {
+                                        case 'completed': badgeClass = 'badge-success'; icon = '<i class="fas fa-check-circle fa-xs mr-1"></i>'; break;
+                                        case 'failed': badgeClass = 'badge-error'; icon = '<i class="fas fa-times-circle fa-xs mr-1"></i>'; break;
+                                        case 'in_progress': badgeClass = 'badge-info animate-pulse'; icon = '<i class="fas fa-spinner fa-spin fa-xs mr-1"></i>'; break;
+                                        case 'planned': badgeClass = 'badge-outline'; icon = '<i class="fas fa-circle-notch fa-xs mr-1 opacity-50"></i>'; break;
+                                        case 'skipped': badgeClass = 'badge-neutral opacity-60'; icon = '<i class="fas fa-forward fa-xs mr-1"></i>'; break;
+                                    }
+                                    return `<span class="badge badge-sm ${badgeClass} !text-2xs !leading-tight !h-auto !py-0.5 !px-1.5">${icon}${status}</span>`;
+                                }
+                            },
+                            { title: "Tool", field: "assigned_tool", width: 130, hozAlign: "left", cssClass: "p-1 text-2xs truncate", 
+                              formatter: (cell) => { const val = cell.getValue(); return val ? val.split(':').pop() : '<span class="italic opacity-50">None</span>'; }, 
+                              tooltip: (cell) => cell.getValue() 
+                            },
+                            { title: "Depends On", field: "depends_on", width: 110, cssClass: "p-1 text-2xs", 
+                              formatter: (cell) => { const deps = cell.getValue(); if (!deps || deps.length === 0) return '<span class="italic opacity-50">None</span>'; return deps.map(d => `...${String(d).slice(-6)}`).join(', '); },
+                              tooltip: (cell) => { const deps = cell.getValue(); return deps && deps.length > 0 ? deps.join('\n') : 'None'; }
+                            }
                         ];
-                        if (!this.agentPlanTable) { // Table NOT initialized
-                            console.log("UI: Initializing new agent plan Tabulator table because instance is null.");
-                            const placeholderText = validPlanData.length === 0 ? "Agent has no active plan or is idle." : "Loading plan...";
+                        
+                        const placeholderText = validPlanData.length === 0 ? 
+                            "<div class='p-4 text-center text-xs italic opacity-70'>Agent has no active plan steps.</div>" : 
+                            "<div class='p-4 text-center text-xs italic opacity-70'>Loading plan...</div>";
+
+                        // If table instance exists and is valid, update its data and placeholder
+                        if (this.agentPlanTable && typeof this.agentPlanTable.setData === 'function') {
+                            console.log("UI: Updating data for existing Agent Plan Tabulator table.");
+                            try {
+                                // For Tabulator, you set the placeholder text on the table options
+                                // or update it via a method if available for dynamic changes.
+                                // If `setPlaceholder` is not a function, we might need to destroy and re-create
+                                // or rely on it being set at initialization.
+                                // Let's try setting data and if it's empty, placeholder will show.
+                                // We can't *change* the placeholder text of an existing instance easily without re-init or specific API.
+                                // So, the placeholder used during init will be the one.
+                                this.agentPlanTable.setData(validPlanData)
+                                    .then(() => { 
+                                        this.$nextTick(() => this.initTippy()); 
+                                    })
+                                    .catch(err => {
+                                        console.error("UI: Tabulator setData error for agent plan:", err);
+                                        tableElement.innerHTML = `<div class="p-4 text-center text-error text-xs">Error updating plan data.</div>`;
+                                    });
+                            } catch (e) {
+                                console.error("UI: Error calling setData on agent plan table (instance might be invalid):", e);
+                                try { this.agentPlanTable.destroy(); } catch(de) {}
+                                this.agentPlanTable = null; 
+                                // Attempt to re-initialize if setData failed badly
+                                this.initAgentPlanTable(planData); // Recursive call - be careful
+                            }
+                        } 
+                        // Else, if table instance does NOT exist, create it
+                        else if (!this.agentPlanTable) {
+                            console.log("UI: Initializing new Tabulator table for Agent Plan.");
+                            tableElement.innerHTML = ''; // Clear previous content/placeholder before new Tabulator
                             try {
                                 this.agentPlanTable = new Tabulator(tableElement, {
                                     data: validPlanData,
-                                    layout: "fitData",
-                                    height: "180px",
-                                    placeholder: placeholderText,
+                                    layout: "fitDataFill", 
+                                    height: "200px",    
+                                    placeholder: placeholderText, // Set placeholder text here
                                     columns: columns,
                                     movableColumns: true,
-                                    initialSort: [{ column: "id", dir: "asc" }]
+                                    resizableRows: false, 
+                                    initialSort: [{ column: "id", dir: "asc" }], 
+                                    rowFormatter:function(row){ /* ... (rowFormatter from previous good version) ... */
+                                        var data = row.getData();
+                                        if(data.status === "in_progress"){
+                                            row.getElement().style.backgroundColor = "hsl(var(--in)/0.1)"; 
+                                            row.getElement().style.fontWeight = "500";
+                                        } else if (data.status === "planned") {
+                                            let foundInProgress = false;
+                                            const tableRows = row.getTable().getRows(); // Get all rows
+                                            if (Array.isArray(tableRows)) { // Check if it's an array
+                                                tableRows.forEach(r => {
+                                                    if(r.getData().status === "in_progress") foundInProgress = true;
+                                                });
+                                            }
+                                            // Highlight first planned if no in_progress and it's the first row object in data
+                                            const firstPlannedCandidate = row.getTable().getData().find(d => d.status === "planned");
+                                            if(!foundInProgress && firstPlannedCandidate && data.id === firstPlannedCandidate.id) {
+                                               row.getElement().style.backgroundColor = "hsl(var(--b2)/0.6)";
+                                            }
+                                        }
+                                    },
+                                    tableBuilt: () => { 
+                                        this.$nextTick(() => this.initTippy()); 
+                                    },
                                 });
-                                // this.$nextTick(() => this.initTippy()); // Tippy for table content if needed
                             } catch(e) {
                                 console.error("UI: Failed to initialize agent plan Tabulator table:", e);
                                 this.agentPlanTable = null;
-                            }
-                        } else { // Table IS initialized, just update data
-                            console.log("UI: Updating data for existing agent plan Tabulator table.");
-                            const placeholderText = validPlanData.length === 0 ? "Agent has no active plan or is idle." : "";
-                            try {
-                                this.agentPlanTable.setPlaceholder(placeholderText);
-                                this.agentPlanTable.setData(validPlanData)
-                                    //.then(() => { this.$nextTick(() => this.initTippy()); }) // Tippy after data update
-                                    .catch(err => console.error("UI: Tabulator setData error for agent plan:", err));
-                            } catch (e) {
-                                console.error("UI: Error calling setData on agent plan table (instance might be invalid):", e);
-                                // If setData fails, instance might be broken, try re-initializing next time
-                                try {this.agentPlanTable.destroy(); } catch(de) {}
-                                this.agentPlanTable = null;
+                                tableElement.innerHTML = `<div class="p-4 text-center text-error text-xs">Error initializing plan table.</div>`;
                             }
                         }
                     }); // End $nextTick
