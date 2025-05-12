@@ -9647,7 +9647,6 @@ class MCPClient:
                             "tools": formatted_tools,
                             "max_tokens": max_tokens or self.config.default_max_tokens, # Use correct default
                             "temperature": self.config.temperature,
-                            # "stream": True, # Anthropic SDK uses stream=True in messages.stream
                         }
                         if system_prompt: stream_params["system"] = system_prompt
                         stream_manager = anthropic_client.messages.stream(**stream_params)
@@ -9700,7 +9699,6 @@ class MCPClient:
                             "tools": formatted_tools,
                             "max_tokens": max_tokens or self.config.default_max_tokens, # Use correct default
                             "temperature": self.config.temperature,
-                            "stream": True,
                         }
                         providers_without_stream_options = { Provider.MISTRAL.value, Provider.CEREBRAS.value }
                         if provider_name not in providers_without_stream_options:

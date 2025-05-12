@@ -2058,7 +2058,7 @@ class AgentMasterLoop:
 
             if new_wf_id:
                 self.state.workflow_id = new_wf_id
-                self.state.context_id = new_wf_id
+                self.state.context_id = new_wf_id # Default context_id to workflow_id
                 is_sub_workflow = parent_wf_id_arg and parent_wf_id_arg in self.state.workflow_stack
                 log_prefix = "sub-" if is_sub_workflow else "new "
                 
@@ -2073,13 +2073,14 @@ class AgentMasterLoop:
                 # --- CRITICAL: Create the root UMS goal for this new workflow ---
                 self.state.goal_stack = []  # Reset local stack for new/root workflow
                 self.state.current_goal_id = None # Will be set if UMS goal creation succeeds
+                root_goal_description_for_ums = final_wf_goal_desc if final_wf_goal_desc else f"Fulfill workflow: {wf_title}"
+
 
                 if self._find_tool_server(TOOL_CREATE_GOAL):
                     try:
-                        root_goal_description_for_ums = final_wf_goal_desc if final_wf_goal_desc else f"Fulfill workflow: {wf_title}"
                         goal_creation_args = {
                             "workflow_id": new_wf_id,
-                            "description": root_goal_description_for_ums,
+                            "description": root_goal_description_for_ums, # Use the determined goal desc
                             "title": f"Root Goal for {log_prefix}workflow: {wf_title}",
                             "parent_goal_id": None, # Explicitly None for a root goal
                             "initial_status": GoalStatus.ACTIVE.value 
@@ -2092,11 +2093,10 @@ class AgentMasterLoop:
                             record_action=False 
                         )
                         
-                        # UMS create_goal returns the full created goal object under the "goal" key
                         created_ums_goal_obj = goal_res.get("goal") if isinstance(goal_res, dict) and goal_res.get("success") else None
 
                         if isinstance(created_ums_goal_obj, dict) and created_ums_goal_obj.get("goal_id"):
-                            self.state.goal_stack = [created_ums_goal_obj] # Initialize stack with the root UMS goal
+                            self.state.goal_stack = [created_ums_goal_obj] 
                             self.state.current_goal_id = created_ums_goal_obj.get("goal_id")
                             self.logger.info(
                                 f"AML: Successfully created and set UMS root goal {_fmt_id(self.state.current_goal_id)} for {log_prefix}workflow '{_fmt_id(new_wf_id)}'."
@@ -2129,17 +2129,20 @@ class AgentMasterLoop:
                 self.logger.info(
                     f"🏷️ Switched to {log_prefix}workflow: '{_fmt_id(new_wf_id)}'. Chain: '{_fmt_id(primary_chain_id)}'. Current UMS Goal: '{_fmt_id(self.state.current_goal_id)}'"
                 )
-                plan_desc_root_goal = final_wf_goal_desc[:60] if final_wf_goal_desc else wf_title
-                plan_desc = f"Start {log_prefix}workflow: '{wf_title}'. Initial UMS Goal: {plan_desc_root_goal}... ({_fmt_id(self.state.current_goal_id)})"
-                self.state.current_plan = [PlanStep(description=plan_desc)]
-                self.state.consecutive_error_count = 0 
-                self.state.last_error_details = None 
                 
-                if self.state.current_goal_id: # If root goal successfully set
-                     self.state.needs_replan = False # LLM can proceed with initial plan for the new goal
-                else: # Root goal creation failed
-                     self.state.needs_replan = True # LLM needs to address the failure to set a root goal
-
+                if self.state.current_goal_id: # Root UMS goal was successfully created
+                    current_goal_desc_for_plan = root_goal_description_for_ums[:100] if root_goal_description_for_ums else wf_title
+                    plan_desc = f"Assess current UMS goal '{current_goal_desc_for_plan}...' ({_fmt_id(self.state.current_goal_id)}) for workflow '{wf_title}' and formulate next steps."
+                    self.state.current_plan = [PlanStep(description=plan_desc)]
+                    self.state.needs_replan = False # Let the LLM proceed with this assessment plan
+                else: # Root UMS goal creation failed
+                    plan_desc = f"ERROR: Failed to establish root UMS goal for workflow '{wf_title}'. Address this error."
+                    self.state.current_plan = [PlanStep(description=plan_desc, status="failed")] 
+                    self.state.needs_replan = True 
+                
+                self.state.consecutive_error_count = 0 
+                if not self.state.needs_replan: 
+                    self.state.last_error_details = None
 
         # --- Side effects for LLM explicitly Creating a New UMS Goal (typically a sub-goal) ---
         elif tool_name == TOOL_CREATE_GOAL and result_content.get("success"):
@@ -2801,6 +2804,8 @@ class AgentMasterLoop:
         except Exception as e:
             self.logger.error(f"Error during promo check query: {e}", exc_info=False)
 
+# In agent_master_loop.py
+
     async def _gather_context(self) -> Dict[str, Any]:
         self.logger.info("🛰️ Gathering comprehensive context for LLM...")
         start_time = time.time()
@@ -2808,202 +2813,203 @@ class AgentMasterLoop:
 
         context_payload: Dict[str, Any] = {
             "agent_name": AGENT_NAME,
-            "current_loop": self.state.current_loop,
+            "current_loop": self.state.current_loop, # Current loop before this turn's increment
             "current_plan_snapshot": [p.model_dump(exclude_none=True) for p in self.state.current_plan],
             "last_action_summary": self.state.last_action_summary,
             "consecutive_error_count": self.state.consecutive_error_count,
-            "last_error_details": copy.deepcopy(self.state.last_error_details),
+            "last_error_details": copy.deepcopy(self.state.last_error_details), # Deep copy for safety
             "needs_replan": self.state.needs_replan,
-            "workflow_stack_summary": [_fmt_id(wf_id) for wf_id in self.state.workflow_stack[-3:]],
+            "workflow_stack_summary": [_fmt_id(wf_id) for wf_id in self.state.workflow_stack[-3:]], # Summary of top 3
             "meta_feedback": self.state.last_meta_feedback,
             "current_thought_chain_id": self.state.current_thought_chain_id,
             "retrieval_timestamp_agent_state": agent_retrieval_timestamp,
-            "status_message_from_agent": "Context assembly by agent.",
+            "status_message_from_agent": "Context assembly by agent.", # Default, will be updated
             "errors_in_context_gathering": [],
         }
+        # Clear meta-feedback after it's been included in the context for this turn
         self.state.last_meta_feedback = None
 
         current_workflow_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
-        current_cognitive_context_id = self.state.context_id  # Agent's current UMS cognitive_state.state_id
+        current_cognitive_context_id = self.state.context_id
         current_plan_step_desc = self.state.current_plan[0].description if self.state.current_plan else DEFAULT_PLAN_STEP
 
         if not current_workflow_id:
             context_payload["status_message_from_agent"] = "No Active Workflow."
             self.logger.warning(context_payload["status_message_from_agent"])
             context_payload["ums_package_retrieval_status"] = "skipped_no_workflow"
+            # Ensure agent_assembled_goal_context is still present but indicates no goal
+            context_payload["agent_assembled_goal_context"] = {
+                "retrieved_at": agent_retrieval_timestamp,
+                "current_goal_details_from_ums": None,
+                "goal_stack_summary_from_agent_state": [],
+                "data_source_comment": "No active workflow, so no UMS goal context.",
+            }
             context_payload["processing_time_sec"] = time.time() - start_time
             return context_payload
 
         context_payload["workflow_id"] = current_workflow_id
         context_payload["cognitive_context_id_agent"] = current_cognitive_context_id
 
-        # 1. Agent Assembles Its Goal Context using _fetch_goal_stack_from_ums
+        # 1. Agent Assembles Its Goal Context
         agent_goal_context_block: Dict[str, Any] = {
             "retrieved_at": agent_retrieval_timestamp,
-            "current_goal_details_from_ums": None,  # This will be the leaf goal object
-            "goal_stack_summary_from_agent_state": [],  # This will be list of parent summaries
-            "data_source_comment": "Goal stack and current goal details fetched from UMS by agent.",
+            "current_goal_details_from_ums": None,
+            "goal_stack_summary_from_agent_state": [],
+            "data_source_comment": "Goal context assembly by agent.",
         }
+
         if self.state.current_goal_id:
-            full_ums_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
-            if full_ums_stack:
-                agent_goal_context_block["current_goal_details_from_ums"] = full_ums_stack[-1]  # Leaf is current
-                # Create summary for prompt, applying show limit
+            # Attempt to fetch from UMS first
+            ums_fetched_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
+
+            if ums_fetched_stack and ums_fetched_stack[-1].get("goal_id") == self.state.current_goal_id:
+                agent_goal_context_block["current_goal_details_from_ums"] = ums_fetched_stack[-1] # Leaf of fetched stack
                 agent_goal_context_block["goal_stack_summary_from_agent_state"] = [
                     {"goal_id": _fmt_id(g.get("goal_id")), "description": (g.get("description") or "")[:150] + "...", "status": g.get("status")}
-                    for g in full_ums_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:]  # Show N items from root towards leaf
+                    for g in ums_fetched_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:] # Summarize top N from fetched stack
                 ]
+                agent_goal_context_block["data_source_comment"] = "Goal stack and current goal details fetched successfully from UMS by agent."
+                self.logger.info(f"Successfully fetched UMS goal stack for {_fmt_id(self.state.current_goal_id)} for context.")
+            elif self.state.goal_stack and self.state.goal_stack[-1].get("goal_id") == self.state.current_goal_id:
+                # Fallback to agent's local stack if UMS fetch failed or didn't match,
+                # but agent has a consistent local stack. This is crucial for the turn immediately after goal creation.
+                self.logger.warning(
+                    f"UMS fetch for goal stack {_fmt_id(self.state.current_goal_id)} failed or mismatched. "
+                    f"Using agent's current local goal_stack for context. UMS fetched: {[_fmt_id(g.get('goal_id')) for g in ums_fetched_stack]}"
+                )
+                agent_goal_context_block["current_goal_details_from_ums"] = self.state.goal_stack[-1] # Use leaf from agent's state
+                agent_goal_context_block["goal_stack_summary_from_agent_state"] = [
+                    {"goal_id": _fmt_id(g.get("goal_id")), "description": (g.get("description") or "")[:150] + "...", "status": g.get("status")}
+                    for g in self.state.goal_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:] # Summarize from agent's state
+                ]
+                agent_goal_context_block["data_source_comment"] = "Used agent's local goal stack state for context (UMS fetch failed/mismatched)."
+                context_payload["errors_in_context_gathering"].append(f"Agent: UMS goal stack fetch for {_fmt_id(self.state.current_goal_id)} was inconsistent, used local state.")
             else:
-                err_msg = f"Agent: Failed to fetch UMS goal stack for current goal {_fmt_id(self.state.current_goal_id)}."
+                err_msg = f"Agent: Failed to fetch UMS goal stack for current goal {_fmt_id(self.state.current_goal_id)} and local agent stack is also inconsistent/empty."
                 context_payload["errors_in_context_gathering"].append(err_msg)
                 agent_goal_context_block["current_goal_details_from_ums"] = {
                     "error_fetching_details": err_msg,
                     "goal_id_attempted": self.state.current_goal_id,
                 }
-                self.logger.warning(err_msg)
+                agent_goal_context_block["data_source_comment"] = "Critical error: Could not obtain current UMS goal details from UMS or agent state."
+                self.logger.error(err_msg) # Log as error as this is problematic
+        else:
+            # This case means the agent believes it's in an active workflow but has no specific current_goal_id.
+            # This could happen if a root goal was just completed and the agent hasn't set a new one,
+            # or if the initial root goal setup failed.
+            agent_goal_context_block["data_source_comment"] = "No current_goal_id set in agent state for this active workflow. UMS goal context is empty."
+            self.logger.info("Agent has no current_goal_id set for active workflow; UMS goal context will be empty for this turn.")
+            # The LLM prompt will need to handle this: "Current Operational Goal: None specified in UMS goal stack. Focus on achieving: {current_task_goal_desc}"
+
         context_payload["agent_assembled_goal_context"] = agent_goal_context_block
 
-        # 2. Call UMS Tool for Rich Context Package (excluding goals)
+        # 2. Call UMS Tool for Rich Context Package (excluding goals, as agent handles its own goal context view)
         ums_package_tool_name = TOOL_GET_RICH_CONTEXT_PACKAGE
-        ums_package_data: Optional[Dict[str, Any]] = {
+        ums_package_data: Optional[Dict[str, Any]] = { # Default error state
             "error_ums_package_tool_unavailable": f"Tool {ums_package_tool_name} unavailable."
-        }  # Default error
+        }
 
         if self._find_tool_server(ums_package_tool_name):
-            # Determine focal_memory_id_hint from the agent's current working memory state if available
-            # The UMS `get_rich_context_package` might use its own `get_working_memory` call.
-            # If agent maintains its own working memory list (e.g., `self.state.working_memory_ids`), use focal from there.
-            # For now, assume UMS `get_rich_context_package` handles WM details based on `context_id`.
-            # We can pass a hint if the agent has a strong idea from a previous cycle.
-            focal_id_hint_for_ums = None  # Placeholder
-            if context_payload.get("ums_context_package", {}).get("current_working_memory", {}).get("focal_memory_id"):  # If UMS already provided WM
-                focal_id_hint_for_ums = context_payload["ums_context_package"]["current_working_memory"]["focal_memory_id"]
-            elif isinstance(self.state.last_error_details, dict) and self.state.last_error_details.get(
-                "focal_memory_id_from_last_wm"
-            ):  # Fallback from previous error context
+            # Determine focal_memory_id_hint
+            # Prefer focal_memory_id from the working memory if UMS context package already has it and is fresh.
+            # Otherwise, the UMS tool itself will determine focus.
+            focal_id_hint_for_ums = None # Default to no hint
+            # Example if agent had its own idea of focal memory from a previous cycle (not implemented here yet)
+            # if self.state.current_focal_memory_id_agent_side:
+            #     focal_id_hint_for_ums = self.state.current_focal_memory_id_agent_side
+            # Or if last error details had a hint:
+            if isinstance(self.state.last_error_details, dict) and self.state.last_error_details.get("focal_memory_id_from_last_wm"):
                 focal_id_hint_for_ums = self.state.last_error_details["focal_memory_id_from_last_wm"]
+
 
             ums_package_params = {
                 "workflow_id": current_workflow_id,
-                "context_id": current_cognitive_context_id,
-                "current_plan_step_description": current_plan_step_desc,
+                "context_id": current_cognitive_context_id, # Agent's UMS cognitive_state.state_id
+                "current_plan_step_description": current_plan_step_desc, # From agent's current plan
                 "focal_memory_id_hint": focal_id_hint_for_ums,
-                "fetch_limits": {
+                "fetch_limits": { # Agent's desired fetch limits for UMS
                     "recent_actions": CONTEXT_RECENT_ACTIONS_FETCH_LIMIT,
                     "important_memories": CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT,
                     "key_thoughts": CONTEXT_KEY_THOUGHTS_FETCH_LIMIT,
                     "proactive_memories": CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT,
                     "procedural_memories": CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT,
                     "link_traversal": CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT,
+                    # "goal_details_depth": CONTEXT_GOAL_DETAILS_FETCH_LIMIT, # Not needed if agent handles its own goal context
                 },
-                "show_limits": {  # For UMS to use if it does truncation/summarization
+                "show_limits": { # Hints for UMS if it does internal summarization/truncation
                     "working_memory": CONTEXT_WORKING_MEMORY_SHOW_LIMIT,
                     "link_traversal": CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT,
+                    # "goal_stack": CONTEXT_GOAL_STACK_SHOW_LIMIT, # Not needed here
                 },
                 "include_core_context": True,
                 "include_working_memory": True,
                 "include_proactive_memories": True,
                 "include_relevant_procedures": True,
                 "include_contextual_links": True,
-                "compression_token_threshold": CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD,
-                "compression_target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS,
+                "compression_token_threshold": CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD, # For UMS to decide if it needs to compress
+                "compression_target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS,     # For UMS to target if it compresses
             }
             try:
-                self.logger.debug(f"Agent: Calling UMS tool '{ums_package_tool_name}'...")
+                self.logger.debug(f"Agent: Calling UMS tool '{ums_package_tool_name}' with params: {ums_package_params}")
                 raw_ums_response = await self._execute_tool_call_internal(ums_package_tool_name, ums_package_params, record_action=False)
+
                 if raw_ums_response.get("success"):
-                    ums_package_data = raw_ums_response.get("context_package", {})  # UMS tool returns under "context_package"
+                    ums_package_data = raw_ums_response.get("context_package", {}) # UMS tool returns payload under "context_package"
                     if not isinstance(ums_package_data, dict):
-                        err_msg = f"Agent: UMS tool {ums_package_tool_name} returned invalid 'context_package'."
+                        err_msg = f"Agent: UMS tool {ums_package_tool_name} returned invalid 'context_package' (type: {type(ums_package_data)})."
                         self.logger.error(err_msg)
                         context_payload["errors_in_context_gathering"].append(err_msg)
-                        ums_package_data = {"error_ums_pkg_invalid": err_msg}
+                        ums_package_data = {"error_ums_pkg_invalid_type": err_msg}
                     else:
                         self.logger.info("Agent: Successfully retrieved rich context package from UMS.")
-                        ums_internal_errors = ums_package_data.get("errors")  # UMS tool should use "errors" key for its own errors
+                        ums_internal_errors = ums_package_data.get("errors") # Check if UMS tool itself reported errors in its package
                         if ums_internal_errors and isinstance(ums_internal_errors, list):
                             context_payload["errors_in_context_gathering"].extend([f"UMS_PKG_ERR: {e}" for e in ums_internal_errors])
-                        ums_package_data.pop("errors", None)  # Clean from context
+                        ums_package_data.pop("errors", None) # Clean from context before sending to LLM
+                        context_payload["ums_package_retrieval_status"] = "success"
                 else:
-                    err_msg = f"Agent: UMS rich context pkg retrieval failed: {raw_ums_response.get('error')}"
+                    err_msg = f"Agent: UMS rich context pkg retrieval failed: {raw_ums_response.get('error', 'Unknown UMS tool error')}"
                     context_payload["errors_in_context_gathering"].append(err_msg)
                     self.logger.warning(err_msg)
                     ums_package_data = {"error_ums_pkg_retrieval": err_msg}
+                    context_payload["ums_package_retrieval_status"] = "failed"
             except Exception as e:
                 err_msg = f"Agent: Exception calling UMS for rich context pkg: {e}"
                 self.logger.error(err_msg, exc_info=True)
                 context_payload["errors_in_context_gathering"].append(err_msg)
                 ums_package_data = {"error_ums_pkg_exception": err_msg}
-        else:  # UMS tool not available
+                context_payload["ums_package_retrieval_status"] = "exception"
+        else: # UMS tool not available
             err_msg = f"Agent: UMS tool '{ums_package_tool_name}' unavailable."
             self.logger.error(err_msg)
             context_payload["errors_in_context_gathering"].append(err_msg)
-            # ums_package_data remains the default error set above
+            context_payload["ums_package_retrieval_status"] = "tool_unavailable"
+            # ums_package_data remains the default error dict set at its initialization
 
         context_payload["ums_context_package"] = ums_package_data
 
-        # 3. Agent-Side Final Compression (if needed)
-        # This logic remains similar, but acts on the combined context_payload
-        # It uses self._estimate_tokens_anthropic and UMS TOOL_SUMMARIZE_TEXT
-        ums_compression_info = context_payload.get("ums_context_package", {}).get("compression_summary")  # UMS tool uses "compression_summary"
-        needs_agent_compression = True
-        if ums_compression_info:
-            self.logger.info("Agent: UMS provided compression. Checking if agent-side pass needed.")
-            current_tokens = await self._estimate_tokens_anthropic(context_payload)
-            if current_tokens <= CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD:
-                needs_agent_compression = False
-            else:
-                self.logger.warning(f"Agent: Context still large ({current_tokens}) after UMS compression. Agent pass.")
-        if needs_agent_compression:
-            try:
-                est_tokens = await self._estimate_tokens_anthropic(context_payload)
-                if est_tokens > CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD:
-                    self.logger.warning(f"Agent: Context ({est_tokens} tokens) > threshold. Agent-side summary compression.")
-                    if self._find_tool_server(TOOL_SUMMARIZE_TEXT):
-                        # Summarize the *entire* context_payload. This can be lossy.
-                        # A more nuanced approach would pick specific large sub-sections from context_payload.
-                        context_str_to_summarize = json.dumps(context_payload, default=str, ensure_ascii=False)
-                        MAX_INPUT_SUMMARY = 45000  # Limit for summarizer input
-                        if len(context_str_to_summarize) > MAX_INPUT_SUMMARY:
-                            self.logger.warning("Agent: Full context for agent summary too long. Truncating input.")
-                            context_str_to_summarize = context_str_to_summarize[-MAX_INPUT_SUMMARY:]
+        # 3. Agent-Side Final Compression (if needed and configured)
+        # This is a fallback if UMS didn't compress enough or if agent wants finer control.
+        # UMS `get_rich_context_package` is expected to handle its own compression if its
+        # `compression_token_threshold` is met. This agent-side step is an additional safety.
+        # For now, let's assume UMS does its job if requested, and agent relies on that.
+        # If UMS compression details were present in ums_package_data, agent could log them here.
+        if ums_package_data.get("ums_compression_details"):
+            self.logger.info(f"Agent: UMS package includes compression details: {ums_package_data['ums_compression_details']}")
 
-                        summary_res = await self._execute_tool_call_internal(
-                            TOOL_SUMMARIZE_TEXT,
-                            {
-                                "text_to_summarize": context_str_to_summarize,
-                                "target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS,
-                                "context_type": "full_agent_context_payload_agent_pass",
-                                "workflow_id": current_workflow_id,
-                                "record_summary": False,
-                            },
-                            record_action=False,
-                        )
-                        if summary_res.get("success") and summary_res.get("summary"):
-                            context_payload["agent_final_compression_summary"] = {
-                                "summary_content": summary_res["summary"],
-                                "original_tokens_before_agent_pass": est_tokens,
-                                "retrieved_at": agent_retrieval_timestamp,
-                            }
-                            self.logger.info("Agent: Agent-side full context compression applied.")
-                            # The _construct_agent_prompt method needs to be aware of 'agent_final_compression_summary'
-                            # and potentially use it as the primary context if present, or merge it smartly.
-                        else:
-                            err_msg = f"Agent: Agent-side full compression failed: {summary_res.get('error')}"
-                            context_payload["errors_in_context_gathering"].append(err_msg)
-                            self.logger.warning(err_msg)
-                    else:
-                        self.logger.warning("Agent: Agent-side compression needed but UMS summarize_text tool unavailable.")
-            except Exception as e:
-                err_msg = f"Agent: Error during agent-side context compression: {e}"
-                context_payload["errors_in_context_gathering"].append(err_msg)
-                self.logger.error(err_msg, exc_info=True)
+        # Update final status message based on workflow AND context gathering success
+        final_errors_count = len(context_payload.get("errors_in_context_gathering", []))
+        if current_workflow_id and not final_errors_count:
+            context_payload["status_message_from_agent"] = "Workflow active. Context ready."
+        elif current_workflow_id and final_errors_count:
+            context_payload["status_message_from_agent"] = f"Workflow active. Context ready with {final_errors_count} errors."
+        # (The "No Active Workflow" case is handled at the start of the function)
 
-        final_errors = len(context_payload.get("errors_in_context_gathering", []))
-        context_payload["status_message_from_agent"] = "Context ready" if not final_errors else f"Context ready with {final_errors} errors"
-        self.logger.info(f"Agent: Context gathering complete. Errors: {final_errors}. Time: {(time.time() - start_time):.3f}s")
-        if final_errors > 0:
-            self.logger.debug(f"Agent: Errors during context gathering: {context_payload.get('errors_in_context_gathering')}")
+        self.logger.info(f"Agent: Context gathering complete. Status: {context_payload['status_message_from_agent']}. Time: {(time.time() - start_time):.3f}s")
+        if final_errors_count > 0:
+            self.logger.info(f"Agent: Errors during context gathering: {context_payload.get('errors_in_context_gathering')}") # Changed to info for less noise
+        
+        context_payload["processing_time_sec"] = time.time() - start_time
         return context_payload
 
 
