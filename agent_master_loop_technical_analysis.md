@@ -160,32 +160,32 @@ The system defines constants for UMS tool names to ensure consistency:
 
 ```python
 # Core memory tools
-TOOL_STORE_MEMORY = "unified_memory:store_memory"
-TOOL_UPDATE_MEMORY = "unified_memory:update_memory"
-TOOL_GET_MEMORY_BY_ID = "unified_memory:get_memory_by_id"
-TOOL_HYBRID_SEARCH = "unified_memory:hybrid_search_memories"
-TOOL_SEMANTIC_SEARCH = "unified_memory:search_semantic_memories"
-TOOL_QUERY_MEMORIES = "unified_memory:query_memories"
+TOOL_STORE_MEMORY = "store_memory"
+TOOL_UPDATE_MEMORY = "update_memory"
+TOOL_GET_MEMORY_BY_ID = "get_memory_by_id"
+TOOL_HYBRID_SEARCH = "hybrid_search_memories"
+TOOL_SEMANTIC_SEARCH = "search_semantic_memories"
+TOOL_QUERY_MEMORIES = "query_memories"
 
 # Working memory tools
-TOOL_GET_WORKING_MEMORY = "unified_memory:get_working_memory"
-TOOL_OPTIMIZE_WM = "unified_memory:optimize_working_memory"
-TOOL_AUTO_FOCUS = "unified_memory:auto_update_focus"
+TOOL_GET_WORKING_MEMORY = "get_working_memory"
+TOOL_OPTIMIZE_WM = "optimize_working_memory"
+TOOL_AUTO_FOCUS = "auto_update_focus"
 
 # Meta-cognitive tools
-TOOL_REFLECTION = "unified_memory:generate_reflection"
-TOOL_CONSOLIDATION = "unified_memory:consolidate_memories"
-TOOL_PROMOTE_MEM = "unified_memory:promote_memory_level"
+TOOL_REFLECTION = "generate_reflection"
+TOOL_CONSOLIDATION = "consolidate_memories"
+TOOL_PROMOTE_MEM = "promote_memory_level"
 
 # Goal stack tools
-TOOL_PUSH_SUB_GOAL = "unified_memory:push_sub_goal"
-TOOL_MARK_GOAL_STATUS = "unified_memory:mark_goal_status"
-TOOL_GET_GOAL_DETAILS = "unified_memory:get_goal_details"
+TOOL_PUSH_SUB_GOAL = "push_sub_goal"
+TOOL_MARK_GOAL_STATUS = "mark_goal_status"
+TOOL_GET_GOAL_DETAILS = "get_goal_details"
 
 # Workflow tools
-TOOL_CREATE_WORKFLOW = "unified_memory:create_workflow"
-TOOL_UPDATE_WORKFLOW_STATUS = "unified_memory:update_workflow_status"
-TOOL_GET_WORKFLOW_DETAILS = "unified_memory:get_workflow_details"
+TOOL_CREATE_WORKFLOW = "create_workflow"
+TOOL_UPDATE_WORKFLOW_STATUS = "update_workflow_status"
+TOOL_GET_WORKFLOW_DETAILS = "get_workflow_details"
 
 # Internal agent tool
 AGENT_TOOL_UPDATE_PLAN = "agent:update_plan"

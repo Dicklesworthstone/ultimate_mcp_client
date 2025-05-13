@@ -121,7 +121,7 @@ This process highlights the interplay between structured process management, cog
     *   **AML (`_gather_context`):** Context is minimal. Status is "No Active Workflow".
     *   **AML -> LLM (`_call_agent_llm`):** Prompt contains the goal and minimal context. The system prompt directs it to create a workflow first.
         *   *LLM Reasoning (Simulated):* "Goal is complex analysis. Need a dedicated workflow. Plan: 1. Create workflow 'Interest Rate & Equity Analysis'. 2. Define initial sub-tasks."
-        *   *LLM Output:* Tool call `unified_memory:create_workflow` (title="Interest Rate & Equity Analysis", goal="Identify key drivers..."). Proposes initial plan in reasoning.
+        *   *LLM Output:* Tool call `create_workflow` (title="Interest Rate & Equity Analysis", goal="Identify key drivers..."). Proposes initial plan in reasoning.
     *   **AML (`_execute_tool_call_internal`):** Executes `create_workflow`.
     *   **UMS:** Creates the workflow record, assigns an ID (e.g., `wf-123`), creates a default `thought_chain` (e.g., `tc-abc`) linked to it.
     *   **AML:** Updates state: `workflow_id = wf-123`, `context_id = wf-123`, `workflow_stack = [wf-123]`, `current_thought_chain_id = tc-abc`. Sets the initial plan provided by the LLM. `last_action_summary` updated.
@@ -130,7 +130,7 @@ This process highlights the interplay between structured process management, cog
     *   **AML (`_gather_context`):** Context now includes `wf-123`, goal, `tc-abc`, and the initial plan.
     *   **AML -> LLM:** Prompt includes the goal and active workflow/thought chain.
         *   *LLM Reasoning:* "Goal has two distinct parts: interest rates and equities. Better to analyze separately first, then synthesize. Create dedicated thought chains for each analysis stream. Plan: 1. Create 'Interest Rate Drivers' thought chain. 2. Create 'Equity Index Drivers' thought chain. 3. Plan initial search for interest rate data."
-        *   *LLM Output:* Tool call `unified_memory:create_thought_chain` (workflow_id=`wf-123`, title="Interest Rate Drivers"). Updates plan in reasoning.
+        *   *LLM Output:* Tool call `create_thought_chain` (workflow_id=`wf-123`, title="Interest Rate Drivers"). Updates plan in reasoning.
     *   **AML:** Updates `current_plan` based on LLM output.
     *   **AML (`_execute_tool_call_internal`):** Executes `create_thought_chain`.
     *   **UMS:** Creates the new thought chain record (e.g., `tc-rates`).
@@ -140,7 +140,7 @@ This process highlights the interplay between structured process management, cog
     *   **AML (`_gather_context`):** Context reflects `wf-123` and the *active* `tc-rates`. Plan includes creating the equity chain and then searching.
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Now focused on 'Interest Rate Drivers' (`tc-rates`). Plan is to create the equity chain next, but let's first plan the rate search *within this chain*. Need to identify relevant data types: Fed statements, economic indicators (CPI, jobs), major political/regulatory news, market commentary. Plan: 1. Record thought detailing search strategy for rates in `tc-rates`. 2. Create 'Equity Index Drivers' thought chain. 3. Execute search for rate drivers."
-        *   *LLM Output:* Tool call `unified_memory:record_thought` (thought_chain_id=`tc-rates`, thought_type=`plan`, content="Plan: Search corpus for 'Fed statements last 7 days', 'CPI report analysis', 'Jobs report impact', 'major regulatory news financial sector', 'interest rate market commentary past week'"). Updates plan.
+        *   *LLM Output:* Tool call `record_thought` (thought_chain_id=`tc-rates`, thought_type=`plan`, content="Plan: Search corpus for 'Fed statements last 7 days', 'CPI report analysis', 'Jobs report impact', 'major regulatory news financial sector', 'interest rate market commentary past week'"). Updates plan.
     *   **AML:** Updates plan.
     *   **AML (`_execute_tool_call_internal`):** Executes `record_thought`.
     *   **UMS:** Stores the planning thought within `tc-rates`. Creates linked `Episodic` memory (`memory_type=REASONING_STEP`).
@@ -152,7 +152,7 @@ This process highlights the interplay between structured process management, cog
     *   **AML (`_gather_context`):** Context includes the plan to create the equity chain and then search for rates. `current_thought_chain_id` is still `tc-rates`.
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Following plan. First step is creating the equity chain."
-        *   *LLM Output:* Tool call `unified_memory:create_thought_chain` (title="Equity Index Drivers"). Updates plan.
+        *   *LLM Output:* Tool call `create_thought_chain` (title="Equity Index Drivers"). Updates plan.
     *   **AML:** Updates plan.
     *   **AML (`_execute_tool_call_internal`):** Executes `create_thought_chain`.
     *   **UMS:** Creates `tc-equities`.
@@ -167,13 +167,13 @@ This process highlights the interplay between structured process management, cog
     *   **AML (`_gather_context`):** Includes successful search action summary. `current_thought_chain_id` is `tc-rates`.
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Search complete. Need to process results. Many snippets. First, summarize the bulk findings. Then extract key distinct points and store them individually as memories. Plan: 1. Summarize results (Tool: `summarize_text`). 2. Record summary as an artifact. 3. Store summary memory." Records this plan as a `thought` in `tc-rates`.
-        *   *LLM Output:* Tool call `unified_memory:summarize_text` (text_to_summarize=results). Updates plan.
+        *   *LLM Output:* Tool call `summarize_text` (text_to_summarize=results). Updates plan.
     *   **AML (`_execute_tool_call_internal`):** Executes `summarize_text`. Gets summary. Records completion.
 
 6.  **Loops 6-8: Store Key Rate Findings as Memories**
     *   **AML -> LLM:** LLM iterates through summarized/original results.
         *   *LLM Reasoning:* "Finding 1: Fed Chair statement emphasized data dependency. Store as semantic fact, high importance." Records `thought` in `tc-rates`.
-        *   *LLM Output:* Tool call `unified_memory:store_memory` (content="Fed Chair emphasized data dependency...", memory_type=`fact`, importance=8.0, confidence=0.95, source="Corpus Search Results Summary").
+        *   *LLM Output:* Tool call `store_memory` (content="Fed Chair emphasized data dependency...", memory_type=`fact`, importance=8.0, confidence=0.95, source="Corpus Search Results Summary").
     *   **AML (`_execute_tool_call_internal`):** Executes `store_memory`.
     *   **UMS:** Stores semantic memory, generates embedding. Background `_run_auto_linking` triggers, potentially linking this to other Fed-related memories if they exist.
     *   *...Repeats for other key findings (CPI data point, jobs report impact, specific regulatory news item)...* Each `store_memory` call increments success counters.
@@ -193,7 +193,7 @@ This process highlights the interplay between structured process management, cog
     *   **AML (`_gather_context`):** Includes the reflection feedback in `last_meta_feedback`. `current_thought_chain_id` is `tc-rates`.
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Meta-feedback noted lack of political/sentiment analysis for rates. Incorporate later. Current plan requires starting equity analysis. Switch focus. Plan: 1. Record thought acknowledging feedback & switch to Equity Chain (`tc-equities`). 2. Plan initial equity driver search."
-        *   *LLM Output:* Tool call `unified_memory:record_thought` (thought_chain_id=`tc-equities`, content="Acknowledging reflection gap on rate drivers (politics/sentiment). Switching focus to equity index analysis."). Updates plan.
+        *   *LLM Output:* Tool call `record_thought` (thought_chain_id=`tc-equities`, content="Acknowledging reflection gap on rate drivers (politics/sentiment). Switching focus to equity index analysis."). Updates plan.
     *   **AML (`_execute_tool_call_internal`):** Executes `record_thought`.
     *   **AML:** State updates `current_thought_chain_id = tc-equities` (assuming loop handles switch based on last thought target).
 
@@ -223,7 +223,7 @@ This process highlights the interplay between structured process management, cog
     *   **AML (`_gather_context`):** Context includes consolidated insights, summaries for rates/equities.
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Sufficient analysis performed on both topics. Consolidated insights available. Synthesize findings into final answer. Plan: 1. Generate final report outlining key drivers identified."
-        *   *LLM Output:* Updates plan: `[{"id": "step_report", "description": "Generate final analysis report", "assigned_tool": "unified_memory:generate_workflow_report", "depends_on": ["action_id_consolidation"]}]` (assuming consolidation action ID is known).
+        *   *LLM Output:* Updates plan: `[{"id": "step_report", "description": "Generate final analysis report", "assigned_tool": "generate_workflow_report", "depends_on": ["action_id_consolidation"]}]` (assuming consolidation action ID is known).
     *   **AML:** Updates plan.
 
 13. **Loop K: Generating Report & Achieving Goal**
@@ -265,10 +265,10 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 7.  **AML `_call_agent_llm`:** Constructs prompt: System prompt details UMS tools. User prompt contains the goal, the "No Active Workflow" context, and the instruction to create a workflow first. Sends to LLM.
 8.  **LLM Response:**
     *   *Text (Simulated):* "Understood. The first step is to establish a workflow for this complex financial analysis task. Reasoning: Essential for tracking progress, actions, and findings. Updated Plan:\n```json\n[{\"id\": \"step-1b\", \"description\": \"Structure analysis: Create dedicated thought chains for Rates and Equities\", \"status\": \"planned\", \"depends_on\": [\"act-create-wf\"]}]\n```" *(LLM anticipates the action ID for the workflow creation)*
-    *   *Tool Call:* `{"name": "unified_memory:create_workflow", "input": {"title": "Interest Rate & Equity Analysis - Week [Current Date]", "goal": "Identify key drivers for US interest rates and equity indexes over the past week.", "tags": ["financial_analysis", "rates", "equities", "weekly"]}}`
+    *   *Tool Call:* `{"name": "create_workflow", "input": {"title": "Interest Rate & Equity Analysis - Week [Current Date]", "goal": "Identify key drivers for US interest rates and equity indexes over the past week.", "tags": ["financial_analysis", "rates", "equities", "weekly"]}}`
 9.  **AML `_call_agent_llm`:** Parses response. Extracts tool call `create_workflow` and `updated_plan_steps`. Returns decision dict.
 10. **AML `run`:** `agent_decision` received. Checks `updated_plan_steps`: Valid. Updates `state.current_plan = [PlanStep(id='step-1b', ...)]`. `state.needs_replan = False`.
-11. **AML `run`:** `decision_type` is `call_tool`. Calls `_execute_tool_call_internal(tool_name="unified_memory:create_workflow", arguments={...}, record_action=True, planned_dependencies=None)`.
+11. **AML `run`:** `decision_type` is `call_tool`. Calls `_execute_tool_call_internal(tool_name="create_workflow", arguments={...}, record_action=True, planned_dependencies=None)`.
 12. **AML `_execute_tool_call_internal`:**
     *   Finds server for `create_workflow`.
     *   Checks dependencies: None.
@@ -283,7 +283,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
             *   `INSERT INTO thought_chains (thought_chain_id, workflow_id, title, created_at) VALUES ('tc-main-fin1', 'wf-fin1', 'Main reasoning for: Interest Rate & Equity Analysis...', now_iso)`
             *   `COMMIT`.
         *   Returns `{"success": True, "workflow_id": "wf-fin1", "primary_thought_chain_id": "tc-main-fin1", "created_at": now_iso}`. Assume hypothetical Action ID assigned by framework/logging is `act-create-wf`.
-    *   `tool_result_content` received (`success=True`). `state.last_action_summary = "Tool unified_memory:create_workflow executed. Success: True..."`. `state.last_error_details = None`. `state.consecutive_error_count = 0`.
+    *   `tool_result_content` received (`success=True`). `state.last_action_summary = "Tool create_workflow executed. Success: True..."`. `state.last_error_details = None`. `state.consecutive_error_count = 0`.
     *   Calls `_handle_workflow_side_effects`.
     *   **AML `_handle_workflow_side_effects`:** Matches `create_workflow`. Updates `state.workflow_id="wf-fin1"`, `state.context_id="wf-fin1"`, `state.workflow_stack=["wf-fin1"]`, `state.current_thought_chain_id="tc-main-fin1"`. Logs state changes. Plan remains as set from LLM (`step-1b`).
     *   Returns `tool_result_content`.
@@ -301,7 +301,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 4.  **AML `run`:** Calls `_call_agent_llm`.
 5.  **LLM Response:**
     *   *Text:* "Okay, structuring the analysis. The goal has two main components: interest rates and equity indexes. It's best to handle these in separate reasoning streams (thought chains) for clarity and potential parallel processing later if needed. First, I'll plan to create the chain for interest rates. Updated Plan:\n```json\n[{\"id\": \"step-2a\", \"description\": \"Create 'Interest Rate Drivers' thought chain\", \"status\": \"planned\", \"depends_on\": [\"act-create-wf\"]}, {\"id\": \"step-2b\", \"description\": \"Create 'Equity Index Drivers' thought chain\", \"status\": \"planned\", \"depends_on\": [\"act-create-rates-chain\"]}, {\"id\": \"step-2c\", \"description\": \"Plan initial search strategy for Interest Rates\", \"status\": \"planned\", \"depends_on\": [\"act-create-equity-chain\"]}]\n```" *(LLM breaks down the structuring task)*
-    *   *Tool Call:* `{"name": "unified_memory:create_thought_chain", "input": {"workflow_id": "wf-fin1", "title": "Interest Rate Drivers"}}`
+    *   *Tool Call:* `{"name": "create_thought_chain", "input": {"workflow_id": "wf-fin1", "title": "Interest Rate Drivers"}}`
 6.  **AML `_call_agent_llm`:** Parses. Returns decision.
 7.  **AML `run`:** Updates `state.current_plan` with the new 3-step plan.
 8.  **AML `run`:** `decision_type` is `call_tool` (`create_thought_chain`). Plan step is now `step-2a`. Checks dependency `act-create-wf`. Calls `_check_prerequisites(["act-create-wf"])`.
@@ -329,7 +329,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Creating the second thought chain for equity index drivers as planned." Updated Plan: [Marks step-2b in progress]
-    *   *Tool Call:* `{"name": "unified_memory:create_thought_chain", "input": {"workflow_id": "wf-fin1", "title": "Equity Index Drivers"}}`
+    *   *Tool Call:* `{"name": "create_thought_chain", "input": {"workflow_id": "wf-fin1", "title": "Equity Index Drivers"}}`
 4.  **AML:** Updates plan status. Executes `create_thought_chain`. Checks dependency `act-create-rates-chain` (completed).
 5.  **AML `_execute_tool_call_internal`:** Executes tool. Action ID `act-create-equity-chain`.
 6.  **UMS:** Creates `tc-equities1`.
@@ -344,7 +344,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Now planning the *interest rate* search. Need to ensure this plan is recorded in the correct thought chain (`tc-rates1`). Relevant data types: Fed statements, economic reports (CPI, jobs this week), key regulatory news, market commentary. Updated Plan:\n```json\n[{\"id\": \"step-4a\", \"description\": \"Record Rate Search Strategy Thought (in tc-rates1)\", \"status\": \"planned\", \"depends_on\": [\"act-create-equity-chain\"]}, {\"id\": \"step-4b\", \"description\": \"Execute search for rate drivers\", \"status\": \"planned\", \"depends_on\": [\"act-rec-rate-strat\"]}]\n```" *(LLM corrects sequencing and explicitly targets the rate chain)*
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-fin1", "thought_chain_id": "tc-rates1", "thought_type": "plan", "content": "Rate Driver Search Plan: Query corpus using fused search for terms: 'Federal Reserve statement last 7 days', 'FOMC minutes impact', 'CPI report analysis [Current Month/Year]', 'Nonfarm payrolls jobs report analysis [Current Month/Year]', 'Treasury auction results analysis week ending [Date]', 'interest rate market commentary past week', 'financial regulation news past week'."}}` *(Specifies target chain)*
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-fin1", "thought_chain_id": "tc-rates1", "thought_type": "plan", "content": "Rate Driver Search Plan: Query corpus using fused search for terms: 'Federal Reserve statement last 7 days', 'FOMC minutes impact', 'CPI report analysis [Current Month/Year]', 'Nonfarm payrolls jobs report analysis [Current Month/Year]', 'Treasury auction results analysis week ending [Date]', 'interest rate market commentary past week', 'financial regulation news past week'."}}` *(Specifies target chain)*
 4.  **AML:** Updates plan (replaces `step-2c`). Executes `record_thought`. Checks dependency `act-create-equity-chain` (completed).
 5.  **AML `_execute_tool_call_internal`:**
     *   Skips recording action start/complete.
@@ -394,7 +394,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 2.  **AML `run`:** Calls `_call_agent_llm`. Context includes summary of `act-exec-rate-search` results.
 3.  **LLM Response:**
     *   *Text:* "The search yielded 45 relevant snippets. Summarizing these to extract key themes regarding rate drivers. Will store the summary as a distinct semantic memory. Updated Plan:\n```json\n[{\"id\": \"step-6a\", \"description\": \"Record thought: Switch back to tc-rates to analyze summary\", \"status\": \"planned\", \"depends_on\": [\"act-summarize-rates\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:summarize_text", "input": {"text_to_summarize": "[Combined text of 45 snippets...]", "target_tokens": 750, "workflow_id": "wf-fin1", "record_summary": true}}` *(Instructs tool to store)*
+    *   *Tool Call:* `{"name": "summarize_text", "input": {"text_to_summarize": "[Combined text of 45 snippets...]", "target_tokens": 750, "workflow_id": "wf-fin1", "record_summary": true}}` *(Instructs tool to store)*
 4.  **AML:** Updates plan. Executes `summarize_text`. Checks dependency `act-exec-rate-search` (completed).
 5.  **AML `_execute_tool_call_internal`:**
     *   Records start (`act-summarize-rates`). Executes tool.
@@ -421,7 +421,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 2.  **AML `run`:** Calls `_call_agent_llm`. Context includes `mem-rates-summary1`.
 3.  **LLM Response:**
     *   *Text:* "Summary memory `mem-rates-summary1` created. Now switching thought context back to `tc-rates1` to perform detailed analysis of that summary. Updated Plan:\n```json\n[{\"id\": \"step-7a\", \"description\": \"Analyze rate summary (mem-rates-summary1) and store key facts\", \"status\": \"planned\", \"depends_on\": [\"act-rec-switch-rates\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-fin1", "thought_chain_id": "tc-rates1", "content": "Switching focus back to interest rate analysis chain (tc-rates1). Will now analyze summary memory mem-rates-summary1.", "thought_type": "reasoning"}}`
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-fin1", "thought_chain_id": "tc-rates1", "content": "Switching focus back to interest rate analysis chain (tc-rates1). Will now analyze summary memory mem-rates-summary1.", "thought_type": "reasoning"}}`
 4.  **AML:** Updates plan. Executes `record_thought`. Checks dependency.
 5.  **AML `_execute_tool_call_internal`:** Executes tool. Action ID `act-rec-switch-rates`.
 6.  **UMS:** Stores thought `th-switch-rates1` in **`tc-rates1`**. Creates linked memory `mem-switch-rates1`.
@@ -436,7 +436,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 2.  **AML `run`:** Calls `_call_agent_llm`. Context includes `mem-rates-summary1`.
 3.  **LLM Response:**
     *   *Text:* "Analyzing `mem-rates-summary1`. First key fact: CPI print details. Storing as distinct semantic memory. Updated Plan:\n```json\n[{\"id\": \"step-7a\", \"description\": \"Analyze rate summary...\", \"status\": \"in_progress\"}, {\"id\": \"step-8a\", \"description\": \"Store Fact: Hot CPI Print\", \"status\": \"planned\", \"depends_on\": [\"act-rec-switch-rates\"]}, {\"id\": \"step-8b\", \"description\": \"Store Fact: Fed Reaction Quote\", ...}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:store_memory", "input": {"workflow_id": "wf-fin1", "memory_level": "semantic", "memory_type": "fact", "content": "CPI data for [Month, Year] released [Date] showed X.X% YoY increase, above consensus of Y.Y%. Core CPI was Z.Z%.", "description": "Fact: Higher-than-expected CPI Print ([Month, Year])", "source": "mem-rates-summary1", "importance": 9.0, "confidence": 0.98, "tags": ["cpi", "inflation", "economic_data", "[Month]", "[Year]"]}}`
+    *   *Tool Call:* `{"name": "store_memory", "input": {"workflow_id": "wf-fin1", "memory_level": "semantic", "memory_type": "fact", "content": "CPI data for [Month, Year] released [Date] showed X.X% YoY increase, above consensus of Y.Y%. Core CPI was Z.Z%.", "description": "Fact: Higher-than-expected CPI Print ([Month, Year])", "source": "mem-rates-summary1", "importance": 9.0, "confidence": 0.98, "tags": ["cpi", "inflation", "economic_data", "[Month]", "[Year]"]}}`
 4.  **AML:** Updates plan. Executes `store_memory`. Checks dependency.
 5.  **AML `_execute_tool_call_internal`:** Records start/completion (`act-store-cpi-fact`).
 6.  **UMS:** Stores `mem-cpi-fact1`. Embeds. Background linking might connect to prior CPI memories.
@@ -452,7 +452,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Key rate facts stored. Completed initial rate driver analysis phase. Switching focus to equity index analysis in chain `tc-equities1`. Updated Plan:\n```json\n[{\"id\": \"step-11a\", \"description\": \"Record thought: Switch to Equities\", \"status\": \"planned\", \"depends_on\": [\"act-store-jobs-fact\"]}, ...]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-fin1", "thought_chain_id": "tc-equities1", "content": "Switching focus to equity index analysis (tc-equities1). Completed rate fact extraction.", "thought_type": "reasoning"}}`
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-fin1", "thought_chain_id": "tc-equities1", "content": "Switching focus to equity index analysis (tc-equities1). Completed rate fact extraction.", "thought_type": "reasoning"}}`
 4.  **AML:** Updates plan. Executes `record_thought`. Checks dependency.
 5.  **AML `_execute_tool_call_internal`:** Executes `record_thought` (Action `act-switch-eq`).
 6.  **UMS:** Stores `th-switch-eq1` in `tc-equities1`. Creates `mem-switch-eq1`.
@@ -474,7 +474,7 @@ Okay, let's simulate the financial analysis task with extreme granularity, focus
 *   **Loop 14 (cont.):** Calls `_call_agent_llm`. Context includes feedback and `needs_replan=True`. Equity search results *also* available from `act-exec-eq-search`.
 *   **LLM Response:**
     *   *Text:* "Reflection noted gaps (rate/equity interaction, politics). Will incorporate after processing current equity search results. Processing equity results now. Plan: 1. Summarize equity results. 2. Store key equity facts. 3. Plan search for interaction/political factors. Updated Plan:\n```json\n[{\"id\": \"step-14a\", \"description\": \"Summarize equity search results\", \"status\": \"planned\", \"depends_on\": [\"act-exec-eq-search\"]}, ...]\n```" *(LLM acknowledges feedback, defers acting on it, focuses on current results, resets replan flag implicitly)*
-    *   *Tool Call:* `{"name": "unified_memory:summarize_text", "input": {"text_to_summarize": "[Equity Snippets]", "record_summary": true}}`
+    *   *Tool Call:* `{"name": "summarize_text", "input": {"text_to_summarize": "[Equity Snippets]", "record_summary": true}}`
 *   **AML:** Updates plan. `needs_replan = False`. Executes `summarize_text` (`act-summarize-eq`). Stores `mem-eq-summary1`. Counter -> 1.
 *   **Loops 15-17:** LLM analyzes `mem-eq-summary1`, calls `store_memory` for key equity facts (e.g., `mem-tech-earn1`, `mem-oil-impact1`) in `tc-equities1`. Counters -> 2, 3, 4.
 *   **Loop 18 (Linking):** LLM explicitly links CPI fact to equity summary: `create_memory_link(source=mem-cpi-fact1, target=mem-eq-summary1, type=causal)`. Action `act-link-cpi-mkt`. Counter -> 5.
@@ -523,14 +523,14 @@ This scenario emphasizes memory synthesis, structured creative planning, artifac
     *   **AML (`_gather_context`):** Minimal context. "No Active Workflow".
     *   **AML -> LLM:** Receives the goal.
         *   *LLM Reasoning:* "Goal requires creative ideation, character dev, story arc, and scriptwriting. Need a workflow. Initial plan: Brainstorm genres and potential concept spaces."
-        *   *LLM Output:* `unified_memory:create_workflow` (title="Novel TV Concept Gen", goal="Develop original series concept, characters, arc, pilot script"). Updates plan: `[{"description": "Brainstorm potential genres and high-level concepts"}]`
+        *   *LLM Output:* `create_workflow` (title="Novel TV Concept Gen", goal="Develop original series concept, characters, arc, pilot script"). Updates plan: `[{"description": "Brainstorm potential genres and high-level concepts"}]`
     *   **AML:** Creates workflow (`wf-tv123`), default thought chain (`tc-main`). Updates state (`workflow_id`, `context_id`, `current_thought_chain_id = tc-main`). Sets plan.
 
 2.  **Loop 2: Genre/Concept Brainstorming (Internal Search & Thought)**
     *   **AML (`_gather_context`):** Context includes workflow, goal, plan.
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Executing brainstorm step. What genres are popular but maybe underserved with novel twists? Sci-fi, Fantasy, Mystery, Historical... Let's search internal memory for 'successful TV show tropes' and 'underused genre combinations'. Then record brainstorming thoughts." Updates plan: `[{"description": "Search memory for tropes/combos"}, {"description": "Record brainstormed ideas"}]`
-        *   *LLM Output:* `unified_memory:hybrid_search_memories` (query="successful TV show tropes OR underused genre combinations", limit=10, include_content=False).
+        *   *LLM Output:* `hybrid_search_memories` (query="successful TV show tropes OR underused genre combinations", limit=10, include_content=False).
     *   **AML (`_execute_tool_call_internal`):** Executes search.
     *   **UMS:** Returns memories related to common tropes, successful shows, maybe past agent reflections on media (if any exist).
     *   **AML:** Updates state (`last_action_summary` includes search results preview).
@@ -539,7 +539,7 @@ This scenario emphasizes memory synthesis, structured creative planning, artifac
     *   **AML (`_gather_context`):** Context includes memory search results. Plan step is "Record brainstormed ideas".
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Memory results show prevalence of 'chosen one' in fantasy, 'gritty detective' in mystery. Underused combo idea: What about a 'slice-of-life comedy set in a high-stakes bureaucratic afterlife'? Or 'historical drama focused on the *assistants* to famous figures'? Or 'sci-fi mystery where memories are physical objects that can be stolen/traded'? Let's record these." Updates plan: `[{"description": "Select most promising concept"}, ...]`
-        *   *LLM Output:* `unified_memory:record_thought` (thought_type=`hypothesis`, content="Idea 1: Bureaucratic Afterlife Comedy.").
+        *   *LLM Output:* `record_thought` (thought_type=`hypothesis`, content="Idea 1: Bureaucratic Afterlife Comedy.").
     *   **AML (`_execute_tool_call_internal`):** Executes `record_thought`.
     *   **UMS:** Stores thought in `tc-main`. Creates linked episodic memory.
     *   *(AML likely loops 2 more times to record the other two ideas as thoughts.)*
@@ -548,12 +548,12 @@ This scenario emphasizes memory synthesis, structured creative planning, artifac
     *   **AML (`_gather_context`):** Context includes the three brainstormed ideas as thoughts. Plan step is "Select most promising concept".
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Evaluating ideas: Afterlife Comedy - high potential for humor/satire, broad appeal possible. Historical Assistants - niche, potentially less broad appeal. Memory Objects Sci-Fi - intriguing, complex, maybe harder execution. Let's pursue the 'Bureaucratic Afterlife Comedy'. Need to store this decision and the core concept." Updates plan: `[{"description": "Check concept novelty"}, {"description": "Develop core premise"}, ...]`
-        *   *LLM Output:* `unified_memory:record_thought` (thought_type=`decision`, content="Selected concept: Bureaucratic Afterlife Comedy.").
+        *   *LLM Output:* `record_thought` (thought_type=`decision`, content="Selected concept: Bureaucratic Afterlife Comedy.").
     *   **AML (`_execute_tool_call_internal`):** Executes `record_thought`.
     *   **UMS:** Stores decision thought.
     *   **AML -> LLM (Implicit next step or combined):**
         *   *LLM Reasoning:* "Store the core concept as a semantic memory for future reference."
-        *   *LLM Output:* `unified_memory:store_memory` (memory_type=`fact`, memory_level=`semantic`, content="TV Concept: Slice-of-life comedy set in a mundane, bureaucratic afterlife where souls navigate paperwork, office politics, and existential dread with humor.", importance=8.0, confidence=0.7).
+        *   *LLM Output:* `store_memory` (memory_type=`fact`, memory_level=`semantic`, content="TV Concept: Slice-of-life comedy set in a mundane, bureaucratic afterlife where souls navigate paperwork, office politics, and existential dread with humor.", importance=8.0, confidence=0.7).
     *   **AML (`_execute_tool_call_internal`):** Executes `store_memory`.
     *   **UMS:** Stores semantic memory, generates embedding. Background linking might connect it to memories about comedy or bureaucracy.
 
@@ -572,7 +572,7 @@ This scenario emphasizes memory synthesis, structured creative planning, artifac
     *   **AML (`_gather_context`):** Concept validated. Plan step: "Develop core premise". `current_thought_chain_id` is `tc-main`.
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Flesh out the core premise. Setting: 'The Intermediate Plane - Department of Soul Processing (DSP)'. Tone: Mix of 'The Office'/'Parks & Rec' mundane humor with existential themes. Main conflict source: Incompetent management, arcane rules, inter-departmental rivalries, occasional soul glitches. Let's create a dedicated chain for this concept's development." Updates plan: `[{"description": "Create 'Afterlife Comedy Dev' thought chain"}, {"description": "Record detailed premise in new chain"}, ...]`
-        *   *LLM Output:* `unified_memory:create_thought_chain` (title="Afterlife Comedy Dev").
+        *   *LLM Output:* `create_thought_chain` (title="Afterlife Comedy Dev").
     *   **AML:** Creates workflow (`wf-tv123`). Executes `create_thought_chain`.
     *   **UMS:** Creates new thought chain (`tc-dev`).
     *   **AML:** Updates state: `current_thought_chain_id = tc-dev`.
@@ -581,29 +581,29 @@ This scenario emphasizes memory synthesis, structured creative planning, artifac
     *   **AML (`_gather_context`):** Now in `tc-dev`. Plan: "Record detailed premise".
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Record the premise details developed last loop within the new `tc-dev` chain."
-        *   *LLM Output:* `unified_memory:record_thought` (thought_chain_id=`tc-dev`, thought_type=`summary`, content="Premise: Comedy set in the DSP... [full details]").
+        *   *LLM Output:* `record_thought` (thought_chain_id=`tc-dev`, thought_type=`summary`, content="Premise: Comedy set in the DSP... [full details]").
     *   **AML (`_execute_tool_call_internal`):** Executes `record_thought`.
     *   **UMS:** Stores detailed premise thought in `tc-dev`.
 
 8.  **Loops 8-10: Character Profile Generation (Thought -> Store Memory -> Link)**
     *   **AML -> LLM:** Focuses on creating the main character (e.g., a newly deceased, bewildered soul).
         *   *LLM Reasoning:* "Develop protagonist: Name: Alex Chen. Recently deceased accountant. Personality: Organized, anxious, overwhelmed by afterlife chaos. Goal: Navigate bureaucracy, find meaning (or just get decent coffee). Record profile." Updates plan: `[{"description": "Store Alex Chen profile memory"}, ...]`.
-        *   *LLM Output:* `unified_memory:record_thought` (thought_chain_id=`tc-dev`, thought_type=`hypothesis`, content="Character Profile: Alex Chen - Accountant, anxious...").
+        *   *LLM Output:* `record_thought` (thought_chain_id=`tc-dev`, thought_type=`hypothesis`, content="Character Profile: Alex Chen - Accountant, anxious...").
     *   **AML (`_execute_tool_call_internal`):** Records thought.
     *   **AML -> LLM (Next Step):**
         *   *LLM Reasoning:* "Store Alex's profile as structured memory."
-        *   *LLM Output:* `unified_memory:store_memory` (memory_type=`character_profile`, memory_level=`semantic`, content=json.dumps({"name": "Alex Chen", "role": "Protagonist", ...}), description="Profile for Alex Chen", importance=7.0).
+        *   *LLM Output:* `store_memory` (memory_type=`character_profile`, memory_level=`semantic`, content=json.dumps({"name": "Alex Chen", "role": "Protagonist", ...}), description="Profile for Alex Chen", importance=7.0).
     *   **AML (`_execute_tool_call_internal`):** Stores memory (`mem-alex`).
     *   *(Repeats for other key characters: cynical angel supervisor, overly enthusiastic demon intern, ancient entity running the archives... Each gets a thought, a stored memory, and potentially links `related` back to the main concept memory.)*
 
 9.  **Loops 11-13: Season 1 Story Arc Development**
     *   **AML -> LLM:** Focuses on the overall narrative for the first season.
         *   *LLM Reasoning:* "Develop Season 1 arc: Alex arrives, struggles with rules, forms unlikely alliances (angel/demon), uncovers minor bureaucratic conspiracy/inefficiency, achieves small win/acceptance by finale. Theme: Finding humanity in the mundane, even after death. Record arc points." Updates plan: `[{"description": "Store Season 1 Arc memory"}, ...]`.
-        *   *LLM Output:* `unified_memory:record_thought` (thought_chain_id=`tc-dev`, thought_type=`plan`, content="S1 Arc: Arrival -> Struggle -> Alliance -> Minor Conspiracy -> Resolution...").
+        *   *LLM Output:* `record_thought` (thought_chain_id=`tc-dev`, thought_type=`plan`, content="S1 Arc: Arrival -> Struggle -> Alliance -> Minor Conspiracy -> Resolution...").
     *   **AML (`_execute_tool_call_internal`):** Records thought.
     *   **AML -> LLM (Next Step):**
         *   *LLM Reasoning:* "Store Season 1 Arc as structured memory."
-        *   *LLM Output:* `unified_memory:store_memory` (memory_type=`story_arc`, memory_level=`semantic`, content="Season 1: [Detailed arc points]", description="Season 1 Story Arc for Afterlife Comedy", importance=7.5).
+        *   *LLM Output:* `store_memory` (memory_type=`story_arc`, memory_level=`semantic`, content="Season 1: [Detailed arc points]", description="Season 1 Story Arc for Afterlife Comedy", importance=7.5).
     *   **AML (`_execute_tool_call_internal`):** Stores memory (`mem-arc`). Links it (`related`) to the main concept memory.
 
 10. **Loop 14: Reflection on Development**
@@ -620,7 +620,7 @@ This scenario emphasizes memory synthesis, structured creative planning, artifac
     *   **AML (`_gather_context`):** Context includes positive feedback, core concept, characters, S1 arc. Current chain `tc-dev`. Plan step: "Generate Pilot Script".
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Ready to write pilot. Pilot should introduce Alex, the setting (DSP), key supporting characters (supervisor, intern), establish tone, and set up initial conflict (e.g., lost paperwork, impossible task). Let's create a dedicated chain for the script." Updates plan: `[{"description": "Create 'Pilot Script Gen' thought chain"}, {"description": "Outline Pilot Scenes"}, ...]`.
-        *   *LLM Output:* `unified_memory:create_thought_chain` (title="Pilot Script Gen").
+        *   *LLM Output:* `create_thought_chain` (title="Pilot Script Gen").
     *   **AML:** Creates workflow (`wf-tv123`). Executes `create_thought_chain`.
     *   **UMS:** Creates `tc-pilot`.
     *   **AML:** Updates state: `current_thought_chain_id = tc-pilot`.
@@ -628,20 +628,20 @@ This scenario emphasizes memory synthesis, structured creative planning, artifac
 12. **Loops 16-18: Outlining Pilot Scenes**
     *   **AML -> LLM:** Iteratively outlines scenes.
         *   *LLM Reasoning:* "Scene 1: Alex arrives disoriented in sterile waiting room. Scene 2: Meets cynical angel supervisor, gets overwhelming stack of forms. Scene 3: Encounters enthusiastic demon intern causing chaos..." Records outlines as `plan` thoughts in `tc-pilot`.
-        *   *LLM Output:* `unified_memory:record_thought` (thought_chain_id=`tc-pilot`, thought_type=`plan`, content="Scene 1 Outline: ...").
+        *   *LLM Output:* `record_thought` (thought_chain_id=`tc-pilot`, thought_type=`plan`, content="Scene 1 Outline: ...").
     *   *(Repeats for key scenes)*
 
 13. **Loops 19-M: Generating Script Sections & Recording Artifacts**
     *   **AML -> LLM:** Takes scene outlines one by one.
         *   *LLM Reasoning:* "Generate dialogue and action for Scene 1 based on outline and character profiles (retrieved via search/context)." Updates plan: `[{"description": "Generate Scene 1 script"}, {"description": "Record Scene 1 script artifact"}, ...]`.
-        *   *LLM Output:* `unified_memory:record_thought` (thought_type=`reasoning`, content="Writing Scene 1: INT. DSP WAITING ROOM - DAY...") *[Self-correction: No, the output should be the action to generate, not the generation itself. The LLM just plans the next step here.]*
+        *   *LLM Output:* `record_thought` (thought_type=`reasoning`, content="Writing Scene 1: INT. DSP WAITING ROOM - DAY...") *[Self-correction: No, the output should be the action to generate, not the generation itself. The LLM just plans the next step here.]*
         *   *LLM Output (Corrected):* Updates plan to include generating Scene 1, perhaps using a hypothetical `creative_writing:generate_scene` tool or just storing the generated text in memory/thought. Let's assume it generates text and plans to store it.
         *   *LLM Reasoning (Internal to LLM):* [Generates Scene 1 script text]
-        *   *LLM Output:* `unified_memory:store_memory` (memory_type=`script_scene`, content="[SCENE 1 SCRIPT TEXT]", description="Pilot Scene 1 Script").
+        *   *LLM Output:* `store_memory` (memory_type=`script_scene`, content="[SCENE 1 SCRIPT TEXT]", description="Pilot Scene 1 Script").
     *   **AML (`_execute_tool_call_internal`):** Stores Scene 1 text as a memory.
     *   **AML -> LLM (Next):**
         *   *LLM Reasoning:* "Scene 1 generated and stored. Need to create an artifact combining scenes as we go." Updates plan: `[{"description": "Record Pilot Script Artifact (partial)"}, ...]`.
-        *   *LLM Output:* `unified_memory:record_artifact` (artifact_type=`text`, name="Pilot_Script_Draft_v1.txt", content="[SCENE 1 SCRIPT TEXT]", description="Ongoing pilot script draft").
+        *   *LLM Output:* `record_artifact` (artifact_type=`text`, name="Pilot_Script_Draft_v1.txt", content="[SCENE 1 SCRIPT TEXT]", description="Ongoing pilot script draft").
     *   **AML (`_execute_tool_call_internal`):** Creates/updates the artifact.
     *   *(Repeats for subsequent scenes, generating text, storing as memory, and updating the script artifact.)*
 
@@ -650,14 +650,14 @@ This scenario emphasizes memory synthesis, structured creative planning, artifac
 14. **Loop K-1: Final Review and Formatting**
     *   **AML -> LLM:** All scenes generated and added to the artifact.
         *   *LLM Reasoning:* "All pilot scenes generated. Retrieve full script artifact, perform final review for consistency and formatting." Updates plan: `[{"description": "Get final script artifact content"}, {"description": "Record final formatted script artifact"}, ...]`.
-        *   *LLM Output:* `unified_memory:get_artifact_by_id` (artifact_id=ID of Pilot_Script_Draft_v1.txt).
+        *   *LLM Output:* `get_artifact_by_id` (artifact_id=ID of Pilot_Script_Draft_v1.txt).
     *   **AML (`_execute_tool_call_internal`):** Retrieves artifact content.
 
 15. **Loop K: Record Final Artifact and Achieve Goal**
     *   **AML (`_gather_context`):** Context includes the full draft script content.
     *   **AML -> LLM:**
         *   *LLM Reasoning:* "Script retrieved. Apply standard screenplay formatting. [Internal formatting step]. Record final artifact. Goal is met." Updates plan.
-        *   *LLM Output:* `unified_memory:record_artifact` (artifact_type=`file`, name="Afterlife_Comedy_Pilot_FINAL.fdx", content="[FINAL FORMATTED SCRIPT]", description="Final Pilot Script", is_output=True). *(Note: FDX format is illustrative)*.
+        *   *LLM Output:* `record_artifact` (artifact_type=`file`, name="Afterlife_Comedy_Pilot_FINAL.fdx", content="[FINAL FORMATTED SCRIPT]", description="Final Pilot Script", is_output=True). *(Note: FDX format is illustrative)*.
     *   **AML (`_execute_tool_call_internal`):** Executes `record_artifact`. Marks it as a workflow output.
     *   **AML -> LLM (Implicit Next):**
         *   *LLM Output:* "Goal Achieved: Developed novel 'Bureaucratic Afterlife Comedy' concept, created character profiles, outlined Season 1 arc, and generated the final formatted pilot script artifact (ID: [final_artifact_id])."
@@ -689,7 +689,7 @@ Okay, let's dive deeper into the granular, low-level simulation of the creative 
 **Loop 1: Initialization & Workflow Creation**
 
 1.  **AML `run` starts:** `state = AgentState()`, `current_loop = 0`. Calls `initialize()`.
-2.  **AML `initialize`:** Loads empty state. Verifies `unified_memory:*` tools (assume OK). `workflow_id` is None.
+2.  **AML `initialize`:** Loads empty state. Verifies `*` tools (assume OK). `workflow_id` is None.
 3.  **AML `run`:** `current_loop = 1`. Calls `_gather_context()`.
 4.  **AML `_gather_context`:** Returns `{"status": "No Active Workflow"}`.
 5.  **AML `run`:** Sets plan based on context: `state.current_plan = [PlanStep(id='step-a', description="Create workflow for goal: Develop original series concept...")]`. `state.needs_replan = False`.
@@ -697,10 +697,10 @@ Okay, let's dive deeper into the granular, low-level simulation of the creative 
 7.  **AML `_call_agent_llm`:** Constructs prompt: System instructions + User prompt (goal, minimal context, explicit instruction to create workflow first). Sends to Claude 3.7 Sonnet.
 8.  **LLM Response (Simulated):**
     *   *Text:* "Okay, the goal is creative development. First, I need a workflow to track everything. Reasoning: Setting up the project structure. Updated Plan:\n```json\n[{\"id\": \"step-b\", \"description\": \"Brainstorm potential genres and high-level concepts\", \"status\": \"planned\"}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:create_workflow", "input": {"title": "Novel TV Concept Gen", "goal": "Develop original series concept, characters, arc, pilot script"}}`
-9.  **AML `_call_agent_llm`:** Parses response. Extracts tool call and the `updated_plan_steps`. Returns `{"decision": "call_tool", "tool_name": "unified_memory:create_workflow", "arguments": {...}, "updated_plan_steps": [PlanStep(id='step-b', ...)]}`.
+    *   *Tool Call:* `{"name": "create_workflow", "input": {"title": "Novel TV Concept Gen", "goal": "Develop original series concept, characters, arc, pilot script"}}`
+9.  **AML `_call_agent_llm`:** Parses response. Extracts tool call and the `updated_plan_steps`. Returns `{"decision": "call_tool", "tool_name": "create_workflow", "arguments": {...}, "updated_plan_steps": [PlanStep(id='step-b', ...)]}`.
 10. **AML `run`:** `agent_decision` received. Checks `updated_plan_steps`: Valid list of `PlanStep` found. Updates `state.current_plan = [PlanStep(id='step-b', ...)]`. `needs_replan = False`.
-11. **AML `run`:** `decision_type` is `call_tool`. Calls `_execute_tool_call_internal(tool_name="unified_memory:create_workflow", arguments={...}, record_action=True, planned_dependencies=None)`.
+11. **AML `run`:** `decision_type` is `call_tool`. Calls `_execute_tool_call_internal(tool_name="create_workflow", arguments={...}, record_action=True, planned_dependencies=None)`.
 12. **AML `_execute_tool_call_internal`:**
     *   Finds server for `create_workflow`.
     *   Checks `planned_dependencies`: None.
@@ -725,8 +725,8 @@ Okay, let's dive deeper into the granular, low-level simulation of the creative 
 4.  **AML `_call_agent_llm`:** Constructs prompt (goal, context incl. `wf-tv123`, `tc-main0`, plan step "Brainstorm...").
 5.  **LLM Response:**
     *   *Text:* "Okay, brainstorming concepts. Need inspiration and structure. Let's check memory for common successful patterns and maybe unusual ideas. Then log the brainstormed concepts as thoughts. Updated Plan:\n```json\n[{\"id\": \"step-c\", \"description\": \"Search memory for tropes/combos\", \"status\": \"planned\"}, {\"id\": \"step-d\", \"description\": \"Record brainstormed ideas as thoughts\", \"status\": \"planned\", \"depends_on\": [\"act-search1\"]}]\n```" *(LLM anticipates the action ID of the search step)*
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-main0", "thought_type": "plan", "content": "Plan brainstorm: 1. Search memory for tropes/combos. 2. Record resulting ideas as thoughts."}}` *(LLM decides to record the plan first)*
-6.  **AML `_call_agent_llm`:** Parses. Returns `{"decision": "call_tool", "tool_name": "unified_memory:record_thought", "arguments": {...}, "updated_plan_steps": [PlanStep(id='step-c', ...), PlanStep(id='step-d', ...)]}`.
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-main0", "thought_type": "plan", "content": "Plan brainstorm: 1. Search memory for tropes/combos. 2. Record resulting ideas as thoughts."}}` *(LLM decides to record the plan first)*
+6.  **AML `_call_agent_llm`:** Parses. Returns `{"decision": "call_tool", "tool_name": "record_thought", "arguments": {...}, "updated_plan_steps": [PlanStep(id='step-c', ...), PlanStep(id='step-d', ...)]}`.
 7.  **AML `run`:** Updates `state.current_plan` from LLM.
 8.  **AML `run`:** Executes `record_thought`.
 9.  **AML `_execute_tool_call_internal`:**
@@ -746,7 +746,7 @@ Okay, let's dive deeper into the granular, low-level simulation of the creative 
 3.  **AML `run`:** Calls `_call_agent_llm`.
 4.  **LLM Response:**
     *   *Text:* "Executing plan step 'Search memory'. Using hybrid search for broad coverage. Updated Plan: [Same as before, step-c status unchanged for now]" *(LLM might not mark step completed until result is processed)*
-    *   *Tool Call:* `{"name": "unified_memory:hybrid_search_memories", "input": {"workflow_id": "wf-tv123", "query": "successful TV show tropes OR underused genre combinations", "limit": 10, "include_content": False}}`
+    *   *Tool Call:* `{"name": "hybrid_search_memories", "input": {"workflow_id": "wf-tv123", "query": "successful TV show tropes OR underused genre combinations", "limit": 10, "include_content": False}}`
 5.  **AML `_call_agent_llm`:** Parses. Returns decision.
 6.  **AML `run`:** LLM didn't update plan, keeps current.
 7.  **AML `run`:** Executes `hybrid_search_memories`.
@@ -772,7 +772,7 @@ Okay, let's dive deeper into the granular, low-level simulation of the creative 
 3.  **AML `run`:** Calls `_call_agent_llm`.
 4.  **LLM Response:**
     *   *Text:* "Search results analyzed (tropes, etc.). Generating novel concepts based on results and goal. Idea 1: 'Bureaucratic Afterlife Comedy'. Idea 2: 'Historical Assistants Drama'. Idea 3: 'Memory Object Sci-Fi'. Recording first idea. Updated Plan:\n```json\n[{\"id\": \"step-d\", \"description\": \"Record brainstormed ideas as thoughts\", \"status\": \"in_progress\"}, {\"id\": \"step-e\", \"description\": \"Select most promising concept\", \"status\": \"planned\", \"depends_on\": [\"act-record-idea3\"]}]\n```" *(LLM marks step 'in_progress', anticipates multiple record actions)*
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-main0", "thought_type": "hypothesis", "content": "Idea 1: Bureaucratic Afterlife Comedy."}}`
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-main0", "thought_type": "hypothesis", "content": "Idea 1: Bureaucratic Afterlife Comedy."}}`
 5.  **AML `_call_agent_llm`:** Parses. Returns decision.
 6.  **AML `run`:** Updates plan (status of step-d, adds step-e).
 7.  **AML `run`:** Executes `record_thought` for Idea 1. Dependency check for `step-d` uses `act-search1`. Assume `_check_prerequisites` uses `get_action_details` on `act-search1` ID, finds it `completed`. Proceeds.
@@ -793,7 +793,7 @@ Okay, let's dive deeper into the granular, low-level simulation of the creative 
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Evaluating concepts... [Reasoning as before]... Decision: Pursue 'Bureaucratic Afterlife Comedy'. Recording decision. Updated Plan:\n```json\n[{\"id\": \"step-f\", \"description\": \"Store core concept memory\", \"status\": \"planned\", \"depends_on\": [\"act-record-decision\"]}, {\"id\": \"step-g\", \"description\": \"Check concept novelty\", \"status\": \"planned\", \"depends_on\": [\"act-store-concept\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-main0", "thought_type": "decision", "content": "Selected concept: Bureaucratic Afterlife Comedy."}}`
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-main0", "thought_type": "decision", "content": "Selected concept: Bureaucratic Afterlife Comedy."}}`
 4.  **AML:** Updates plan. Executes `record_thought`.
 5.  **UMS:** Stores `th-decision1`, `mem-decision1`.
 6.  **AML:** Background link task for `mem-decision1`. Success counters increment.
@@ -804,7 +804,7 @@ Okay, let's dive deeper into the granular, low-level simulation of the creative 
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Storing the chosen concept details as a semantic memory for robustness." Updated Plan: [Marks step-f in progress, step-g depends on act-store-concept]
-    *   *Tool Call:* `{"name": "unified_memory:store_memory", "input": {"workflow_id": "wf-tv123", "memory_level": "semantic", "memory_type": "fact", "content": "TV Concept: Slice-of-life comedy set in...", "importance": 8.0, "confidence": 0.7}}`
+    *   *Tool Call:* `{"name": "store_memory", "input": {"workflow_id": "wf-tv123", "memory_level": "semantic", "memory_type": "fact", "content": "TV Concept: Slice-of-life comedy set in...", "importance": 8.0, "confidence": 0.7}}`
 4.  **AML:** Updates plan. Executes `store_memory` (checks dependency `act-record-decision` first).
 5.  **AML `_execute_tool_call_internal`:** Records action start (`act-store-concept`). Executes tool. Records completion.
 6.  **UMS:** Stores `mem-concept1`, generates embedding.
@@ -833,7 +833,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Concept ('Bureaucratic Afterlife Comedy') is selected and validated. Next, develop the core premise details (setting, tone, conflict). To keep this organized, I'll create a dedicated thought chain for development. Updated Plan:\n```json\n[{\"id\": \"step-h\", \"description\": \"Create 'Afterlife Comedy Dev' thought chain\", \"status\": \"planned\"}, {\"id\": \"step-i\", \"description\": \"Record detailed premise in new chain\", \"status\": \"planned\", \"depends_on\": [\"act-create-dev-chain\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:create_thought_chain", "input": {"workflow_id": "wf-tv123", "title": "Afterlife Comedy Dev"}}`
+    *   *Tool Call:* `{"name": "create_thought_chain", "input": {"workflow_id": "wf-tv123", "title": "Afterlife Comedy Dev"}}`
 4.  **AML `_call_agent_llm`:** Parses. Returns decision.
 5.  **AML `run`:** Updates `state.current_plan` from LLM.
 6.  **AML `run`:** Executes `create_thought_chain`. Plan step `step-h`. No dependencies.
@@ -854,7 +854,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Now in the 'Afterlife Comedy Dev' chain (`tc-dev1`). Recording the detailed premise developed previously: Setting: 'The Intermediate Plane - Department of Soul Processing (DSP)'. Tone: 'The Office' meets existentialism. Conflict: Incompetent management, arcane rules, soul glitches. Updated Plan:\n```json\n[{\"id\": \"step-j\", \"description\": \"Plan protagonist character (Alex Chen)\", \"status\": \"planned\", \"depends_on\": [\"act-record-premise\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-dev1", "thought_type": "summary", "content": "Premise: Comedy set in the DSP, mixing mundane office humor (The Office style) with existential themes. Core conflict stems from bureaucratic inefficiency, arbitrary rules, inter-departmental friction, and occasional 'soul glitches'."}}`
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-dev1", "thought_type": "summary", "content": "Premise: Comedy set in the DSP, mixing mundane office humor (The Office style) with existential themes. Core conflict stems from bureaucratic inefficiency, arbitrary rules, inter-departmental friction, and occasional 'soul glitches'."}}`
 4.  **AML `_call_agent_llm`:** Parses. Returns decision.
 5.  **AML `run`:** Updates `state.current_plan`.
 6.  **AML `run`:** Executes `record_thought`. Checks dependency `act-create-dev-chain` (completed). Proceeds.
@@ -869,7 +869,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Developing the protagonist. Name: Alex Chen. Role: Recently deceased human, former accountant. Personality: Orderly, anxious, easily overwhelmed by the absurdity and inefficiency of the DSP. Initial Goal: Simply understand the rules and survive the afterlife onboarding process. Updated Plan:\n```json\n[{\"id\": \"step-k\", \"description\": \"Record Alex Chen character thought\", \"status\": \"planned\", \"depends_on\": [\"act-record-premise\"]}, {\"id\": \"step-l\", \"description\": \"Store Alex Chen profile memory\", \"status\": \"planned\", \"depends_on\": [\"act-record-alex-thought\"]}]\n```" *(LLM plans two steps: record thought, then store memory)*
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-dev1", "thought_type": "hypothesis", "content": "Character Concept: Alex Chen (Protagonist). Accountant, newly deceased. Anxious, seeks order in chaotic DSP. Initial motivation: Survival/understanding."}}`
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-dev1", "thought_type": "hypothesis", "content": "Character Concept: Alex Chen (Protagonist). Accountant, newly deceased. Anxious, seeks order in chaotic DSP. Initial motivation: Survival/understanding."}}`
 4.  **AML:** Updates plan (replaces `step-j` with `step-k`, `step-l`). Executes `record_thought`. Checks dependency `act-record-premise` (completed).
 5.  **AML `_execute_tool_call_internal`:** Executes tool. Action ID `act-record-alex-thought`.
 6.  **UMS:** Stores thought `th-alex1`, memory `mem-alex-idea1`.
@@ -881,7 +881,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Storing the detailed Alex Chen profile as a semantic memory for easy retrieval later during scriptwriting." Updated Plan: `[{"id": "step-m", "description": "Plan supervisor character", "status": "planned", "depends_on": ["act-store-alex-mem"]}]`
-    *   *Tool Call:* `{"name": "unified_memory:store_memory", "input": {"workflow_id": "wf-tv123", "memory_level": "semantic", "memory_type": "character_profile", "content": "{\"name\": \"Alex Chen\", \"role\": \"Protagonist\", \"background\": \"Mid-level accountant, died unexpectedly (e.g., rogue filing cabinet incident)\", \"personality\": \"Organized, detail-oriented, anxious, seeks logic, dry wit under stress\", \"initial_goal\": \"Navigate DSP onboarding, find decent coffee\"}", "description": "Character Profile: Alex Chen (Protagonist)", "importance": 7.5, "confidence": 0.85, "tags": ["character", "protagonist", "human"]}}`
+    *   *Tool Call:* `{"name": "store_memory", "input": {"workflow_id": "wf-tv123", "memory_level": "semantic", "memory_type": "character_profile", "content": "{\"name\": \"Alex Chen\", \"role\": \"Protagonist\", \"background\": \"Mid-level accountant, died unexpectedly (e.g., rogue filing cabinet incident)\", \"personality\": \"Organized, detail-oriented, anxious, seeks logic, dry wit under stress\", \"initial_goal\": \"Navigate DSP onboarding, find decent coffee\"}", "description": "Character Profile: Alex Chen (Protagonist)", "importance": 7.5, "confidence": 0.85, "tags": ["character", "protagonist", "human"]}}`
 4.  **AML:** Updates plan. Executes `store_memory`. Checks dependency `act-record-alex-thought` (completed).
 5.  **AML `_execute_tool_call_internal`:** Records start (`act-store-alex-mem`). Executes tool. Records completion.
 6.  **UMS:** Stores memory `mem-alex-profile`, generates embedding.
@@ -902,7 +902,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Characters established. Now outlining the Season 1 story arc within the dev chain (`tc-dev1`). Arc: Alex arrives, struggles, forms alliances with Bartholomew/Fizzle against inefficient system/minor antagonist (e.g., rival dept head), uncovers source of a recurring 'soul glitch', achieves a small victory improving their section's process, gains grudging respect. Updated Plan:\n```json\n[{\"id\": \"step-r\", \"description\": \"Record Season 1 Arc thought\", \"status\": \"planned\", \"depends_on\": [\"act-store-int-mem\"]}, {\"id\": \"step-s\", \"description\": \"Store Season 1 Arc memory\", \"status\": \"planned\", \"depends_on\": [\"act-record-arc-thought\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-dev1", "thought_type": "plan", "content": "S1 Arc Outline: 1. Arrival/Confusion. 2. Intro Supervisor/Intern. 3. Initial Task/Failure. 4. Unlikely Alliance Formation. 5. Investigate 'Soul Glitch'. 6. Confront Rival/Obstacle. 7. Minor System Improvement/Resolution. 8. Finale: Tentative acceptance/new status quo."}}`
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-dev1", "thought_type": "plan", "content": "S1 Arc Outline: 1. Arrival/Confusion. 2. Intro Supervisor/Intern. 3. Initial Task/Failure. 4. Unlikely Alliance Formation. 5. Investigate 'Soul Glitch'. 6. Confront Rival/Obstacle. 7. Minor System Improvement/Resolution. 8. Finale: Tentative acceptance/new status quo."}}`
 4.  **AML:** Updates plan. Executes `record_thought`. Checks dependency.
 5.  **AML `_execute_tool_call_internal`:** Executes tool. Action ID `act-record-arc-thought`.
 6.  **UMS:** Stores `th-arc1`, `mem-arc-idea1`.
@@ -914,7 +914,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Storing the Season 1 arc details as a semantic memory." Updated Plan: `[{"id": "step-t\", \"description\": \"Plan Pilot Episode structure\", \"status\": \"planned\", \"depends_on\": [\"act-store-arc-mem\"]}]` *(Planning moves towards pilot)*
-    *   *Tool Call:* `{"name": "unified_memory:store_memory", "input": {"workflow_id": "wf-tv123", "memory_level": "semantic", "memory_type": "story_arc", "content": "Season 1 Arc: [Full arc details from thought th-arc1]", "description": "Season 1 Story Arc for Afterlife Comedy", "importance": 7.5, "confidence": 0.8, "tags": ["arc", "season1", "plot"]}}`
+    *   *Tool Call:* `{"name": "store_memory", "input": {"workflow_id": "wf-tv123", "memory_level": "semantic", "memory_type": "story_arc", "content": "Season 1 Arc: [Full arc details from thought th-arc1]", "description": "Season 1 Story Arc for Afterlife Comedy", "importance": 7.5, "confidence": 0.8, "tags": ["arc", "season1", "plot"]}}`
 4.  **AML:** Updates plan. Executes `store_memory`. Checks dependency.
 5.  **AML `_execute_tool_call_internal`:** Records start (`act-store-arc-mem`). Executes tool. Records completion. Also calls `create_memory_link` (source=`act-store-arc-mem`, target=`mem-concept1`, type=`related`).
 6.  **UMS:** Stores `mem-arc-profile`, generates embedding. Stores link.
@@ -932,7 +932,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 8.  **AML `run`:** Calls `_call_agent_llm`. Context includes the positive feedback. Plan is `[step-t]`.
 9.  **LLM Response:**
     *   *Text:* "Positive reflection noted. Proceeding to plan pilot episode structure. This requires a new thought chain for script details. Updated Plan:\n```json\n[{\"id\": \"step-u\", \"description\": \"Create 'Pilot Script Gen' thought chain\", \"status\": \"planned\", \"depends_on\": [\"act-store-arc-mem\"]}, {\"id\": \"step-v\", \"description\": \"Outline Pilot Scene 1\", \"status\": \"planned\", \"depends_on\": [\"act-create-pilot-chain\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:create_thought_chain", "input": {"workflow_id": "wf-tv123", "title": "Pilot Script Gen"}}`
+    *   *Tool Call:* `{"name": "create_thought_chain", "input": {"workflow_id": "wf-tv123", "title": "Pilot Script Gen"}}`
 10. **AML:** Updates plan. Executes `create_thought_chain`. Checks dependency.
 11. **AML `_execute_tool_call_internal`:** Executes tool. Action ID `act-create-pilot-chain`.
 12. **UMS:** Creates `tc-pilot1`.
@@ -947,7 +947,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Planning Scene 1 for the pilot in chain `tc-pilot1`. Goal: Introduce Alex, establish bewildered tone, show sterile environment. Outline: INT. DSP WAITING ROOM - DAY. Sterile, beige, fluorescent lights. Alex appears, confused. Reads baffling 'Welcome to the Intermediate Plane' pamphlet. Updated Plan:\n```json\n[{\"id\": \"step-w\", \"description\": \"Record Scene 1 Outline thought\", \"status\": \"planned\", \"depends_on\": [\"act-create-pilot-chain\"]}, {\"id\": \"step-x\", \"description\": \"Outline Pilot Scene 2\", \"status\": \"planned\", \"depends_on\": [\"act-record-sc1-outline\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-pilot1", "thought_type": "plan", "content": "Scene 1 Outline: INT. DSP WAITING ROOM - DAY. Sterile setting. Alex appears, confused. Interacts with confusing pamphlet."}}`
+    *   *Tool Call:* `{"name": "record_thought", "input": {"workflow_id": "wf-tv123", "thought_chain_id": "tc-pilot1", "thought_type": "plan", "content": "Scene 1 Outline: INT. DSP WAITING ROOM - DAY. Sterile setting. Alex appears, confused. Interacts with confusing pamphlet."}}`
 4.  **AML:** Updates plan (replaces `step-v`). Executes `record_thought`. Checks dependency.
 5.  **AML `_execute_tool_call_internal`:** Executes tool. Action ID `act-record-sc1-outline`.
 6.  **UMS:** Stores `th-sc1-outline`.
@@ -963,7 +963,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Generating script text for Scene 1 based on outline (`th-sc1-outline`) and Alex's profile (`mem-alex-profile`). Storing result as memory first. Updated Plan:\n```json\n[{\"id\": \"step-bb\", \"description\": \"Store Scene 1 Script memory\", \"status\": \"planned\", \"depends_on\": [\"act-record-sc3-outline\"]}, {\"id\": \"step-cc\", \"description\": \"Record Pilot Script Artifact (v1)\", \"status\": \"planned\", \"depends_on\": [\"act-store-sc1-mem\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:store_memory", "input": {"workflow_id": "wf-tv123", "memory_level": "episodic", "memory_type": "script_scene", "content": "[GENERATED SCRIPT TEXT FOR SCENE 1 - Approx 3 pages]", "description": "Pilot Script: Scene 1", "importance": 6.0, "confidence": 0.9, "tags": ["script", "scene1", "pilot"], "action_id": "act-gen-sc1" }}` *(LLM anticipates action ID)*
+    *   *Tool Call:* `{"name": "store_memory", "input": {"workflow_id": "wf-tv123", "memory_level": "episodic", "memory_type": "script_scene", "content": "[GENERATED SCRIPT TEXT FOR SCENE 1 - Approx 3 pages]", "description": "Pilot Script: Scene 1", "importance": 6.0, "confidence": 0.9, "tags": ["script", "scene1", "pilot"], "action_id": "act-gen-sc1" }}` *(LLM anticipates action ID)*
 4.  **AML:** Updates plan (replaces `step-aa`). Executes `store_memory`. Checks dependency.
 5.  **AML `_execute_tool_call_internal`:** Records start (`act-store-sc1-mem`). Executes tool. Records completion.
 6.  **UMS:** Stores memory `mem-sc1`. Generates embedding.
@@ -975,7 +975,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Creating the initial draft artifact containing Scene 1." Updated Plan: `[{"id\": \"step-dd\", \"description\": \"Generate Scene 2 Script memory\", \"status\": \"planned\", \"depends_on\": [\"act-record-art1\"]}]`
-    *   *Tool Call:* `{"name": "unified_memory:record_artifact", "input": {"workflow_id": "wf-tv123", "artifact_type": "text", "name": "Pilot_Script_Draft_v1.txt", "content": "[CONTENT FROM mem-sc1]", "description": "Pilot script draft, scenes 1", "tags": ["script", "draft", "pilot"], "action_id": "act-record-art1"}}` *(LLM uses content from memory)*
+    *   *Tool Call:* `{"name": "record_artifact", "input": {"workflow_id": "wf-tv123", "artifact_type": "text", "name": "Pilot_Script_Draft_v1.txt", "content": "[CONTENT FROM mem-sc1]", "description": "Pilot script draft, scenes 1", "tags": ["script", "draft", "pilot"], "action_id": "act-record-art1"}}` *(LLM uses content from memory)*
 4.  **AML:** Updates plan. Executes `record_artifact`. Checks dependency.
 5.  **AML `_execute_tool_call_internal`:** Records start (`act-record-art1`). Executes tool. Records completion. `record_artifact` returns `artifact_id="art-draft1"` and `linked_memory_id`.
 6.  **UMS:** Stores artifact `art-draft1`. Stores linked memory about artifact creation.
@@ -999,7 +999,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Pilot script scenes generated and combined in draft artifact `art-draft1`. Need to retrieve the full content, perform a final consistency check, apply standard screenplay formatting, and save as the final output artifact. Updated Plan:\n```json\n[{\"id\": \"step-gg\", \"description\": \"Get final draft script content\", \"status\": \"planned\", \"depends_on\": [\"act-update-art3\"]}, {\"id\": \"step-hh\", \"description\": \"Record FINAL formatted script artifact\", \"status\": \"planned\", \"depends_on\": [\"act-get-draft\"]}]\n```"
-    *   *Tool Call:* `{"name": "unified_memory:get_artifact_by_id", "input": {"artifact_id": "art-draft1", "include_content": true}}`
+    *   *Tool Call:* `{"name": "get_artifact_by_id", "input": {"artifact_id": "art-draft1", "include_content": true}}`
 4.  **AML:** Updates plan. Executes `get_artifact_by_id`. Checks dependency `act-update-art3`.
 5.  **AML `_execute_tool_call_internal`:** Executes tool. Action ID `act-get-draft`.
 6.  **UMS:** Returns full content of `art-draft1`.
@@ -1011,7 +1011,7 @@ Okay, let's continue the detailed simulation, picking up right after the concept
 2.  **AML `run`:** Calls `_call_agent_llm`.
 3.  **LLM Response:**
     *   *Text:* "Retrieved full draft. [Internal LLM step: Applying standard screenplay formatting - Headers, Dialogue, Action lines]. Saving the final version as a distinct output artifact. Goal should be met after this. Updated Plan: []" *(LLM empties plan as this is final step)*
-    *   *Tool Call:* `{"name": "unified_memory:record_artifact", "input": {"workflow_id": "wf-tv123", "artifact_type": "file", "name": "Afterlife_Comedy_Pilot_FINAL.txt", "content": "[FINAL FORMATTED SCRIPT TEXT]", "description": "Final Pilot Script - Formatted", "is_output": true, "tags": ["script", "final", "pilot", "output"], "action_id": "act-record-final"}}`
+    *   *Tool Call:* `{"name": "record_artifact", "input": {"workflow_id": "wf-tv123", "artifact_type": "file", "name": "Afterlife_Comedy_Pilot_FINAL.txt", "content": "[FINAL FORMATTED SCRIPT TEXT]", "description": "Final Pilot Script - Formatted", "is_output": true, "tags": ["script", "final", "pilot", "output"], "action_id": "act-record-final"}}`
 4.  **AML:** Updates plan (empty). Executes `record_artifact`. Checks dependency `act-get-draft`.
 5.  **AML `_execute_tool_call_internal`:** Records start (`act-record-final`). Executes tool. Records completion. Returns `artifact_id="art-final1"`.
 6.  **UMS:** Stores `art-final1` artifact, marks `is_output=True`. Stores linked memory.

@@ -57,6 +57,8 @@ dependencies = [
     "uvicorn[standard]",
     "websockets",
     "python-multipart",
+    "python-Levenshtein",
+    "thefuzz",
 ]
 
 # Defines the command-line script entry points

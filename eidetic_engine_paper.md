@@ -266,7 +266,7 @@ The EideticEngine architecture relies not only on its internal logic (AML) and i
 
 ### 6.1. Architecture: UMS as a Tool Suite within a Larger Gateway
 
-It's crucial to understand that the **UMS is implemented as a collection of tools within the broader LLM Gateway MCP Server**. The AML, via the `Ultimate MCP Client`, interacts with the UMS not through direct database calls, but by invoking specific `unified_memory:*` tools registered on the Gateway server. This modular design offers several advantages:
+It's crucial to understand that the **UMS is implemented as a collection of tools within the broader LLM Gateway MCP Server**. The AML, via the `Ultimate MCP Client`, interacts with the UMS not through direct database calls, but by invoking specific `*` tools registered on the Gateway server. This modular design offers several advantages:
 
 * **Decoupling:** The agent's core logic (AML) is decoupled from the specific implementation details of the memory system.
 * **Extensibility:** New memory features or other functionalities can be added to the Gateway server as new tools without requiring changes to the AML itself.

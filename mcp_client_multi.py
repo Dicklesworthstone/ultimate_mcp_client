@@ -268,8 +268,8 @@ if TYPE_CHECKING:
     from agent_master_loop import AgentMasterLoop, PlanStep
 
 else:
-    AgentMasterLoop = "AgentMasterLoop" # Placeholder for AgentMasterLoop
-    PlanStep = "PlanStep"             # Placeholder for PlanStep
+    AgentMasterLoop = "AgentMasterLoop"  # Placeholder for AgentMasterLoop
+    PlanStep = "PlanStep"  # Placeholder for PlanStep
 
 decouple_config = DecoupleConfig(RepositoryEnv(".env"))
 
@@ -338,7 +338,7 @@ COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
     # Gemini models (Google)
     "gemini-2.0-flash-lite": {"input": 0.075, "output": 0.30},
     "gemini-2.0-flash": {"input": 0.35, "output": 1.05},
-    "gemini-2.0-flash-thinking-exp-01-21": {"input": 0.0, "output": 0.0}, # Assuming free tier
+    "gemini-2.0-flash-thinking-exp-01-21": {"input": 0.0, "output": 0.0},  # Assuming free tier
     "gemini-2.5-pro-exp-03-25": {"input": 1.25, "output": 10.0},
     # OpenRouter models (Prefixed)
     "openrouter/mistralai/mistral-nemo": {"input": 0.035, "output": 0.08},
@@ -349,35 +349,35 @@ COST_PER_MILLION_TOKENS: Dict[str, Dict[str, float]] = {
     "grok-3-mini-latest": {"input": 0.30, "output": 0.50},
     "grok-3-mini-fast-latest": {"input": 0.60, "output": 4.0},
     # Mistral models (Native Mistral API)
-    "mistral-large-latest": {"input": 2.0, "output": 6.0}, 
+    "mistral-large-latest": {"input": 2.0, "output": 6.0},
     "mistral-small-latest": {"input": 0.1, "output": 0.3},
     # Groq models (Prefixed)
-    "groq/llama-3.3-70b-versatile": {"input": 0.0, "output": 0.0}, # Groq often has very low/free pricing during beta
-    "groq/meta-llama/llama-4-scout-17b-16e-instruct": {"input": 0.0, "output": 0.0}, 
-    "groq/mistral-saba-24b": {"input": 0.0, "output": 0.0}, 
+    "groq/llama-3.3-70b-versatile": {"input": 0.0, "output": 0.0},  # Groq often has very low/free pricing during beta
+    "groq/meta-llama/llama-4-scout-17b-16e-instruct": {"input": 0.0, "output": 0.0},
+    "groq/mistral-saba-24b": {"input": 0.0, "output": 0.0},
     "groq/qwen-qwq-32b": {"input": 0.0, "output": 0.0},
     "groq/gemma2-9b-it": {"input": 0.0, "output": 0.0},
     "groq/compound-beta": {"input": 0.0, "output": 0.0},
     "groq/compound-beta-mini": {"input": 0.0, "output": 0.0},
     # Cerebras models (Prefixed)
-    "cerebras/llama-4-scout-17b-16e-instruct": {"input": 0.0001, "output": 0.0001}, # Using placeholder cost
-    "cerebras/llama-3.3-70b": {"input": 0.0001, "output": 0.0001}, # Using placeholder cost
+    "cerebras/llama-4-scout-17b-16e-instruct": {"input": 0.0001, "output": 0.0001},  # Using placeholder cost
+    "cerebras/llama-3.3-70b": {"input": 0.0001, "output": 0.0001},  # Using placeholder cost
 }
 
 # Default models by provider (Updated with prefixed names)
 DEFAULT_MODELS = {
-    Provider.OPENAI: "gpt-4o-mini", # Changed to newer mini model
+    Provider.OPENAI: "gpt-4o-mini",  # Changed to newer mini model
     Provider.ANTHROPIC: "claude-3-5-haiku-20241022",
     Provider.DEEPSEEK: "deepseek-chat",
-    Provider.GEMINI: "gemini-2.0-flash-lite", # Changed to cheaper flash model
+    Provider.GEMINI: "gemini-2.0-flash-lite",  # Changed to cheaper flash model
     Provider.OPENROUTER: "openrouter/tngtech/deepseek-r1t-chimera:free",
-    Provider.GROK: "grok-3-mini-latest", # Changed to cheaper Grok model
+    Provider.GROK: "grok-3-mini-latest",  # Changed to cheaper Grok model
     Provider.MISTRAL: "mistral-large-latest",
     Provider.GROQ: "groq/compound-beta",
     Provider.CEREBRAS: "cerebras/llama-4-scout-17b-16e-instruct",
 }
 
-OPENAI_MAX_TOOL_COUNT = 128 # Maximum tools to send to OpenAI-compatible APIs
+OPENAI_MAX_TOOL_COUNT = 128  # Maximum tools to send to OpenAI-compatible APIs
 
 # Emoji mapping
 EMOJI_MAP = {
@@ -461,11 +461,14 @@ EMOJI_MAP["status_degraded"] = EMOJI_MAP["warning"]
 EMOJI_MAP["status_error"] = EMOJI_MAP["cross_mark"]
 EMOJI_MAP["status_unknown"] = EMOJI_MAP["question_mark"]
 
+AGENT_TOOL_UPDATE_PLAN = "agent:update_plan"
+
 # =============================================================================
 # Model -> Provider Mapping
 # =============================================================================
 # Maps known model identifiers (or prefixes) to their provider's enum value string.
 MODEL_PROVIDER_MAP: Dict[str, str] = {}
+
 
 def _infer_provider(model_name: str) -> Optional[str]:
     """
@@ -484,11 +487,11 @@ def _infer_provider(model_name: str) -> Optional[str]:
         "cerebras/": Provider.CEREBRAS.value,
         "openai/": Provider.OPENAI.value,
         "anthropic/": Provider.ANTHROPIC.value,
-        "google/": Provider.GEMINI.value, # Keep google/ for Gemini
-        "gemini/": Provider.GEMINI.value, # Allow gemini/ too
+        "google/": Provider.GEMINI.value,  # Keep google/ for Gemini
+        "gemini/": Provider.GEMINI.value,  # Allow gemini/ too
         "grok/": Provider.GROK.value,
         "deepseek/": Provider.DEEPSEEK.value,
-        "mistralai/": Provider.MISTRAL.value, # Keep mistralai/ -> Mistral as default
+        "mistralai/": Provider.MISTRAL.value,  # Keep mistralai/ -> Mistral as default
     }
     for prefix, provider_val in prefixes.items():
         if lname.startswith(prefix):
@@ -498,8 +501,8 @@ def _infer_provider(model_name: str) -> Optional[str]:
             # For others like mistralai/, it *could* be OpenRouter/Groq, but default to the main provider if no other prefix matches
             # This logic becomes less critical as the main flow uses the explicit provider.
             # Let's refine this: If it starts with a known base model provider but ISN'T explicitly openrouter/groq/cerebras, assume base provider.
-            if provider_val not in [Provider.MISTRAL.value]: # Example: Don't return Mistral if it might be OpenRouter/Groq
-                 return provider_val
+            if provider_val not in [Provider.MISTRAL.value]:  # Example: Don't return Mistral if it might be OpenRouter/Groq
+                return provider_val
 
     # 2. Common Model Name Prefixes (Lower Priority)
     if lname.startswith("gpt-") or lname.startswith("o1-") or lname.startswith("o3-"):
@@ -507,8 +510,8 @@ def _infer_provider(model_name: str) -> Optional[str]:
     if lname.startswith("claude-"):
         return Provider.ANTHROPIC.value
     # Handle Gemini models that don't start with google/ or gemini/
-    if lname.startswith("gemini-"): # Ensure this check happens
-         return Provider.GEMINI.value
+    if lname.startswith("gemini-"):  # Ensure this check happens
+        return Provider.GEMINI.value
     if lname.startswith("grok-"):
         return Provider.GROK.value
     if lname.startswith("deepseek-"):
@@ -521,11 +524,15 @@ def _infer_provider(model_name: str) -> Optional[str]:
     # This is useful for models like `mistralai/mistral-nemo` if they haven't been prefixed
     if model_name in COST_PER_MILLION_TOKENS:
         # Try inferring based *solely* on COST_PER_MILLION_TOKENS keys (less reliable)
-        if model_name.startswith("mistralai/"): return Provider.OPENROUTER.value # Heuristic: Nemo is likely OpenRouter
-        if model_name.startswith("llama-"): # Heuristic: Llama 3.3 is Groq, Llama 4 is Cerebras
-            if "3.3" in model_name: return Provider.GROQ.value
-            if "4-scout" in model_name: return Provider.CEREBRAS.value
-    return None # Cannot reliably infer
+        if model_name.startswith("mistralai/"):
+            return Provider.OPENROUTER.value  # Heuristic: Nemo is likely OpenRouter
+        if model_name.startswith("llama-"):  # Heuristic: Llama 3.3 is Groq, Llama 4 is Cerebras
+            if "3.3" in model_name:
+                return Provider.GROQ.value
+            if "4-scout" in model_name:
+                return Provider.CEREBRAS.value
+    return None  # Cannot reliably infer
+
 
 # Populate the map (used for informational purposes, e.g., /model list)
 # The runtime logic relies on get_provider_from_model
@@ -744,21 +751,26 @@ sigint_handler.counter = 0
 signal.signal(signal.SIGINT, sigint_handler)
 atexit.register(atexit_handler)
 
+
 def _fmt_id(val: Any, length: int = 8) -> str:
     s = str(val) if val is not None else "?"
     return s[:length] if len(s) >= length else s
+
 
 # --- Pydantic Models (ServerAddRequest, ConfigUpdateRequest, etc. - Update ConfigUpdateRequest) ---
 class WebSocketMessage(BaseModel):
     type: str
     payload: Any = None
 
+
 class SetModelRequest(BaseModel):
     model: str = Field(..., min_length=1)
+
 
 class ServerType(Enum):
     STDIO = "stdio"
     SSE = "sse"
+
 
 class ServerAddRequest(BaseModel):
     name: str
@@ -766,14 +778,17 @@ class ServerAddRequest(BaseModel):
     path: str
     argsString: Optional[str] = ""
 
+
 class AgentStartRequest(BaseModel):
     goal: str
     max_loops: int = Field(default=50, gt=0)
-    llm_model: Optional[str] = None # Optional model override for this run
+    llm_model: Optional[str] = None  # Optional model override for this run
+
 
 class AgentInjectThoughtRequest(BaseModel):
     content: str
     thought_type: str = Field(default="user_guidance")
+
 
 # Model for the GET /api/config response (excluding sensitive data)
 class ConfigGetResponse(BaseModel):
@@ -1292,6 +1307,7 @@ class MCPResource:
     call_count: int = 0
     last_used: datetime = field(default_factory=datetime.now)
 
+
 @dataclass
 class MCPPrompt:
     name: str
@@ -1330,7 +1346,7 @@ class ConversationNode:
         return {
             "id": self.id,
             "name": self.name,
-            "messages": self.messages, # Pass the list directly
+            "messages": self.messages,  # Pass the list directly
             "parent_id": self.parent.id if self.parent else None,
             "children_ids": [child.id for child in self.children],
             "created_at": self.created_at.isoformat(),
@@ -1365,10 +1381,11 @@ class ChatHistory:
     cached: bool = False
     streamed: bool = False
 
+
 class ToolBlacklistManager:
     def __init__(self, filepath: Path = BLACKLIST_FILE):
         self.filepath = filepath
-        self.blacklist: Dict[str, List[str]] = {} # provider -> list of blocked tool names
+        self.blacklist: Dict[str, List[str]] = {}  # provider -> list of blocked tool names
         self.load()
 
     def load(self):
@@ -1382,7 +1399,7 @@ class ToolBlacklistManager:
                 self.blacklist = {}
         except (json.JSONDecodeError, IOError, Exception) as e:
             log.error(f"Error loading tool blacklist {self.filepath}: {e}", exc_info=True)
-            self.blacklist = {} # Start fresh on error
+            self.blacklist = {}  # Start fresh on error
 
     def save(self):
         """Saves the current blacklist to the JSON file."""
@@ -1406,7 +1423,7 @@ class ToolBlacklistManager:
                 added = True
         if added:
             log.info(f"Added tools to {provider} blacklist: {tool_names}")
-            self.save() # Save immediately after adding
+            self.save()  # Save immediately after adding
 
     def is_blacklisted(self, provider: str, tool_name: str) -> bool:
         """Checks if a tool is blacklisted for a specific provider."""
@@ -1415,7 +1432,8 @@ class ToolBlacklistManager:
     def get_blacklisted_tools(self, provider: str) -> List[str]:
         """Gets the list of blacklisted tools for a provider."""
         return self.blacklist.get(provider, []).copy()
-    
+
+
 class ServerRegistry:
     """
     Manages discovery and interaction with remote registries and local network servers.
@@ -2014,7 +2032,7 @@ class ConversationGraph:
         data_to_save = {
             "current_node_id": self.current_node.id,
             # Call the node's to_dict method, which now returns the messages list directly
-            "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()}
+            "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()},
         }
 
         try:
@@ -2024,7 +2042,7 @@ class ConversationGraph:
                     data_to_save,
                     indent=2,
                     ensure_ascii=False,
-                    default=self._json_serializer_default # Use the custom handler
+                    default=self._json_serializer_default,  # Use the custom handler
                 )
                 await f.write(json_string)
             log.debug(f"Saved graph to {file_path} using simplified serialization.")
@@ -2171,7 +2189,7 @@ class Config:
         and applying environment variable overrides for simple settings.
         """
         log.debug("Initializing Config object...")
-        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.1_integrated.json") # Default agent state file
+        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.1_integrated.json")  # Default agent state file
         self._set_defaults()
         self.dotenv_path = find_dotenv(raise_error_if_not_found=False, usecwd=True)
         if self.dotenv_path:
@@ -3977,7 +3995,7 @@ class ServerManager:
                     span = span_context_manager = None
                 finally:
                     if span_context_manager and hasattr(span_context_manager, "__exit__"):
-                        with suppress(Exception): 
+                        with suppress(Exception):
                             span_context_manager.__exit__(*sys.exc_info())
 
                 try:
@@ -4783,10 +4801,12 @@ class MCPClient:
 
         self.current_model = self.config.default_model
         self.current_provider: Optional[str] = self.get_provider_from_model(self.current_model)
+        self.logger = log  # Assign the global logger to an instance variable
         if not self.current_provider:
-             log.warning(f"Could not determine provider for default model '{self.current_model}'. LLM calls may fail.")
+            self.logger.warning(f"Could not determine provider for default model '{self.current_model}'. LLM calls may fail.")  # Use self.logger
         else:
-             log.info(f"Initial provider set to: {self.current_provider} for model {self.current_model}")        
+            self.logger.info(f"Initial provider set to: {self.current_provider} for model {self.current_model}")  # Use self.logger
+
         self.server_monitor = ServerMonitor(self.server_manager)
         self.discovered_local_servers = set()
         self.local_discovery_task = None
@@ -4809,7 +4829,7 @@ class MCPClient:
         self.agent_loop_instance: Optional[AgentMasterLoop] = None
         self.agent_task: Optional[asyncio.Task] = None
         self.agent_goal: Optional[str] = None
-        self.agent_status: str = "idle" # idle, running, completed, failed, stopped
+        self.agent_status: str = "idle"  # idle, running, completed, failed, stopped
         self.agent_last_message: Optional[str] = None
         self.agent_current_loop: int = 0
         self.agent_max_loops: int = 0
@@ -4820,7 +4840,7 @@ class MCPClient:
         self._current_query_text: str = ""
         self._current_status_messages: List[str] = []
         self._active_live_display: Optional[Live] = None  # Track the Live instance
-        self.tool_blacklist_manager = ToolBlacklistManager() # Initialize blacklist manager
+        self.tool_blacklist_manager = ToolBlacklistManager()  # Initialize blacklist manager
         # Command handler dictionary (populated later)
         self.commands: Dict[str, Callable[[str], Coroutine[Any, Any, None]]] = {}  # Type hint
 
@@ -4848,36 +4868,40 @@ class MCPClient:
                     if histfile_path.exists():
                         # Only read if the file exists AND has content
                         if histfile_path.stat().st_size > 0:
-                            log.debug(f"Attempting to load readline history from non-empty file: {histfile}")
+                            self.logger.debug(f"Attempting to load readline history from non-empty file: {histfile}")  # Use self.logger
                             try:
                                 readline.read_history_file(histfile)
                             except OSError as read_err:
                                 # Log specifically if the read fails, but continue
-                                log.warning(f"Could not load readline history from '{histfile}': {read_err}", exc_info=False)
+                                self.logger.warning(
+                                    f"Could not load readline history from '{histfile}': {read_err}", exc_info=False
+                                )  # Use self.logger
                             except Exception as read_generic_err:  # Catch other potential read errors
-                                log.warning(f"Unexpected error loading readline history from '{histfile}': {read_generic_err}", exc_info=False)
+                                self.logger.warning(
+                                    f"Unexpected error loading readline history from '{histfile}': {read_generic_err}", exc_info=False
+                                )  # Use self.logger
                         else:
-                            log.debug(f"Readline history file exists but is empty, skipping read: {histfile}")
+                            self.logger.debug(f"Readline history file exists but is empty, skipping read: {histfile}")  # Use self.logger
                     else:
                         try:
                             histfile_path.touch()  # Create if not exists
-                            log.debug(f"Created empty readline history file: {histfile}")
+                            self.logger.debug(f"Created empty readline history file: {histfile}")  # Use self.logger
                         except OSError as touch_err:
-                            log.warning(f"Could not create readline history file '{histfile}': {touch_err}")
+                            self.logger.warning(f"Could not create readline history file '{histfile}': {touch_err}")  # Use self.logger
                     readline.set_history_length(1000)
                     # Register saving history at exit
                     atexit.register(readline.write_history_file, histfile)
-                    log.debug(f"Readline history configured using: {histfile}")
+                    self.logger.debug(f"Readline history configured using: {histfile}")  # Use self.logger
                 # --- Keep the outer Exception block for other setup errors ---
                 except Exception as e:
                     # Catch specific potential errors if needed (e.g., PermissionError, OSError)
-                    log.warning(f"Could not load/save readline history from '{histfile}': {e}", exc_info=False)  # Less verbose log
+                    self.logger.warning(f"Could not load/save readline history from '{histfile}': {e}", exc_info=False)  # Less verbose log
             except ImportError:
-                log.warning("Readline library not available, CLI history and completion disabled.")
+                self.logger.warning("Readline library not available, CLI history and completion disabled.")  # Use self.logger
             except Exception as e:
-                log.warning(f"Error setting up readline: {e}")
+                self.logger.warning(f"Error setting up readline: {e}")  # Use self.logger
         else:
-            log.info("Readline setup skipped on Windows.")
+            self.logger.info("Readline setup skipped on Windows.")  # Use self.logger
 
     def _initialize_commands(self):
         """Populates the command dictionary."""
@@ -6379,7 +6403,7 @@ class MCPClient:
 
     async def set_active_model(self, model_name: str, source: str = "CLI") -> bool:
         """
-        Sets the active model AND 
+        Sets the active model AND
         , updates the default config, and saves.
 
         Args:
@@ -6399,23 +6423,25 @@ class MCPClient:
         new_provider = self.get_provider_from_model(new_model)
         if not new_provider:
             safe_console.print(f"[{source}] [red]Error: Could not determine provider for model '{new_model}'. Model not set.[/]")
-            return False # Prevent setting if provider is unknown
+            return False  # Prevent setting if provider is unknown
 
         # Check if model/provider combo is actually changing
         if self.current_model == new_model and self.current_provider == new_provider:
             log.debug(f"Model/Provider already set to '{new_model}'/'{new_provider}', no change needed.")
             # Optionally notify user
             # self.safe_print(f"[{source}] Model is already set to: [cyan]{new_model}[/] (Provider: {new_provider})")
-            return False # Indicate no change was made
+            return False  # Indicate no change was made
 
         log.info(f"Setting active model to '{new_model}' (Provider: {new_provider}) (requested via {source})")
         self.current_model = new_model
-        self.current_provider = new_provider # <-- Set the provider attribute
-        self.config.default_model = new_model # Update persistent default
-        await self.config.save_async() # Save the updated default
-        self.safe_print(f"[{source}] {EMOJI_MAP.get(new_provider, EMOJI_MAP['model'])} Default model set to: [cyan]{new_model}[/] (Provider: {new_provider})")
-        return True # Indicate a change occurred
-    
+        self.current_provider = new_provider  # <-- Set the provider attribute
+        self.config.default_model = new_model  # Update persistent default
+        await self.config.save_async()  # Save the updated default
+        self.safe_print(
+            f"[{source}] {EMOJI_MAP.get(new_provider, EMOJI_MAP['model'])} Default model set to: [cyan]{new_model}[/] (Provider: {new_provider})"
+        )
+        return True  # Indicate a change occurred
+
     async def cmd_model(self, args: str):
         """Change the current AI model (CLI command)."""
         safe_console = get_safe_console()
@@ -6432,7 +6458,7 @@ class MCPClient:
             safe_console.print("\n[bold]Available Models (based on cost data):[/]")
             for provider, models in sorted(models_by_provider.items()):
                 safe_console.print(f" [blue]{provider}:[/] {', '.join(sorted(models))}")
-            safe_console.print("\nUsage: /model MODEL_NAME (e.g., /model openrouter/mistralai/mistral-nemo)") # Added example
+            safe_console.print("\nUsage: /model MODEL_NAME (e.g., /model openrouter/mistralai/mistral-nemo)")  # Added example
             return
 
         # Call the shared method
@@ -8042,7 +8068,7 @@ class MCPClient:
         Returns:
             The generated text content as a string, or None if the call fails.
         """
-        internal_model_name_for_cost_lookup = model # User-facing name for logging/cost
+        internal_model_name_for_cost_lookup = model  # User-facing name for logging/cost
         provider_name = self.get_provider_from_model(internal_model_name_for_cost_lookup)
         if not provider_name:
             log.error(f"Cannot execute internal call: Unknown provider for model '{internal_model_name_for_cost_lookup}'")
@@ -8059,7 +8085,7 @@ class MCPClient:
         temperature_to_use = temperature if temperature is not None else self.config.temperature
 
         # --- Prepare ACTUAL Model Name String for the API Call ---
-        actual_model_name_string = internal_model_name_for_cost_lookup # Default to user-facing name
+        actual_model_name_string = internal_model_name_for_cost_lookup  # Default to user-facing name
         providers_to_strip = [
             Provider.OPENROUTER.value,
             Provider.GROQ.value,
@@ -8068,10 +8094,14 @@ class MCPClient:
         if provider_name in providers_to_strip:
             prefix_to_strip = f"{provider_name}/"
             if internal_model_name_for_cost_lookup.lower().startswith(prefix_to_strip):
-                actual_model_name_string = internal_model_name_for_cost_lookup[len(prefix_to_strip):]
-                log.debug(f"Internal Call: Stripped prefix for API. Original: '{internal_model_name_for_cost_lookup}', Sent: '{actual_model_name_string}'")
+                actual_model_name_string = internal_model_name_for_cost_lookup[len(prefix_to_strip) :]
+                log.debug(
+                    f"Internal Call: Stripped prefix for API. Original: '{internal_model_name_for_cost_lookup}', Sent: '{actual_model_name_string}'"
+                )
             else:
-                log.warning(f"Internal Call: Provider is '{provider_name}', but model '{internal_model_name_for_cost_lookup}' doesn't start with expected prefix '{prefix_to_strip}'. Sending model name as is.")
+                log.warning(
+                    f"Internal Call: Provider is '{provider_name}', but model '{internal_model_name_for_cost_lookup}' doesn't start with expected prefix '{prefix_to_strip}'. Sending model name as is."
+                )
         # --- End Prefix Stripping ---
 
         log.info(f"Executing internal LLM call (no history): Model='{actual_model_name_string}', Provider='{provider_name}'")
@@ -8080,11 +8110,13 @@ class MCPClient:
         formatted_messages, system_prompt = self._format_messages_for_provider(messages, provider_name, internal_model_name_for_cost_lookup)
 
         if not formatted_messages and provider_name != Provider.ANTHROPIC.value:
-             log.error(f"Internal Call Error: Formatted messages are empty for model '{internal_model_name_for_cost_lookup}'. Cannot make API call.")
-             return None
+            log.error(f"Internal Call Error: Formatted messages are empty for model '{internal_model_name_for_cost_lookup}'. Cannot make API call.")
+            return None
         elif not formatted_messages and provider_name == Provider.ANTHROPIC.value and not system_prompt:
-             log.error(f"Internal Call Error (Anthropic): Formatted messages and system prompt are both empty for model '{internal_model_name_for_cost_lookup}'.")
-             return None
+            log.error(
+                f"Internal Call Error (Anthropic): Formatted messages and system prompt are both empty for model '{internal_model_name_for_cost_lookup}'."
+            )
+            return None
 
         try:
             response_text: Optional[str] = None
@@ -8094,29 +8126,37 @@ class MCPClient:
             if provider_name == Provider.ANTHROPIC.value:
                 anthropic_client = cast("AsyncAnthropic", api_client)
                 anthropic_params = {
-                    "model": actual_model_name_string, # Use stripped param
+                    "model": actual_model_name_string,  # Use stripped param
                     "messages": formatted_messages,
                     "max_tokens": max_tokens_to_use,
                     "temperature": temperature_to_use,
                 }
-                if system_prompt: anthropic_params["system"] = system_prompt
-                if not formatted_messages: log.warning("Internal Call (Anthropic): Sending API call with only a system prompt.")
+                if system_prompt:
+                    anthropic_params["system"] = system_prompt
+                if not formatted_messages:
+                    log.warning("Internal Call (Anthropic): Sending API call with only a system prompt.")
                 response = await anthropic_client.messages.create(**anthropic_params)
                 if response.content and isinstance(response.content, list):
                     response_text = "\n".join(block.text for block in response.content if block.type == "text").strip()
-                elif isinstance(response.content, str): response_text = response.content
+                elif isinstance(response.content, str):
+                    response_text = response.content
 
             elif provider_name in [
-                Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
-                Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value,
-                Provider.GEMINI.value, Provider.OPENROUTER.value
+                Provider.OPENAI.value,
+                Provider.GROK.value,
+                Provider.DEEPSEEK.value,
+                Provider.GROQ.value,
+                Provider.MISTRAL.value,
+                Provider.CEREBRAS.value,
+                Provider.GEMINI.value,
+                Provider.OPENROUTER.value,
             ]:
                 openai_client = cast("AsyncOpenAI", api_client)
                 if not formatted_messages:
-                     log.error(f"Internal Call Error ({provider_name}): No messages to send after formatting.")
-                     return None
+                    log.error(f"Internal Call Error ({provider_name}): No messages to send after formatting.")
+                    return None
                 response = await openai_client.chat.completions.create(
-                    model=actual_model_name_string, # Use stripped param
+                    model=actual_model_name_string,  # Use stripped param
                     messages=formatted_messages,  # type: ignore
                     max_tokens=max_tokens_to_use,
                     temperature=temperature_to_use,
@@ -8132,14 +8172,19 @@ class MCPClient:
             return response_text.strip() if response_text else None
 
         # --- Error Handling ---
-        except (anthropic.APIConnectionError, openai.APIConnectionError) as e: log.error(f"Internal Call Connection Error ({provider_name}): {e}")
-        except (anthropic.AuthenticationError, openai.AuthenticationError): log.error(f"Internal Call Authentication Error ({provider_name}). Check API Key.")
-        except (anthropic.RateLimitError, openai.RateLimitError): log.warning(f"Internal Call Rate Limit Exceeded ({provider_name}).")
-        except (anthropic.APIError, openai.APIError) as e: log.error(f"Internal Call API Error ({provider_name}): {e}", exc_info=True)
-        except Exception as e: log.error(f"Unexpected error during internal LLM call ({provider_name}): {e}", exc_info=True)
+        except (anthropic.APIConnectionError, openai.APIConnectionError) as e:
+            log.error(f"Internal Call Connection Error ({provider_name}): {e}")
+        except (anthropic.AuthenticationError, openai.AuthenticationError):
+            log.error(f"Internal Call Authentication Error ({provider_name}). Check API Key.")
+        except (anthropic.RateLimitError, openai.RateLimitError):
+            log.warning(f"Internal Call Rate Limit Exceeded ({provider_name}).")
+        except (anthropic.APIError, openai.APIError) as e:
+            log.error(f"Internal Call API Error ({provider_name}): {e}", exc_info=True)
+        except Exception as e:
+            log.error(f"Unexpected error during internal LLM call ({provider_name}): {e}", exc_info=True)
 
         return None
-    
+
     async def summarize_conversation(self, target_tokens: Optional[int] = None, model: Optional[str] = None) -> Optional[str]:
         """
         Generates a summary of the current conversation branch *without* modifying history.
@@ -8204,7 +8249,7 @@ class MCPClient:
         self,
         messages: InternalMessageList,
         provider: str,
-        model_name: str, # Keep model_name for potential future provider-specific logic
+        model_name: str,  # Keep model_name for potential future provider-specific logic
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Formats internal message list into the specific structure required by the provider.
@@ -8217,7 +8262,7 @@ class MCPClient:
         """
         formatted_messages: List[Dict[str, Any]] = []
         system_prompt_extracted: Optional[str] = None
-        messages_to_process: InternalMessageList = [] # Messages excluding the system prompt for Anthropic
+        messages_to_process: InternalMessageList = []  # Messages excluding the system prompt for Anthropic
 
         # First pass: Extract system prompt and filter messages for Anthropic
         first_system_message_found = False
@@ -8230,9 +8275,11 @@ class MCPClient:
                 if provider != Provider.ANTHROPIC.value:
                     messages_to_process.append(msg)
             else:
-                messages_to_process.append(msg) # Add non-system or subsequent system messages
+                messages_to_process.append(msg)  # Add non-system or subsequent system messages
 
-        log.debug(f"Formatting {len(messages_to_process)} non-system messages for provider '{provider}'. System prompt extracted: {bool(system_prompt_extracted)}")
+        log.debug(
+            f"Formatting {len(messages_to_process)} non-system messages for provider '{provider}'. System prompt extracted: {bool(system_prompt_extracted)}"
+        )
 
         # --- Anthropic Formatting (Uses messages_to_process) ---
         if provider == Provider.ANTHROPIC.value:
@@ -8245,7 +8292,7 @@ class MCPClient:
                     log.warning("Skipping subsequent system message found when formatting for Anthropic.")
                     continue
 
-                api_role = role # user or assistant
+                api_role = role  # user or assistant
                 api_content_list: List[Dict[str, Any]]
 
                 if isinstance(content, str):
@@ -8262,13 +8309,17 @@ class MCPClient:
                             # Apply the same sanitization used when defining tools for the current provider
                             # Anthropic names: ^[a-zA-Z0-9_-]{1,64}$
                             sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_tool_name)[:64]
-                            if not sanitized_name: # Handle case where sanitization results in empty string
-                                log.warning(f"Original tool name '{original_tool_name}' resulted in empty sanitized name during Anthropic history formatting. Skipping tool_use block.")
-                                continue # Skip this block if sanitization failed
+                            if not sanitized_name:  # Handle case where sanitization results in empty string
+                                log.warning(
+                                    f"Original tool name '{original_tool_name}' resulted in empty sanitized name during Anthropic history formatting. Skipping tool_use block."
+                                )
+                                continue  # Skip this block if sanitization failed
 
                             # Log the sanitization happening during history formatting for clarity
                             if original_tool_name != sanitized_name:
-                                log.debug(f"History Formatting (Anthropic): Sanitized '{original_tool_name}' -> '{sanitized_name}' for historical tool_use block.")
+                                log.debug(
+                                    f"History Formatting (Anthropic): Sanitized '{original_tool_name}' -> '{sanitized_name}' for historical tool_use block."
+                                )
                             # --- END CORRECTION ---
 
                             processed_blocks.append(
@@ -8280,7 +8331,7 @@ class MCPClient:
                             # Stringify simply for now. Richer handling might be needed.
                             stringified_content = self._stringify_content(result_content)
                             # Wrap string content in a text block if needed, or handle list of blocks directly
-                            result_content_api = [{"type": "text", "text": stringified_content}] # Simplest form
+                            result_content_api = [{"type": "text", "text": stringified_content}]  # Simplest form
                             result_block_api = {"type": "tool_result", "tool_use_id": block.get("tool_use_id", ""), "content": result_content_api}
                             if block.get("is_error") is True:
                                 result_block_api["is_error"] = True
@@ -8301,15 +8352,20 @@ class MCPClient:
 
         # --- OpenAI-Compatible Formatting (Uses messages_to_process, which *includes* system message) ---
         elif provider in [
-            Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
-            Provider.GROQ.value, Provider.GEMINI.value, Provider.MISTRAL.value,
-            Provider.CEREBRAS.value, Provider.OPENROUTER.value # Added openrouter
+            Provider.OPENAI.value,
+            Provider.GROK.value,
+            Provider.DEEPSEEK.value,
+            Provider.GROQ.value,
+            Provider.GEMINI.value,
+            Provider.MISTRAL.value,
+            Provider.CEREBRAS.value,
+            Provider.OPENROUTER.value,  # Added openrouter
         ]:
             # Process messages_to_process (which includes system message for OpenAI)
             for msg in messages_to_process:
                 role = msg["role"]
                 content = msg["content"]
-                openai_role = role # Roles map directly (system, user, assistant)
+                openai_role = role  # Roles map directly (system, user, assistant)
 
                 # Handle System Prompt (already in messages_to_process)
                 if openai_role == "system":
@@ -8336,8 +8392,11 @@ class MCPClient:
                                 log.debug(f"Truncating tool_call_id '{tool_call_id_for_result}' to '{truncated_tool_call_id}' for OpenAI history.")
                             stringified_result = self._stringify_content(tool_result_content)
                             final_tool_content = f"Error: {stringified_result}" if tool_is_error else stringified_result
-                            formatted_messages.append({"role": "tool", "tool_call_id": truncated_tool_call_id, "content": final_tool_content}) # Use truncated ID
-                        else: log.warning("Internal tool result missing 'tool_use_id'. Skipping.")
+                            formatted_messages.append(
+                                {"role": "tool", "tool_call_id": truncated_tool_call_id, "content": final_tool_content}
+                            )  # Use truncated ID
+                        else:
+                            log.warning("Internal tool result missing 'tool_use_id'. Skipping.")
                     else:
                         user_text = self._extract_text_from_internal_content(content)
                         formatted_messages.append({"role": "user", "content": user_text})
@@ -8360,14 +8419,16 @@ class MCPClient:
                                 original_tool_name_from_history = block.get("name", "unknown_tool")
                                 # --- Truncate tool_call_id for OpenAI Provider ---
                                 MAX_OPENAI_TOOL_ID_LEN = 40
-                                tool_call_id = block.get("id", "")[:MAX_OPENAI_TOOL_ID_LEN] # Truncate here
+                                tool_call_id = block.get("id", "")[:MAX_OPENAI_TOOL_ID_LEN]  # Truncate here
                                 if len(block.get("id", "")) > MAX_OPENAI_TOOL_ID_LEN:
-                                     log.debug(f"Truncating assistant tool_call.id '{block.get('id', '')}' to '{tool_call_id}' for OpenAI history.")
+                                    log.debug(f"Truncating assistant tool_call.id '{block.get('id', '')}' to '{tool_call_id}' for OpenAI history.")
                                 tool_input = block.get("input", {})
                                 name_for_api = re.sub(r"[^a-zA-Z0-9_-]", "_", original_tool_name_from_history)[:64]
                                 if not name_for_api:
-                                     log.warning(f"Tool name '{original_tool_name_from_history}' resulted in empty sanitized name. Skipping tool call in history.")
-                                     continue
+                                    log.warning(
+                                        f"Tool name '{original_tool_name_from_history}' resulted in empty sanitized name. Skipping tool call in history."
+                                    )
+                                    continue
                                 try:
                                     arguments_str = json.dumps(tool_input)
                                 except TypeError:
@@ -8380,9 +8441,8 @@ class MCPClient:
                         # Combine text parts, ensure None if empty after stripping
                         combined_text = "\n".join(text_parts).strip()
                         assistant_text_content = combined_text if combined_text else None
-                    elif content is not None: # Handle unexpected types
-                         assistant_text_content = str(content) if str(content) else None
-
+                    elif content is not None:  # Handle unexpected types
+                        assistant_text_content = str(content) if str(content) else None
 
                     # --- Build the payload carefully ---
                     assistant_msg_payload: Dict[str, Any] = {"role": "assistant"}
@@ -8410,12 +8470,12 @@ class MCPClient:
                     # --- End payload building ---
 
             # Return messages *with* system prompt, and None for extracted prompt
-            return formatted_messages, None # No separate system prompt for OpenAI call
+            return formatted_messages, None  # No separate system prompt for OpenAI call
 
         # --- Unknown Provider ---
         else:
             log.error(f"Message formatting failed: Provider '{provider}' is not supported.")
-            return [], None # Indicate failure
+            return [], None  # Indicate failure
 
     async def _handle_anthropic_stream(self, stream: AsyncMessageStream) -> AsyncGenerator[Tuple[str, Any], None]:
         """Process Anthropic stream and emit standardized events."""
@@ -8485,94 +8545,6 @@ class MCPClient:
             yield ("error", f"Unexpected stream processing error: {e}")
             stop_reason = "error"
         finally:
-            yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
-            yield ("stop_reason", stop_reason)
-
-    async def _handle_openai_stream(self, stream: AsyncStream[ChatCompletionChunk]) -> AsyncGenerator[Tuple[str, Any], None]:
-        """Process OpenAI/Grok/DeepSeek stream and emit standardized events."""
-        current_tool_calls: Dict[int, Dict] = {}  # {index: {'id':..., 'name':..., 'args':...}}
-        current_tool_args_accumulator: Dict[int, str] = {}  # {index: accumulated_args_str}
-        collected_chunks_for_usage = []  # Collect chunks if usage not in stream
-        input_tokens = 0  # Often not available in stream
-        output_tokens = 0  # Often not available in stream
-        stop_reason = "stop"  # Default
-        finish_reason = None
-
-        try:
-            async for chunk in stream:
-                collected_chunks_for_usage.append(chunk)  # Collect for potential post-processing
-                choice = chunk.choices[0] if chunk.choices else None
-                if not choice:
-                    continue
-
-                delta = choice.delta
-                finish_reason = choice.finish_reason  # Store the latest finish_reason
-
-                # 1. Text Chunks
-                if delta and delta.content:
-                    yield ("text_chunk", delta.content)
-
-                # 2. Tool Calls
-                if delta and delta.tool_calls:
-                    for tool_call_chunk in delta.tool_calls:
-                        idx = tool_call_chunk.index
-                        # Start of a new tool call
-                        if tool_call_chunk.id and tool_call_chunk.function and tool_call_chunk.function.name:
-                            tool_id = tool_call_chunk.id
-                            tool_name = tool_call_chunk.function.name
-                            current_tool_calls[idx] = {"id": tool_id, "name": tool_name, "args": ""}
-                            current_tool_args_accumulator[idx] = ""
-                            yield ("tool_call_start", {"id": tool_id, "name": tool_name})
-
-                        # Argument chunks for an existing tool call
-                        if tool_call_chunk.function and tool_call_chunk.function.arguments:
-                            args_chunk = tool_call_chunk.function.arguments
-                            if idx in current_tool_args_accumulator:
-                                current_tool_args_accumulator[idx] += args_chunk
-                                # Yield incremental input chunk
-                                if idx in current_tool_calls:  # Ensure id exists
-                                    yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
-                            else:
-                                log.warning(f"Received args chunk for unknown tool index {idx}")
-
-            # After stream ends, finalize tool calls
-            for idx, accumulated_args in current_tool_args_accumulator.items():
-                if idx in current_tool_calls:
-                    tool_info = current_tool_calls[idx]
-                    parsed_input = {}
-                    try:
-                        if accumulated_args:  # Only parse if not empty
-                            parsed_input = json.loads(accumulated_args)
-                    except json.JSONDecodeError as e:
-                        log.error(f"OpenAI JSON parse failed for tool {tool_info['name']} (ID: {tool_info['id']}): {e}. Raw: '{accumulated_args}'")
-                        parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
-                    yield ("tool_call_end", {"id": tool_info["id"], "parsed_input": parsed_input})
-
-            # Determine final stop reason
-            stop_reason = finish_reason if finish_reason else "stop"
-            # If finish_reason indicates tool use, standardize it
-            if stop_reason == "tool_calls":
-                stop_reason = "tool_use"
-
-            # Try to get usage (may not be present in stream)
-            # Some OpenAI proxy might add usage in the last chunk or x-headers
-            final_usage = getattr(chunk, "usage", None)  # Check last chunk
-            if final_usage:
-                input_tokens = final_usage.prompt_tokens
-                output_tokens = final_usage.completion_tokens
-
-        except openai.APIError as e:
-            log.error(f"OpenAI/Grok/DeepSeek stream API error: {e}")
-            yield ("error", f"API Error: {e}")
-            stop_reason = "error"
-        except Exception as e:
-            log.error(f"Unexpected error in OpenAI stream handler: {e}", exc_info=True)
-            yield ("error", f"Unexpected stream processing error: {e}")
-            stop_reason = "error"
-        finally:
-            # Yield potentially estimated usage
-            if input_tokens == 0 or output_tokens == 0:
-                log.warning("OpenAI stream did not provide token counts. Usage will be estimated.")
             yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
             yield ("stop_reason", stop_reason)
 
@@ -8915,12 +8887,14 @@ class MCPClient:
         if not model_name:
             log.warning("get_provider_from_model called with empty model name.")
             return None
-        provider = _infer_provider(model_name) # Use the refined inference function
+        provider = _infer_provider(model_name)  # Use the refined inference function
         if provider:
             log.debug(f"Determined provider for '{model_name}': {provider}")
             return provider
         else:
-            log.warning(f"Could not determine provider for model: '{model_name}'. Ensure it has a known prefix (e.g., 'openrouter/', 'groq/') or is in MODEL_PROVIDER_MAP.")
+            log.warning(
+                f"Could not determine provider for model: '{model_name}'. Ensure it has a known prefix (e.g., 'openrouter/', 'groq/') or is in MODEL_PROVIDER_MAP."
+            )
             return None
 
     def _extract_text_from_internal_content(self, content: Any) -> str:
@@ -8946,167 +8920,219 @@ class MCPClient:
         Formats the available MCP tools into the specific structure required by the target LLM provider's API.
 
         Handles sanitization of tool names and validation of input schemas according to provider requirements.
+        Ensures that the sanitized names returned in the formatted list are unique FOR THIS CALL.
+        It also updates the shared `self.server_manager.sanitized_to_original` map with the
+        sanitized_name -> original_mcp_name mapping for the tools included in the returned list.
 
         Args:
             provider: The string identifier of the target provider (e.g., "openai", "anthropic").
 
         Returns:
             A list of dictionaries representing the tools in the provider's expected format,
-            or None if no tools are available.
+            or None if no tools are available or an error occurs.
         """
-        mcp_tools_all = list(self.server_manager.tools.values())
+        # Use a distinct logger prefix for this critical formatting function
+        log_prefix = f"MCPC_FMT_TOOLS ({provider})"
+
+        mcp_tools_all = list(self.server_manager.tools.values()) # Get all tools known to ServerManager
         if not mcp_tools_all:
-            log.debug(f"No MCP tools found to format for provider '{provider}'.")
+            log.debug(f"{log_prefix}: No MCP tools registered in ServerManager to format.")
             return None
 
-        # --- Load blacklist and filter tools ---
+        # 1. Filter tools based on the blacklist for the current provider
         blacklisted_for_provider = self.tool_blacklist_manager.get_blacklisted_tools(provider)
         mcp_tools_filtered = [
             tool for tool in mcp_tools_all
-            if not self.tool_blacklist_manager.is_blacklisted(provider, tool.name)
+            if not self.tool_blacklist_manager.is_blacklisted(provider, tool.name) # tool.name is original MCP name
         ]
+
         if len(mcp_tools_all) != len(mcp_tools_filtered):
             excluded_count = len(mcp_tools_all) - len(mcp_tools_filtered)
-            log.info(f"Excluding {excluded_count} blacklisted tools for provider '{provider}'. Blacklist: {blacklisted_for_provider}")
+            log.info(f"{log_prefix}: Excluded {excluded_count} blacklisted tools. Blacklist for '{provider}': {blacklisted_for_provider}")
         else:
-            log.debug(f"No tools blacklisted for provider '{provider}'. Formatting all {len(mcp_tools_filtered)} tools.")
-        # --- End Blacklist Filtering ---
-        
-        formatted_tools: List[Dict[str, Any]] = []
-        # Ensure the mapping is cleared before formatting a new set of tools for a call
-        self.server_manager.sanitized_to_original.clear()
-        log.debug(f"Cleared sanitized_to_original map. Formatting {len(mcp_tools_filtered)} tools for provider: {provider}")
+            log.debug(f"{log_prefix}: No tools blacklisted for provider '{provider}'. Formatting all {len(mcp_tools_filtered)} tools.")
 
-        provider_enum_val = provider  # Use the string value directly
+        if not mcp_tools_filtered:
+            log.info(f"{log_prefix}: No tools remaining after blacklist filtering.")
+            return None
 
-        # --- Anthropic ---
+        # This set tracks sanitized names *generated during this specific call* to ensure uniqueness
+        # in the list being returned *by this function*.
+        used_sanitized_names_this_call: Set[str] = set()
+        formatted_tools_for_provider: List[Dict[str, Any]] = []
+
+        log.info(f"{log_prefix}: Starting formatting for {len(mcp_tools_filtered)} tools.")
+        # Note: self.server_manager.sanitized_to_original will be updated by this function.
+        # It's crucial to handle existing mappings carefully if a tool's sanitized name changes.
+
+        provider_enum_val = provider # Assumes provider is already validated and lowercased
+
+        # --- Provider-Specific Formatting ---
+
+        # ANTHROPIC
         if provider_enum_val == Provider.ANTHROPIC.value:
-            log.debug("Formatting tools for Anthropic.")
-            for tool in sorted(mcp_tools_filtered, key=lambda t: t.name):
-                original_name = tool.name
-                # Anthropic names: ^[a-zA-Z0-9_-]{1,64}$
-                sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_name)[:64]
-                if not sanitized_name:
-                    log.warning(f"Skipping Anthropic tool '{original_name}' due to invalid sanitized name.")
-                    continue
+            log.debug(f"{log_prefix}: Formatting for Anthropic.")
+            for tool_idx, tool_obj in enumerate(sorted(mcp_tools_filtered, key=lambda t: t.name)):
+                original_mcp_name = tool_obj.name # This is the "Server:Function" name
 
-                self.server_manager.sanitized_to_original[sanitized_name] = original_name
-                log.debug(f"Mapping Anthropic sanitized '{sanitized_name}' -> original '{original_name}'")
+                # Sanitize original_mcp_name according to Anthropic rules: ^[a-zA-Z0-9_-]{1,64}$
+                base_sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_mcp_name)[:64]
+                if not base_sanitized_name: # Handle empty string after sanitization
+                    base_sanitized_name = f"tool_{str(uuid.uuid4())[:8]}" # Fallback unique name
+                    log.warning(f"{log_prefix}: Original name '{original_mcp_name}' for Anthropic sanitized to empty, using fallback '{base_sanitized_name}'.")
 
-                # Basic schema validation (must be a dict)
-                input_schema = tool.input_schema
+                # Ensure uniqueness for this provider call
+                final_sanitized_name_for_llm = base_sanitized_name
+                counter = 1
+                while final_sanitized_name_for_llm in used_sanitized_names_this_call:
+                    suffix = f"_v{counter}"
+                    if len(base_sanitized_name) + len(suffix) > 64:
+                        final_sanitized_name_for_llm = base_sanitized_name[:64 - len(suffix)] + suffix
+                    else:
+                        final_sanitized_name_for_llm = base_sanitized_name + suffix
+                    counter += 1
+                
+                used_sanitized_names_this_call.add(final_sanitized_name_for_llm)
+
+                # Update the shared sanitized_to_original map in ServerManager
+                # If the sanitized name changed from the base (due to _vX suffix),
+                # and an old mapping for base_sanitized_name existed for THIS original_mcp_name, remove it.
+                if base_sanitized_name != final_sanitized_name_for_llm and \
+                   base_sanitized_name in self.server_manager.sanitized_to_original and \
+                   self.server_manager.sanitized_to_original[base_sanitized_name] == original_mcp_name:
+                    del self.server_manager.sanitized_to_original[base_sanitized_name]
+                    log.debug(f"{log_prefix}: Removed prior shared mapping for '{base_sanitized_name}' as it's being updated to '{final_sanitized_name_for_llm}' for '{original_mcp_name}'.")
+                
+                # Add/Update the mapping for the name being sent to the LLM
+                self.server_manager.sanitized_to_original[final_sanitized_name_for_llm] = original_mcp_name
+                log.debug(f"{log_prefix}: Anthropic Tool {tool_idx+1}: Original='{original_mcp_name}', FinalSanitized='{final_sanitized_name_for_llm}'. Mapping updated in ServerManager.")
+
+                input_schema = tool_obj.input_schema
                 if not isinstance(input_schema, dict):
-                    log.warning(
-                        f"Tool '{original_name}' for Anthropic has invalid schema type ({type(input_schema)}), expected dict. Sending empty schema."
-                    )
-                    input_schema = {"type": "object", "properties": {}, "required": []}  # Default empty
+                    log.warning(f"{log_prefix}: Tool '{original_mcp_name}' for Anthropic has invalid schema type ({type(input_schema)}), expected dict. Sending empty schema.")
+                    input_schema = {"type": "object", "properties": {}, "required": []}
+                elif not input_schema: # Ensure empty dict if it's falsey but not None (e.g. empty string)
+                    input_schema = {"type": "object", "properties": {}, "required": []}
 
-                formatted_tools.append(
-                    {
-                        "name": sanitized_name,
-                        "description": tool.description or "No description provided.",  # Ensure description exists
-                        "input_schema": input_schema,
-                    }
-                )
-            # Anthropic specific: Add cache_control to the last tool if any were added
-            if formatted_tools:
-                formatted_tools[-1]["cache_control"] = {"type": "ephemeral"}
-                log.debug("Added ephemeral cache_control to the last Anthropic tool.")
 
-        # --- OpenAI / Grok / DeepSeek / Groq / Gemini / Mistral / Cerebras / OpenRouter (using OpenAI compatibility) ---
+                formatted_tools_for_provider.append({
+                    "name": final_sanitized_name_for_llm,
+                    "description": tool_obj.description or "No description provided.",
+                    "input_schema": input_schema,
+                })
+            
+            if formatted_tools_for_provider: # Add cache_control for Anthropic
+                formatted_tools_for_provider[-1]["cache_control"] = {"type": "ephemeral"}
+                log.debug(f"{log_prefix}: Added ephemeral cache_control to the last Anthropic tool.")
+
+        # OPENAI-COMPATIBLE (OpenAI, Grok, DeepSeek, Groq, Mistral, Cerebras, Gemini, OpenRouter)
         elif provider_enum_val in [
-            Provider.OPENAI.value,
-            Provider.GROK.value,
-            Provider.DEEPSEEK.value,
-            Provider.GROQ.value,
-            Provider.MISTRAL.value,
-            Provider.CEREBRAS.value,
-            Provider.GEMINI.value,
-            Provider.OPENROUTER.value,
+            Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
+            Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value,
+            Provider.GEMINI.value, Provider.OPENROUTER.value,
         ]:
-            log.debug(f"Formatting tools for OpenAI-compatible provider: {provider_enum_val}")
-            # Initial formatting loop (same as before)
-            initially_formatted_tools: List[Dict[str, Any]] = [] # Store formatted tools here first
-            for tool in sorted(mcp_tools_filtered, key=lambda t: t.name):
-                original_name = tool.name
-                # OpenAI names: ^[a-zA-Z0-9_-]{1,64}$
-                sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_name)[:64]
-                if not sanitized_name:
-                    log.warning(f"Skipping OpenAI-like tool '{original_name}' due to invalid sanitized name.")
-                    continue
+            log.debug(f"{log_prefix}: Formatting for OpenAI-compatible provider: {provider_enum_val}")
+            
+            temp_formatted_list_for_truncation: List[Dict[str, Any]] = []
+            for tool_idx, tool_obj in enumerate(sorted(mcp_tools_filtered, key=lambda t: t.name)):
+                original_mcp_name = tool_obj.name
 
-                self.server_manager.sanitized_to_original[sanitized_name] = original_name
-                log.debug(f"Mapping OpenAI-like sanitized '{sanitized_name}' -> original '{original_name}'")
+                # Sanitize original_mcp_name: ^[a-zA-Z0-9_-]{1,64}$
+                base_sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_mcp_name)[:64]
+                if not base_sanitized_name:
+                    base_sanitized_name = f"tool_{str(uuid.uuid4())[:8]}"
+                    log.warning(f"{log_prefix}: Original name '{original_mcp_name}' for {provider_enum_val} sanitized to empty, using fallback '{base_sanitized_name}'.")
 
-                # Schema validation: Must be 'object' type for OpenAI functions
-                input_schema = tool.input_schema
+                # Ensure uniqueness for this provider call
+                final_sanitized_name_for_llm = base_sanitized_name
+                counter = 1
+                while final_sanitized_name_for_llm in used_sanitized_names_this_call:
+                    suffix = f"_v{counter}"
+                    if len(base_sanitized_name) + len(suffix) > 64:
+                        final_sanitized_name_for_llm = base_sanitized_name[:64 - len(suffix)] + suffix
+                    else:
+                        final_sanitized_name_for_llm = base_sanitized_name + suffix
+                    counter += 1
+                
+                used_sanitized_names_this_call.add(final_sanitized_name_for_llm)
+
+                # Update ServerManager's shared map
+                if base_sanitized_name != final_sanitized_name_for_llm and \
+                   base_sanitized_name in self.server_manager.sanitized_to_original and \
+                   self.server_manager.sanitized_to_original[base_sanitized_name] == original_mcp_name:
+                    del self.server_manager.sanitized_to_original[base_sanitized_name]
+                    log.debug(f"{log_prefix}: Removed prior shared mapping for '{base_sanitized_name}' as it's being updated to '{final_sanitized_name_for_llm}' for '{original_mcp_name}'.")
+                
+                self.server_manager.sanitized_to_original[final_sanitized_name_for_llm] = original_mcp_name
+                log.debug(f"{log_prefix}: OpenAI-like Tool {tool_idx+1}: Original='{original_mcp_name}', FinalSanitized='{final_sanitized_name_for_llm}'. Mapping updated in ServerManager.")
+
+                input_schema = tool_obj.input_schema
                 validated_schema: Dict[str, Any]
                 if isinstance(input_schema, dict) and input_schema.get("type") == "object":
-                    # Ensure properties is a dict and required is a list
                     validated_schema = {
                         "type": "object",
-                        "properties": input_schema.get("properties", {}),
-                        "required": input_schema.get("required", []),
+                        "properties": input_schema.get("properties", {}), # Default to empty dict if missing
+                        "required": input_schema.get("required", []),   # Default to empty list if missing
                     }
                     if not isinstance(validated_schema["properties"], dict):
-                        log.warning(f"Tool '{original_name}' schema 'properties' is not a dict. Using empty dict.")
+                        log.warning(f"{log_prefix}: Tool '{original_mcp_name}' schema 'properties' is not a dict ({type(validated_schema['properties'])}). Using empty dict.")
                         validated_schema["properties"] = {}
                     if not isinstance(validated_schema["required"], list):
-                        log.warning(f"Tool '{original_name}' schema 'required' is not a list. Using empty list.")
+                        log.warning(f"{log_prefix}: Tool '{original_mcp_name}' schema 'required' is not a list ({type(validated_schema['required'])}). Using empty list.")
                         validated_schema["required"] = []
                 else:
-                    log.warning(
-                        f"Tool '{original_name}' for {provider_enum_val} has invalid schema root type ({input_schema.get('type') if isinstance(input_schema, dict) else type(input_schema)}), expected 'object'. Using empty schema."
-                    )
-                    validated_schema = {"type": "object", "properties": {}, "required": []}  # Default empty
+                    log.warning(f"{log_prefix}: Tool '{original_mcp_name}' for {provider_enum_val} has invalid schema root type ({input_schema.get('type') if isinstance(input_schema, dict) else type(input_schema)}), expected 'object'. Using empty schema.")
+                    validated_schema = {"type": "object", "properties": {}, "required": []}
 
-                initially_formatted_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": sanitized_name,
-                            "description": tool.description or "No description provided.",  # Ensure description exists
-                            "parameters": validated_schema,
-                        },
-                    }
-                )
+                temp_formatted_list_for_truncation.append({
+                    "type": "function",
+                    "function": {
+                        "name": final_sanitized_name_for_llm,
+                        "description": tool_obj.description or "No description provided.",
+                        "parameters": validated_schema,
+                    },
+                })
+            
+            # Apply OpenAI_MAX_TOOL_COUNT truncation if needed
+            if len(temp_formatted_list_for_truncation) > OPENAI_MAX_TOOL_COUNT:
+                original_tool_count = len(temp_formatted_list_for_truncation)
+                formatted_tools_for_provider = temp_formatted_list_for_truncation[:OPENAI_MAX_TOOL_COUNT]
+                truncated_tool_count = len(formatted_tools_for_provider)
+                
+                # Identify and log excluded tools, and remove their mappings from the shared map
+                kept_sanitized_names_in_final_list = {t["function"]["name"] for t in formatted_tools_for_provider}
+                excluded_original_names_log: List[str] = []
 
-            if len(initially_formatted_tools) > OPENAI_MAX_TOOL_COUNT:
-                original_count = len(initially_formatted_tools)
-                # Truncate the list (tools are already sorted by name)
-                formatted_tools = initially_formatted_tools[:OPENAI_MAX_TOOL_COUNT]
-                truncated_count = len(formatted_tools)
-
-                # Identify excluded tools for logging (using original names)
-                truncated_sanitized_names = {t['function']['name'] for t in formatted_tools}
-                excluded_original_names = []
-                for tool_dict in initially_formatted_tools:
-                    sanitized_name = tool_dict['function']['name']
-                    if sanitized_name not in truncated_sanitized_names:
-                        original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name) # Fallback just in case
-                        excluded_original_names.append(original_name)
-
-                log.warning(
-                    f"Tool list for {provider_enum_val} ({original_count} tools) exceeds OpenAI limit ({OPENAI_MAX_TOOL_COUNT}). "
-                    f"Truncating to {truncated_count} tools. "
-                    f"Excluded {len(excluded_original_names)} tools: {', '.join(sorted(excluded_original_names))}"
-                )
+                for tool_dict_from_full_list in temp_formatted_list_for_truncation:
+                    sanitized_name_in_full_list = tool_dict_from_full_list["function"]["name"]
+                    if sanitized_name_in_full_list not in kept_sanitized_names_in_final_list:
+                        # This tool was truncated from the list sent to LLM
+                        original_mcp_name_of_truncated = self.server_manager.sanitized_to_original.get(sanitized_name_in_full_list)
+                        excluded_original_names_log.append(original_mcp_name_of_truncated or f"UnknownOriginal(Sanitized:{sanitized_name_in_full_list})")
+                        # Remove its mapping from the shared ServerManager map as it won't be sent
+                        if sanitized_name_in_full_list in self.server_manager.sanitized_to_original:
+                            del self.server_manager.sanitized_to_original[sanitized_name_in_full_list]
+                            log.debug(f"{log_prefix}: Removed mapping for TRUNCATED tool '{sanitized_name_in_full_list}' -> '{original_mcp_name_of_truncated}'.")
+                
+                log.warning(f"{log_prefix}: Tool list for {provider_enum_val} ({original_tool_count} tools) exceeded limit ({OPENAI_MAX_TOOL_COUNT}). Truncated to {truncated_tool_count} tools. Excluded: {', '.join(sorted(excluded_original_names_log))}")
             else:
-                # No truncation needed
-                formatted_tools = initially_formatted_tools
+                formatted_tools_for_provider = temp_formatted_list_for_truncation
+        
         else:
-            log.warning(f"Tool formatting not implemented or provider '{provider}' unknown. Returning no tools.")
+            log.error(f"{log_prefix}: Tool formatting not implemented or provider '{provider}' unknown. Returning no tools.")
             return None
-        # Log the *final* count being returned
-        log.info(f"Formatted {len(formatted_tools)} tools for provider '{provider}'.")
-        return formatted_tools if formatted_tools else None
+
+        final_tool_count = len(formatted_tools_for_provider)
+        log.info(f"{log_prefix}: Successfully formatted {final_tool_count} tools. Sanitized names generated this call: {len(used_sanitized_names_this_call)}.")
+        # Log final state of shared map for debugging if it changed significantly
+        # log.debug(f"{log_prefix}: Final self.server_manager.sanitized_to_original map sample: {str(dict(list(self.server_manager.sanitized_to_original.items())[:10]))}")
+        return formatted_tools_for_provider if formatted_tools_for_provider else None
 
     # --- Streaming Handlers (_handle_*_stream) ---
     async def _handle_anthropic_stream(self, stream: AsyncMessageStream) -> AsyncGenerator[Tuple[str, Any], None]:
-        """Process Anthropic stream and emit standardized events. (Enhanced Error Handling)"""
-        # (Keep variable initializations as before)
         current_text_block = None
-        current_tool_use_block = None
+        # current_tool_use_block stores {'id': tool_id, 'name': original_tool_name}
+        current_tool_use_block_info: Optional[Dict[str, str]] = None # Store full info
         current_tool_input_json_accumulator = ""
         input_tokens = 0
         output_tokens = 0
@@ -9114,9 +9140,8 @@ class MCPClient:
 
         try:
             async for event in stream:
-                try:  # Add inner try for processing each event
+                try:
                     event_type = event.type
-                    # --- Event Processing Logic (mostly unchanged) ---
                     if event_type == "message_start":
                         input_tokens = event.message.usage.input_tokens
                     elif event_type == "content_block_start":
@@ -9125,32 +9150,43 @@ class MCPClient:
                             current_text_block = {"type": "text", "text": ""}
                         elif block_type == "tool_use":
                             tool_id = event.content_block.id
-                            tool_name = event.content_block.name
-                            original_tool_name = self.server_manager.sanitized_to_original.get(tool_name, tool_name)
-                            current_tool_use_block = {"id": tool_id, "name": original_tool_name}
+                            sanitized_tool_name_from_llm = event.content_block.name # Name LLM used
+                            # Map back to original MCP name
+                            original_tool_name = self.server_manager.sanitized_to_original.get(sanitized_tool_name_from_llm, sanitized_tool_name_from_llm)
+                            if sanitized_tool_name_from_llm != original_tool_name:
+                                log.debug(f"Anthropic Stream: LLM used tool '{sanitized_tool_name_from_llm}', mapped to original '{original_tool_name}'.")
+                            else:
+                                log.debug(f"Anthropic Stream: LLM used tool '{original_tool_name}' (no change from sanitized).")
+
+                            current_tool_use_block_info = {"id": tool_id, "name": original_tool_name} # Store original name
                             current_tool_input_json_accumulator = ""
-                            yield ("tool_call_start", {"id": tool_id, "name": original_tool_name})
+                            yield ("tool_call_start", {"id": tool_id, "name": original_tool_name}) # Yield original name
                     elif event_type == "content_block_delta":
                         delta = event.delta
                         if delta.type == "text_delta":
                             if current_text_block is not None:
                                 yield ("text_chunk", delta.text)
                         elif delta.type == "input_json_delta":
-                            if current_tool_use_block is not None:
+                            if current_tool_use_block_info is not None: # Check the info dict
                                 current_tool_input_json_accumulator += delta.partial_json
-                                yield ("tool_call_input_chunk", {"id": current_tool_use_block["id"], "json_chunk": delta.partial_json})
+                                yield ("tool_call_input_chunk", {"id": current_tool_use_block_info["id"], "json_chunk": delta.partial_json})
                     elif event_type == "content_block_stop":
                         if current_text_block is not None:
                             current_text_block = None
-                        elif current_tool_use_block is not None:
+                        elif current_tool_use_block_info is not None: # Check the info dict
                             parsed_input = {}
                             try:
                                 parsed_input = json.loads(current_tool_input_json_accumulator) if current_tool_input_json_accumulator else {}
                             except json.JSONDecodeError as e:
-                                log.error(f"Anthropic JSON parse failed: {e}. Raw: '{current_tool_input_json_accumulator}'")
+                                log.error(f"Anthropic JSON parse failed for tool {current_tool_use_block_info['name']} (ID: {current_tool_use_block_info['id']}): {e}. Raw: '{current_tool_input_json_accumulator}'")
                                 parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
-                            yield ("tool_call_end", {"id": current_tool_use_block["id"], "parsed_input": parsed_input})
-                            current_tool_use_block = None
+                            
+                            yield ("tool_call_end", {
+                                "id": current_tool_use_block_info["id"],
+                                "name": current_tool_use_block_info["name"], # Include the name
+                                "parsed_input": parsed_input
+                            })
+                            current_tool_use_block_info = None # Reset after processing
                     elif event_type == "message_delta":
                         if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                             stop_reason = event.delta.stop_reason
@@ -9160,22 +9196,20 @@ class MCPClient:
                         final_message = await stream.get_final_message()
                         stop_reason = final_message.stop_reason
                         output_tokens = final_message.usage.output_tokens
-                        break  # Exit loop on message_stop
-                    elif event_type == "error":  # Handle explicit stream error event from Anthropic
+                        break 
+                    elif event_type == "error":
                         stream_error = getattr(event, "error", {})
                         error_message = stream_error.get("message", "Unknown stream error")
                         log.error(f"Anthropic stream reported error event: {error_message}")
                         yield ("error", f"Anthropic Stream Error: {error_message}")
                         stop_reason = "error"
-                        break  # Exit loop on explicit error
+                        break
                 except Exception as event_proc_err:
-                    # Catch errors processing a specific event, log, yield error, and break
-                    log.error(f"Error processing Anthropic stream event ({event.type}): {event_proc_err}", exc_info=True)
+                    log.error(f"Error processing Anthropic stream event ({getattr(event, 'type', 'UNKNOWN_EVENT_TYPE')}): {event_proc_err}", exc_info=True)
                     yield ("error", f"Error processing stream event: {event_proc_err}")
                     stop_reason = "error"
-                    break  # Exit loop on event processing error
+                    break
 
-        # --- Catch errors related to the stream iteration itself ---
         except anthropic.APIConnectionError as e:
             log.error(f"Anthropic stream connection error: {e}")
             yield ("error", f"Anthropic Conn Error: {e}")
@@ -9183,12 +9217,12 @@ class MCPClient:
         except anthropic.RateLimitError as e:
             log.warning(f"Anthropic stream rate limit error: {e}")
             yield ("error", f"Anthropic Rate Limit: {e}")
-            stop_reason = "rate_limit"  # Use specific reason
+            stop_reason = "rate_limit"
         except anthropic.APIStatusError as e:
             log.error(f"Anthropic stream API status error ({e.status_code}): {e}")
             yield ("error", f"Anthropic API Error ({e.status_code}): {e}")
             stop_reason = "error"
-        except anthropic.APIError as e:
+        except anthropic.APIError as e: # Catch other Anthropic API errors
             log.error(f"Anthropic stream generic API error: {e}")
             yield ("error", f"Anthropic API Error: {e}")
             stop_reason = "error"
@@ -9203,93 +9237,88 @@ class MCPClient:
     async def _handle_openai_compatible_stream(
         self, stream: AsyncStream[ChatCompletionChunk], provider_name: str
     ) -> AsyncGenerator[Tuple[str, Any], None]:
-        """Process OpenAI/Grok/DeepSeek/etc. stream and emit standardized events."""
-        current_tool_calls: Dict[int, Dict] = {} # {index: {'id':..., 'name':..., 'args_acc':...}}
-        # --- Initialize usage tokens to None to clearly indicate if they were received ---
+        current_tool_calls: Dict[int, Dict] = {}
         input_tokens: Optional[int] = None
         output_tokens: Optional[int] = None
-        # -----------------------------------------------------------------------------
-        stop_reason = "stop"  # Default
+        stop_reason = "stop"
         finish_reason = None
-        final_chunk_usage: Optional[Any] = None # Variable to store usage from the final chunk
+        final_chunk_usage: Optional[Any] = None
 
         try:
             async for chunk in stream:
-                # --- Process Chunk Data (Text, Tools) ---
                 choice = chunk.choices[0] if chunk.choices else None
-
-                # --- Capture Usage if present in ANY chunk (especially the last one) ---
                 if chunk.usage:
-                    # The final chunk contains the total usage
                     final_chunk_usage = chunk.usage
                     log.debug(f"Received usage data in stream chunk for {provider_name}: {final_chunk_usage}")
-                    # We capture it here but yield it in the finally block
-
-                # --- If it's the usage chunk, it might have empty choices, so skip choice processing ---
                 if not choice and chunk.usage:
                     continue
-                elif not choice: # Skip if no choices and no usage (e.g., empty initial chunk)
+                elif not choice:
                     continue
-                # ----------------------------------------------------------------------------------
 
                 delta = choice.delta
-                finish_reason = choice.finish_reason # Store the latest finish_reason
+                finish_reason = choice.finish_reason
 
-                # 1. Text Chunks
                 if delta and delta.content:
                     yield ("text_chunk", delta.content)
 
-                # 2. Tool Calls (Parsing logic remains the same)
                 if delta and delta.tool_calls:
                     for tc_chunk in delta.tool_calls:
                         idx = tc_chunk.index
-                        # Start of a new tool call
                         if tc_chunk.id and tc_chunk.function and tc_chunk.function.name:
                             tool_id = tc_chunk.id
-                            sanitized_name = tc_chunk.function.name
-                            original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
-                            current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
-                            yield ("tool_call_start", {"id": tool_id, "name": original_name})
-
-                        # Argument chunks for an existing tool call
+                            sanitized_name = tc_chunk.function.name # This is the name OpenAI/LLM returned
+                            original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name) # Map back
+                            
+                            # Initialize current_tool_calls[idx] if it's a new tool call
+                            if idx not in current_tool_calls:
+                                current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
+                                yield ("tool_call_start", {"id": tool_id, "name": original_name})
+                            # If it's a subsequent chunk for an existing tool call, ensure name is consistent (though it should be)
+                            elif current_tool_calls[idx]["name"] != original_name:
+                                log.warning(f"Tool name mismatch for index {idx}: expected {current_tool_calls[idx]['name']}, got {original_name}. Using original.")
+                                # Potentially update or just log, current logic assumes it's part of the same tool.
+                        
                         if tc_chunk.function and tc_chunk.function.arguments:
                             args_chunk = tc_chunk.function.arguments
-                            if idx in current_tool_calls:
+                            if idx in current_tool_calls: # Check if the tool call was properly started
                                 current_tool_calls[idx]["args_acc"] += args_chunk
                                 yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
                             else:
-                                log.warning(f"Args chunk for unknown tool index {idx} from {provider_name}")
+                                log.warning(f"Args chunk for unknown tool index {idx} from {provider_name}. Tool ID from chunk: {tc_chunk.id}")
 
-                # --- Handle Groq per-chunk usage (Keep this as Groq might be different) ---
+
                 if provider_name == Provider.GROQ.value and hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
                     usage = chunk.x_groq.usage
                     if usage:
-                        # Only update if input_tokens hasn't been set by the final usage chunk yet
                         if input_tokens is None:
                             input_tokens = getattr(usage, "prompt_tokens", None)
                         current_chunk_output = getattr(usage, "completion_tokens", 0)
-                        output_tokens = max(output_tokens or 0, current_chunk_output) # Accumulate max for Groq
+                        output_tokens = max(output_tokens or 0, current_chunk_output)
                         log.debug(f"Groq chunk usage: In={input_tokens}, Out={output_tokens} (Chunk Out={current_chunk_output})")
 
-
-            # --- After Stream Ends: Finalize Tool Calls ---
             for idx, tool_data in current_tool_calls.items():
                 accumulated_args = tool_data["args_acc"]
                 parsed_input = {}
                 try:
-                    if accumulated_args: # Only parse if not empty
+                    if accumulated_args:
                         parsed_input = json.loads(accumulated_args)
                 except json.JSONDecodeError as e:
-                    log.error(f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'")
+                    log.error(
+                        f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'"
+                    )
                     parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
-                yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
+                
+                # Include "name" in the yielded event_data for "tool_call_end"
+                yield ("tool_call_end", {
+                    "id": tool_data["id"],
+                    "name": tool_data["name"], # Add the original_name here
+                    "parsed_input": parsed_input
+                })
 
-            # Determine final stop reason
             stop_reason = finish_reason if finish_reason else "stop"
             if stop_reason == "tool_calls":
-                stop_reason = "tool_use" # Standardize
+                stop_reason = "tool_use"
 
-        # --- Error Handling ---
         except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e:
             log.error(f"{provider_name} stream API error: {e}")
             yield ("error", f"{provider_name} API Error: {e}")
@@ -9298,29 +9327,23 @@ class MCPClient:
             log.error(f"Unexpected error in {provider_name} stream handler: {e}", exc_info=True)
             yield ("error", f"Unexpected stream processing error: {e}")
             stop_reason = "error"
-        # --- End Main Try/Except ---
         finally:
-            # --- Get Final Usage from the captured final chunk ---
-            # Use the final_chunk_usage if captured, otherwise default to 0
             if final_chunk_usage:
                 input_tokens = final_chunk_usage.prompt_tokens
                 output_tokens = final_chunk_usage.completion_tokens
                 log.debug(f"Using final usage from stream options for {provider_name}: In={input_tokens}, Out={output_tokens}")
-            elif provider_name != Provider.GROQ.value: # Don't warn for Groq if we accumulated
+            elif provider_name != Provider.GROQ.value:
                 log.warning(f"Final usage chunk not received or parsed for {provider_name}. Usage will be 0 or based on Groq accumulation.")
-                # Ensure defaults if not set
                 if input_tokens is None: input_tokens = 0
                 if output_tokens is None: output_tokens = 0
-
-            # --- Log and Yield Final Events ---
-            # Default tokens to 0 if they are still None after processing
+            
             final_input_tokens = input_tokens if input_tokens is not None else 0
             final_output_tokens = output_tokens if output_tokens is not None else 0
 
             if final_input_tokens == 0 or final_output_tokens == 0:
-                if final_chunk_usage: # If we got the usage object but values are 0
+                if final_chunk_usage:
                     log.warning(f"{provider_name} usage details reported as zero (Input: {final_input_tokens}, Output: {final_output_tokens}).")
-                elif provider_name != Provider.GROQ.value: # Only warn if not Groq and no usage chunk found
+                elif provider_name != Provider.GROQ.value:
                     log.warning(f"{provider_name} usage details unavailable. Cannot calculate cost accurately.")
 
             yield ("final_usage", {"input_tokens": final_input_tokens, "output_tokens": final_output_tokens})
@@ -9451,684 +9474,591 @@ class MCPClient:
 
     async def _relay_agent_llm_event_to_ui(self, sender: Callable[[str, Any], Coroutine], event_type: str, event_data: Any):
         """Safely sends an agent's LLM event to the UI via the provided sender."""
-        if not sender: return
+        if not sender:
+            return
         try:
             # Prefix event types for agent's LLM stream to distinguish from user's query stream
             prefixed_event_type = f"agent_llm_{event_type}" if not event_type.startswith("agent_llm_") else event_type
-            
+
             # For 'status' events, ensure data is a string or simple dict for JSON serialization
             payload_to_send = event_data
             if prefixed_event_type == "agent_llm_status" and not isinstance(event_data, (str, dict)):
                 payload_to_send = {"text": str(event_data)}
             elif prefixed_event_type == "agent_llm_error" and not isinstance(event_data, (str, dict)):
-                 payload_to_send = {"message": str(event_data)}
-
+                payload_to_send = {"message": str(event_data)}
 
             await sender(prefixed_event_type, payload_to_send)
         except Exception as e:
             log.warning(f"MCPC: Error relaying agent LLM event '{prefixed_event_type}' to UI: {e}", exc_info=False)
 
+
     async def process_streaming_query(
-        self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None, ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None
+        self, query: str, model: Optional[str] = None, max_tokens: Optional[int] = None, temperature: Optional[float] = None,
+        messages_override: Optional[InternalMessageList] = None,
+        tools_override: Optional[List[Dict[str, Any]]] = None,
+        ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None
     ) -> AsyncGenerator[Tuple[str, Any], None]:
-        """
-        Process a query using the specified model and available tools with streaming.
-        Handles multiple providers, tool use, status updates, and error handling.
-        Yields standardized tuples:
-        (event_type, event_data).
-        Known event_types:
-        text_chunk, status, error, tool_call_start,
-                           tool_call_input_chunk, tool_call_end, final_usage, stop_reason
-        """
-        # --- 0. Initial Setup & Validation ---
+
         span: Optional[trace.Span] = None
         span_context_manager = None
         current_task = asyncio.current_task()
-        stop_reason: Optional[str] = "processing"
-        error_occurred = False
+        # Overall stop reason for the entire multi-turn query process for this one user/agent prompt
+        overall_query_stop_reason: Optional[str] = "processing"
+        overall_query_error_occurred = False # Overall error flag for the entire query
+        retrying_without_tools = False
 
-        self.session_input_tokens = 0
-        self.session_output_tokens = 0
-        self.session_total_cost = 0.0
-        self.cache_hit_count = 0
-        self.tokens_saved_by_cache = 0
-        retrying_without_tools = False # Flag for blacklist retry logic
+        is_agent_llm_turn = messages_override is not None
 
+        # Initialize session-level accumulators if they are not already present or need reset
+        # These are for the *entire multi-turn query process*, not just one LLM call
+        if not hasattr(self, 'session_input_tokens') or is_agent_llm_turn:
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_total_cost = 0.0
+            self.cache_hit_count = 0
+            self.tokens_saved_by_cache = 0
+
+        # These are specific to this query (which might involve multiple LLM turns for tool use)
+        cache_hits_this_query_for_tools: int = 0
+        tokens_saved_by_tool_cache_this_query: int = 0
+        # `tool_results_for_client_history` is for MCPClient's own ChatHistory log,
+        # not directly for the LLM's conversational history.
+        tool_execution_details_for_client_log: List[Dict] = []
+
+        # This context manager ensures stdout protection for this function's scope
         with safe_stdout():
-            start_time = time.time()
-            # --- Determine Model and Provider ---
+            start_time_overall_query = time.time()
             internal_model_name_for_cost_lookup = model or self.current_model
-            if not max_tokens:
-                max_tokens = self.config.default_max_tokens
+            if not max_tokens: max_tokens = self.config.default_max_tokens
 
-            provider_name = self.current_provider # Use the stored provider
+            provider_name = self.get_provider_from_model(internal_model_name_for_cost_lookup)
 
             if not provider_name:
-                error_msg = f"No provider determined for current model '{internal_model_name_for_cost_lookup}'. Cannot process query."
+                error_msg = f"No provider determined for model '{internal_model_name_for_cost_lookup}'. Cannot process."
                 log.error(error_msg)
                 yield "error", error_msg
                 return
 
-            # Get provider client
             provider_client = getattr(self, f"{provider_name}_client", None)
             if not provider_client and provider_name == Provider.ANTHROPIC.value:
-                provider_client = self.anthropic
+                provider_client = self.anthropic # Anthropic client has a different attribute name
             if not provider_client:
-                error_msg = f"API key/client for provider '{provider_name}' not configured or initialized for model '{internal_model_name_for_cost_lookup}'."
+                error_msg = f"API client for provider '{provider_name}' not initialized for model '{internal_model_name_for_cost_lookup}'."
                 log.error(error_msg)
                 yield "error", error_msg
                 return
 
-            # --- Prepare ACTUAL Model Name String for the API Call ---
-            actual_model_name_string = internal_model_name_for_cost_lookup
-            providers_to_strip = [
-                Provider.OPENROUTER.value,
-                Provider.GROQ.value,
-                Provider.CEREBRAS.value,
-            ]
-            if provider_name in providers_to_strip:
+            # Determine the actual model name string to send to the API (stripping prefixes for certain providers)
+            actual_model_name_string_for_api = internal_model_name_for_cost_lookup
+            providers_requiring_prefix_strip = [Provider.OPENROUTER.value, Provider.GROQ.value, Provider.CEREBRAS.value]
+            if provider_name in providers_requiring_prefix_strip:
                 prefix_to_strip = f"{provider_name}/"
                 if internal_model_name_for_cost_lookup.lower().startswith(prefix_to_strip):
-                    actual_model_name_string = internal_model_name_for_cost_lookup[len(prefix_to_strip):]
-                    log.debug(f"Stripped prefix for API call. Original: '{internal_model_name_for_cost_lookup}', Sent: '{actual_model_name_string}'")
-                else:
-                    log.warning(f"Provider is '{provider_name}', but model '{internal_model_name_for_cost_lookup}' doesn't start with expected prefix '{prefix_to_strip}'. Sending model name as is.")
+                    actual_model_name_string_for_api = internal_model_name_for_cost_lookup[len(prefix_to_strip):]
+            log.info(f"MCPC Streaming Query: Provider='{provider_name}', Model (Display/Cost)='{internal_model_name_for_cost_lookup}', Model (API)='{actual_model_name_string_for_api}'")
 
-            log.info(f"Streaming query: Provider='{provider_name}', Model (User Facing/Cost)='{internal_model_name_for_cost_lookup}', Model (API Param)='{actual_model_name_string}'")
-
-            # Start OpenTelemetry Span
-            if tracer:
+            if tracer: # OpenTelemetry tracing
                 try:
-                    span_attributes = {"llm.model_name": internal_model_name_for_cost_lookup, "llm.provider": provider_name, "query_length": len(query), "streaming": True}
-                    span_context_manager = tracer.start_as_current_span("process_streaming_query", attributes=span_attributes)
-                    if span_context_manager:
-                        span = span_context_manager.__enter__()
-                except TypeError as te:
-                     log.warning(f"OpenTelemetry type error setting attributes: {te}. Span attributes may be incomplete.")
-                     span = span_context_manager = None
-                except Exception as e:
-                    log.warning(f"Failed to start trace span: {e}")
-                    span = span_context_manager = None
+                    span_attributes = {
+                        "llm.model_name": internal_model_name_for_cost_lookup, "llm.provider": provider_name,
+                        "query_length": len(query), "streaming": True, "is_agent_turn": is_agent_llm_turn
+                    }
+                    span_context_manager = tracer.start_as_current_span("mcpclient.process_streaming_query", attributes=span_attributes)
+                    if span_context_manager: span = span_context_manager.__enter__()
+                except Exception as e: log.warning(f"Failed to start trace span: {e}")
 
-            # Prepare initial conversation state
-            await self.auto_prune_context()
-            messages: InternalMessageList = self.conversation_graph.current_node.messages.copy()
-            user_message: InternalMessage = {"role": "user", "content": query}
-            messages.append(user_message)
+            # Prepare messages for the first LLM turn
+            messages_to_use_for_api: InternalMessageList
+            if messages_override is not None: # Agent turn, messages come from AML
+                messages_to_use_for_api = messages_override # This is already a new list or copy
+            else: # User turn
+                await self.auto_prune_context() # Prune if user query and context is too large
+                messages_to_use_for_api = self.conversation_graph.current_node.messages.copy()
+                if query: # Add user's new query
+                    user_message: InternalMessage = {"role": "user", "content": query}
+                    messages_to_use_for_api.append(user_message)
+            
             if span:
-                 try: span.set_attribute("conversation_length", len(messages))
-                 except Exception as e: log.warning(f"Failed to set span attribute 'conversation_length': {e}")
+                try: span.set_attribute("conversation_length_initial", len(messages_to_use_for_api))
+                except Exception as e: log.warning(f"Span attr error for conversation_length_initial: {e}")
 
-            # Function-scope state
-            final_response_text: str = ""
-            servers_used: Set[str] = set()
-            tools_used: List[str] = []
-            tool_results_for_history: List[Dict] = []
-            cache_hits_during_query: int = 0
+            # This accumulates only the LLM's direct text response for the final ChatHistory object
+            final_response_text_for_chat_history_log: str = ""
+            servers_used_this_query_session: Set[str] = set()
+            tools_used_this_query_session: List[str] = [] # Original MCP names for logging
 
-        # --- 1. Main Interaction Loop ---
+        # Main try block for the multi-turn interaction loop (LLM -> Tool -> LLM ...)
         try:
-            while True:
-                if current_task.cancelled():
-                    raise asyncio.CancelledError("Query cancelled before API turn")
+            turn_count = 0
+            while True: # Loop for multi-turn interactions (tool use)
+                turn_count += 1
+                log.debug(f"[{provider_name}] Starting LLM Interaction Turn {turn_count} for query.")
 
-                # --- 1a. Reset State ---
-                accumulated_text_this_turn = ""
-                tool_calls_in_progress: Dict[str, Dict] = {}
-                completed_tool_calls: List[Dict] = []
-                turn_input_tokens = 0; turn_output_tokens = 0; turn_cost = 0.0
-                turn_stop_reason = None; turn_api_error = None
+                if current_task and current_task.cancelled():
+                    log.info(f"[{provider_name}] Query processing cancelled by client before API call in turn {turn_count}.")
+                    raise asyncio.CancelledError(f"Query cancelled before API turn {turn_count}")
 
-                # --- 1b. Format Inputs ---
-                messages_to_send_this_turn = self._filter_faulty_client_tool_results(messages)
-                formatted_messages, system_prompt = self._format_messages_for_provider(
-                    messages_to_send_this_turn, provider_name, internal_model_name_for_cost_lookup
+                # Per-LLM-API-call state
+                accumulated_text_this_llm_turn: str = ""
+                # Stores dicts: {"id": tool_call_id, "name": original_mcp_tool_name, "input": parsed_args_dict}
+                llm_requested_tool_calls_this_turn: List[Dict[str, Any]] = []
+                current_llm_turn_input_tokens = 0
+                current_llm_turn_output_tokens = 0
+                current_llm_turn_stop_reason: Optional[str] = "unknown_llm_stop_reason"
+                current_llm_turn_api_error: Optional[str] = None # Error from this specific LLM API call
+
+                # Prepare messages & tools for THIS LLM API call
+                messages_to_send_to_llm_api = self._filter_faulty_client_tool_results(messages_to_use_for_api)
+                if span:
+                    try: span.set_attribute(f"llm_turn_{turn_count}.messages_sent_count", len(messages_to_send_to_llm_api))
+                    except Exception as e: log.warning(f"Span attr error for messages_sent_count: {e}")
+
+                formatted_messages_for_api, system_prompt_for_api = self._format_messages_for_provider(
+                    messages_to_send_to_llm_api, provider_name, internal_model_name_for_cost_lookup
                 )
-
-                # --- Conditionally format tools based on blacklist retry ---
-                if retrying_without_tools:
-                    formatted_tools = None # Force no tools on retry
-                    log.info(f"Retrying API call for {provider_name} without tools due to previous error.")
-                else:
-                    formatted_tools = self._format_tools_for_provider(provider_name) # Normal formatting
-                # ----------------------------------------------------------
-
-                # --- DeepSeek Reasoner Tool Check ---
-                if provider_name == Provider.DEEPSEEK.value and "deepseek-reasoner" in internal_model_name_for_cost_lookup:
-                    if formatted_tools is not None: # Only log if tools were initially formatted
-                        log.warning(f"Model '{internal_model_name_for_cost_lookup}' does not support tools. Sending request without tools.")
-                    formatted_tools = None # Override tools for this specific model
-                # ----------------------------------
-
-                tools_len_str = str(len(formatted_tools)) if formatted_tools else "0"
-                log.debug(f"[{provider_name}] Turn Start: Msgs={len(formatted_messages)}, Tools={tools_len_str}")
-
-                # +++++ ADDED DETAILED PROMPT LOGGING HERE +++++
-                log.info(f"MCPC: Sending to LLM Provider '{provider_name}', Model '{actual_model_name_string}'.")
-                log.debug(f"MCPC: SYSTEM PROMPT FOR LLM:\n----\n{system_prompt}\n----")
-                try:
-                    messages_json_for_log = json.dumps(formatted_messages, indent=2, ensure_ascii=False)
-                    log.debug(f"MCPC: MESSAGES FOR LLM (length {len(formatted_messages)}):\n----\n{messages_json_for_log}\n----")
-                except Exception as json_err:
-                    log.error(f"MCPC: Could not serialize messages for LLM logging: {json_err}")
-                    log.debug(f"MCPC: MESSAGES FOR LLM (raw object, length {len(formatted_messages)}):\n----\n{formatted_messages}\n----")
                 
-                if formatted_tools:
-                    try:
-                        tools_json_for_log = json.dumps(formatted_tools, indent=2, ensure_ascii=False)
-                        log.debug(f"MCPC: TOOLS FOR LLM (count {len(formatted_tools)}):\n----\n{tools_json_for_log[:2000]}...\n----") # Log first 2000 chars
-                    except Exception as json_err:
-                         log.error(f"MCPC: Could not serialize tools for LLM logging: {json_err}")
+                formatted_tools_for_api: Optional[List[Dict[str, Any]]]
+                if tools_override is not None and is_agent_llm_turn:
+                    formatted_tools_for_api = tools_override # Agent provides its own pre-formatted tool list
+                elif retrying_without_tools:
+                    formatted_tools_for_api = None # Force no tools on retry
                 else:
-                    log.debug("MCPC: No tools sent to LLM for this turn.")
-                # +++++ END DETAILED PROMPT LOGGING +++++
-
-                if not formatted_messages and provider_name != Provider.ANTHROPIC.value:
-                     log.error(f"Error preparing API call for {provider_name}: Formatted messages list is empty.")
-                     yield "error", "Internal Error: No messages to send to the LLM after formatting."
-                     error_occurred = True; stop_reason = "error"; break
-                elif not formatted_messages and provider_name == Provider.ANTHROPIC.value and not system_prompt:
-                     log.error(f"Error preparing API call for Anthropic: Formatted messages and system prompt are both empty.")
-                     yield "error", "Internal Error: No messages or system prompt to send to Anthropic."
-                     error_occurred = True; stop_reason = "error"; break
-
-                # --- 1c. API Call & Stream ---
-                stream_start_time = time.time()
+                    # For user queries, MCPClient formats all available tools
+                    formatted_tools_for_api = self._format_tools_for_provider(provider_name)
+                
+                # Special model checks
+                if provider_name == Provider.DEEPSEEK.value and "deepseek-reasoner" in internal_model_name_for_cost_lookup:
+                    if formatted_tools_for_api is not None:
+                        log.warning(f"Model '{internal_model_name_for_cost_lookup}' (DeepSeek Reasoner) does not support tools. Sending request without tools.")
+                    formatted_tools_for_api = None
+                
+                log.debug(f"[{provider_name}] LLM Turn {turn_count} START: Messages to LLM API={len(formatted_messages_for_api)}, Tools to LLM API={len(formatted_tools_for_api) if formatted_tools_for_api else 'None'}")
+                
+                # Detailed prompt logging for LLM call (as implemented before)
+                logger_for_llm_prompt = getattr(self, 'logger', log)
+                prompt_origin_log_tag = f"AGENT LLM TURN {getattr(self.agent_loop_instance.state, 'current_loop', 'N/A') if self.agent_loop_instance and is_agent_llm_turn else 'N/A'}" if is_agent_llm_turn else f"USER QUERY TURN {turn_count}"
+                logger_for_llm_prompt.info(f"MCPC {prompt_origin_log_tag}: Sending to LLM Provider '{provider_name}', Model '{actual_model_name_string_for_api}'.")
+                if system_prompt_for_api: logger_for_llm_prompt.debug(f"MCPC {prompt_origin_log_tag}: SYSTEM PROMPT FOR LLM:\n----\n{system_prompt_for_api}\n----")
                 try:
-                    log.debug(f"Initiating API call to {provider_name} using model parameter '{actual_model_name_string}'...")
-                    stream_iterator: Optional[AsyncGenerator] = None
-                    api_client: Any = provider_client
+                    messages_json_log = json.dumps(formatted_messages_for_api, indent=2, ensure_ascii=False)
+                    logger_for_llm_prompt.debug(f"MCPC {prompt_origin_log_tag}: MESSAGES FOR LLM (count {len(formatted_messages_for_api)}):\n----\n{messages_json_log}\n----")
+                except Exception as json_log_err: logger_for_llm_prompt.error(f"MCPC {prompt_origin_log_tag}: Could not serialize messages for LLM logging: {json_log_err}")
+                if formatted_tools_for_api:
+                    try:
+                        tools_json_log = json.dumps(formatted_tools_for_api, indent=2, ensure_ascii=False)
+                        logger_for_llm_prompt.debug(f"MCPC {prompt_origin_log_tag}: TOOLS FOR LLM (count {len(formatted_tools_for_api)}):\n----\n{tools_json_log[:3000]}...\n----")
+                    except Exception as json_log_err_tools: logger_for_llm_prompt.error(f"MCPC {prompt_origin_log_tag}: Could not serialize tools for LLM logging: {json_log_err_tools}")
+                else: logger_for_llm_prompt.debug(f"MCPC {prompt_origin_log_tag}: NO TOOLS sent to LLM for this turn.")
+
+
+                # Validate messages before sending
+                if not formatted_messages_for_api and provider_name != Provider.ANTHROPIC.value:
+                     current_llm_turn_api_error = "Internal Error: No messages to send to LLM after formatting."
+                     log.error(f"[{provider_name}] {current_llm_turn_api_error}")
+                     break # Exit while True loop for turns
+                elif not formatted_messages_for_api and provider_name == Provider.ANTHROPIC.value and not system_prompt_for_api:
+                     current_llm_turn_api_error = "Internal Error (Anthropic): No messages or system prompt to send to LLM."
+                     log.error(f"[{provider_name}] {current_llm_turn_api_error}")
+                     break # Exit while True loop for turns
+
+                # --- LLM API Call ---
+                stream_start_time_llm_api_call = time.time()
+                try:
+                    stream_iterator: Optional[AsyncGenerator[Tuple[str, Any], None]] = None
+                    api_client_for_call: Any = provider_client # Should be correctly initialized client
 
                     if provider_name == Provider.ANTHROPIC.value:
-                        anthropic_client = cast("AsyncAnthropic", api_client)
-                        stream_params = {
-                            "model": actual_model_name_string,
-                            "messages": formatted_messages,
-                            "tools": formatted_tools,
-                            "max_tokens": max_tokens or self.config.default_max_tokens, # Use correct default
-                            "temperature": self.config.temperature,
+                        anthropic_sdk_client = cast("AsyncAnthropic", api_client_for_call)
+                        stream_params_anthropic: Dict[str, Any] = {
+                            "model": actual_model_name_string_for_api, "messages": formatted_messages_for_api,
+                            "max_tokens": max_tokens or self.config.default_max_tokens,
+                            "temperature": temperature if temperature is not None else self.config.temperature,
                         }
-                        if system_prompt: stream_params["system"] = system_prompt
-                        stream_manager = anthropic_client.messages.stream(**stream_params)
-                        async with stream_manager as api_stream:
-                            stream_iterator = self._handle_anthropic_stream(api_stream)
-                            async for std_event_type, std_event_data in stream_iterator:
-                                if current_task.cancelled(): raise asyncio.CancelledError("Query cancelled during stream")
-                                if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "anthropic_stream_event", {"type": std_event_type, "data": std_event_data})
-                                if std_event_type == "error": turn_api_error = str(std_event_data); break
-                                # --- Event Processing (Anthropic) ---
-                                elif std_event_type == "text_chunk": accumulated_text_this_turn += std_event_data; yield "text_chunk", std_event_data
-                                elif std_event_type == "tool_call_start":
-                                    tool_id = std_event_data["id"]
-                                    original_tool_name = std_event_data["name"]
-                                    tool_calls_in_progress[tool_id] = {"name": original_tool_name, "args_acc": ""}
-                                    yield "status", f"{EMOJI_MAP['tool']} Preparing tool: [bold]{original_tool_name.split(':')[-1]}[/] (ID: {tool_id[:8]})..."
-                                elif std_event_type == "tool_call_input_chunk":
-                                    tool_id = std_event_data["id"]
-                                    if tool_id in tool_calls_in_progress: tool_calls_in_progress[tool_id]["args_acc"] += std_event_data["json_chunk"]
-                                elif std_event_type == "tool_call_end":
-                                    tool_id = std_event_data["id"]
-                                    if tool_id in tool_calls_in_progress:
-                                        tool_info = tool_calls_in_progress.pop(tool_id)
-                                        completed_tool_calls.append({"id": tool_id, "name": tool_info["name"], "input": std_event_data["parsed_input"]})
-                                elif std_event_type == "final_usage":
-                                    turn_input_tokens = std_event_data["input_tokens"]
-                                    turn_output_tokens = std_event_data["output_tokens"]
-                                    turn_cost = self._calculate_and_log_cost(internal_model_name_for_cost_lookup, turn_input_tokens, turn_output_tokens)
-                                    self.session_input_tokens += turn_input_tokens; self.session_output_tokens += turn_output_tokens; self.session_total_cost += turn_cost
-                                    yield "status", f"{EMOJI_MAP['token']} Turn Tokens: In={turn_input_tokens:,}, Out={turn_output_tokens:,} | {EMOJI_MAP['cost']} Turn Cost: ${turn_cost:.4f}"
-                                    if span:
-                                        try:
-                                            turn_index = sum(1 for m in messages if m.get("role") == "assistant") # Get current turn index
-                                            span.set_attribute(f"turn_{turn_index}.input_tokens", turn_input_tokens)
-                                            span.set_attribute(f"turn_{turn_index}.output_tokens", turn_output_tokens)
-                                            span.set_attribute(f"turn_{turn_index}.cost", turn_cost)
-                                        except Exception as span_err: log.warning(f"Failed set span attrs: {span_err}")
-                                elif std_event_type == "stop_reason":
-                                    turn_stop_reason = std_event_data
-
+                        if formatted_tools_for_api: stream_params_anthropic["tools"] = formatted_tools_for_api
+                        if system_prompt_for_api: stream_params_anthropic["system"] = system_prompt_for_api
+                        
+                        anthropic_stream_manager = anthropic_sdk_client.messages.stream(**stream_params_anthropic)
+                        async with anthropic_stream_manager as api_stream_obj_anthropic:
+                            stream_iterator = self._handle_anthropic_stream(api_stream_obj_anthropic)
+                    
                     elif provider_name in [
                         Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
                         Provider.GROQ.value, Provider.MISTRAL.value, Provider.CEREBRAS.value,
                         Provider.GEMINI.value, Provider.OPENROUTER.value,
                     ]:
-                        openai_client = cast("AsyncOpenAI", api_client)
-                        completion_params = {
-                            "model": actual_model_name_string,
-                            "messages": formatted_messages,  # type: ignore
-                            "tools": formatted_tools,
-                            "max_tokens": max_tokens or self.config.default_max_tokens, # Use correct default
-                            "temperature": self.config.temperature,
+                        openai_sdk_client = cast("AsyncOpenAI", api_client_for_call)
+                        completion_params_openai: Dict[str, Any] = {
+                            "model": actual_model_name_string_for_api, "messages": formatted_messages_for_api, # type: ignore
+                            "max_tokens": max_tokens or self.config.default_max_tokens,
+                            "temperature": temperature if temperature is not None else self.config.temperature,
+                            "stream": True,
                         }
-                        providers_without_stream_options = { Provider.MISTRAL.value, Provider.CEREBRAS.value }
-                        if provider_name not in providers_without_stream_options:
-                            completion_params["stream_options"] = {"include_usage": True}
-                        else: log.debug(f"Skipping stream_options for {provider_name}")
+                        if formatted_tools_for_api: completion_params_openai["tools"] = formatted_tools_for_api
+                        
+                        providers_not_supporting_stream_options = {Provider.MISTRAL.value, Provider.CEREBRAS.value} # Example
+                        if provider_name not in providers_not_supporting_stream_options:
+                            completion_params_openai["stream_options"] = {"include_usage": True}
+                        
+                        api_stream_obj_openai = await openai_sdk_client.chat.completions.create(**completion_params_openai)
+                        stream_iterator = self._handle_openai_compatible_stream(api_stream_obj_openai, provider_name)
+                    else:
+                        # This should ideally be caught by provider_client check earlier, but as a safeguard
+                        current_llm_turn_api_error = f"Internal Error: Streaming not implemented for provider '{provider_name}'."
+                        log.critical(current_llm_turn_api_error) # Critical as it implies a programming error
+                        break # Exit while True loop
 
-                        # --- Cerebras Logging ---
-                        if provider_name == Provider.CEREBRAS.value:
-                             try:
-                                 log.debug(f"[{provider_name}] Sending API request. Params: {json.dumps(completion_params, indent=2, default=lambda o: f'<not serializable: {type(o).__name__}>')}")
-                             except Exception as json_log_err:
-                                 log.warning(f"Failed to log completion_params for Cerebras: {json_log_err}")
-                        # -----------------------
-
-                        api_stream = await openai_client.chat.completions.create(**completion_params)
-                        stream_iterator = self._handle_openai_compatible_stream(api_stream, provider_name)
+                    # Consume the stream
+                    if stream_iterator:
                         async for std_event_type, std_event_data in stream_iterator:
-                            if current_task.cancelled(): raise asyncio.CancelledError("Query cancelled during stream")
-                            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, f"{provider_name}_stream_event", {"type": std_event_type, "data": std_event_data})
-                            if std_event_type == "error": turn_api_error = str(std_event_data); break
-                            # --- Event Processing (OpenAI Compatible) ---
-                            elif std_event_type == "text_chunk": accumulated_text_this_turn += std_event_data; yield "text_chunk", std_event_data
-                            elif std_event_type == "tool_call_start":
-                                tool_id = std_event_data["id"]
-                                original_tool_name = std_event_data["name"]
-                                tool_calls_in_progress[tool_id] = {"name": original_tool_name, "args_acc": ""}
-                                yield "status", f"{EMOJI_MAP['tool']} Preparing tool: [bold]{original_tool_name.split(':')[-1]}[/] (ID: {tool_id[:8]})..."
-                            elif std_event_type == "tool_call_input_chunk":
-                                tool_id = std_event_data["id"]
-                                if tool_id in tool_calls_in_progress: tool_calls_in_progress[tool_id]["args_acc"] += std_event_data["json_chunk"]
+                            if current_task and current_task.cancelled():
+                                log.info(f"[{provider_name}] Query cancelled by client during LLM stream consumption in turn {turn_count}.")
+                                raise asyncio.CancelledError("Query cancelled during LLM stream consumption")
+                            
+                            # Yield ALL events from stream handlers.
+                            # The UI or agent processing logic will decide what to do with them.
+                            yield std_event_type, std_event_data
+
+                            # Update internal state based on events from this LLM turn's stream
+                            if std_event_type == "error":
+                                current_llm_turn_api_error = str(std_event_data)
+                                log.error(f"[{provider_name}] Error event from stream handler: {current_llm_turn_api_error}")
+                                break # Stop processing this LLM turn's stream on error
+                            elif std_event_type == "text_chunk":
+                                accumulated_text_this_llm_turn += str(std_event_data)
                             elif std_event_type == "tool_call_end":
-                                tool_id = std_event_data["id"]
-                                if tool_id in tool_calls_in_progress:
-                                    tool_info = tool_calls_in_progress.pop(tool_id)
-                                    completed_tool_calls.append({"id": tool_id, "name": tool_info["name"], "input": std_event_data["parsed_input"]})
-                            elif std_event_type == "final_usage":
-                                turn_input_tokens = std_event_data["input_tokens"]
-                                turn_output_tokens = std_event_data["output_tokens"]
-                                turn_cost = self._calculate_and_log_cost(internal_model_name_for_cost_lookup, turn_input_tokens, turn_output_tokens)
-                                self.session_input_tokens += turn_input_tokens; self.session_output_tokens += turn_output_tokens; self.session_total_cost += turn_cost
-                                yield "status", f"{EMOJI_MAP['token']} Turn Tokens: In={turn_input_tokens:,}, Out={turn_output_tokens:,} | {EMOJI_MAP['cost']} Turn Cost: ${turn_cost:.4f}"
-                                if span:
-                                    try:
-                                        turn_index = sum(1 for m in messages if m.get("role") == "assistant") # Get current turn index
-                                        span.set_attribute(f"turn_{turn_index}.input_tokens", turn_input_tokens)
-                                        span.set_attribute(f"turn_{turn_index}.output_tokens", turn_output_tokens)
-                                        span.set_attribute(f"turn_{turn_index}.cost", turn_cost)
-                                    except Exception as span_err:
-                                        log.warning(f"Failed set span attrs: {span_err}")
-                            elif std_event_type == "stop_reason": turn_stop_reason = std_event_data
-                    else:
-                        raise NotImplementedError(f"Streaming API call not implemented for provider: {provider_name}")
-
-                    if turn_stop_reason == "error": break
-
-                # --- Catch API Errors & Handle Blacklisting ---
-                # Use more specific OpenAI error types where available
-                except OpenAIBadRequestError as e:
-                    error_detail = str(e)
-                    is_tool_error = "tool declaration" in error_detail or "'tools'" in error_detail or "Function Calling" in error_detail or "tool_calls" in error_detail or "'functions'" in error_detail # Broaden check
-                    failing_tool_name = None
-
-                    # Specific Gemini Error Parsing
-                    if provider_name == Provider.GEMINI.value and "Failed to parse parameters of tool declaration with name" in error_detail:
-                        match = re.search(r"with name (\S+)", error_detail)
-                        if match:
-                            sanitized_failing_tool_name = match.group(1)
-                            failing_tool_name = self.server_manager.sanitized_to_original.get(sanitized_failing_tool_name, sanitized_failing_tool_name)
-                            log.warning(f"Gemini tool parse error identified for: {failing_tool_name} (Sanitized: {sanitized_failing_tool_name})")
-                        else:
-                            log.warning("Could not extract tool name from Gemini error: " + error_detail)
-                            is_tool_error = False # Treat as generic if name extraction fails
-
-                    # Specific OpenAI Tool ID Length Error Parsing (Check if needed, might be handled by truncation)
-                    elif provider_name == Provider.OPENAI.value and "tool_calls[0].id': string too long" in error_detail:
-                         # We assume truncation fixed this, but log if it still happens
-                         log.error(f"Encountered OpenAI tool ID length error despite truncation logic: {error_detail}")
-                         # Treat as generic bad request for now, maybe blacklist all tools if persistent
-                         is_tool_error = True # Mark as tool error for potential blacklisting
-
-                    # Blacklist Logic
-                    if is_tool_error and not retrying_without_tools:
-                        log.warning(f"Caught tool-related BadRequestError for {provider_name}: {e}")
-                        tools_to_blacklist_now = []
-                        if failing_tool_name:
-                            tools_to_blacklist_now.append(failing_tool_name)
-                        elif formatted_tools: # If generic tool error, blacklist all tools sent in this turn
-                             tools_to_blacklist_now = []
-                             for tool_fmt in formatted_tools:
-                                 if tool_fmt.get("type") == "function" and isinstance(tool_fmt.get("function"), dict):
-                                     sanitized_name = tool_fmt["function"].get("name")
-                                     if sanitized_name:
-                                         original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
-                                         tools_to_blacklist_now.append(original_name)
-                             if tools_to_blacklist_now:
-                                 log.warning(f"Blacklisting all tools sent for {provider_name} due to generic tool error: {tools_to_blacklist_now}")
-                             else:
-                                 log.warning("Generic tool error detected, but couldn't determine which tools were sent to blacklist.")
-
-                        if tools_to_blacklist_now:
-                             # Use the instance method to add to blacklist
-                             self.tool_blacklist_manager.add_to_blacklist(provider_name, list(set(tools_to_blacklist_now))) # Use set to avoid duplicates
-                             retrying_without_tools = True # Set flag to retry without tools
-                             yield "status", f"[yellow]Tool error detected for {provider_name}. Retrying without blacklisted tool(s)...[/]"
-                             if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] Tool error for {provider_name}. Retrying without tool(s)..."})
-                             await asyncio.sleep(0.1) # Brief pause before retry
-                             continue # Go to start of while loop for retry
-                        else:
-                             # Couldn't identify tools to blacklist, treat as normal error
-                             turn_api_error = f"BadRequestError (Tools?, No specific tool identified): {e}"
-                             log.error(f"{provider_name} {turn_api_error}", exc_info=False) # Less verbose log for this case
-                    else:
-                        # Not a tool error, or already retrying without tools
-                        turn_api_error = f"BadRequestError: {e}"
-                        log.error(f"{provider_name} {turn_api_error}", exc_info=True)
-
-                # --- More Specific Error Handling (Using imported exceptions) ---
-                except (anthropic.APIConnectionError, OpenAIAPIConnectionError) as e: turn_api_error = f"Connection Error: {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True)
-                except (anthropic.AuthenticationError, OpenAIAuthenticationError) as e: turn_api_error = f"Authentication Error (Check API Key): {e}"; log.error(f"{provider_name} {turn_api_error}")
-                except (anthropic.PermissionDeniedError, OpenAIPermissionDeniedError) as e: turn_api_error = f"Permission Denied: {e}"; log.error(f"{provider_name} {turn_api_error}")
-                except (anthropic.NotFoundError, OpenAINotFoundError) as e: turn_api_error = f"API Endpoint or Model Not Found: {e}"; log.error(f"{provider_name} {turn_api_error}")
-                except (anthropic.RateLimitError, OpenAIRateLimitError) as e: turn_api_error = f"Rate Limit Exceeded: {e}"; log.warning(f"{provider_name} {turn_api_error}")
-                except (anthropic.APIStatusError, OpenAIAPIStatusError) as e: turn_api_error = f"API Status Error ({e.status_code}): {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True)
-                except (anthropic.APIError, OpenAIAPIError) as e: turn_api_error = f"API Error: {e}"; log.error(f"{provider_name} {turn_api_error}", exc_info=True) # Catch base API errors
-                except httpx.RequestError as e: turn_api_error = f"Network Error: {e}"; log.error(f"{provider_name} Network Error: {turn_api_error}", exc_info=True)
-                except asyncio.CancelledError: log.debug(f"API call/stream setup cancelled for {provider_name}"); raise
-                except NotImplementedError as e: turn_api_error = str(e); log.error(turn_api_error)
-                except Exception as api_err: turn_api_error = f"Unexpected API/Stream Error: {api_err}"; log.error(f"Unexpected error during API call/stream for {provider_name}: {api_err}", exc_info=True)
-                finally:
-                    log.debug(f"Stream processing finished for turn. Duration: {time.time() - stream_start_time:.2f}s. API Error: {turn_api_error}. Stop Reason: {turn_stop_reason}")
-
-                if turn_api_error:
-                    error_occurred = True
-                    yield "error", f"Error ({provider_name}): {turn_api_error}"
-                    stop_reason = "error"
-                    break # Break loop on non-tool-related API error or failed retry
-
-                # --- Reset retry flag if this attempt (potentially without tools) succeeded ---
-                retrying_without_tools = False
-
-                # --- 1e. Post-Stream Processing & Assistant Message Update ---
-                assistant_content_blocks: List[Union[TextContentBlock, ToolUseContentBlock]] = []
-                if accumulated_text_this_turn:
-                    assistant_content_blocks.append({"type": "text", "text": accumulated_text_this_turn})
-                    final_response_text += accumulated_text_this_turn
-                for tc in completed_tool_calls:
-                    assistant_content_blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["input"]})
-                if assistant_content_blocks:
-                    messages.append({"role": "assistant", "content": assistant_content_blocks})
-                else:
-                    # Only log warning if the stop reason wasn't 'tool_use' (it's expected to yield no text then)
-                    if turn_stop_reason != 'tool_use':
-                        log.warning(f"LLM turn for {provider_name} completed but yielded no text or tool calls. Stop Reason: {turn_stop_reason}")
-
-                # --- 1f. Handle Stop Reason ---
-                if current_task.cancelled(): raise asyncio.CancelledError("Cancelled before stop reason handling")
-                stop_reason = turn_stop_reason
-
-                if stop_reason == "tool_use":
-                    if not completed_tool_calls:
-                        log.warning(f"{provider_name} stop reason 'tool_use' but no calls parsed.")
-                        yield "status", "[yellow]Warning: Model requested tools, but none were identified.[/]"
-                        break # Stop if model wanted tools but none were found
-
-                    tool_results_for_api: List[InternalMessage] = []
-                    yield "status", f"{EMOJI_MAP['tool']} Processing {len(completed_tool_calls)} tool call(s)..."
-                    try:
-                        for tool_call in completed_tool_calls:
-                            if current_task.cancelled(): raise asyncio.CancelledError("Cancelled during tool processing")
-                            tool_use_id = tool_call["id"]
-                            original_tool_name = tool_call["name"]
-                            tool_args = tool_call["input"]
-                            tool_short_name = original_tool_name.split(":")[-1] if ":" in original_tool_name else original_tool_name
-                            tool_start_time = time.time()
-                            tool_result_content: Union[str, List[Dict], Dict] = "Error: Tool execution failed unexpectedly."
-                            log_content_for_history: Any = tool_result_content
-                            is_error_flag = True
-                            cache_used_flag = False
-
-                            # Handle client-side parse error first
-                            if isinstance(tool_args, dict) and "_tool_input_parse_error" in tool_args:
-                                error_text = f"Client JSON parse error for '{original_tool_name}'."
-                                tool_result_content = f"Error: {error_text}"
-                                # Extract raw JSON if available from the error dict
-                                raw_json_detail = "N/A"
-                                if isinstance(tool_args["_tool_input_parse_error"], dict):
-                                    raw_json_detail = tool_args["_tool_input_parse_error"].get("raw_json", "N/A")
-                                log_content_for_history = {"error": error_text, "raw_json": raw_json_detail}
-                                yield "status", f"{EMOJI_MAP['failure']} Input Error [bold]{tool_short_name}[/]: Client parse failed."
-                                log.error(f"{error_text} Raw: {log_content_for_history['raw_json']}")
-                            else:
-                                # Check if tool exists locally
-                                mcp_tool_obj = self.server_manager.tools.get(original_tool_name)
-                                if not mcp_tool_obj:
-                                    error_text = f"Tool '{original_tool_name}' not found by client."
-                                    tool_result_content = f"Error: {error_text}"
-                                    log_content_for_history = {"error": error_text}
-                                    yield "status", f"{EMOJI_MAP['failure']} Tool Error: Tool '[bold]{original_tool_name}[/]' not found."
-                                    if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] Tool Error: Tool '{original_tool_name}' not found."})
+                                # std_event_data from stream handlers should now contain:
+                                # {"id": ..., "name": original_mcp_tool_name, "parsed_input": ...}
+                                if isinstance(std_event_data, dict) and std_event_data.get("id") and std_event_data.get("name"):
+                                    # Store it directly as it's already in the desired format for llm_requested_tool_calls_this_turn
+                                    llm_requested_tool_calls_this_turn.append({
+                                        "id": std_event_data["id"],
+                                        "name": std_event_data["name"], # This is original_mcp_name
+                                        "input": std_event_data.get("parsed_input", {}) # This is the "input" key
+                                    })
                                 else:
-                                    # Tool exists, proceed with cache check and execution
-                                    server_name = mcp_tool_obj.server_name
-                                    servers_used.add(server_name)
-                                    tools_used.append(original_tool_name)
-                                    cached_result = None
+                                    log.warning(f"[{provider_name}] Received malformed 'tool_call_end' event: {std_event_data}")
+                            elif std_event_type == "final_usage":
+                                current_llm_turn_input_tokens = std_event_data.get("input_tokens", 0)
+                                current_llm_turn_output_tokens = std_event_data.get("output_tokens", 0)
+                                # Update session totals immediately after each LLM API call
+                                self.session_input_tokens += current_llm_turn_input_tokens
+                                self.session_output_tokens += current_llm_turn_output_tokens
+                                turn_cost = self._calculate_and_log_cost(internal_model_name_for_cost_lookup, current_llm_turn_input_tokens, current_llm_turn_output_tokens)
+                                self.session_total_cost += turn_cost
+                            elif std_event_type == "stop_reason":
+                                current_llm_turn_stop_reason = str(std_event_data)
+                    else: # stream_iterator was None
+                        if not current_llm_turn_api_error: # If no specific error was set by a provider block
+                            current_llm_turn_api_error = f"Internal Error: Stream iterator was not properly created for provider {provider_name}."
+                        log.error(f"[{provider_name}] {current_llm_turn_api_error}")
+                        # This error will be handled below to break the while True loop
 
-                                    # Cache Check
-                                    if self.tool_cache and self.config.enable_caching:
-                                        try: cached_result = self.tool_cache.get(original_tool_name, tool_args)
-                                        except TypeError: cached_result = None # Unhashable args
-                                        # Check if cached result itself is an error indicator (e.g., {'error': ...})
-                                        # Adapt this check based on how errors might be stored in cache
-                                        cache_is_error = isinstance(cached_result, dict) and cached_result.get("error") is not None
+                # --- Catch API call errors and tool-related bad requests ---
+                except OpenAIBadRequestError as e_br_openai:
+                    error_detail_br_openai = str(e_br_openai)
+                    is_tool_error_br_openai = "tool" in error_detail_br_openai.lower() or "function" in error_detail_br_openai.lower() or "parameter" in error_detail_br_openai.lower()
+                    failing_tool_name_br_openai: Optional[str] = None
+                    if provider_name == Provider.GEMINI.value and "Failed to parse parameters of tool declaration with name" in error_detail_br_openai:
+                        match_br_openai = re.search(r"with name (\S+)", error_detail_br_openai)
+                        if match_br_openai: failing_tool_name_br_openai = self.server_manager.sanitized_to_original.get(match_br_openai.group(1), match_br_openai.group(1))
+                    
+                    if is_tool_error_br_openai and not retrying_without_tools and formatted_tools_for_api:
+                        log.warning(f"[{provider_name}] Caught tool-related BadRequestError: {e_br_openai}")
+                        tools_to_blacklist_now_br_openai = []
+                        if failing_tool_name_br_openai: tools_to_blacklist_now_br_openai.append(failing_tool_name_br_openai)
+                        else: tools_to_blacklist_now_br_openai = [self.server_manager.sanitized_to_original.get(tf["function"]["name"], tf["function"]["name"]) for tf in formatted_tools_for_api if tf.get("type") == "function" and isinstance(tf.get("function"), dict) and tf["function"].get("name")]
+                        
+                        if tools_to_blacklist_now_br_openai:
+                             log.warning(f"[{provider_name}] Adding to blacklist and retrying LLM call without: {tools_to_blacklist_now_br_openai}")
+                             self.tool_blacklist_manager.add_to_blacklist(provider_name, list(set(tools_to_blacklist_now_br_openai)))
+                             retrying_without_tools = True # Set flag for next iteration of while True
+                             yield "status", f"[yellow]Tool schema error with {provider_name}. Retrying without affected tool(s)...[/]"
+                             await asyncio.sleep(0.1)
+                             continue # Retry the while True loop (will re-format tools, excluding newly blacklisted)
+                        else:
+                             current_llm_turn_api_error = f"BadRequestError (Tool related, but no specific tool identified to blacklist): {e_br_openai}"
+                             log.error(f"[{provider_name}] {current_llm_turn_api_error}", exc_info=False)
+                    else: # Not a tool error, or already retrying without tools
+                        current_llm_turn_api_error = f"BadRequestError: {e_br_openai}"
+                        log.error(f"[{provider_name}] {current_llm_turn_api_error}", exc_info=True)
+                
+                # Simplified error handling for other specific API errors
+                except (anthropic.APIConnectionError, OpenAIAPIConnectionError, httpx.RequestError) as e_conn: current_llm_turn_api_error = f"Connection Error: {e_conn}"; log.error(f"[{provider_name}] {current_llm_turn_api_error}", exc_info=True)
+                except (anthropic.AuthenticationError, OpenAIAuthenticationError) as e_auth: current_llm_turn_api_error = f"Authentication Error (Check API Key for {provider_name}): {e_auth}"; log.error(f"[{provider_name}] {current_llm_turn_api_error}")
+                except (anthropic.PermissionDeniedError, OpenAIPermissionDeniedError) as e_perm: current_llm_turn_api_error = f"Permission Denied by {provider_name}: {e_perm}"; log.error(f"[{provider_name}] {current_llm_turn_api_error}")
+                except (anthropic.NotFoundError, OpenAINotFoundError) as e_nf: current_llm_turn_api_error = f"API Endpoint or Model Not Found for {provider_name}: {e_nf}"; log.error(f"[{provider_name}] {current_llm_turn_api_error}")
+                except (anthropic.RateLimitError, OpenAIRateLimitError) as e_rl: current_llm_turn_api_error = f"Rate Limit Exceeded for {provider_name}: {e_rl}"; log.warning(f"[{provider_name}] {current_llm_turn_api_error}")
+                except (anthropic.APIStatusError, OpenAIAPIStatusError) as e_stat: current_llm_turn_api_error = f"API Status Error ({e_stat.status_code}) from {provider_name}: {getattr(e_stat, 'message', e_stat)}"; log.error(f"[{provider_name}] {current_llm_turn_api_error}", exc_info=True)
+                except (anthropic.APIError, OpenAIAPIError) as e_api: current_llm_turn_api_error = f"Generic API Error from {provider_name}: {e_api}"; log.error(f"[{provider_name}] {current_llm_turn_api_error}", exc_info=True)
+                except asyncio.CancelledError: log.debug(f"[{provider_name}] API call/stream consumption cancelled during turn {turn_count}."); raise
+                except NotImplementedError as e_ni: current_llm_turn_api_error = str(e_ni); log.error(f"[{provider_name}] {current_llm_turn_api_error}")
+                except Exception as api_err_outer: current_llm_turn_api_error = f"Unexpected API/Stream Error for {provider_name}: {api_err_outer}"; log.error(f"[{provider_name}] {current_llm_turn_api_error}", exc_info=True)
+                finally:
+                    log.debug(f"[{provider_name}] LLM API Call for Turn {turn_count} finished. Duration: {(time.time() - stream_start_time_llm_api_call):.2f}s. API Error this turn: {current_llm_turn_api_error}. LLM Stop Reason this turn: {current_llm_turn_stop_reason}")
 
-                                        if cached_result is not None and not cache_is_error:
-                                            tool_result_content = cached_result
-                                            log_content_for_history = cached_result
-                                            is_error_flag = False
-                                            cache_used_flag = True
-                                            cache_hits_during_query += 1
-                                            # Estimate tokens saved
-                                            content_str_tokens = self._stringify_content(cached_result)
-                                            cached_tokens = self._estimate_string_tokens(content_str_tokens)
-                                            self.tokens_saved_by_cache += cached_tokens
-                                            status_msg_cache = f"{EMOJI_MAP['cached']} Using cache for tool [bold]{tool_short_name}[/] ({cached_tokens:,} tokens saved)"
-                                            yield "status", status_msg_cache
-                                            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_cache}"})
-                                            log.info(f"Using cached result for {original_tool_name}")
-                                        elif cached_result is not None:
-                                            # We found a cached *error* result, ignore it and execute fresh
-                                            log.info(f"Ignoring cached error result for {original_tool_name}. Executing tool.")
-                                            cached_result = None # Ensure we don't use it
+                # --- Post LLM Stream Turn Processing ---
+                if current_llm_turn_api_error: # If ANY error occurred during this LLM API call
+                    overall_query_error_occurred = True
+                    overall_query_stop_reason = "error" # Set overall stop reason for the entire query
+                    log.error(f"[{provider_name}] Exiting interaction loop for this query due to API error in LLM turn {turn_count}: {current_llm_turn_api_error}")
+                    # Yield the error to the consumer if not already done by stream handler
+                    # This might be redundant if stream handler already yielded "error", but safe.
+                    yield "error", current_llm_turn_api_error
+                    break # Break main `while True` loop for turns
 
-                                    # Execute Tool if not cached or cache was error
-                                    if not cache_used_flag:
-                                        status_msg_exec = f"{EMOJI_MAP['server']} Executing LLM-decided tool [bold]{tool_short_name}[/] via {server_name}..."
-                                        yield "status", status_msg_exec
-                                        if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_exec}"})
-                                        log.info(f"Executing tool '{original_tool_name}' via server '{server_name}'...")
-                                        try:
-                                            if current_task.cancelled(): raise asyncio.CancelledError("Cancelled before tool execution")
-                                            with safe_stdout():
-                                                # Ensure execute_tool exists and handles context correctly
-                                                exec_params = {"server_name": server_name, "tool_name": original_tool_name, "tool_args": tool_args}
-                                                mcp_result: CallToolResult = await self.execute_tool(**exec_params)
-                                            tool_latency = time.time() - tool_start_time
+                # If we got here, the LLM API call for this turn was successful (no API error)
+                retrying_without_tools = False # Reset flag if this LLM turn was successful
 
-                                            if mcp_result.isError:
-                                                error_detail = str(mcp_result.content) if mcp_result.content is not None else "Unknown server error"
-                                                tool_result_content = f"Error: Tool execution failed: {error_detail}"
-                                                # Store structured error info for history if possible
-                                                log_content_for_history = {"error": error_detail, "raw_content": mcp_result.content}
-                                                status_msg_err = f"{EMOJI_MAP['failure']} Error from tool [bold]{tool_short_name}[/] ({tool_latency:.1f}s): {error_detail[:100]}..."
-                                                yield "status", status_msg_err
-                                                if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_err}"})
-                                                log.warning(f"Tool '{original_tool_name}' failed on '{server_name}': {error_detail}")
-                                                # Note: is_error_flag remains True
-                                            else:
-                                                # Success case
-                                                tool_result_content = mcp_result.content if mcp_result.content is not None else ""
-                                                log_content_for_history = mcp_result.content
-                                                is_error_flag = False
-                                                content_str_tokens = self._stringify_content(tool_result_content)
-                                                result_tokens = self._estimate_string_tokens(content_str_tokens)
-                                                status_msg_ok = f"{EMOJI_MAP['success']} Result from tool [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {tool_latency:.1f}s)"
-                                                yield "status", status_msg_ok
-                                                if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_ok}"})
-                                                log.info(f"Tool '{original_tool_name}' OK ({result_tokens:,} tokens, {tool_latency:.1f}s)")
-                                                # Cache the successful result
-                                                if self.tool_cache and self.config.enable_caching and not is_error_flag:
-                                                    try: self.tool_cache.set(original_tool_name, tool_args, tool_result_content)
-                                                    except TypeError: log.warning(f"Failed cache {original_tool_name}: unhashable args")
+                # Prepare assistant's response for history (InternalMessageList)
+                # This includes text and any tool_use blocks *requested by the LLM in this turn*.
+                assistant_response_blocks_for_history_this_turn: List[Union[TextContentBlock, ToolUseContentBlock]] = []
+                if accumulated_text_this_llm_turn: # Text part of LLM's response
+                    assistant_response_blocks_for_history_this_turn.append({"type": "text", "text": accumulated_text_this_llm_turn})
+                    final_response_text_for_chat_history_log += accumulated_text_this_llm_turn # For final ChatHistory object
+                
+                # Add tool_use blocks requested by LLM in this turn
+                # `llm_requested_tool_calls_this_turn` items already have structure: {"id": ..., "name": original_mcp_tool_name, "input": parsed_args_dict}
+                for llm_tool_call_obj in llm_requested_tool_calls_this_turn:
+                    assistant_response_blocks_for_history_this_turn.append({
+                        "type": "tool_use",
+                        "id": llm_tool_call_obj.get("id", f"missing_id_{str(uuid.uuid4())[:4]}"),
+                        "name": llm_tool_call_obj.get("name", "unknown_tool_name"),
+                        "input": llm_tool_call_obj.get("input", {}) # This key should now be correct
+                    })
+                
+                # Add this complete assistant message (text + tool_use requests) to messages_to_use_for_api for the *next* turn
+                if assistant_response_blocks_for_history_this_turn:
+                    messages_to_use_for_api.append({"role": "assistant", "content": assistant_response_blocks_for_history_this_turn})
+                
+                overall_query_stop_reason = current_llm_turn_stop_reason # Update overall reason with this turn's reason
 
-                                        except asyncio.CancelledError:
-                                            tool_result_content = "Error: Tool execution cancelled by user."
-                                            log_content_for_history = {"error": "Tool execution cancelled"}
-                                            is_error_flag = True # Ensure error flag is set
-                                            yield "status", f"[yellow]Tool [bold]{tool_short_name}[/] aborted.[/]"
-                                            raise # Re-raise cancellation to stop the query
-                                        except Exception as exec_err:
-                                            tool_latency = time.time() - tool_start_time
-                                            error_text = f"Client error during LLM-decided tool execution: {str(exec_err)}"
-                                            tool_result_content = f"Error: {error_text}"
-                                            log_content_for_history = {"error": error_text}
-                                            status_msg_client_err = f"{EMOJI_MAP['failure']} Client Error for tool [bold]{tool_short_name}[/] ({tool_latency:.2f}s): {str(exec_err)}"
-                                            yield "status", status_msg_client_err
-                                            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": f"[Agent LLM] {status_msg_client_err}"})
-                                            log.error(f"Client error executing LLM-decided tool {original_tool_name}: {exec_err}", exc_info=True)
+                # --- TOOL EXECUTION PHASE (if LLM requested tools) ---
+                if overall_query_stop_reason == "tool_use":
+                    if not llm_requested_tool_calls_this_turn:
+                        log.warning(f"[{provider_name}] LLM stop reason 'tool_use' but no tool requests were parsed by MCPClient. Breaking query loop.")
+                        yield "status", "[yellow]Warning: Model indicated tool use, but no tools were identified by client.[/]"
+                        overall_query_stop_reason = "error_no_tool_parsed" # More specific
+                        overall_query_error_occurred = True
+                        break # Exit while True loop
+                    
+                    tool_results_for_next_llm_api_turn: List[InternalMessage] = []
+                    yield "status", f"{EMOJI_MAP['tool']} MCPClient processing {len(llm_requested_tool_calls_this_turn)} tool call(s) requested by LLM..."
+                    
+                    all_tool_executions_successful_this_round = True
 
-                            # Construct the tool result block for the API call and history
-                            tool_result_block: ToolResultContentBlock = {
+                    for tool_call_request_obj_from_llm in llm_requested_tool_calls_this_turn:
+                        if current_task and current_task.cancelled():
+                            log.info(f"[{provider_name}] Query processing cancelled by client during tool execution phase in turn {turn_count}.")
+                            raise asyncio.CancelledError("Cancelled during tool processing phase")
+                        
+                        # `tool_call_request_obj_from_llm` has "id", "name" (original_mcp_name), "input" (parsed_args)
+                        original_mcp_tool_name_to_execute = tool_call_request_obj_from_llm["name"]
+                        tool_args_for_execution = tool_call_request_obj_from_llm["input"]
+                        tool_use_id_from_llm_for_result = tool_call_request_obj_from_llm["id"]
+                        
+                        tool_execution_output_content: Any = {"error": "MCPClient: Tool execution failed by default.", "success": False}
+                        tool_execution_is_error_flag = True
+                        
+                        # Check if it's an agent-internal tool (like agent:update_plan)
+                        # These are NOT executed via MCP `execute_tool` by MCPClient.
+                        # They are passed back to AgentMasterLoop to handle.
+                        is_agent_internal_tool_call_for_aml = (original_mcp_tool_name_to_execute == AGENT_TOOL_UPDATE_PLAN)
+
+                        if not is_agent_internal_tool_call_for_aml:
+                            # This is a UMS/Server tool, MCPClient executes it.
+                            yield "status", f"MCPClient executing server tool: {original_mcp_tool_name_to_execute}..."
+                            mcp_tool_object_from_manager = self.server_manager.tools.get(original_mcp_tool_name_to_execute)
+
+                            if not mcp_tool_object_from_manager:
+                                tool_execution_output_content = {"error": f"Tool '{original_mcp_tool_name_to_execute}' not found by MCPClient for execution.", "success": False}
+                                tool_execution_is_error_flag = True
+                                log.error(f"MCPClient: Tool '{original_mcp_tool_name_to_execute}' requested by LLM not found in ServerManager.")
+                            else:
+                                server_name_for_tool_exec = mcp_tool_object_from_manager.server_name
+                                servers_used_this_query_session.add(server_name_for_tool_exec)
+                                tools_used_this_query_session.append(original_mcp_tool_name_to_execute) # Log original name
+                                
+                                cached_tool_result = None
+                                if self.tool_cache and self.config.enable_caching:
+                                    try: cached_tool_result = self.tool_cache.get(original_mcp_tool_name_to_execute, tool_args_for_execution)
+                                    except TypeError: log.warning(f"Could not generate cache key for {original_mcp_tool_name_to_execute}, skipping cache get.")
+                                
+                                is_cached_result_an_error = isinstance(cached_tool_result, dict) and (cached_tool_result.get("error") or cached_tool_result.get("success") is False)
+
+                                if cached_tool_result is not None and not is_cached_result_an_error:
+                                    tool_execution_output_content = cached_tool_result
+                                    tool_execution_is_error_flag = False
+                                    cache_hits_this_query_for_tools += 1
+                                    content_str_for_token_saving_calc = self._stringify_content(cached_tool_result)
+                                    tokens_saved_by_this_tool_cache_hit = self._estimate_string_tokens(content_str_for_token_saving_calc)
+                                    tokens_saved_by_tool_cache_this_query += tokens_saved_by_this_tool_cache_hit
+                                    yield "status", f"{EMOJI_MAP['cached']} MCPClient: Using cache for {original_mcp_tool_name_to_execute} ({tokens_saved_by_this_tool_cache_hit:,} est. tokens saved)"
+                                else:
+                                    if cached_tool_result is not None and is_cached_result_an_error:
+                                        log.info(f"MCPClient: Ignoring cached error result for {original_mcp_tool_name_to_execute}. Executing tool.")
+                                    try:
+                                        # `self.execute_tool` is the MCPClient method that calls the server
+                                        mcp_call_tool_result_object: CallToolResult = await self.execute_tool(
+                                            server_name_for_tool_exec, original_mcp_tool_name_to_execute, tool_args_for_execution
+                                        )
+                                        tool_execution_is_error_flag = mcp_call_tool_result_object.isError
+                                        tool_execution_output_content = mcp_call_tool_result_object.content # This is the raw content from MCP Tool (UMS)
+                                        
+                                        if not tool_execution_is_error_flag and self.tool_cache and self.config.enable_caching:
+                                            try: self.tool_cache.set(original_mcp_tool_name_to_execute, tool_args_for_execution, tool_execution_output_content)
+                                            except TypeError: log.warning(f"Failed to cache result for {original_mcp_tool_name_to_execute}: unhashable args or result.")
+                                    except Exception as tool_exec_exception_mcpc:
+                                        tool_execution_output_content = {"error": f"MCPClient exception during tool execution for '{original_mcp_tool_name_to_execute}': {str(tool_exec_exception_mcpc)}", "success": False}
+                                        tool_execution_is_error_flag = True
+                                        log.error(f"MCPClient exception executing UMS/Server tool '{original_mcp_tool_name_to_execute}': {tool_exec_exception_mcpc}", exc_info=True)
+                            
+                            # If it's an agent's LLM turn and MCPClient executed a UMS/Server tool, yield specific event
+                            if is_agent_llm_turn:
+                                yield ("mcp_tool_executed_for_agent", {
+                                    "id": tool_use_id_from_llm_for_result,
+                                    "name": original_mcp_tool_name_to_execute, # Original MCP name
+                                    "input": tool_args_for_execution,
+                                    "result": tool_execution_output_content # Direct result from UMS/server
+                                })
+                            if tool_execution_is_error_flag:
+                                all_tool_executions_successful_this_round = False
+                        else: # Tool is AGENT_TOOL_UPDATE_PLAN or other future agent-internal tool
+                            log.info(f"MCPClient: LLM (for Agent) requested agent-internal tool '{original_mcp_tool_name_to_execute}'. This will be passed to AgentMasterLoop. No direct execution by MCPClient.")
+                            # For agent-internal tools, we don't execute them here and don't add a result to `tool_results_for_next_llm_api_turn`.
+                            # The `process_agent_llm_turn` will formulate a "call_tool" decision for AML.
+                            pass
+
+                        # Construct the "tool_result" message to send BACK to the LLM for the *next* LLM turn
+                        # This should ONLY be for UMS/Server tools that MCPClient executed.
+                        if not is_agent_internal_tool_call_for_aml:
+                            tool_result_block_for_llm_api: ToolResultContentBlock = {
                                 "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": tool_result_content, # The content to send back to LLM
-                                "is_error": is_error_flag,
+                                "tool_use_id": tool_use_id_from_llm_for_result,
+                                "content": tool_execution_output_content, # The actual result content
+                                "is_error": tool_execution_is_error_flag,
                                 "_is_tool_result": True # Internal flag
                             }
-                            # Message to send back to API
-                            tool_result_message: InternalMessage = {"role": "user", "content": [tool_result_block]}
-                            tool_results_for_api.append(tool_result_message)
-                            # More detailed entry for client-side history log
-                            tool_results_for_history.append({
-                                "tool_name": original_tool_name,
-                                "tool_use_id": tool_use_id,
-                                "content": log_content_for_history, # Potentially more structured content/error
-                                "is_error": is_error_flag,
-                                "cache_used": cache_used_flag
-                            })
-                            await asyncio.sleep(0.01) # Slight delay for status updates
-
-                    except asyncio.CancelledError: raise # Propagate cancellation
-                    except Exception as tool_loop_err:
-                        log.error(f"Unexpected error during tool execution loop: {tool_loop_err}", exc_info=True)
-                        yield "error", f"Error during tool processing: {tool_loop_err}"
-                        error_occurred = True; stop_reason = "error"; break # Exit loop on tool processing error
-
-                    # Add tool results to message history for the next API turn
-                    messages.extend(tool_results_for_api)
-                    self.cache_hit_count += cache_hits_during_query # Update session cache hit count
-                    log.info(f"Added {len(tool_results_for_api)} tool results. Continuing interaction loop.")
-                    await asyncio.sleep(0.01)
-                    continue # Continue the main while loop to send results back to LLM
-
-                elif stop_reason == "error":
-                    log.error(f"Exiting interaction loop due to error during turn for {provider_name}.")
-                    yield "status", "[bold red]Exiting due to turn error.[/]"
-                    if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text": "[Agent LLM] Exiting due to turn error."})
-                    error_occurred = True
-                    break
-                else:
-                    # Any other stop reason (e.g., "stop", "max_tokens", "end_turn") terminates the loop
-                    log.info(f"LLM interaction finished normally. Stop reason: {stop_reason}")
-                    break
-
-        # --- Handle Outer Loop Exceptions ---
+                            # The message containing this block is role "user" for OpenAI, "user" for Anthropic (tool_result is part of user message)
+                            tool_result_message_for_llm_api: InternalMessage = {"role": "user", "content": [tool_result_block_for_llm_api]}
+                            tool_results_for_next_llm_api_turn.append(tool_result_message_for_llm_api)
+                        
+                        # Log details for MCPClient's own ChatHistory
+                        tool_execution_details_for_client_log.append({
+                            "tool_name": original_mcp_tool_name_to_execute, # Original MCP name
+                            "tool_use_id": tool_use_id_from_llm_for_result,
+                            "content": tool_execution_output_content, # Actual result
+                            "is_error": tool_execution_is_error_flag,
+                            "cache_used": cached_tool_result is not None if 'cached_tool_result' in locals() else False
+                        })
+                    # End of loop for tool_call_request_obj_from_llm
+                    
+                    if not all_tool_executions_successful_this_round and is_agent_llm_turn:
+                        yield "status", "[yellow]MCPClient: One or more UMS/server tools failed during execution for agent's LLM turn."
+                    
+                    # If there were UMS/Server tool results, add them to messages_to_use_for_api and continue the LLM loop
+                    if tool_results_for_next_llm_api_turn:
+                        messages_to_use_for_api.extend(tool_results_for_next_llm_api_turn)
+                        log.info(f"[{provider_name}] Added {len(tool_results_for_next_llm_api_turn)} UMS/Server tool results to history. Continuing interaction loop with LLM for turn {turn_count + 1}.")
+                        retrying_without_tools = False # Reset this if we successfully processed tools
+                        # This `continue` goes to the next iteration of the `while True` loop for LLM turns
+                        continue
+                    # If only agent-internal tools were requested (like agent:update_plan),
+                    # llm_requested_tool_calls_this_turn would be non-empty, but tool_results_for_next_llm_api_turn would be empty.
+                    # In this case, we should break the LLM interaction loop here because MCPClient doesn't execute agent-internal tools.
+                    # The decision to call the agent-internal tool will be passed back by process_agent_llm_turn.
+                    elif llm_requested_tool_calls_this_turn and not tool_results_for_next_llm_api_turn:
+                        log.info(f"[{provider_name}] LLM requested only agent-internal tools (e.g., {llm_requested_tool_calls_this_turn[0]['name']}). Breaking LLM interaction loop to pass to AgentMasterLoop.")
+                        overall_query_stop_reason = "agent_internal_tool_request" # Specific reason
+                        break # Exit while True loop for LLM turns
+                    else: # Should not happen if stop_reason was "tool_use" and llm_requested_tool_calls_this_turn was non-empty
+                        log.debug(f"[{provider_name}] No UMS/Server tool results to send back to LLM this turn. Breaking LLM interaction loop. LLM Stop Reason was: {overall_query_stop_reason}")
+                        break # Exit while True loop for LLM turns
+                
+                elif overall_query_stop_reason == "error": # This means an error from this LLM turn's API call
+                    log.error(f"[{provider_name}] Exiting query processing loop due to API error in LLM turn {turn_count}.")
+                    # overall_query_error_occurred and overall_query_stop_reason are already set.
+                    break # Exit while True loop
+                else: # "stop", "max_tokens", "end_turn", or any other reason from LLM that isn't "tool_use" or "error"
+                    log.info(f"[{provider_name}] LLM interaction finished for this query (turn {turn_count}). Stop reason from LLM: {overall_query_stop_reason}")
+                    break # Exit while True loop
+            # End of `while True` loop for LLM interaction turns
+        
         except asyncio.CancelledError:
-            log.info("Query processing was cancelled.")
+            log.info(f"[{provider_name}] Query processing was cancelled by client (asyncio.CancelledError).")
+            overall_query_stop_reason = "cancelled"
+            overall_query_error_occurred = True # Treat cancellation as an error for overall status
             yield "status", "[yellow]Request cancelled by user.[/]"
-            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "status", {"text":"[Agent LLM] Request cancelled."})
-            if span: span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
-            stop_reason = "cancelled"; error_occurred = True
-        except Exception as e:
-            error_msg = f"Unexpected error during query processing loop: {str(e)}"
-            log.error(error_msg, exc_info=True)
+        except Exception as e_outer_loop:
+            error_msg_outer_loop = f"Unexpected error during MCPClient query processing loop: {str(e_outer_loop)}"
+            log.error(error_msg_outer_loop, exc_info=True)
             if span:
-                span.set_status(trace.StatusCode.ERROR, description=error_msg)
-                if hasattr(span, "record_exception"): span.record_exception(e)
-            yield "error", f"Unexpected Error: {error_msg}"
-            if ui_websocket_sender: await self._relay_agent_llm_event_to_ui(ui_websocket_sender, "error", {"message": f"[Agent LLM] Unexpected Error: {error_msg}"})
-            stop_reason = "error"; error_occurred = True
-
-        # --- Final Updates ---
+                span.set_status(trace.StatusCode.ERROR, description=error_msg_outer_loop)
+                if hasattr(span, "record_exception"): span.record_exception(e_outer_loop) # type: ignore
+            yield "error", f"Unexpected Error: {error_msg_outer_loop}"
+            overall_query_stop_reason = "error_outer_loop"
+            overall_query_error_occurred = True
         finally:
+            # This finally block executes after the `while True` loop breaks or an exception occurs.
             if span:
-                final_status_code = trace.StatusCode.OK
-                final_desc = f"Query finished: {stop_reason or 'completed'}"
-                is_error_status = False
-                if error_occurred or stop_reason == "error": final_status_code = trace.StatusCode.ERROR; final_desc = f"Query failed or cancelled: {stop_reason or 'unknown error'}"; is_error_status = True
-                elif stop_reason == "cancelled": final_status_code = trace.StatusCode.ERROR; final_desc = "Query cancelled by user"; is_error_status = True
-
-                # Set status based on outcome
-                if is_error_status:
-                    span.set_status(final_status_code, description=final_desc)
-                else:
-                    span.set_status(final_status_code)
-
-                # Add final attributes
+                final_span_status_code = trace.StatusCode.ERROR if overall_query_error_occurred else trace.StatusCode.OK
+                final_span_description = f"Query failed/cancelled: {overall_query_stop_reason}" if overall_query_error_occurred else f"Query finished: {overall_query_stop_reason or 'completed'}"
+                span.set_status(final_span_status_code, description=final_span_description)
                 try:
-                    span.set_attribute("total_input_tokens", self.session_input_tokens)
-                    span.set_attribute("total_output_tokens", self.session_output_tokens)
-                    span.set_attribute("total_estimated_cost", self.session_total_cost)
-                    span.set_attribute("cache_hits", cache_hits_during_query) # Use query-specific count
-                    span.set_attribute("tokens_saved_by_cache", self.tokens_saved_by_cache)
-                    # Add final stop reason as an event or attribute
-                    span.add_event("query_processing_ended", attributes={"final_stop_reason": stop_reason or "unknown"})
-                except Exception as span_final_err:
-                    log.warning(f"Failed set final span attrs: {span_final_err}")
-
-            # Close the span context manager if it was created
+                    span.set_attribute("final_llm_stop_reason_overall", overall_query_stop_reason or "unknown")
+                    span.set_attribute("total_input_tokens_session_accumulated", self.session_input_tokens)
+                    span.set_attribute("total_output_tokens_session_accumulated", self.session_output_tokens)
+                    span.set_attribute("total_estimated_cost_session_accumulated", self.session_total_cost)
+                    span.set_attribute("tool_cache_hits_this_query_total", cache_hits_this_query_for_tools)
+                    span.set_attribute("tokens_saved_by_tool_cache_this_query_total", tokens_saved_by_tool_cache_this_query)
+                except Exception as span_final_attr_err: log.warning(f"Failed to set final span attributes: {span_final_attr_err}")
             if span_context_manager and hasattr(span_context_manager, "__exit__"):
-                with suppress(Exception): # Suppress errors during span closing
-                    span_context_manager.__exit__(*sys.exc_info())
+                with suppress(Exception): span_context_manager.__exit__(*sys.exc_info())
 
-            # Update Conversation Graph and History Log
-            if not error_occurred and not (current_task and current_task.cancelled()):
+            # Update conversation graph and history ONLY IF it's a user turn AND no error AND not cancelled.
+            if not is_agent_llm_turn and not overall_query_error_occurred and not (current_task and current_task.cancelled()):
                 try:
-                    # Save the final state of messages (including user query, assistant responses, tool results)
-                    self.conversation_graph.current_node.messages = messages
-                    self.conversation_graph.current_node.model = internal_model_name_for_cost_lookup # Save original name
+                    # messages_to_use_for_api now contains the full history of this user query interaction
+                    self.conversation_graph.current_node.messages = messages_to_use_for_api
+                    self.conversation_graph.current_node.model = internal_model_name_for_cost_lookup # Log model used for this node
                     await self.conversation_graph.save(str(self.conversation_graph_file))
 
-                    # Add entry to client's history log
-                    end_time = time.time()
-                    latency_ms = (end_time - start_time) * 1000
-                    tokens_used_hist = self.session_input_tokens + self.session_output_tokens
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    end_time_for_chat_history_log = time.time()
+                    latency_ms_for_chat_history_log = (end_time_for_chat_history_log - start_time_overall_query) * 1000
+                    # Use session_input/output_tokens as they reflect cumulative for multi-turn if applicable
+                    tokens_used_for_chat_history_log = self.session_input_tokens + self.session_output_tokens
+                    timestamp_for_chat_history_log = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
                     if hasattr(self, "history") and hasattr(self.history, "add_async"):
-                        history_entry = ChatHistory(
-                            query=query,
-                            response=final_response_text, # The accumulated text part of the response
-                            model=internal_model_name_for_cost_lookup, # Use original name
-                            timestamp=timestamp,
-                            server_names=list(servers_used),
-                            tools_used=tools_used, # List of original tool names used
+                        history_entry_for_log = ChatHistory(
+                            query=query, # The original user query
+                            response=final_response_text_for_chat_history_log, # Only assistant's text part
+                            model=internal_model_name_for_cost_lookup,
+                            timestamp=timestamp_for_chat_history_log,
+                            server_names=list(servers_used_this_query_session),
+                            tools_used=tools_used_this_query_session, # Original MCP names of tools executed
                             conversation_id=self.conversation_graph.current_node.id,
-                            latency_ms=latency_ms,
-                            tokens_used=tokens_used_hist,
+                            latency_ms=latency_ms_for_chat_history_log,
+                            tokens_used=tokens_used_for_chat_history_log,
                             streamed=True,
-                            cached=(cache_hits_during_query > 0), # Based on cache hits *during this query*
+                            cached=(cache_hits_this_query_for_tools > 0), # Based on tool cache hits
                         )
-                        await self.history.add_async(history_entry)
-                    else:
-                        log.warning("History object/method not found, cannot save history.")
-                except Exception as final_update_err:
-                    log.error(f"Error during final graph/history update: {final_update_err}", exc_info=True)
-                    # Yield error but don't overwrite final usage/stop reason
-                    yield "error", f"Failed to save history: {final_update_err}"
-
-            # Yield final usage statistics and stop reason
-            final_usage_payload = {
-                "input_tokens": self.session_input_tokens,
-                "output_tokens": self.session_output_tokens,
-                "total_cost": self.session_total_cost,
-                "cache_hits": cache_hits_during_query, # Send query-specific count
-                "tokens_saved": self.tokens_saved_by_cache,
+                        await self.history.add_async(history_entry_for_log)
+                except Exception as final_update_error:
+                    log.error(f"Error during final graph/history update for user query: {final_update_error}", exc_info=True)
+                    yield "error", f"Failed to save history for user query: {final_update_error}" # Yield error for UI
+            
+            # Yield final usage and stop reason for the entire query process
+            final_usage_payload_to_yield_overall = {
+                "input_tokens": self.session_input_tokens, # Accumulated for the whole query
+                "output_tokens": self.session_output_tokens, # Accumulated for the whole query
+                "total_cost": self.session_total_cost, # Accumulated for the whole query
+                "tool_cache_hits_this_query": cache_hits_this_query_for_tools,
+                "tokens_saved_by_tool_cache_this_query": tokens_saved_by_tool_cache_this_query,
             }
-            yield "final_usage", final_usage_payload
-            yield "stop_reason", stop_reason or "unknown"
+            yield "final_usage", final_usage_payload_to_yield_overall
+            yield "stop_reason", overall_query_stop_reason or "unknown_overall_stop"
 
-        log.info(f"Streaming query finished. Final Stop Reason: {stop_reason}. Total Latency: {(time.time() - start_time) * 1000:.0f}ms")
+        log.info(f"MCPC Streaming Query processing finished. Overall Stop Reason: {overall_query_stop_reason}. Overall Query Latency: {(time.time() - start_time_overall_query) * 1000:.0f}ms")
 
     async def _stream_wrapper(self, stream_generator: AsyncGenerator[Any, None]) -> AsyncGenerator[Tuple[str, Any], None]:
         """Wraps the query generator to extract specific event types and final stats."""
@@ -10192,153 +10122,192 @@ class MCPClient:
             else:
                 log.warning("Stream wrapper did not capture final stats/reason.")
 
-
     async def process_agent_llm_turn(
         self,
-        prompt_messages: List[Dict[str, Any]], # This is already in the InternalMessageList-like format from Agent
-        tool_schemas: List[Dict[str, Any]],    # Tools formatted for the target provider
+        prompt_messages: List[Dict[str, Any]],
+        tool_schemas: List[Dict[str, Any]],
         model_name: str,
         ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
-        # Optional: temperature, max_tokens_llm if agent should control these per turn
     ) -> Dict[str, Any]:
-        """
-        Handles the LLM API call for an agent turn USING THE EXISTING STREAMING INFRASTRUCTURE.
-        It collects the full response (text and tool calls) from the stream and
-        parses it into a standardized decision format for AgentMasterLoop.
-        """
-        self.safe_print(f"MCPC: Processing LLM turn for Agent via STREAMING. Model: {model_name}. Tools: {len(tool_schemas) if tool_schemas else 'None'}")
-        log.debug(f"MCPC: Agent turn - Prompt messages for LLM: {str(prompt_messages)[:500]}...")
+        self.safe_print(f"MCPC: Processing LLM turn for Agent. Model: {model_name}. Provided Tools: {len(tool_schemas) if tool_schemas else 'None'}")
 
-        # --- 1. MCPClient needs to temporarily set its internal conversation state ---
-        # This is because process_streaming_query uses self.conversation_graph.current_node.messages
-        # We'll save and restore the original conversation state.
-        original_graph_node_messages: Optional[List[Dict[str,Any]]] = None
+        logger_to_use = getattr(self, "logger", log)
+
+        current_agent_internal_loop = "N/A"
+        if self.agent_loop_instance and hasattr(self.agent_loop_instance, "state"):
+            current_agent_internal_loop = str(self.agent_loop_instance.state.current_loop)
+
+        logger_to_use.info(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}) DETAILS (BEGIN) ==================")
+        logger_to_use.info(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): Model for this turn: {model_name}")  # Added
+        logger_to_use.info(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): Type of prompt_messages: {type(prompt_messages)}")
+        # ... (rest of detailed logging as before) ...
+        logger_to_use.info(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}) DETAILS (END)   ==================")
+
+        original_graph_node_messages: Optional[List[Dict[str, Any]]] = None
         original_graph_node_model: Optional[str] = None
-        agent_turn_temp_node_id = f"agent_turn_temp_{uuid.uuid4().hex[:8]}"  # noqa: F841
 
-        if hasattr(self, 'conversation_graph') and self.conversation_graph and self.conversation_graph.current_node:
-            # Save current conversational messages and model
+        if hasattr(self, "conversation_graph") and self.conversation_graph and self.conversation_graph.current_node:
             original_graph_node_messages = self.conversation_graph.current_node.messages.copy()
             original_graph_node_model = self.conversation_graph.current_node.model
-            # Temporarily set the messages for this agent turn
-            self.conversation_graph.current_node.messages = prompt_messages # prompt_messages are already in InternalMessage format
-            self.conversation_graph.current_node.model = model_name # Set model for this turn
+            # Convert InternalMessage to Dict for temporary graph storage if needed, though prompt_messages should be dicts.
+            # Assuming prompt_messages are already List[Dict[str, Any]] compatible with InternalMessage
+            self.conversation_graph.current_node.messages = cast("InternalMessageList", prompt_messages)
+            self.conversation_graph.current_node.model = model_name
             log.debug(f"MCPC: Temporarily set conversation graph for agent turn (Node: {self.conversation_graph.current_node.id}).")
         else:
-            # This case should ideally not happen if MCPClient is properly initialized.
-            log.error("MCPC: Conversation graph or current_node not available for agent LLM turn. This is unexpected.")
-            return {"decision": "error", "message": "Internal MCPClient state error: Conversation graph unavailable.", "error_type_for_agent": "InternalError"}
+            log.error("MCPC: Conversation graph or current_node not available for agent LLM turn.")
+            return {
+                "decision": "error",
+                "message": "Internal MCPClient state error: Conversation graph unavailable.",
+                "error_type_for_agent": "InternalError",
+            }
 
-        # --- 2. Variables to collect data from the stream ---
         full_text_response_accumulated = ""
-        tool_calls_detected: List[Dict[str, Any]] = [] # To store parsed tool_call_end events
-        final_decision: Dict[str, Any] = {"decision": "error", "message": "No actionable response from LLM stream.", "error_type_for_agent": "LLMOutputError"}
+        llm_requested_tool_calls: List[Dict[str, Any]] = []
+        executed_tool_details_for_agent: Optional[Dict[str, Any]] = None  # To pass to AML
+
+        final_decision: Dict[str, Any] = {
+            "decision": "error",
+            "message": "No actionable response from LLM stream.",
+            "error_type_for_agent": "LLMOutputError",
+        }
         llm_error_message: Optional[str] = None
         llm_stop_reason: Optional[str] = None
 
         try:
-            # --- 3. Call process_streaming_query and iterate through the _stream_wrapper ---
-            # The `process_streaming_query` itself determines the provider and formats messages/tools.
-            # We pass `model_name` to ensure it uses the agent's desired model.
-            # `max_tokens` and `temperature` from `self.config` will be used by default by `process_streaming_query`.
-            # If agent needs to override these, `process_streaming_query` would need to accept them.
-
+            # `process_streaming_query` is now called with `messages_override` and `tools_override`
+            # so it uses the agent's prepared prompt and tool list directly.
             async for event_type, event_data in self._stream_wrapper(
                 self.process_streaming_query(
-                    query="", # Query text is already part of prompt_messages
-                    model=model_name, # Explicitly use the agent's chosen model
-                    # max_tokens=max_tokens_for_llm, # If agent needs to control this
-                    # temperature=temperature_for_llm # If agent needs to control this
+                    query="",  # Query is embedded in prompt_messages
+                    model=model_name,
+                    messages_override=cast("InternalMessageList", prompt_messages),  # Pass agent's messages
+                    tools_override=tool_schemas,  # Pass agent's tools
+                    ui_websocket_sender=ui_websocket_sender,  # Relay agent's LLM stream to UI
                 )
             ):
-                # Relay specific events from the LLM stream to the UI WebSocket for the agent
-                if ui_websocket_sender:
-                    # Prefix event types to distinguish them from user-initiated query streams
-                    # e.g., "agent_llm_text_chunk", "agent_llm_tool_call_start", etc.
-                    if event_type in ["text_chunk", "tool_call_start", "tool_call_input_chunk", "tool_call_end", "status", "error", "final_stats"]:
-                        # The "final_stats" already includes "stop_reason"
-                        await ui_websocket_sender(f"agent_llm_{event_type}", event_data)
-                        
+                if ui_websocket_sender:  # This relay is for the UI to see what the agent's LLM is doing
+                    if event_type in [
+                        "text_chunk",
+                        "tool_call_start",
+                        "tool_call_input_chunk",
+                        "tool_call_end",
+                        "status",
+                        "error",
+                        "final_stats",
+                        "mcp_tool_executed_for_agent",
+                    ]:
+                        await self._relay_agent_llm_event_to_ui(ui_websocket_sender, event_type, event_data)
+
                 if event_type == "text_chunk":
                     full_text_response_accumulated += str(event_data)
-                elif event_type == "tool_call_end": # We care about the fully formed tool call
-                    # event_data for tool_call_end is expected to be:
-                    # {"id": tool_id, "parsed_input": parsed_input_dict, "name": original_tool_name (added by _stream_wrapper or _handle_*_stream)}
-                    # The 'name' here should be the *original* (un-sanitized) tool name.
-                    tool_call_info = {
-                        "id": event_data.get("id"),
-                        "name": event_data.get("name"), # Original name
-                        "input": event_data.get("parsed_input")
-                    }
-                    if tool_call_info["id"] and tool_call_info["name"]:
-                        tool_calls_detected.append(tool_call_info)
-                        log.debug(f"MCPC (Agent Turn Stream): Detected tool_call_end: {tool_call_info}")
+                elif event_type == "tool_call_end":
+                    # This event from _stream_wrapper now signifies the LLM *requested* a tool.
+                    # It contains: {"id": tool_id, "name": original_tool_name, "parsed_input": ...}
+                    # It does NOT contain "result_from_mcp_execution" anymore from this path.
+                    llm_tool_request = {"id": event_data.get("id"), "name": event_data.get("name"), "input": event_data.get("parsed_input")}
+                    if llm_tool_request["id"] and llm_tool_request["name"]:
+                        llm_requested_tool_calls.append(llm_tool_request)
+                        log.debug(f"MCPC (Agent Turn Stream): LLM requested tool_call: {llm_tool_request}")
                     else:
-                        log.warning(f"MCPC (Agent Turn Stream): tool_call_end event missing id or name: {event_data}")
+                        log.warning(f"MCPC (Agent Turn Stream): tool_call_end event from LLM stream missing id or name: {event_data}")
+
+                elif event_type == "mcp_tool_executed_for_agent":  # NEW event type from process_streaming_query
+                    # This event signifies that MCPClient itself executed a UMS/server tool
+                    # on behalf of the LLM during the agent's turn.
+                    # event_data: {"id": tool_id, "name": original_name, "input": parsed_input, "result": actual_ums_result}
+                    executed_tool_details_for_agent = {
+                        "tool_name": event_data.get("name"),  # Original MCP name
+                        "arguments": event_data.get("input"),
+                        "result": event_data.get("result"),  # The direct result from UMS/server
+                    }
+                    log.info(f"MCPC (Agent Turn Stream): Captured MCP-executed tool details: {executed_tool_details_for_agent['tool_name']}")
+                    # This will take precedence in final_decision formulation.
+                    # If multiple UMS tools were called by LLM in one turn (Anthropic style),
+                    # process_streaming_query would yield this event for EACH. We take the last one for now
+                    # or AgentMasterLoop would need to handle a list of executed_tool_details.
+                    # For simplicity, let's assume the agent framework or LLM aims for one UMS tool call at a time if direct execution by MCP is expected.
+
                 elif event_type == "error":
                     llm_error_message = str(event_data)
-                    log.error(f"MCPC (Agent Turn Stream): Error event received: {llm_error_message}")
-                    break # Stop processing stream on error
-                elif event_type == "final_stats": # Was "final_usage" and "stop_reason"
+                    log.error(f"MCPC (Agent Turn Stream): Error event received from stream: {llm_error_message}")
+                    break
+                elif event_type == "final_stats":
                     llm_stop_reason = event_data.get("stop_reason", "unknown")
-                    # Token counts are already handled by self.session_input/output_tokens
-                    # within process_streaming_query and its helpers.
                     log.debug(f"MCPC (Agent Turn Stream): Final stats received. Stop reason: {llm_stop_reason}")
-                    # Break after final_stats as it's the end of the stream events from _stream_wrapper
                     break
 
-            # --- 4. Formulate the decision based on collected stream data ---
+            # --- Formulate the decision based on collected stream data ---
             if llm_error_message:
-                final_decision = {"decision": "error", "message": llm_error_message, "error_type_for_agent": "LLMError"} # General LLM error
-            elif tool_calls_detected:
-                # If multiple tool calls are possible, AgentMasterLoop would need to handle a list.
-                # For now, assuming agent framework expects one primary tool call or will iterate.
-                # We'll pass all detected tool calls. Agent can decide.
-                # AgentMasterLoop expects a single tool_name and arguments.
-                # Let's make it return the first tool call if multiple, and log a warning.
-                if len(tool_calls_detected) > 1:
-                    log.warning(f"MCPC (Agent Turn): LLM decided multiple tool calls ({len(tool_calls_detected)}). Agent will receive the first: {tool_calls_detected[0]['name']}")
-                
-                first_tool_call = tool_calls_detected[0]
+                final_decision = {"decision": "error", "message": llm_error_message, "error_type_for_agent": "LLMError"}
+
+            elif executed_tool_details_for_agent:  # HIGHEST PRIORITY: If MCPClient executed a UMS tool
                 final_decision = {
-                    "decision": "call_tool",
-                    "tool_name": first_tool_call["name"], # Original name
-                    "arguments": first_tool_call["input"],
-                    "tool_use_id": first_tool_call["id"], # Pass the ID for linking results
-                    # Optionally include all tool calls if agent can handle it:
-                    # "all_tool_calls": tool_calls_detected
+                    "decision": "tool_executed_by_mcp",  # Agent will use this result directly
+                    "tool_name": executed_tool_details_for_agent["tool_name"],
+                    "arguments": executed_tool_details_for_agent["arguments"],
+                    "result": executed_tool_details_for_agent["result"],
                 }
+                log.info(
+                    f"MCPC (Agent Turn): LLM initiated UMS tool '{executed_tool_details_for_agent['tool_name']}' was executed by MCPClient. Passing result to AML."
+                )
+
+            elif llm_requested_tool_calls:  # LLM requested tool(s) that MCPClient did NOT execute (e.g., agent:update_plan)
+                if len(llm_requested_tool_calls) > 1:
+                    log.warning(
+                        f"MCPC (Agent Turn): LLM decided multiple non-UMS tool calls ({len(llm_requested_tool_calls)}). Agent will receive the first: {llm_requested_tool_calls[0]['name']}"
+                    )
+
+                first_tool_call_request = llm_requested_tool_calls[0]
+                final_decision = {
+                    "decision": "call_tool",  # AML will call _execute_tool_call_internal for this
+                    "tool_name": first_tool_call_request["name"],
+                    "arguments": first_tool_call_request["input"],
+                    "tool_use_id": first_tool_call_request["id"],  # Pass tool_use_id if LLM provided it
+                }
+                log.info(f"MCPC (Agent Turn): LLM requested agent-internal/non-UMS tool '{first_tool_call_request['name']}'. AML will execute.")
+
             elif full_text_response_accumulated.lower().startswith("goal achieved:"):
                 summary = full_text_response_accumulated[len("goal achieved:") :].strip()
-                log.info(f"MCPC (Agent Turn): LLM signaled goal completion via stream: {summary}")
                 final_decision = {"decision": "complete", "summary": summary}
-            # Check for plan update in text (same logic as before)
-            elif "plan:" in full_text_response_accumulated.lower() or \
-                 "steps:" in full_text_response_accumulated.lower() or \
-                 "```json" in full_text_response_accumulated:
+            elif (
+                "plan:" in full_text_response_accumulated.lower()
+                or "steps:" in full_text_response_accumulated.lower()
+                or "```json" in full_text_response_accumulated
+            ):
                 try:
                     json_match = re.search(r"```json\s*([\s\S]*?)\s*```", full_text_response_accumulated)
                     if json_match:
                         plan_json_str = json_match.group(1)
                         parsed_plan_list = json.loads(plan_json_str)
                         if isinstance(parsed_plan_list, list):
-                            validated_steps = [PlanStep(**step_data) for step_data in parsed_plan_list]
-                            log.info(f"MCPC (Agent Turn): Parsed structured plan from LLM stream text ({len(validated_steps)} steps).")
-                            final_decision = {"decision": "plan_update", "updated_plan_steps": validated_steps, "original_text": full_text_response_accumulated}
-                        else: # Not a list of steps, treat as thought
-                            log.debug("MCPC (Agent Turn): JSON found in text but not a list of plan steps. Treating as thought.")
+                            # AgentMasterLoop.execute_llm_decision expects list of dicts for plan steps
+                            validated_steps_data = [PlanStep(**step_data).model_dump(exclude_none=True) for step_data in parsed_plan_list]
+                            final_decision = {
+                                "decision": "plan_update",
+                                "updated_plan_steps": validated_steps_data,
+                                "original_text": full_text_response_accumulated,
+                            }
+                            log.info(f"MCPC (Agent Turn): Parsed structured plan from LLM stream text ({len(validated_steps_data)} steps).")
+                        else:
                             final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
-                    else: # No JSON plan found, treat as thought
+                    else:
                         final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
                 except (json.JSONDecodeError, ValidationError) as e:
-                    log.warning(f"MCPC (Agent Turn): Failed to parse plan from LLM stream text (error: {e}). Treating as thought. Text: {full_text_response_accumulated[:200]}...")
+                    log.warning(
+                        f"MCPC (Agent Turn): Failed to parse plan from LLM stream text (error: {e}). Treating as thought. Text: {full_text_response_accumulated[:200]}..."
+                    )
                     final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
             elif full_text_response_accumulated:
                 log.info(f"MCPC (Agent Turn): LLM stream response is textual thought/reasoning.")
                 final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
-            else: # No tool calls, no "goal achieved", no text with plan, no text at all
+            else:
                 log.warning(f"MCPC (Agent Turn): LLM stream yielded no actionable content. Stop reason: {llm_stop_reason}")
-                final_decision = {"decision": "error", "message": f"LLM stream no actionable content. Stop: {llm_stop_reason}", "error_type_for_agent": "LLMOutputError"}
+                final_decision = {
+                    "decision": "error",
+                    "message": f"LLM stream no actionable content. Stop: {llm_stop_reason}",
+                    "error_type_for_agent": "LLMOutputError",
+                }
 
         except asyncio.CancelledError:
             log.warning("MCPC (Agent Turn): LLM turn processing cancelled.")
@@ -10347,34 +10316,33 @@ class MCPClient:
             log.error(f"MCPC (Agent Turn): Unexpected error processing LLM turn stream: {e}", exc_info=True)
             final_decision = {"decision": "error", "message": f"Unexpected error processing LLM stream: {e}", "error_type_for_agent": "InternalError"}
         finally:
-            # --- 5. Restore original conversation graph state ---
-            if hasattr(self, 'conversation_graph') and self.conversation_graph and self.conversation_graph.current_node:
+            if hasattr(self, "conversation_graph") and self.conversation_graph and self.conversation_graph.current_node:
                 if original_graph_node_messages is not None:
                     self.conversation_graph.current_node.messages = original_graph_node_messages
                 if original_graph_node_model is not None:
                     self.conversation_graph.current_node.model = original_graph_node_model
-                # Persist any modifications made by process_streaming_query to the temp node (if any)
-                # For agent turns, we typically don't want to save this temp state to the main graph file.
                 log.debug("MCPC: Restored original conversation graph state after agent LLM turn.")
-            else:
-                log.warning("MCPC: Could not restore conversation graph state, was not available.")
 
+        log.info(
+            f"MCPC (Agent Turn): Final decision for agent: {final_decision.get('decision')}. Message/Content Preview: {str(final_decision.get('message') or final_decision.get('content') or final_decision.get('tool_name'))[:100]}..."
+        )
         return final_decision
 
     async def _initialize_agent_if_needed(self, default_llm_model_override: Optional[str] = None) -> bool:
         """Initializes the AgentMasterLoop instance if not already done."""
         if self.agent_loop_instance is None:
             log.info("MCPC: Initializing AgentMasterLoop instance...")
-            ActualAgentMasterLoopClass = None # Initialize to None
+            ActualAgentMasterLoopClass = None  # Initialize to None
             try:
                 from agent_master_loop import AgentMasterLoop as AMLClass
-                ActualAgentMasterLoopClass = AMLClass # Assign to our variable
+
+                ActualAgentMasterLoopClass = AMLClass  # Assign to our variable
                 log.debug(f"MCPC: Successfully imported AgentMasterLoop as AMLClass: {type(ActualAgentMasterLoopClass)}")
             except ImportError as ie:
                 log.critical(f"MCPC: CRITICAL - Failed to import AgentMasterLoop class from agent_master_loop.py: {ie}", exc_info=True)
                 self.agent_loop_instance = None
                 return False
-            
+
             if ActualAgentMasterLoopClass is None or not callable(ActualAgentMasterLoopClass):
                 # This case should ideally be caught by ImportError, but as a safeguard:
                 log.critical(f"MCPC: CRITICAL - AgentMasterLoop was not a callable class after import. Type: {type(ActualAgentMasterLoopClass)}")
@@ -10385,27 +10353,34 @@ class MCPClient:
                 agent_model_to_use = default_llm_model_override or self.current_model
                 # Now, use the explicitly imported class alias
                 self.agent_loop_instance = ActualAgentMasterLoopClass(
-                    mcp_client_instance=self, 
-                    default_llm_model_string=agent_model_to_use,
-                    agent_state_file=self.config.agent_state_file_path
+                    mcp_client_instance=self, default_llm_model_string=agent_model_to_use, agent_state_file=self.config.agent_state_file_path
                 )
                 if not await self.agent_loop_instance.initialize():
-                    self.agent_loop_instance = None 
+                    self.agent_loop_instance = None
                     log.error("MCPC: AgentMasterLoop instance .initialize() method failed.")
                     return False
                 log.info(f"MCPC: AgentMasterLoop initialized successfully with model {agent_model_to_use}.")
                 return True
-            except TypeError as te: # Catch TypeError specifically around instantiation
-                log.critical(f"MCPC: CRITICAL - TypeError during AgentMasterLoop instantiation: {te}. This might indicate the class was not imported correctly.", exc_info=True)
+            except TypeError as te:  # Catch TypeError specifically around instantiation
+                log.critical(
+                    f"MCPC: CRITICAL - TypeError during AgentMasterLoop instantiation: {te}. This might indicate the class was not imported correctly.",
+                    exc_info=True,
+                )
                 self.agent_loop_instance = None
                 return False
-            except Exception as e: # Catch other general exceptions during init
+            except Exception as e:  # Catch other general exceptions during init
                 log.critical(f"MCPC: CRITICAL - Error initializing AgentMasterLoop instance: {e}", exc_info=True)
                 self.agent_loop_instance = None
                 return False
-        return True # Already initialized
+        return True  # Already initialized
 
-    async def start_agent_task(self, goal: str, max_loops: int = 100, llm_model_override: Optional[str] = None, ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None) -> Dict[str, Any]:
+    async def start_agent_task(
+        self,
+        goal: str,
+        max_loops: int = 100,
+        llm_model_override: Optional[str] = None,
+        ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
+    ) -> Dict[str, Any]:
         """
         Starts the self-driving agent task in the background.
         """
@@ -10416,7 +10391,7 @@ class MCPClient:
         if not await self._initialize_agent_if_needed(default_llm_model_override=llm_model_override):
             return {"success": False, "message": "Agent initialization failed.", "status": "error"}
 
-        if not self.agent_loop_instance: # Should be caught by above, but defensive check
+        if not self.agent_loop_instance:
             return {"success": False, "message": "Agent loop instance is not available.", "status": "error"}
 
         self.agent_goal = goal
@@ -10424,31 +10399,78 @@ class MCPClient:
         self.agent_last_message = "Agent task initiated."
         self.agent_current_loop = 0
         self.agent_max_loops = max_loops
-        self.agent_loop_instance.state.goal_achieved_flag = False # Reset flag for new run
-        agent_loop_instance_ref = self.agent_loop_instance # Capture current instance
+
+        # --- CRITICAL STATE RESET FOR NEW AGENT TASK ---
+        # Import necessary components directly from the agent_master_loop module
+        # This ensures we are using the actual classes/constants, not trying to access them via the string placeholder.
+        try:
+            from agent_master_loop import AgentState as ActualAgentState, PlanStep as ActualPlanStep, DEFAULT_PLAN_STEP as ACTUAL_DEFAULT_PLAN_STEP
+
+            log.debug(f"MCPC: Successfully imported AgentState/PlanStep from agent_master_loop.py for state reset.")
+        except ImportError as e:
+            log.critical(f"MCPC: CRITICAL - Failed to import AgentState/PlanStep from agent_master_loop.py for state reset: {e}", exc_info=True)
+            return {"success": False, "message": "Internal error: Agent components not found.", "status": "error"}
+
+        current_wf_id = self.agent_loop_instance.state.workflow_id
+        current_ctx_id = self.agent_loop_instance.state.context_id
+        current_wf_stack = self.agent_loop_instance.state.workflow_stack.copy()
+        current_thought_chain = self.agent_loop_instance.state.current_thought_chain_id
+
+        preserved_tool_stats = self.agent_loop_instance.state.tool_usage_stats
+        preserved_reflection_thresh = self.agent_loop_instance.state.current_reflection_threshold
+        preserved_consolidation_thresh = self.agent_loop_instance.state.current_consolidation_threshold
+
+        self.agent_loop_instance.state = ActualAgentState(  # Use the imported ActualAgentState
+            workflow_id=current_wf_id,
+            context_id=current_ctx_id,
+            workflow_stack=current_wf_stack,
+            current_thought_chain_id=current_thought_chain,
+            goal_stack=[],
+            current_goal_id=None,
+            current_plan=[ActualPlanStep(description=ACTUAL_DEFAULT_PLAN_STEP)],  # Use imported ActualPlanStep and ACTUAL_DEFAULT_PLAN_STEP
+            last_action_summary="New agent task started by MCPClient.",
+            current_loop=0,
+            goal_achieved_flag=False,
+            consecutive_error_count=0,
+            needs_replan=False,
+            last_error_details=None,
+            successful_actions_since_reflection=0.0,
+            successful_actions_since_consolidation=0.0,
+            loops_since_optimization=0,
+            loops_since_promotion_check=0,
+            loops_since_stats_adaptation=0,
+            loops_since_maintenance=0,
+            reflection_cycle_index=0,
+            last_meta_feedback=None,
+            tool_usage_stats=preserved_tool_stats,
+            current_reflection_threshold=preserved_reflection_thresh,
+            current_consolidation_threshold=preserved_consolidation_thresh,
+        )
+        self.logger.info("MCPC: Agent internal state (plan, errors, goals) reset for new task.")
+        # --- END CRITICAL STATE RESET ---
+
+        agent_loop_instance_ref = self.agent_loop_instance
 
         async def agent_runner_wrapper():
             try:
                 self.agent_status = "running"
                 log.info(f"MCPC Agent Task: Starting self-driving agent for goal: '{self.agent_goal}' (Max Loops: {max_loops})")
-                # The run_self_driving_agent now orchestrates calls to prepare_next_turn_data and execute_llm_decision
                 await self.run_self_driving_agent(
                     agent_loop=agent_loop_instance_ref,
                     overall_goal=self.agent_goal,
                     max_agent_loops=max_loops,
-                    ui_websocket_sender=ui_websocket_sender
+                    ui_websocket_sender=ui_websocket_sender,
                 )
-                # After run_self_driving_agent finishes, check the agent's final state
                 if agent_loop_instance_ref.state.goal_achieved_flag:
                     self.agent_status = "completed"
                     self.agent_last_message = "Agent achieved its goal."
                     log.info(f"MCPC Agent Task: Goal '{self.agent_goal}' achieved.")
-                elif agent_loop_instance_ref._shutdown_event.is_set():
+                elif agent_loop_instance_ref._shutdown_event.is_set():  # Accessing protected member, but necessary here
                     self.agent_status = "stopped"
                     self.agent_last_message = "Agent task was stopped or shut down."
                     log.info(f"MCPC Agent Task: Agent for goal '{self.agent_goal}' was stopped/shut down.")
                 else:
-                    self.agent_status = "max_loops_reached" # Or could be "failed" if errors occurred
+                    self.agent_status = "max_loops_reached"
                     self.agent_last_message = f"Agent reached max loops ({max_loops}) or stopped for other reasons."
                     log.info(f"MCPC Agent Task: Agent for goal '{self.agent_goal}' finished (max_loops or other).")
 
@@ -10456,17 +10478,16 @@ class MCPClient:
                 self.agent_status = "stopped"
                 self.agent_last_message = "Agent task was cancelled."
                 log.info(f"MCPC Agent Task: Run for goal '{self.agent_goal}' cancelled.")
-                if agent_loop_instance_ref and not agent_loop_instance_ref._shutdown_event.is_set():
-                    await agent_loop_instance_ref.shutdown() # Ensure agent cleans up if wrapper cancelled
+                if agent_loop_instance_ref and not agent_loop_instance_ref._shutdown_event.is_set():  # Accessing protected member
+                    await agent_loop_instance_ref.shutdown()
             except Exception as e:
                 self.agent_status = "failed"
                 self.agent_last_message = f"Agent task failed: {str(e)[:100]}"
                 log.error(f"MCPC Agent Task: Error running agent for goal '{self.agent_goal}': {e}", exc_info=True)
-                if agent_loop_instance_ref and not agent_loop_instance_ref._shutdown_event.is_set():
-                    await agent_loop_instance_ref.shutdown() # Ensure agent cleans up on error
+                if agent_loop_instance_ref and not agent_loop_instance_ref._shutdown_event.is_set():  # Accessing protected member
+                    await agent_loop_instance_ref.shutdown()
             finally:
                 self.agent_current_loop = agent_loop_instance_ref.state.current_loop if agent_loop_instance_ref else self.agent_max_loops
-                # Don't clear self.agent_task here, status endpoint needs it to know if it was run
 
         self.agent_task = asyncio.create_task(agent_runner_wrapper(), name=f"mcp_agent_task_{self.agent_goal[:20]}")
         return {"success": True, "message": "Agent task started in background.", "status": self.agent_status}
@@ -10485,19 +10506,19 @@ class MCPClient:
 
         # Signal the AgentMasterLoop to shut down first
         if self.agent_loop_instance:
-            await self.agent_loop_instance.shutdown() # This sets its internal _shutdown_event
+            await self.agent_loop_instance.shutdown()  # This sets its internal _shutdown_event
 
         # Then, cancel the wrapper task in MCPClient
         self.agent_task.cancel()
         try:
-            await asyncio.wait_for(self.agent_task, timeout=15.0) # Give it time to clean up
+            await asyncio.wait_for(self.agent_task, timeout=15.0)  # Give it time to clean up
         except asyncio.CancelledError:
             log.info("MCPC: Agent task successfully cancelled.")
             self.agent_status = "stopped"
             self.agent_last_message = "Agent task stopped successfully."
         except asyncio.TimeoutError:
             log.warning("MCPC: Timeout waiting for agent task to stop after cancellation. It might be stuck.")
-            self.agent_status = "stopping_timeout" # A special status
+            self.agent_status = "stopping_timeout"  # A special status
             self.agent_last_message = "Agent task stop timed out."
         except Exception as e:
             log.error(f"MCPC: Error during agent task stop: {e}", exc_info=True)
@@ -10505,7 +10526,6 @@ class MCPClient:
             self.agent_last_message = f"Error stopping agent: {str(e)[:100]}"
 
         return {"success": True, "message": self.agent_last_message, "status": self.agent_status}
-
 
     def get_agent_status(self) -> Dict[str, Any]:
         """
@@ -10515,42 +10535,41 @@ class MCPClient:
         """
         # --- Initialize with default/fallback values ---
         is_agent_task_active = bool(self.agent_task and not self.agent_task.done())
-        
+
         # MCPClient's high-level status (this is set by start/stop_agent_task etc.)
         mcpc_agent_status_str = self.agent_status if isinstance(self.agent_status, str) else "unknown"
-        
+
         # Defaults for when agent_loop_instance is not available or state is minimal
         agent_internal_loop_count = 0
-        agent_max_loops_from_mcp = self.agent_max_loops # Max loops set by MCPC when starting
+        agent_max_loops_from_mcp = self.agent_max_loops  # Max loops set by MCPC when starting
         agent_last_action_summary = "Agent not initialized or no actions yet."
         agent_current_plan_steps_for_api: List[Dict[str, Any]] = []
         agent_current_plan_step_summary = "No active plan."
         agent_current_plan_step_full_desc = "No active plan."
         agent_current_plan_step_dependencies: List[str] = []
-        
+
         agent_current_ums_goal_id: Optional[str] = None
         agent_current_ums_goal_desc = "No active UMS goal."
         agent_local_ums_goal_stack_summary_for_api: List[Dict[str, Any]] = []
-        
+
         agent_target_model_name = "Not set."
-        agent_workflow_id : Optional[str] = None
+        agent_workflow_id: Optional[str] = None
         agent_thought_chain_id: Optional[str] = None
 
         # --- Derive a user-friendly display status ---
         # Start with MCPClient's view, then refine if agent_loop_instance is active
-        status_display = mcpc_agent_status_str.replace('_', ' ').title()
-        if is_agent_task_active and mcpc_agent_status_str == "running": # Check both
-            status_display = f"Running (Loop .../...)" # Placeholder, will be updated if agent_loop_instance exists
+        status_display = mcpc_agent_status_str.replace("_", " ").title()
+        if is_agent_task_active and mcpc_agent_status_str == "running":  # Check both
+            status_display = f"Running (Loop .../...)"  # Placeholder, will be updated if agent_loop_instance exists
         elif mcpc_agent_status_str == "completed":
-             status_display = "Goal Achieved!"
-
+            status_display = "Goal Achieved!"
 
         # --- If AgentMasterLoop instance exists, get more detailed state ---
         if self.agent_loop_instance:
-            agent_state = self.agent_loop_instance.state # Shortcut to agent's internal state
+            agent_state = self.agent_loop_instance.state  # Shortcut to agent's internal state
             agent_internal_loop_count = agent_state.current_loop
             agent_last_action_summary = agent_state.last_action_summary
-            agent_target_model_name = self.agent_loop_instance.agent_llm_model # Get the model AML is configured with
+            agent_target_model_name = self.agent_loop_instance.agent_llm_model  # Get the model AML is configured with
             agent_workflow_id = agent_state.workflow_id
             agent_thought_chain_id = agent_state.current_thought_chain_id
 
@@ -10561,13 +10580,13 @@ class MCPClient:
             # Get current plan from agent's state
             if agent_state.current_plan:
                 try:
-                    agent_current_plan_steps_for_api = [
-                        step.model_dump(exclude_none=True) for step in agent_state.current_plan
-                    ]
-                    if agent_current_plan_steps_for_api: # Ensure plan is not empty
+                    agent_current_plan_steps_for_api = [step.model_dump(exclude_none=True) for step in agent_state.current_plan]
+                    if agent_current_plan_steps_for_api:  # Ensure plan is not empty
                         current_step_obj = agent_state.current_plan[0]
                         agent_current_plan_step_full_desc = current_step_obj.description
-                        agent_current_plan_step_summary = current_step_obj.description[:100] + ("..." if len(current_step_obj.description) > 100 else "")
+                        agent_current_plan_step_summary = current_step_obj.description[:100] + (
+                            "..." if len(current_step_obj.description) > 100 else ""
+                        )
                         agent_current_plan_step_dependencies = current_step_obj.depends_on
                     else:
                         agent_current_plan_step_summary = "Plan is empty."
@@ -10578,70 +10597,67 @@ class MCPClient:
                     agent_current_plan_step_full_desc = "Error getting plan."
                     agent_current_plan_steps_for_api = [{"error": "Could not serialize plan"}]
 
-
             # Get current UMS goal and stack summary from agent's state
             # The agent's `self.state.goal_stack` should contain full UMS goal dictionaries
             # The agent's `self.state.current_goal_id` is the ID of its current operational UMS goal
             agent_current_ums_goal_id = agent_state.current_goal_id
-            
+
             if agent_state.current_goal_id and agent_state.goal_stack:
                 # Find the current operational goal object in the stack
                 current_op_goal_obj_from_stack = next(
-                    (g for g in reversed(agent_state.goal_stack) if isinstance(g, dict) and g.get("goal_id") == agent_state.current_goal_id),
-                    None
+                    (g for g in reversed(agent_state.goal_stack) if isinstance(g, dict) and g.get("goal_id") == agent_state.current_goal_id), None
                 )
                 if current_op_goal_obj_from_stack:
                     agent_current_ums_goal_desc = current_op_goal_obj_from_stack.get("description", "Unnamed UMS Operational Goal")
                 else:
                     agent_current_ums_goal_desc = f"UMS Goal ID '{_fmt_id(agent_state.current_goal_id)}' (Details not in local stack)"
-                    log.warning(f"MCPC: Agent's current_goal_id {_fmt_id(agent_state.current_goal_id)} not found in its local goal_stack of {len(agent_state.goal_stack)} items.")
+                    log.warning(
+                        f"MCPC: Agent's current_goal_id {_fmt_id(agent_state.current_goal_id)} not found in its local goal_stack of {len(agent_state.goal_stack)} items."
+                    )
 
                 # Summarize the agent's local view of the UMS goal stack for the API
                 # The stack in agent_state.goal_stack is already ordered root-to-leaf
                 # Take the last N items for summary (leaf-most)
-                GOAL_STACK_SUMMARY_LIMIT_FOR_API = 5 # Defined in AML, copied for consistency
+                GOAL_STACK_SUMMARY_LIMIT_FOR_API = 5  # Defined in AML, copied for consistency
                 goals_to_summarize_for_api = agent_state.goal_stack[-GOAL_STACK_SUMMARY_LIMIT_FOR_API:]
                 for goal_dict_from_agent_stack in goals_to_summarize_for_api:
-                    if isinstance(goal_dict_from_agent_stack, dict): # Ensure it's a dict
-                        agent_local_ums_goal_stack_summary_for_api.append({
-                            "goal_id": goal_dict_from_agent_stack.get("goal_id", "UnknownID"),
-                            "description": goal_dict_from_agent_stack.get("description", "No description provided"), # Full description
-                            "status": goal_dict_from_agent_stack.get("status", "unknown")
-                        })
+                    if isinstance(goal_dict_from_agent_stack, dict):  # Ensure it's a dict
+                        agent_local_ums_goal_stack_summary_for_api.append(
+                            {
+                                "goal_id": goal_dict_from_agent_stack.get("goal_id", "UnknownID"),
+                                "description": goal_dict_from_agent_stack.get("description", "No description provided"),  # Full description
+                                "status": goal_dict_from_agent_stack.get("status", "unknown"),
+                            }
+                        )
             elif not agent_state.current_goal_id and agent_state.workflow_id:
                 # Workflow is active, but no specific UMS goal is the current focus (e.g., between root goals, or if root failed to set)
                 agent_current_ums_goal_desc = "Workflow active, UMS operational goal not set."
-                if agent_state.goal_stack: # Should be empty if current_goal_id is None
-                     log.warning("MCPC: Agent has goal_stack items but no current_goal_id. Inconsistent state.")
+                if agent_state.goal_stack:  # Should be empty if current_goal_id is None
+                    log.warning("MCPC: Agent has goal_stack items but no current_goal_id. Inconsistent state.")
 
         # --- Construct the final status dictionary for the API ---
         status_to_return = {
             "agent_running": is_agent_task_active,
-            "status": mcpc_agent_status_str, # MCPClient's high-level status
-            "status_display": status_display, # User-friendly display string
-
-            "overall_goal_from_mcp_client": self.agent_goal, # The goal MCPClient was asked to start the agent with
-
+            "status": mcpc_agent_status_str,  # MCPClient's high-level status
+            "status_display": status_display,  # User-friendly display string
+            "overall_goal_from_mcp_client": self.agent_goal,  # The goal MCPClient was asked to start the agent with
             # Details from AgentMasterLoop's state
             "agent_workflow_id": agent_workflow_id,
             "agent_thought_chain_id": agent_thought_chain_id,
             "agent_target_model": agent_target_model_name,
             "agent_internal_loop_count": agent_internal_loop_count,
-            "agent_max_loops_from_mcp_config": agent_max_loops_from_mcp, # Max loops MCPC is running the agent for
-            
+            "agent_max_loops_from_mcp_config": agent_max_loops_from_mcp,  # Max loops MCPC is running the agent for
             "agent_current_ums_goal_id": agent_current_ums_goal_id,
-            "agent_current_ums_goal_description": agent_current_ums_goal_desc, # Full description
-            "agent_local_ums_goal_stack_summary": agent_local_ums_goal_stack_summary_for_api, # Summary of agent's view
-
+            "agent_current_ums_goal_description": agent_current_ums_goal_desc,  # Full description
+            "agent_local_ums_goal_stack_summary": agent_local_ums_goal_stack_summary_for_api,  # Summary of agent's view
             "agent_last_action_summary": agent_last_action_summary,
-            "agent_last_general_message": self.agent_last_message, # General message from MCPClient about agent task
-            
-            "agent_current_plan_step_summary": agent_current_plan_step_summary, # Truncated
-            "agent_current_plan_step_full_description": agent_current_plan_step_full_desc, # Full
+            "agent_last_general_message": self.agent_last_message,  # General message from MCPClient about agent task
+            "agent_current_plan_step_summary": agent_current_plan_step_summary,  # Truncated
+            "agent_current_plan_step_full_description": agent_current_plan_step_full_desc,  # Full
             "agent_current_plan_step_dependencies": agent_current_plan_step_dependencies,
-            "agent_current_full_plan": agent_current_plan_steps_for_api, # List of all plan step dicts
+            "agent_current_full_plan": agent_current_plan_steps_for_api,  # List of all plan step dicts
         }
-        
+
         # Log a summary of what's being returned by this status check
         log.debug(
             f"MCPC Agent Status: Running={status_to_return['agent_running']}, "
@@ -10650,10 +10666,16 @@ class MCPClient:
             f"UMS Goal='{_fmt_id(status_to_return['agent_current_ums_goal_id'])}', "
             f"Plan Steps={len(status_to_return['agent_current_full_plan'])}"
         )
-        
+
         return status_to_return
 
-    async def run_self_driving_agent(self, agent_loop: AgentMasterLoop, overall_goal: str, max_agent_loops: int, ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None):
+    async def run_self_driving_agent(
+        self,
+        agent_loop: AgentMasterLoop,
+        overall_goal: str,
+        max_agent_loops: int,
+        ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
+    ):
         """
         Runs the agent in a self-driving (autonomous) mode.
         This method orchestrates the interaction with AgentMasterLoop by preparing data,
@@ -10670,7 +10692,7 @@ class MCPClient:
         self.safe_print(f"Max Loops (from MCPC): {max_agent_loops}")
         log.info(f"MCPC: Orchestrating self-driving agent. Goal: '{overall_goal}', Max Loops: {max_agent_loops}")
 
-        if not agent_loop: # Simply check if the agent_loop instance itself is valid
+        if not agent_loop:  # Simply check if the agent_loop instance itself is valid
             self.safe_print("[bold red]Error: AgentMasterLoop instance is not valid for self-driving mode.[/]")
             log.critical("MCPC: AgentMasterLoop instance is None or invalid in run_self_driving_agent.")
             # Update MCPClient's view of the agent status if this happens
@@ -10682,35 +10704,37 @@ class MCPClient:
         for loop_num_mcp_managed in range(max_agent_loops):
             # Check agent's internal shutdown/completion flags first
             # Access agent_loop.state directly (it's the AgentMasterLoop instance)
-            if agent_loop._shutdown_event.is_set(): # agent_loop is the AgentMasterLoop instance
+            if agent_loop._shutdown_event.is_set():  # agent_loop is the AgentMasterLoop instance
                 self.safe_print(f"MCPC: Agent shutdown signal detected at start of turn {loop_num_mcp_managed + 1}. Stopping agent.")
                 log.info(f"MCPC: Agent shutdown signal detected. Loop {loop_num_mcp_managed + 1}/{max_agent_loops}.")
-                self.agent_status = "stopped" # Update MCPClient's status
+                self.agent_status = "stopped"  # Update MCPClient's status
                 self.agent_last_message = "Agent shutdown signal."
                 break
-            if agent_loop.state.goal_achieved_flag: # agent_loop is the AgentMasterLoop instance
+            if agent_loop.state.goal_achieved_flag:  # agent_loop is the AgentMasterLoop instance
                 self.safe_print(f"MCPC: Agent signaled overall goal achievement at start of turn {loop_num_mcp_managed + 1}. Stopping agent.")
                 log.info(f"MCPC: Agent goal_achieved_flag is true. Loop {loop_num_mcp_managed + 1}/{max_agent_loops}.")
-                self.agent_status = "completed" # Update MCPClient's status
+                self.agent_status = "completed"  # Update MCPClient's status
                 self.agent_last_message = "Agent achieved overall goal."
                 break
 
             # Sync MCPClient's loop count view for agentStatus API (agent_loop manages its own internal state.current_loop)
             self.agent_current_loop = loop_num_mcp_managed
-            current_aml_loop = agent_loop.state.current_loop + 1 # Get AML's internal next loop number
-            self.safe_print(f"\n--- MCPC: Starting Agent Turn {loop_num_mcp_managed + 1}/{max_agent_loops} (AML Internal Loop: {current_aml_loop}) ---")
+            current_aml_loop = agent_loop.state.current_loop + 1  # Get AML's internal next loop number
+            self.safe_print(
+                f"\n--- MCPC: Starting Agent Turn {loop_num_mcp_managed + 1}/{max_agent_loops} (AML Internal Loop: {current_aml_loop}) ---"
+            )
             log.info(f"MCPC: Beginning agent turn {loop_num_mcp_managed + 1}. AML Internal Loop: {current_aml_loop}.")
-            self.agent_status = "running" # Update MCPClient's status
+            self.agent_status = "running"  # Update MCPClient's status
             self.agent_last_message = f"Executing turn {current_aml_loop}."
 
             # 1. Agent prepares data for the LLM turn.
             try:
                 # Call prepare_next_turn_data directly on the agent_loop instance
                 turn_data_for_llm = await agent_loop.prepare_next_turn_data(overall_goal)
-                if turn_data_for_llm is None: # This means agent decided to stop
+                if turn_data_for_llm is None:  # This means agent decided to stop
                     self.safe_print("MCPC: Agent signaled termination during its data preparation phase.")
                     log.info("MCPC: AgentMasterLoop.prepare_next_turn_data returned None, signaling stop.")
-                    self.agent_status = "stopped" # Update MCPClient's status
+                    self.agent_status = "stopped"  # Update MCPClient's status
                     self.agent_last_message = "Agent preparation phase signaled stop."
                     break
             except asyncio.CancelledError:
@@ -10718,13 +10742,13 @@ class MCPClient:
                 log.info("MCPC: AgentMasterLoop.prepare_next_turn_data was cancelled.")
                 if not agent_loop._shutdown_event.is_set():
                     await agent_loop.shutdown()
-                self.agent_status = "stopped" # Update MCPClient's status
+                self.agent_status = "stopped"  # Update MCPClient's status
                 self.agent_last_message = "Agent preparation cancelled."
                 break
             except Exception as prep_err:
                 self.safe_print(f"[bold red]MCPC: Error during agent data preparation: {str(prep_err)[:200]}[/]")
                 log.error(f"MCPC: Critical error in agent_loop.prepare_next_turn_data: {prep_err}", exc_info=True)
-                self.agent_status = "failed" # Update MCPClient's status
+                self.agent_status = "failed"  # Update MCPClient's status
                 self.agent_last_message = f"Preparation error: {str(prep_err)[:100]}"
                 if not agent_loop._shutdown_event.is_set():
                     await agent_loop.shutdown()
@@ -10741,34 +10765,37 @@ class MCPClient:
                     prompt_messages=prompt_messages,
                     tool_schemas=tool_schemas,
                     model_name=agent_loop.agent_llm_model,
-                    ui_websocket_sender=ui_websocket_sender
+                    ui_websocket_sender=ui_websocket_sender,
                 )
             except Exception as llm_call_err:
                 self.safe_print(f"[bold red]MCPC: Critical error calling LLM for agent: {str(llm_call_err)[:200]}[/]")
                 log.error(f"MCPC: Unhandled exception in self.process_agent_llm_turn: {llm_call_err}", exc_info=True)
-                llm_decision = {"decision": "error", "message": f"MCPClient failed to get LLM decision: {llm_call_err}", "error_type_for_agent": "MCPClientError"}
-                self.agent_status = "failed" # Update MCPClient's status
+                llm_decision = {
+                    "decision": "error",
+                    "message": f"MCPClient failed to get LLM decision: {llm_call_err}",
+                    "error_type_for_agent": "MCPClientError",
+                }
+                self.agent_status = "failed"  # Update MCPClient's status
                 self.agent_last_message = f"LLM call error: {str(llm_call_err)[:100]}"
                 if not agent_loop._shutdown_event.is_set():
                     await agent_loop.shutdown()
                 break
 
             # 3. Agent executes the LLM decision.
-            decision_type_log = llm_decision.get('decision', 'unknown')
+            decision_type_log = llm_decision.get("decision", "unknown")
             self.safe_print(f"MCPC: Passing LLM decision (type: {decision_type_log}) to agent for execution...")
             log.debug(f"MCPC: LLM decision for agent: {str(llm_decision)[:300]}")
             self.agent_last_message = f"Executing LLM decision (type: {decision_type_log}) for turn {current_aml_loop}..."
             try:
                 # Call execute_llm_decision directly on the agent_loop instance
                 should_continue_loop = await agent_loop.execute_llm_decision(llm_decision)
-                
+
                 # Relay agent's internal action summary if sender available (AFTER execution)
                 if ui_websocket_sender and agent_loop and agent_loop.state.last_action_summary:
                     activity_summary = agent_loop.state.last_action_summary
-                    await ui_websocket_sender("agent_activity_log", {
-                        "summary": activity_summary,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    })
+                    await ui_websocket_sender(
+                        "agent_activity_log", {"summary": activity_summary, "timestamp": datetime.now(timezone.utc).isoformat()}
+                    )
 
                 if not should_continue_loop:
                     self.safe_print("MCPC: Agent signaled loop termination after executing decision.")
@@ -10794,7 +10821,7 @@ class MCPClient:
                 if not agent_loop._shutdown_event.is_set():
                     await agent_loop.shutdown()
                 break
-            
+
             # Note: AgentMasterLoop.state.current_loop is incremented internally by agent_loop.execute_llm_decision upon success.
 
             if agent_loop.state.goal_achieved_flag:
@@ -10804,20 +10831,22 @@ class MCPClient:
                 self.agent_last_message = "Agent achieved overall goal."
                 break
 
-            await asyncio.sleep(0.1) 
+            await asyncio.sleep(0.1)
 
         # --- Loop End ---
         final_aml_loop_count = agent_loop.state.current_loop if agent_loop else 0
-        self.agent_current_loop = final_aml_loop_count # Ensure final sync for agentStatus API
+        self.agent_current_loop = final_aml_loop_count  # Ensure final sync for agentStatus API
 
         # Update final status based on how the loop exited
-        if self.agent_status == "running": # If loop finished due to max_agent_loops
+        if self.agent_status == "running":  # If loop finished due to max_agent_loops
             self.agent_status = "max_loops_reached"
             self.agent_last_message = f"Agent reached max MCPC-driven loops ({max_agent_loops})."
-        
+
         # Print final summary message
         if self.agent_status == "completed":
-            self.safe_print(f"[bold green]{EMOJI_MAP.get('party_popper', '🎉')} Agent achieved its overall goal after {final_aml_loop_count} internal loops![/]")
+            self.safe_print(
+                f"[bold green]{EMOJI_MAP.get('party_popper', '🎉')} Agent achieved its overall goal after {final_aml_loop_count} internal loops![/]"
+            )
             log.info(f"MCPC: Agent run finished - goal achieved after {final_aml_loop_count} internal loops.")
         elif self.agent_status == "stopped":
             self.safe_print(f"[yellow]{EMOJI_MAP.get('cancel', '🛑')} Agent task stopped/cancelled after {final_aml_loop_count} internal loops.[/]")
@@ -10825,8 +10854,10 @@ class MCPClient:
         elif self.agent_status == "failed":
             self.safe_print(f"[bold red]{EMOJI_MAP.get('collision', '💥')} Agent task failed after {final_aml_loop_count} internal loops.[/]")
             log.info(f"MCPC: Agent run finished - failed after {final_aml_loop_count} internal loops.")
-        else: # Max loops reached or other states
-            self.safe_print(f"[yellow]{EMOJI_MAP.get('warning', '⚠️')} Agent run concluded after {final_aml_loop_count} internal loops. Final status: {self.agent_status}[/]")
+        else:  # Max loops reached or other states
+            self.safe_print(
+                f"[yellow]{EMOJI_MAP.get('warning', '⚠️')} Agent run concluded after {final_aml_loop_count} internal loops. Final status: {self.agent_status}[/]"
+            )
             log.info(f"MCPC: Agent run finished - {final_aml_loop_count} internal loops. Status: {self.agent_status}")
 
         if agent_loop and not agent_loop._shutdown_event.is_set():
@@ -10837,12 +10868,11 @@ class MCPClient:
         else:
             self.safe_print("MCPC: Agent already processing shutdown.")
 
-        self.safe_print(f"[bold cyan]{EMOJI_MAP.get('robot','🤖')} Self-Driving Agent Orchestration Concluded by MCPC.[/]")
-
+        self.safe_print(f"[bold cyan]{EMOJI_MAP.get('robot', '🤖')} Self-Driving Agent Orchestration Concluded by MCPC.[/]")
 
     async def interactive_loop(self):
         """Runs the main interactive command loop with direct stream handling."""
-        interactive_console = get_safe_console() # Get console instance once
+        interactive_console = get_safe_console()  # Get console instance once
 
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print(f"Default Model: [cyan]{self.current_model}[/]. Type '/help' for commands.")
@@ -10850,22 +10880,22 @@ class MCPClient:
 
         # Define fixed layout dimensions
         RESPONSE_PANEL_HEIGHT = 55
-        STATUS_PANEL_HEIGHT = 10 # Reduced status height
+        STATUS_PANEL_HEIGHT = 10  # Reduced status height
         # --- Throttling Config ---
-        TEXT_UPDATE_INTERVAL = 0.2 # Update Markdown max ~5 times/sec
+        TEXT_UPDATE_INTERVAL = 0.2  # Update Markdown max ~5 times/sec
 
         @contextmanager
         def suppress_logs_during_live():
             """Temporarily suppress logging below WARNING during Live display."""
-            logger_instance = logging.getLogger("mcpclient_multi") # Get specific logger
+            logger_instance = logging.getLogger("mcpclient_multi")  # Get specific logger
             original_level = logger_instance.level
             # Suppress INFO and DEBUG during live updates
             if original_level < logging.WARNING:
-                 logger_instance.setLevel(logging.WARNING)
+                logger_instance.setLevel(logging.WARNING)
             try:
                 yield
             finally:
-                 logger_instance.setLevel(original_level) # Restore original level
+                logger_instance.setLevel(original_level)  # Restore original level
 
         while True:
             # --- Reset state for this iteration ---
@@ -10876,7 +10906,7 @@ class MCPClient:
             query_error: Optional[Exception] = None
             query_cancelled = False
             final_stats_to_print = {}
-            last_text_update_time = 0.0 # For throttling
+            last_text_update_time = 0.0  # For throttling
 
             try:
                 user_input = await asyncio.to_thread(Prompt.ask, "\n[bold blue]>>> [/]", console=interactive_console, default="")
@@ -10891,13 +10921,15 @@ class MCPClient:
                     if hasattr(self, "_active_live_display") and self._active_live_display:
                         log.warning("Attempting to run command while Live display might be active. Stopping display.")
                         if live_display and live_display.is_started:
-                            with suppress(Exception): live_display.stop()
+                            with suppress(Exception):
+                                live_display.stop()
                         self._active_live_display = None
                         live_display = None
 
                     try:
                         cmd_parts = shlex.split(user_input[1:])
-                        if not cmd_parts: continue
+                        if not cmd_parts:
+                            continue
                         cmd = cmd_parts[0].lower()
                         args = shlex.join(cmd_parts[1:]) if len(cmd_parts) > 1 else ""
                     except ValueError as e:
@@ -10916,17 +10948,19 @@ class MCPClient:
                     query = user_input
                     status_lines = deque(maxlen=STATUS_PANEL_HEIGHT)
                     abort_message = Text("Press Ctrl+C once to abort...", style="dim yellow")
-                    current_response_text = "" # Text accumulated *during* the live update
-                    needs_render_update = False # Flag to trigger render
+                    current_response_text = ""  # Text accumulated *during* the live update
+                    needs_render_update = False  # Flag to trigger render
 
                     # --- Setup Live Display Placeholders ---
                     response_panel = Panel(Text("Waiting...", style="dim"), title="Response", height=RESPONSE_PANEL_HEIGHT, border_style="dim blue")
-                    status_panel = Panel(Group(*[Text("")]*STATUS_PANEL_HEIGHT), title="Status", height=STATUS_PANEL_HEIGHT+2, border_style="dim blue")
+                    status_panel = Panel(
+                        Group(*[Text("")] * STATUS_PANEL_HEIGHT), title="Status", height=STATUS_PANEL_HEIGHT + 2, border_style="dim blue"
+                    )
                     abort_panel = Panel(abort_message, height=3, border_style="none")
                     main_group = Group(response_panel, status_panel, abort_panel)
                     live_panel = Panel(main_group, title=f"Querying {self.current_model}...", border_style="dim green")
 
-                    self._active_live_display = True # Set flag
+                    self._active_live_display = True  # Set flag
                     consuming_task = asyncio.current_task()
                     self.current_query_task = consuming_task
 
@@ -10936,12 +10970,12 @@ class MCPClient:
                             live_display = live
                             try:
                                 current_time = time.time()
-                                last_text_update_time = current_time # Initialize time
+                                last_text_update_time = current_time  # Initialize time
 
                                 # Directly iterate over the wrapped generator stream
                                 async for chunk_type, chunk_data in self._stream_wrapper(self.process_streaming_query(query)):
                                     current_time = time.time()
-                                    needs_render_update = False # Reset flag for this chunk
+                                    needs_render_update = False  # Reset flag for this chunk
 
                                     if consuming_task.cancelled():
                                         query_cancelled = True
@@ -10954,7 +10988,7 @@ class MCPClient:
                                         # --- Throttle Markdown Update ---
                                         if current_time - last_text_update_time >= TEXT_UPDATE_INTERVAL:
                                             response_panel.renderable = Markdown(current_response_text, code_theme="monokai")
-                                            response_panel.border_style = "blue" # Update style as text comes in
+                                            response_panel.border_style = "blue"  # Update style as text comes in
                                             live_panel.border_style = "green"
                                             last_text_update_time = current_time
                                             needs_render_update = True
@@ -10968,7 +11002,7 @@ class MCPClient:
                                             display_status = padding + display_status
                                         status_panel.renderable = Group(*display_status)
                                         status_panel.border_style = "blue"
-                                        needs_render_update = True # Update immediately for status
+                                        needs_render_update = True  # Update immediately for status
                                     elif chunk_type == "error":
                                         query_error = RuntimeError(chunk_data)
                                         status_lines.append(Text.from_markup(f"[bold red]Error: {chunk_data}[/bold red]"))
@@ -10978,13 +11012,15 @@ class MCPClient:
                                             display_status = padding + display_status
                                         status_panel.renderable = Group(*display_status)
                                         status_panel.border_style = "red"
-                                        needs_render_update = True # Update immediately for error
+                                        needs_render_update = True  # Update immediately for error
                                     elif chunk_type == "final_stats":
                                         final_stats_to_print = chunk_data
 
                                     # Update abort message visibility & title
                                     abort_panel.renderable = abort_message if not consuming_task.done() else Text("")
-                                    live_panel.title = f"Querying {self.current_model}..." if not consuming_task.done() else f"Result ({self.current_model})"
+                                    live_panel.title = (
+                                        f"Querying {self.current_model}..." if not consuming_task.done() else f"Result ({self.current_model})"
+                                    )
                                     # Always need to update if title/abort message changes
                                     needs_render_update = True
 
@@ -10995,17 +11031,23 @@ class MCPClient:
                                 # --- Perform one final update after the loop ---
                                 # Ensure the last text chunk is rendered
                                 response_panel.renderable = Markdown(current_response_text, code_theme="monokai")
-                                response_panel.border_style = "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                response_panel.border_style = (
+                                    "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                )
                                 # Update final status state
                                 display_status_final = list(status_lines)[-STATUS_PANEL_HEIGHT:]
                                 if len(display_status_final) < STATUS_PANEL_HEIGHT:
-                                     padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
-                                     display_status_final = padding + display_status_final
+                                    padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
+                                    display_status_final = padding + display_status_final
                                 status_panel.renderable = Group(*display_status_final)
-                                status_panel.border_style = "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                status_panel.border_style = (
+                                    "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                )
                                 # Update final title/abort message
                                 abort_panel.renderable = Text("")
-                                live_panel.title = f"Result ({self.current_model})" + (" - Cancelled" if query_cancelled else (" - Error" if query_error else ""))
+                                live_panel.title = f"Result ({self.current_model})" + (
+                                    " - Cancelled" if query_cancelled else (" - Error" if query_error else "")
+                                )
                                 live_panel.border_style = "green" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
                                 # Trigger final refresh
                                 live.update(live_panel)
@@ -11058,8 +11100,8 @@ class MCPClient:
                     # Rebuild final status renderable using the final state of status_lines
                     display_status_final = list(status_lines)[-STATUS_PANEL_HEIGHT:]
                     if len(display_status_final) < STATUS_PANEL_HEIGHT:
-                         padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
-                         display_status_final = padding + display_status_final
+                        padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
+                        display_status_final = padding + display_status_final
                     final_status_renderable = Group(*display_status_final)
 
                     # Build final panels
@@ -11081,7 +11123,8 @@ class MCPClient:
             except KeyboardInterrupt:
                 self.safe_print("\n[yellow]Input interrupted. Type /exit or Ctrl+C again to quit.[/yellow]")
                 if live_display and live_display.is_started:
-                    with suppress(Exception): live_display.stop()
+                    with suppress(Exception):
+                        live_display.stop()
                     self._active_live_display = None
                     live_display = None
                 continue
@@ -11092,14 +11135,16 @@ class MCPClient:
                 self.safe_print(f"\n[bold red]Unexpected Error in interactive loop:[/] {loop_err}")
                 log.error("Unexpected error in interactive loop", exc_info=True)
                 if live_display and live_display.is_started:
-                    with suppress(Exception): live_display.stop()
+                    with suppress(Exception):
+                        live_display.stop()
                     self._active_live_display = None
                     live_display = None
                 await asyncio.sleep(1)
 
             finally:
                 if live_display and live_display.is_started:
-                    with suppress(Exception): live_display.stop()
+                    with suppress(Exception):
+                        live_display.stop()
                 self._active_live_display = None
                 if self.current_query_task == asyncio.current_task():
                     self.current_query_task = None
@@ -11233,6 +11278,7 @@ class MCPClient:
         """Manage client configuration (view, edit YAML, reset to defaults)."""
         # Run the config management function
         asyncio.run(config_async(show, edit, reset))
+
 
 async def main_async(query, model, server, dashboard, interactive, webui_flag, webui_host, webui_port, serve_ui_file, cleanup_servers):
     """Main async entry point - Handles CLI, Interactive, Dashboard, and Web UI modes."""
@@ -11449,10 +11495,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     return {"message": "No configuration changes applied."}
 
             @app.put("/api/model", status_code=200)
-            async def set_model_api(
-                req: SetModelRequest,
-                mcp_client: MCPClient = Depends(get_mcp_client)
-            ):
+            async def set_model_api(req: SetModelRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Sets the active model for subsequent queries."""
                 log.info(f"API request to set model to: {req.model}")
                 try:
@@ -11467,7 +11510,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                 except Exception as e:
                     log.error(f"Error setting model via API: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Failed to set model: {str(e)}") from e
-            
+
             @app.get("/api/models")
             async def list_models_api(mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Lists available models, grouped by provider, based on cost data and initialized clients."""
@@ -11681,40 +11724,42 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     log.error(f"Data validation error for server '{decoded_server_name}' details: {e}")
                     raise HTTPException(status_code=500, detail="Internal error retrieving server details.") from e
 
-            @app.get("/api/tools") # Keep the original endpoint for now
+            @app.get("/api/tools")  # Keep the original endpoint for now
             async def list_tools_api(
                 server_name: Optional[str] = None,
-                provider_for_format: Optional[str] = None, # ADD THIS QUERY PARAM
+                provider_for_format: Optional[str] = None,  # ADD THIS QUERY PARAM
                 mcp_client: MCPClient = Depends(get_mcp_client),
             ):
                 """Lists available tools, optionally filtered by server_name.
                 If provider_for_format is given, returns tools formatted for that provider."""
-                
-                if provider_for_format: # If a provider is specified for formatting
+
+                if provider_for_format:  # If a provider is specified for formatting
                     log.info(f"API: Request to list tools formatted for provider: {provider_for_format}")
                     # Ensure provider_for_format is a valid provider string if necessary
                     try:
-                        Provider(provider_for_format.lower()) # Validate
+                        Provider(provider_for_format.lower())  # Validate
                     except ValueError as e:
                         raise HTTPException(status_code=400, detail=f"Invalid provider_for_format: {provider_for_format}") from e
-                    
+
                     formatted_tools = mcp_client._format_tools_for_provider(provider_for_format.lower())
                     if formatted_tools is None:
-                        return [] # Or an appropriate empty response
+                        return []  # Or an appropriate empty response
                     # Log a sample of what's being returned for verification
-                    log.debug(f"API: Returning {len(formatted_tools)} tools formatted for '{provider_for_format}'. Sample: {str(formatted_tools[:2])[:500]}")
+                    log.debug(
+                        f"API: Returning {len(formatted_tools)} tools formatted for '{provider_for_format}'. Sample: {str(formatted_tools[:2])[:500]}"
+                    )
                     # Also log the sanitized_to_original map that was just populated
                     s_to_o_map_snapshot = mcp_client.server_manager.sanitized_to_original.copy()
                     log.debug(f"API: Current sanitized_to_original map (size {len(s_to_o_map_snapshot)}): {str(s_to_o_map_snapshot)[:1000]}...")
-                    return formatted_tools # Return the directly formatted list
+                    return formatted_tools  # Return the directly formatted list
                 else:
                     # Original logic for generic tool listing
                     tools_list = []
                     sorted_tools = sorted(mcp_client.server_manager.tools.values(), key=lambda t: t.name)
                     for tool in sorted_tools:
                         if server_name is None or tool.server_name == server_name:
-                            tool_data = { # ... existing generic tool_data ... }
-                                "name": tool.name, # Original MCP name
+                            tool_data = {  # ... existing generic tool_data ... }
+                                "name": tool.name,  # Original MCP name
                                 "description": tool.description,
                                 "server_name": tool.server_name,
                                 "input_schema": tool.input_schema,
@@ -11833,22 +11878,18 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     log.error(f"Error executing tool '{req.tool_name}' via API: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Tool execution failed: {str(e)}") from e
 
-            @app.post("/api/agent/start", status_code=202) # 202 Accepted for background task
+            @app.post("/api/agent/start", status_code=202)  # 202 Accepted for background task
             async def start_agent_api(req: AgentStartRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Starts the self-driving agent with a given goal."""
-                if not hasattr(mcp_client, 'start_agent_task'): # Ensure method exists
+                if not hasattr(mcp_client, "start_agent_task"):  # Ensure method exists
                     log.error("API: start_agent_task method not found on mcp_client.")
                     raise HTTPException(status_code=501, detail="Agent functionality not fully implemented in server.")
 
                 log.info(f"API: Request to start agent. Goal: '{req.goal}', Max Loops: {req.max_loops}, Model: {req.llm_model or 'default'}")
-                result = await mcp_client.start_agent_task(
-                    goal=req.goal,
-                    max_loops=req.max_loops,
-                    llm_model_override=req.llm_model
-                )
+                result = await mcp_client.start_agent_task(goal=req.goal, max_loops=req.max_loops, llm_model_override=req.llm_model)
                 if not result.get("success"):
                     # Determine appropriate status code based on message
-                    status_code = 409 if "already running" in result.get("message","").lower() else 500
+                    status_code = 409 if "already running" in result.get("message", "").lower() else 500
                     log.warning(f"API: Failed to start agent: {result.get('message')}")
                     raise HTTPException(status_code=status_code, detail=result.get("message", "Failed to start agent."))
                 log.info(f"API: Agent task successfully initiated. Current status: {result.get('status')}")
@@ -11858,7 +11899,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
             @app.post("/api/agent/stop", status_code=200)
             async def stop_agent_api(mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Stops the currently running agent task."""
-                if not hasattr(mcp_client, 'stop_agent_task'):
+                if not hasattr(mcp_client, "stop_agent_task"):
                     log.error("API: stop_agent_task method not found on mcp_client.")
                     raise HTTPException(status_code=501, detail="Agent functionality not fully implemented.")
 
@@ -11869,19 +11910,13 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                 log.info(f"API: Agent stop process finished. Result message: {result.get('message')}")
                 return {"message": result.get("message"), "agent_status": mcp_client.get_agent_status()}
 
-
             @app.post("/api/agent/inject_thought", status_code=202)
-            async def inject_thought_into_agent_api(
-                req: AgentInjectThoughtRequest,
-                mcp_client: MCPClient = Depends(get_mcp_client)
-            ):
+            async def inject_thought_into_agent_api(req: AgentInjectThoughtRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Injects a thought (guidance/observation) into a running agent."""
-                if not mcp_client.agent_loop_instance or \
-                   not mcp_client.agent_task or \
-                   mcp_client.agent_task.done():
+                if not mcp_client.agent_loop_instance or not mcp_client.agent_task or mcp_client.agent_task.done():
                     raise HTTPException(status_code=409, detail="Agent is not currently running or available.")
 
-                if not hasattr(mcp_client.agent_loop_instance, 'inject_manual_thought'):
+                if not hasattr(mcp_client.agent_loop_instance, "inject_manual_thought"):
                     log.error("API: AgentMasterLoop instance is missing 'inject_manual_thought' method.")
                     raise HTTPException(status_code=501, detail="Agent guidance injection not supported by current agent version.")
 
@@ -11890,38 +11925,40 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     # The inject_manual_thought method in AML should handle UMS calls and potentially update agent's state or plan.
                     success_inject = await mcp_client.agent_loop_instance.inject_manual_thought(
                         content=req.content,
-                        thought_type=req.thought_type if req.thought_type else "user_guidance" # AML defaults if not provided
+                        thought_type=req.thought_type if req.thought_type else "user_guidance",  # AML defaults if not provided
                     )
                     if success_inject:
                         return {"success": True, "message": "Guidance injected into agent's reasoning process."}
                     else:
                         # This else implies inject_manual_thought returned False explicitly
                         raise HTTPException(status_code=500, detail="Agent failed to process injected thought.")
-                except AttributeError as ae: # If method doesn't exist on old agent state
+                except AttributeError as ae:  # If method doesn't exist on old agent state
                     log.error(f"API: Missing 'inject_manual_thought' on agent loop: {ae}")
                     raise HTTPException(status_code=501, detail="Agent version does not support thought injection.") from ae
                 except Exception as e:
                     log.error(f"API: Error injecting thought into agent: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Error injecting thought: {str(e)}") from e
-                
-            @app.get("/api/agent/status") # No response_model needed here as it's dynamic
+
+            @app.get("/api/agent/status")  # No response_model needed here as it's dynamic
             async def get_agent_status_api(mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Gets the current status of the self-driving agent, including plan and goal stack."""
-                if not hasattr(mcp_client, 'get_agent_status'):
+                if not hasattr(mcp_client, "get_agent_status"):
                     log.error("API: get_agent_status method not found on mcp_client.")
                     raise HTTPException(status_code=501, detail="Agent functionality not fully implemented.")
-                
+
                 # get_agent_status in MCPClient should now be expanded to include
                 # current_plan_from_agent and agent_current_operational_goal_stack_summary
                 status = mcp_client.get_agent_status()
-                log.debug(f"API: Polled agent status. Status: {status.get('status')}, Loop: {status.get('current_loop')}/{status.get('max_loops')}, Plan steps: {len(status.get('current_plan_from_agent',[]))}, Goal Stack Depth: {len(status.get('agent_current_operational_goal_stack_summary',[]))}")
+                log.debug(
+                    f"API: Polled agent status. Status: {status.get('status')}, Loop: {status.get('current_loop')}/{status.get('max_loops')}, Plan steps: {len(status.get('current_plan_from_agent', []))}, Goal Stack Depth: {len(status.get('agent_current_operational_goal_stack_summary', []))}"
+                )
                 return status
 
             @app.get("/api/conversation")
             async def get_conversation_api(mcp_client: MCPClient = Depends(get_mcp_client)):
                 """Gets the current state of the conversation graph."""
                 node = mcp_client.conversation_graph.current_node
-                nodes_data_serializable = [] # Store serializable node data
+                nodes_data_serializable = []  # Store serializable node data
 
                 # Ensure nodes are serializable using jsonable_encoder
                 for n_id, n_obj in mcp_client.conversation_graph.nodes.items():
@@ -11944,11 +11981,11 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     return {
                         "currentNodeId": node.id,
                         "currentNodeName": node.name,
-                        "messages": serializable_messages, # Use the encoded list
+                        "messages": serializable_messages,  # Use the encoded list
                         "model": node.model or mcp_client.config.default_model,
-                        "nodes": nodes_data_serializable, # Use the encoded list of nodes
+                        "nodes": nodes_data_serializable,  # Use the encoded list of nodes
                     }
-                except Exception as e: # Catch potential errors during jsonable_encoder itself
+                except Exception as e:  # Catch potential errors during jsonable_encoder itself
                     log.error(f"Conversation data not serializable via jsonable_encoder: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail="Internal error: Conversation state not serializable") from e
 
@@ -12404,7 +12441,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     try:
                         # Use model_dump() for Pydantic v2 compatibility
                         await websocket.send_json(WebSocketMessage(type=msg_type, payload=payload).model_dump())
-                    except (WebSocketDisconnect, RuntimeError) as send_err: # More specific exceptions
+                    except (WebSocketDisconnect, RuntimeError) as send_err:  # More specific exceptions
                         # Ignore errors if the socket is already closing/closed
                         log.debug(f"WS-{connection_id}: Failed send (Type: {msg_type}) - likely disconnected: {send_err}")
                     except Exception as send_err:
@@ -12429,7 +12466,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                 # --- Consumer coroutine for processing the query stream ---
                 async def _consume_query_stream(query_text: str):
                     """Consumes the query stream and sends updates over WebSocket."""
-                    nonlocal active_query_task # Allow modification of outer scope variable
+                    nonlocal active_query_task  # Allow modification of outer scope variable
                     try:
                         # Iterate over the standardized events yielded by the stream wrapper
                         # Call process_streaming_query without model - it uses mcp_client.current_model
@@ -12470,8 +12507,8 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                         await send_ws_message("error", {"message": error_msg})
                     finally:
                         # --- Cleanup specific to this query task ---
-                        task_being_cleaned = active_query_task # Capture current task locally
-                        active_query_task = None # Clear task reference for this WS connection
+                        task_being_cleaned = active_query_task  # Capture current task locally
+                        active_query_task = None  # Clear task reference for this WS connection
 
                         # Clear global task reference ONLY if it was THIS task
                         # Check the task object itself for safety before clearing
@@ -12494,7 +12531,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                             if message.type == "query":
                                 query_text = str(message.payload or "").strip()
                                 if not query_text:
-                                    continue # Ignore empty queries
+                                    continue  # Ignore empty queries
                                 if active_query_task and not active_query_task.done():
                                     await send_error_response("Previous query still running.")
                                     continue
@@ -12525,11 +12562,12 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                     try:
                                         # Use shlex to handle potential quoting in args
                                         parts = shlex.split(command_str[1:])
-                                        if not parts: continue # Ignore empty command
+                                        if not parts:
+                                            continue  # Ignore empty command
                                         cmd = parts[0].lower()
                                         args = shlex.join(parts[1:]) if len(parts) > 1 else ""
                                     except ValueError as e:
-                                        await send_error_response(f"Error parsing command: {e}", cmd=command_str[:10]) # Pass partial command
+                                        await send_error_response(f"Error parsing command: {e}", cmd=command_str[:10])  # Pass partial command
                                         continue
 
                                     log.info(f"WS-{connection_id} processing command: /{cmd} {args}")
@@ -12540,7 +12578,9 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                             # Optionally switch back to root, or stay on cleared node
                                             # mcp_client.conversation_graph.set_current_node("root")
                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                            await send_command_response(True, "Conversation branch cleared.", {"messages": []}) # Send cleared messages
+                                            await send_command_response(
+                                                True, "Conversation branch cleared.", {"messages": []}
+                                            )  # Send cleared messages
                                         elif cmd == "model":
                                             if args:
                                                 # Use the set_active_model method which handles provider logic
@@ -12549,29 +12589,45 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                                     await send_command_response(True, f"Model set to: {args}", {"currentModel": args})
                                                 else:
                                                     # Error message printed by set_active_model if provider unknown
-                                                    await send_command_response(False, f"Failed to set model to {args} (check logs).", {"currentModel": mcp_client.current_model})
+                                                    await send_command_response(
+                                                        False,
+                                                        f"Failed to set model to {args} (check logs).",
+                                                        {"currentModel": mcp_client.current_model},
+                                                    )
                                             else:
-                                                await send_command_response(True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model})
+                                                await send_command_response(
+                                                    True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model}
+                                                )
                                         elif cmd == "fork":
                                             new_node = mcp_client.conversation_graph.create_fork(name=args if args else None)
                                             mcp_client.conversation_graph.set_current_node(new_node.id)
                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                            await send_command_response(True, f"Created and switched to branch: {new_node.name}", {"newNodeId": new_node.id, "newNodeName": new_node.name, "messages": new_node.messages})
+                                            await send_command_response(
+                                                True,
+                                                f"Created and switched to branch: {new_node.name}",
+                                                {"newNodeId": new_node.id, "newNodeName": new_node.name, "messages": new_node.messages},
+                                            )
                                         elif cmd == "checkout":
                                             if not args:
                                                 await send_error_response("Usage: /checkout NODE_ID_or_Prefix", cmd)
                                                 continue
                                             node_id_prefix = args
                                             node_to_checkout = None
-                                            matches = [n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id_prefix)]
+                                            matches = [
+                                                n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id_prefix)
+                                            ]
                                             if len(matches) == 1:
                                                 node_to_checkout = matches[0]
                                             elif len(matches) > 1:
-                                                 await send_error_response(f"Ambiguous node ID prefix '{node_id_prefix}'", cmd)
-                                                 continue
+                                                await send_error_response(f"Ambiguous node ID prefix '{node_id_prefix}'", cmd)
+                                                continue
 
                                             if node_to_checkout and mcp_client.conversation_graph.set_current_node(node_to_checkout.id):
-                                                await send_command_response(True, f"Switched to branch: {node_to_checkout.name}", {"currentNodeId": node_to_checkout.id, "messages": node_to_checkout.messages})
+                                                await send_command_response(
+                                                    True,
+                                                    f"Switched to branch: {node_to_checkout.name}",
+                                                    {"currentNodeId": node_to_checkout.id, "messages": node_to_checkout.messages},
+                                                )
                                             else:
                                                 await send_error_response(f"Node ID prefix '{node_id_prefix}' not found.", cmd)
                                         elif cmd == "apply_prompt":
@@ -12580,14 +12636,16 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                                 continue
                                             success = await mcp_client.apply_prompt_to_conversation(args)
                                             if success:
-                                                await send_command_response(True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages})
+                                                await send_command_response(
+                                                    True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages}
+                                                )
                                             else:
                                                 await send_error_response(f"Prompt not found: {args}", cmd)
                                         elif cmd == "abort":
                                             log.info(f"WS-{connection_id} received abort command.")
-                                            task_to_cancel = active_query_task # Target the task specific to this connection
+                                            task_to_cancel = active_query_task  # Target the task specific to this connection
                                             if task_to_cancel and not task_to_cancel.done():
-                                                was_cancelled = task_to_cancel.cancel() # Request cancellation  # noqa: F841
+                                                was_cancelled = task_to_cancel.cancel()  # Request cancellation  # noqa: F841
                                                 await send_command_response(True, "Abort signal sent.")
                                             else:
                                                 await send_command_response(False, "No active query for this connection.")
@@ -12611,7 +12669,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                             log.warning(f"WS-{connection_id} invalid message: {raw_data[:100]}... Error: {e}")
                             await send_ws_message("error", {"message": "Invalid message format."})
                         except WebSocketDisconnect:
-                            raise # Re-raise to be caught by the outer handler
+                            raise  # Re-raise to be caught by the outer handler
                         except Exception as e:
                             log.error(f"WS-{connection_id} error processing message: {e}", exc_info=True)
                             # Use suppress correctly when sending error back
@@ -12625,7 +12683,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     log.error(f"WS-{connection_id} unexpected handler error: {e}", exc_info=True)
                     # Use suppress correctly when trying to close the socket on error
                     with suppress(Exception):
-                       await websocket.close(code=1011)
+                        await websocket.close(code=1011)
                 finally:
                     # --- Final Cleanup for this WebSocket Connection ---
                     log.debug(f"WS-{connection_id}: Cleaning up WebSocket handler resources.")
@@ -12652,11 +12710,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     @app.get("/", response_class=FileResponse, include_in_schema=False)
                     async def serve_html():
                         # Added cache control headers to encourage browser reloading for development
-                        headers = {
-                            "Cache-Control": "no-cache, no-store, must-revalidate",
-                            "Pragma": "no-cache",
-                            "Expires": "0"
-                        }
+                        headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
                         return FileResponse(str(ui_file.resolve()), headers=headers)
                 else:
                     log.warning(f"UI file {ui_file} not found. Cannot serve.")
@@ -12669,19 +12723,19 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                 await server_instance.serve()
                 log.info("Web UI server shut down normally.")
             except OSError as e:
-                if e.errno == 98: # Address already in use
+                if e.errno == 98:  # Address already in use
                     safe_console.print(f"[bold red]ERROR: Could not start Web UI. Port {webui_port} is already in use.[/]")
                     safe_console.print(f"[yellow]Please stop the other process using port {webui_port} or choose a different port using --port.[/]")
-                    sys.exit(1) # Exit directly
+                    sys.exit(1)  # Exit directly
                 else:
                     log.error(f"Uvicorn server failed with OS error: {e}", exc_info=True)
                     safe_console.print(f"[bold red]Web UI server failed to start (OS Error): {e}[/]")
-                    sys.exit(1) # Exit on other OS errors too
-            except Exception as e: # Catch other potential server errors during serve()
+                    sys.exit(1)  # Exit on other OS errors too
+            except Exception as e:  # Catch other potential server errors during serve()
                 log.error(f"Uvicorn server failed: {e}", exc_info=True)
                 safe_console.print(f"[bold red]Web UI server failed to start: {e}[/]")
-                sys.exit(1) # Exit on other startup errors
-                
+                sys.exit(1)  # Exit on other startup errors
+
             log.info("Web UI server shut down.")
             # NOTE: Cleanup for webui is handled by lifespan, so return here
         elif dashboard:
@@ -12791,14 +12845,14 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
             sys.exit(1)  # Exit with error code
     finally:
         # Ensure cleanup doesn't run if webui failed early OR if lifespan is handling it
-        should_cleanup_main = not webui_flag # Default: cleanup if not webui
+        should_cleanup_main = not webui_flag  # Default: cleanup if not webui
         # If webui mode, assume lifespan handles cleanup *unless* we explicitly
         # exited early (e.g., due to OSError above, which calls sys.exit).
         # If sys.exit was called, this finally block might not execute fully anyway.
         # The goal is to avoid double cleanup if lifespan is responsible.
         if webui_flag:
-             should_cleanup_main = False # Lifespan is responsible in normal webui operation/shutdown
-             log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan or exited early).")
+            should_cleanup_main = False  # Lifespan is responsible in normal webui operation/shutdown
+            log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan or exited early).")
 
         if should_cleanup_main and client and hasattr(client, "close"):
             log.info("Performing final cleanup...")
@@ -12948,8 +13002,14 @@ async def _import_conv_async(file_path_str: str):
             await client.close()  # Close client if setup was performed
 
 
-
-async def main_async_agent_mode(initial_goal: str, max_loops: int, llm_model_for_agent: Optional[str], server_to_connect: Optional[str], verbose_logging_flag: bool, cleanup_servers_flag: bool):
+async def main_async_agent_mode(
+    initial_goal: str,
+    max_loops: int,
+    llm_model_for_agent: Optional[str],
+    server_to_connect: Optional[str],
+    verbose_logging_flag: bool,
+    cleanup_servers_flag: bool,
+):
     """
     Async entry point specifically for running the self-driving agent mode.
     """
@@ -12972,7 +13032,7 @@ async def main_async_agent_mode(initial_goal: str, max_loops: int, llm_model_for
                     connected = await client.connect_server(server_to_connect)
                     if not connected:
                         safe_console.print(f"[bold red]Agent Mode Error: Failed to connect to specified server '{server_to_connect}'. Aborting.[/]")
-                        return # Cannot proceed if essential server connection fails
+                        return  # Cannot proceed if essential server connection fails
                 else:
                     log.info(f"Agent Mode: Specified server '{server_to_connect}' is already connected.")
             else:
@@ -12984,7 +13044,7 @@ async def main_async_agent_mode(initial_goal: str, max_loops: int, llm_model_for
         start_result = await client.start_agent_task(
             goal=initial_goal,
             max_loops=max_loops,
-            llm_model_override=llm_model_for_agent # Pass model if specified
+            llm_model_override=llm_model_for_agent,  # Pass model if specified
         )
 
         if not start_result.get("success"):
@@ -12997,7 +13057,7 @@ async def main_async_agent_mode(initial_goal: str, max_loops: int, llm_model_for
         # allowing for graceful shutdown via Ctrl+C or API stop.
         if client.agent_task:
             try:
-                await client.agent_task # Wait for the agent task to complete
+                await client.agent_task  # Wait for the agent task to complete
                 log.info("Agent task completed its run.")
             except asyncio.CancelledError:
                 log.info("Agent task wait was cancelled (likely due to client.stop_agent_task or main shutdown).")
@@ -13005,7 +13065,6 @@ async def main_async_agent_mode(initial_goal: str, max_loops: int, llm_model_for
                 log.error(f"Agent task finished with an unexpected error: {e}", exc_info=True)
         else:
             log.error("Agent task was not successfully created or started.")
-
 
     except KeyboardInterrupt:
         safe_console.print("\n[yellow]Agent Mode Interrupted, shutting down...[/]")
@@ -13024,7 +13083,7 @@ async def main_async_agent_mode(initial_goal: str, max_loops: int, llm_model_for
                 if client.agent_task and not client.agent_task.done():
                     log.warning("Client shutting down, ensuring agent task is stopped...")
                     await client.stop_agent_task()
-                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout -1)
+                await asyncio.wait_for(client.close(), timeout=max_shutdown_timeout - 1)
             except asyncio.TimeoutError:
                 safe_console.print("[red]Agent mode shutdown timed out. Some processes may still be running.[/]")
             except Exception as close_error:
@@ -13052,7 +13111,7 @@ def run(
     cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers on startup.")] = False,
     agent_mode: Annotated[bool, typer.Option("--agent", "-a", help="Run in self-driving agent mode.")] = False,
     agent_goal: Annotated[Optional[str], typer.Option("--agent-goal", "-g", help="The overall goal for the agent.")] = None,
-    agent_max_loops: Annotated[int, typer.Option("--agent-max-loops", "-l", help="Max loops for the agent to run.")] = 50, # Default to 50    
+    agent_max_loops: Annotated[int, typer.Option("--agent-max-loops", "-l", help="Max loops for the agent to run.")] = 50,  # Default to 50
 ):
     """
     Run the MCP client (Interactive, Single Query, Web UI, Dashboard, or Self-Driving Agent).
@@ -13069,11 +13128,13 @@ def run(
     actual_interactive = interactive
 
     if modes_selected > 1:
-        stderr_console.print("[bold red]Error: Please specify only one primary mode: --interactive, --query, --dashboard, --webui, or --agent.[/bold red]")
+        stderr_console.print(
+            "[bold red]Error: Please specify only one primary mode: --interactive, --query, --dashboard, --webui, or --agent.[/bold red]"
+        )
         raise typer.Exit(code=1)
     elif modes_selected == 0:
         stderr_console.print("[dim]No mode specified, defaulting to interactive mode.[/dim]")
-        actual_interactive = True # Set interactive if no other mode chosen
+        actual_interactive = True  # Set interactive if no other mode chosen
 
     if agent_mode and not agent_goal:
         stderr_console.print("[bold red]Error: --agent-goal is required when using --agent mode.[/bold red]")
@@ -13084,9 +13145,9 @@ def run(
         # Call a new async entry point for agent mode
         asyncio.run(
             main_async_agent_mode(
-                initial_goal=agent_goal, # Will not be None due to check above
+                initial_goal=agent_goal,  # Will not be None due to check above
                 max_loops=agent_max_loops,
-                llm_model_for_agent=model, # Pass the --model if specified
+                llm_model_for_agent=model,  # Pass the --model if specified
                 # Pass other relevant flags if agent_master_loop needs them indirectly
                 # For now, these are mainly for MCPClient setup
                 server_to_connect=server,
@@ -13174,4 +13235,3 @@ if __name__ == "__main__":
     # Directly call the Typer app instance. Typer handles argument parsing
     # and calling the appropriate command function.
     app()
-
