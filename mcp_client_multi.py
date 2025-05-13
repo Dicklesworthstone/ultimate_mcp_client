@@ -9914,11 +9914,37 @@ class MCPClient:
                             
                             # If it's an agent's LLM turn and MCPClient executed a UMS/Server tool, yield specific event
                             if is_agent_llm_turn:
+                                # Prepare the result for the agent.
+                                # It should be the direct UMS payload (dict).
+                                final_result_for_agent_event = tool_execution_output_content # This is mcp_call_result_obj.content
+
+                                potential_text_content_block = None
+                                if isinstance(final_result_for_agent_event, list) and len(final_result_for_agent_event) == 1:
+                                    potential_text_content_block = final_result_for_agent_event[0]
+                                
+                                # Check if it's dict-like and has the 'type' and 'text' keys we expect
+                                # This will correctly handle TypedDicts at runtime as they are dict-like.
+                                if isinstance(potential_text_content_block, dict) and \
+                                   potential_text_content_block.get("type") == "text" and \
+                                   isinstance(potential_text_content_block.get("text"), str):
+                                    
+                                    json_string_payload = potential_text_content_block.get("text")
+                                    log.warning(f"MCPC (Agent Tool Exec): Result for agent was wrapped in [{{'type':'text', 'text':'...'}}]. Attempting to parse JSON string: {str(json_string_payload)[:100]}...")
+                                    try:
+                                        unwrapped_payload = json.loads(json_string_payload)
+                                        final_result_for_agent_event = unwrapped_payload # Replace with the actual dict
+                                        log.info(f"MCPC (Agent Tool Exec): Successfully unwrapped and parsed JSON payload for agent. Type now: {type(final_result_for_agent_event)}")
+                                    except json.JSONDecodeError as e:
+                                        log.error(f"MCPC (Agent Tool Exec): Failed to parse JSON from TextContent's text field: {e}. Passing wrapped structure to agent. JSON String: {str(json_string_payload)[:200]}")
+                                        # If parsing fails, final_result_for_agent_event remains the [TextContent(...)] list
+                                else:
+                                    log.debug(f"MCPC (Agent Tool Exec): Result for agent is not a [{{'type':'text', 'text':'...'}}] list/object. Type: {type(final_result_for_agent_event)}. Value: {str(final_result_for_agent_event)[:200]}. Assuming it's the direct UMS payload.")
+
                                 yield ("mcp_tool_executed_for_agent", {
-                                    "id": tool_use_id_from_llm_for_result,
-                                    "name": original_mcp_tool_name_to_execute, # Original MCP name
+                                    "id": tool_use_id_from_llm_for_result, 
+                                    "name": original_mcp_tool_name_to_execute,
                                     "input": tool_args_for_execution,
-                                    "result": tool_execution_output_content # Direct result from UMS/server
+                                    "result": final_result_for_agent_event 
                                 })
                             if tool_execution_is_error_flag:
                                 all_tool_executions_successful_this_round = False
@@ -10060,67 +10086,85 @@ class MCPClient:
 
         log.info(f"MCPC Streaming Query processing finished. Overall Stop Reason: {overall_query_stop_reason}. Overall Query Latency: {(time.time() - start_time_overall_query) * 1000:.0f}ms")
 
+
     async def _stream_wrapper(self, stream_generator: AsyncGenerator[Any, None]) -> AsyncGenerator[Tuple[str, Any], None]:
         """Wraps the query generator to extract specific event types and final stats."""
-        final_stats = {}
+        final_stats: Dict[str, Any] = {} # Ensure final_stats is always a dict
+        # Ensure stop_reason in final_stats has a default if not set by stream
+        final_stats["stop_reason"] = "unknown_wrapper_exit"
+
         try:
-            # Directly iterate over the generator passed in
             async for chunk in stream_generator:
-                # Check if the chunk is one of our standardized tuples
+                # Ensure chunk is a tuple of (type, data) as expected from process_streaming_query
                 if isinstance(chunk, tuple) and len(chunk) == 2:
                     event_type, event_data = chunk
-                    # Handle known event types
-                    if event_type == "text_chunk":
+                    
+                    # --- Explicitly handle mcp_tool_executed_for_agent ---
+                    if event_type == "mcp_tool_executed_for_agent":
+                        log.debug(f"Stream wrapper: Relaying '{event_type}' with data: {str(event_data)[:150]}...")
+                        yield event_type, event_data # Crucial: Pass the original event tuple through
+                        
+                        # Optional: Yield a status message for UI if this wrapper is used directly by UI
+                        if isinstance(event_data, dict):
+                             tool_name_for_status = event_data.get("name", "Unknown UMS Tool")
+                             # Ensure tool_name_for_status is a string before splitting
+                             tool_short_name_for_status = str(tool_name_for_status).split(':')[-1] if tool_name_for_status else "Unknown"
+                             yield "status", f"{EMOJI_MAP['tool']} MCPClient executed: [bold]{tool_short_name_for_status}[/]"
+                    
+                    elif event_type == "text_chunk":
                         yield "text", event_data
-                    elif event_type == "status":  # Pass through status if yielded as tuple
+                    elif event_type == "status":
                         yield "status", event_data
                     elif event_type == "tool_call_start":
-                        yield (
-                            "status",
-                            f"{EMOJI_MAP['tool']} Preparing tool: [bold]{event_data.get('name', 'unknown').split(':')[-1]}[/] (ID: {event_data.get('id', '?')[:8]})...",
-                        )
+                        # This is when LLM *requests* a tool
+                        tool_name_req = event_data.get("name", "unknown_tool_request")
+                        tool_id_req = event_data.get("id", "unknown_id")
+                        yield "status", f"{EMOJI_MAP['tool']} LLM preparing to call: [bold]{str(tool_name_req).split(':')[-1]}[/] (ID: {str(tool_id_req)[:8]})..."
                     elif event_type == "tool_call_input_chunk":
-                        # Maybe yield a subtle status update here if desired, otherwise ignore
-                        pass
+                        # UI might not need every chunk of input, or could display "Tool input streaming..."
+                        pass # For now, don't yield a status for every input chunk to avoid noise
                     elif event_type == "tool_call_end":
-                        # Yield a status message indicating tool execution start
-                        tool_name = event_data.get("name", "unknown")
-                        tool_short_name = tool_name.split(":")[-1]
-                        yield "status", f"{EMOJI_MAP['tool']} Executing tool: [bold]{tool_short_name}[/]"
+                        # This is when LLM has finished defining a tool call request
+                        tool_name_decided = event_data.get("name", "unknown_tool_decision")
+                        yield "status", f"{EMOJI_MAP['tool']} LLM decided to call: [bold]{str(tool_name_decided).split(':')[-1]}[/]"
                     elif event_type == "error":
-                        log.error(f"Stream wrapper received error event: {event_data}")
-                        yield "error", str(event_data)
-                    # Capture specific metadata events without immediately yielding them
+                        log.error(f"Stream wrapper received error event from generator: {event_data}")
+                        yield "error", str(event_data) # Pass error through
+                        final_stats["stop_reason"] = "error_from_generator" # Update stop reason
                     elif event_type == "final_usage":
-                        final_stats.update(event_data)  # Merge usage stats
+                        final_stats.update(event_data) # Merge usage stats
                         log.debug(f"Stream wrapper captured final usage: {event_data}")
                     elif event_type == "stop_reason":
-                        final_stats["stop_reason"] = event_data  # Store stop reason
+                        final_stats["stop_reason"] = event_data # Store/overwrite stop reason
                         log.debug(f"Stream wrapper captured stop reason: {event_data}")
                     else:
-                        log.warning(f"Stream wrapper encountered unhandled tuple type: {event_type}")
-
-                # Handle legacy @@STATUS@@ format if process_streaming_query still yields it
+                        log.warning(f"Stream wrapper: Encountered unhandled standardized event tuple type: '{event_type}', Data: {str(event_data)[:100]}")
+                
+                # Handle legacy @@STATUS@@ format if process_streaming_query might still yield it (should be phased out)
                 elif isinstance(chunk, str) and chunk.startswith("@@STATUS@@"):
+                    log.debug("Stream wrapper: Handling legacy @@STATUS@@ format.")
                     yield "status", chunk[len("@@STATUS@@") :].strip()
-                # Assume any other string is a text chunk
+                # Assume any other string is a text chunk (also legacy or direct passthrough)
                 elif isinstance(chunk, str):
+                    log.debug("Stream wrapper: Treating unhandled string chunk as 'text'.")
                     yield "text", chunk
                 else:
-                    log.warning(f"Unexpected chunk type from stream generator: {type(chunk)} Data: {repr(chunk)[:100]}")
+                    log.warning(f"Stream wrapper: Encountered unexpected chunk type from stream generator: {type(chunk)} Data: {repr(chunk)[:100]}")
 
         except asyncio.CancelledError:
-            log.debug("Stream wrapper detected cancellation during iteration.")
-            raise  # Propagate cancellation
-        except Exception as e:
-            log.error(f"Error in stream wrapper iteration: {e}", exc_info=True)
-            yield "error", str(e)  # Yield error message
+            log.info("Stream wrapper: Iteration was cancelled.")
+            final_stats["stop_reason"] = "cancelled_in_wrapper"
+            raise # Important to propagate cancellation
+        except Exception as e_wrapper_iter:
+            log.error(f"Stream wrapper: Error during stream iteration: {e_wrapper_iter}", exc_info=True)
+            final_stats["stop_reason"] = "error_in_wrapper_iteration"
+            yield "error", str(e_wrapper_iter) # Yield the error for the consumer
         finally:
-            # Yield the combined stats at the very end
-            if final_stats:
-                yield "final_stats", final_stats  # Yield collected stats
-            else:
-                log.warning("Stream wrapper did not capture final stats/reason.")
+            # Ensure a 'final_stats' event is always yielded, containing the latest stop_reason
+            # (even if it defaulted to 'unknown_wrapper_exit' or was set by an error/cancellation).
+            log.debug(f"Stream wrapper: Finalizing. Collected stats before yield: {final_stats}")
+            yield "final_stats", final_stats
+            log.debug("Stream wrapper: Final 'final_stats' event yielded.")
 
     async def process_agent_llm_turn(
         self,

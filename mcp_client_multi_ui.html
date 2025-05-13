@@ -3386,8 +3386,12 @@
                     <div class="chat-header text-xs opacity-60 mb-0.5 ml-1"
                         :class="{'text-right mr-1': message.role === 'user'}">
                         <span x-text="message.is_agent_activity ? 'Agent Activity' : messageRoleDisplayName(message.role, message.content_type)"></span>
-                        <span x-show="message.model && (!message.is_agent_activity || message.content_type === 'agent_llm_stream_output')" class="opacity-70" <!-- Show model for agent's LLM stream, not for its generic logs -->
-                            x-text="message.model ? (' (' + message.model + ')') : ''"></span>
+                        
+                        <!-- Revised Model Display Span -->
+                        <template x-if="message.model && typeof message.model === 'string' && message.model.trim() !== '' && (!message.is_agent_activity || message.content_type === 'agent_llm_stream_output')">
+                            <span class="opacity-70" x-text="' (' + message.model + ')'"></span>
+                        </template>
+                        
                         <time class="text-xs opacity-50 ml-1" x-show="uiSettings.showTimestamps"
                             x-text="formatTimestamp(message.timestamp)"></time>
                         <!-- Bookmark Toggle Icon -->
@@ -7776,43 +7780,75 @@
                 },
                 addMessageToConversation(role, content, metadata = {}) {
                     const tempId = `${role}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+                    
+                    let messageModel = metadata.model; // Use metadata.model if provided
+
+                    // Determine model string if not explicitly provided in metadata
+                    if (typeof messageModel === 'undefined' || messageModel === null) { // Check for undefined or null explicitly
+                        if (role === 'user') {
+                            messageModel = null; // User messages don't have an originating model
+                        } else if (metadata.is_agent_activity) {
+                            if (metadata.content_type === 'agent_llm_stream_output' && this.agentStatus && this.agentStatus.agent_target_model) {
+                                messageModel = this.agentStatus.agent_target_model;
+                            } else {
+                                // For other agent activities (like log summaries), a generic label is fine
+                                messageModel = "Agent Activity"; 
+                            }
+                        } else if (metadata.content_type === 'tool_result' || metadata.content_type === 'tool_execution_error') {
+                            messageModel = "Tool Output"; // Specific placeholder for direct tool outputs
+                        } else if (role === 'assistant' && this.currentModelShort) {
+                             messageModel = this.currentModelShort; // Fallback to current model for general assistant messages
+                        } else {
+                            messageModel = "System"; // Default for other system/assistant messages
+                        }
+                    }
+                    // Ensure messageModel is either a string or null, not undefined.
+                    if (typeof messageModel === 'undefined') {
+                        messageModel = null;
+                    }
+
                     const newMessage = {
                         role: role,
                         content: content,
                         id: metadata.id || tempId,
                         timestamp: metadata.timestamp || new Date().toISOString(),
-                        model: metadata.model || (role === 'assistant' ? this.currentModelShort : null),
+                        model: messageModel, // Use the determined and potentially placeholder model string
                         content_type: metadata.content_type || null,
                         tool_name: metadata.tool_name,
-                        is_error: metadata.is_error,
-                        ...metadata
+                        is_error: metadata.is_error || false, // Ensure is_error defaults to false
+                        is_agent_activity: metadata.is_agent_activity || false, // Ensure defaults
+                        ...metadata 
                     };
+
                     const existingIndex = this.currentConversation.findIndex(m => m.id === newMessage.id);
                     if (existingIndex === -1) {
                         this.currentConversation.push(newMessage);
                     } else {
-                        this.currentConversation[existingIndex] = {
-                            ...this.currentConversation[existingIndex],
-                            ...newMessage
+                        // Merge new data into existing message, ensuring critical fields are updated
+                        const existingMsg = this.currentConversation[existingIndex];
+                        this.currentConversation[existingIndex] = { 
+                            ...existingMsg, 
+                            ...newMessage,
+                            content: newMessage.content, // Ensure content is fully replaced or appended correctly
+                            model: newMessage.model // Ensure model is updated
                         };
-                        this.currentConversation = [...this.currentConversation];
+                        // If content was a string and new content is a string, append (for streaming)
+                        if (typeof existingMsg.content === 'string' && typeof newMessage.content === 'string' && newMessage.id === this.currentAssistantMessageId) {
+                            this.currentConversation[existingIndex].content = existingMsg.content + newMessage.content;
+                        }
+                        this.currentConversation = [...this.currentConversation]; // Trigger reactivity
                     }
+                    
                     this.$nextTick(() => {
                         setTimeout(() => {
                             const messageElement = document.getElementById(`message-${newMessage.id}`);
                             if (messageElement) {
                                 const bubbleElement = messageElement.querySelector('.chat-bubble');
-                                if (bubbleElement) {
-                                    if (this.contrastOptimizer) {
-                                        this.contrastOptimizer.fixContrastRecursively(bubbleElement, bubbleElement);
-                                    }
-                                } else {
-                                    console.warn("Could not find BUBBLE element inside message element for contrast fix:", newMessage.id);
+                                if (bubbleElement && this.contrastOptimizer) {
+                                    this.contrastOptimizer.fixContrastRecursively(bubbleElement, bubbleElement);
                                 }
-                            } else {
-                                console.log(`Message element ${newMessage.id} not found for contrast fix (likely removed before check).`);
                             }
-                        }, 150);
+                        }, 150); 
                     });
                     this.scrollToBottom();
                 },
@@ -9236,21 +9272,102 @@
                     return rendered;
                 },
                 async executeToolDirectly() {
-                    if (!this.selectedTool) return; let params;
-                    try { params = JSON.parse(this.directToolParams || '{}'); this.directToolError = null; }
-                    catch (e) { this.directToolError = `Invalid JSON parameters: ${e.message}`; this.directToolResult = null; this.$nextTick(() => this.initHighlighting(document.getElementById('toolDetailsModal'))); return; }
-                    this.isLoadingDirectTool = true; this.directToolResult = null; this.directToolError = null;
+                    if (!this.selectedTool) {
+                        this.addNotification('No tool selected for direct execution.', 'warning');
+                        return;
+                    }
+                    
+                    let params;
                     try {
-                        const payload = { tool_name: this.selectedTool.name, server_name: this.selectedTool.server_name, params: params };
-                        const result = await this.apiFetch('/tool/execute', { method: 'POST', body: JSON.stringify(payload) });
-                        if (result && (result.is_error || result.error || (result.status && result.status !== 'success' && result.status !== 200))) { this.directToolError = `Tool execution failed: ${JSON.stringify(result.content || result.error || result.detail || result)}`; this.directToolResult = null; }
-                        else {
-                            this.directToolResult = result;
-                            this.addNotification(`Tool '${this.selectedTool.name}' executed successfully.`, 'success', 2000);
-                            this.addToRecentTools(this.selectedTool); // Add to recents on success
+                        params = JSON.parse(this.directToolParams || '{}');
+                        if (typeof params !== 'object' || params === null) throw new Error("Parameters must be a JSON object.");
+                        this.directToolError = null;
+                    } catch (e) {
+                        this.directToolError = `Invalid JSON parameters: ${e.message}`;
+                        this.directToolResult = null;
+                        this.addNotification(this.directToolError, 'error');
+                        this.$nextTick(() => { if (document.getElementById('toolDetailsModal')) this.initHighlighting(document.getElementById('toolDetailsModal')); });
+                        return;
+                    }
+
+                    this.isLoadingDirectTool = true;
+                    this.directToolResult = null;
+                    this.directToolError = null;
+                    const toolToExecute = this.selectedTool; // Capture before potential modal close
+
+                    this.addMessageToConversation('user', // Represent the call as a user action
+                        `Executing tool directly: ${toolToExecute.name}\nParameters: ${JSON.stringify(params, null, 2)}`,
+                        { 
+                            content_type: 'direct_tool_call_request',
+                            tool_name: toolToExecute.name,
+                            model: "Direct Action" // Placeholder for model
                         }
-                    } catch (e) { this.directToolError = `Execution request failed: ${e.message}`; this.directToolResult = null; this.addNotification(`Failed to execute tool '${this.selectedTool.name}'.`, 'error'); }
-                    finally { this.isLoadingDirectTool = false; this.$nextTick(() => this.initHighlighting(document.getElementById('toolDetailsModal'))); }
+                    );
+
+                    try {
+                        const payload = {
+                            tool_name: toolToExecute.name, // Original MCP Name from selectedTool
+                            // server_name: toolToExecute.server_name, // API endpoint might not need server_name if tool_name is globally unique via API
+                            params: params
+                        };
+                        const result = await this.apiFetch('/tool/execute', {
+                            method: 'POST',
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (result && (result.isError || result.error || (typeof result.success === 'boolean' && !result.success))) {
+                            this.directToolError = `Tool execution failed: ${JSON.stringify(result.content || result.error || result.detail || result, null, 2)}`;
+                            this.directToolResult = null; // Clear any partial result
+                            this.addNotification(`Error executing tool ${toolToExecute.shortName || toolToExecute.name}: ${this.directToolError.substring(0,100)}...`, 'error');
+                            // Add error message to main chat display
+                            this.addMessageToConversation('assistant', // Or 'system'
+                                result.content || { error: this.directToolError }, // Pass the error content
+                                { 
+                                    is_error: true, 
+                                    content_type: 'tool_result', // Still a tool_result, but an error one
+                                    tool_name: toolToExecute.name,
+                                    model: "Tool Error" // Placeholder
+                                }
+                            );
+                        } else {
+                            this.directToolResult = result; // Store the full result for the modal
+                            this.addNotification(`Tool '${toolToExecute.shortName || toolToExecute.name}' executed successfully.`, 'success', 2500);
+                            this.addToRecentTools(toolToExecute);
+                            // Add successful tool result to main chat display
+                            this.addMessageToConversation('assistant', // Display as assistant
+                                result.content, // This is the actual content from the tool
+                                { 
+                                    content_type: 'tool_result',
+                                    tool_name: toolToExecute.name,
+                                    model: "Tool Result" // Placeholder
+                                }
+                            );
+                        }
+                    } catch (e) {
+                        this.directToolError = `Execution request failed: ${e.message}`;
+                        this.directToolResult = null;
+                        this.addNotification(`Failed to execute tool '${toolToExecute.shortName || toolToExecute.name}': ${e.message}`, 'error');
+                        // Add error message to main chat display
+                        this.addMessageToConversation('assistant', // Or 'system'
+                           { error: `Request failed: ${e.message}`},
+                           { 
+                               is_error: true, 
+                               content_type: 'tool_result', // Still a tool_result, error one
+                               tool_name: toolToExecute.name,
+                               model: "Request Error" // Placeholder
+                           }
+                        );
+                    } finally {
+                        this.isLoadingDirectTool = false;
+                        // Ensure highlighting is re-applied within the modal if it's still open
+                        // and also for any new messages added to the main chat.
+                        this.$nextTick(() => {
+                            if (this.showToolDetailsModal && document.getElementById('toolDetailsModal')) {
+                                this.initHighlighting(document.getElementById('toolDetailsModal'));
+                            }
+                            this.initHighlighting(this.$refs.chatbox); // Re-highlight main chat
+                        });
+                    }
                 },
                 async applyPrompt(promptName) { // Make it async
                     if (!promptName) return;
