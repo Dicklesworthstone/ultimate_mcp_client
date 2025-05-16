@@ -59,6 +59,7 @@ dependencies = [
     "python-multipart",
     "python-Levenshtein",
     "thefuzz",
+    "json5",
 ]
 
 # Defines the command-line script entry points
