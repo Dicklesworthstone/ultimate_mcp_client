@@ -158,6 +158,7 @@ import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import time
 import traceback
 import uuid
@@ -222,6 +223,7 @@ from mcp.types import (
     ListToolsResult,
     ReadResourceResult,
     Resource,
+    TextContent, # noqa: F401
     Tool,
 )
 from mcp.types import (
@@ -1230,38 +1232,139 @@ def extract_json_from_markdown(text: str) -> str:
 ###############################################################################
 # 3) Robustly parse MCP tool results
 ###############################################################################
-async def robust_parse_mcp_tool_content(result: Any) -> Dict[str, Any]:
-    """
-    Attempt to coerce *result* into a Python dict.
-    Falls back to LLM-based repair (generate_completion) only when standard
-    heuristics fail.
-    """
-    # -------- helper to normalise “result” into a string to parse ------------
-    def _extract_str(obj: Any) -> str|None:
-        if obj is None: return None
-        if isinstance(obj, str): return obj
-        if hasattr(obj, "text"): return getattr(obj, "text") # noqa: B009
-        if isinstance(obj, dict): return None
-        if isinstance(obj, list) and obj:
-            inner = obj[0]
-            if isinstance(inner, dict) and inner.get("type")=="text":
-                return inner.get("text","")
-            return _extract_str(inner)
-        return None
 
-    # dictionaries can be returned as-is
-    if isinstance(result, dict): return result
-    # attempt to pull a text representation
-    text = _extract_str(result)
-    if text is None or not text.strip():
-        return {"error":"No parsable text content", "original_type":str(type(result))}
-    # try direct / fenced JSON first
-    json_str = extract_json_from_markdown(text)
-    for mode in (False, True):
-        try: return json.loads(json_str)
-        except json.JSONDecodeError:
-            if mode: break
-            json_str = _repair_json(json_str, aggressive=True)
+
+def _strip_markdown_fences(txt: str) -> str:
+    txt = txt.strip()
+    if txt.startswith("```"):
+        first_newline = txt.find("\n")
+        if first_newline != -1 and txt.rstrip().endswith("```"):
+            return txt[first_newline + 1 : txt.rfind("```")].strip()
+    return txt
+
+def robust_parse_mcp_tool_content(content_from_call_tool_result: Any) -> Dict[str, Any]:
+    """
+    Extracts a JSON string from CallToolResult.content (expected to be List[TextContent]
+    from mcp.py SSE client) and parses it.
+    Returns a dictionary: successfully parsed JSON, or an error structure.
+    """
+    log.debug(
+        f"ROBUST_PARSE_V_FINAL: Received raw content of type: {type(content_from_call_tool_result)}, "
+        f"Preview: {str(content_from_call_tool_result)[:500]}"
+    )
+
+    extracted_json_string: Optional[str] = None
+
+    # Primary expected path: content is a list, first item is TextContent
+    if isinstance(content_from_call_tool_result, list) and content_from_call_tool_result:
+        first_block = content_from_call_tool_result[0]
+        log.debug(f"ROBUST_PARSE_V_FINAL: Processing first block from list. Type: {type(first_block)}, Value: {str(first_block)[:200]}")
+
+        # Explicitly check if it's an mcp.types.TextContent instance
+        if isinstance(first_block, TextContent): # Requires TextContent to be imported
+            if first_block.type == 'text' and isinstance(first_block.text, str):
+                extracted_json_string = first_block.text
+                log.debug(f"ROBUST_PARSE_V_FINAL: Extracted via isinstance(TextContent): '{extracted_json_string[:100]}...' (Length: {len(extracted_json_string)})")
+            else:
+                log.warning(f"ROBUST_PARSE_V_FINAL: Is TextContent, but type is not 'text' or .text not string. Type: {first_block.type}")
+        # Fallback check using hasattr (duck-typing) if isinstance fails or TextContent not imported
+        elif dataclasses.is_dataclass(first_block) and \
+             hasattr(first_block, 'type') and getattr(first_block, 'type') == 'text' and hasattr(first_block, 'text') and isinstance(getattr(first_block, 'text'), str): # noqa: B009
+            extracted_json_string = getattr(first_block, 'text') # noqa: B009
+            log.debug(f"ROBUST_PARSE_V_FINAL: Extracted via hasattr (dataclass): '{extracted_json_string[:100]}...' (Length: {len(extracted_json_string)})")
+        elif isinstance(first_block, dict) and \
+             first_block.get("type") == "text" and \
+             isinstance(first_block.get("text"), str):
+            extracted_json_string = first_block.get("text")
+            log.debug(f"ROBUST_PARSE_V_FINAL: Extracted from dict-like TextContent: '{extracted_json_string[:100]}...' (Length: {len(extracted_json_string)})")
+        else:
+            log.warning(f"ROBUST_PARSE_V_FINAL: First block in list not recognized TextContent. Type: {type(first_block)}. Content: {str(first_block)[:150]}")
+
+    elif isinstance(content_from_call_tool_result, TextContent): # Handle single TextContent not in a list
+        if content_from_call_tool_result.type == 'text' and isinstance(content_from_call_tool_result.text, str):
+            extracted_json_string = content_from_call_tool_result.text
+            log.debug(f"ROBUST_PARSE_V_FINAL: Extracted from standalone TextContent object: '{extracted_json_string[:100]}...' (Length: {len(extracted_json_string)})")
+        else:
+            log.warning(f"ROBUST_PARSE_V_FINAL: Standalone TextContent object, but type is not 'text' or .text not string. Type: {content_from_call_tool_result.type}")
+
+    elif isinstance(content_from_call_tool_result, str): # If mcp.py client somehow already gave a string
+        extracted_json_string = content_from_call_tool_result
+        log.debug(f"ROBUST_PARSE_V_FINAL: Content was already a string: '{extracted_json_string[:100]}...' (Length: {len(extracted_json_string)})")
+
+    elif isinstance(content_from_call_tool_result, dict): # If it's already a dict (e.g. from a direct non-SSE tool, or if wrapper already parsed)
+        log.info(f"ROBUST_PARSE_V_FINAL: Content is already a dict. Returning as is. Keys: {list(content_from_call_tool_result.keys())}")
+        # Ensure it has a "success" key if it's meant to be a UMS-style response for the agent
+        if "success" not in content_from_call_tool_result and not ("error" in content_from_call_tool_result and "error_type" in content_from_call_tool_result):
+            log.warning("ROBUST_PARSE_V_FINAL: Input dict lacks 'success' key. Adding 'success: True' assuming it's data, not an error structure from this func.")
+            content_from_call_tool_result["success"] = True # Agent expects this
+        return content_from_call_tool_result
+
+    elif content_from_call_tool_result is None:
+        log.warning("ROBUST_PARSE_V_FINAL: Received None as input content.")
+        return {"success": False, "error": "Tool content was None.", "error_type": "NoneContentReceived_MCPC"}
+        
+    else: # Fallback for completely unexpected types
+        log.error(f"ROBUST_PARSE_V_FINAL: Unhandled content type: {type(content_from_call_tool_result)}. Attempting str(). Content: {str(content_from_call_tool_result)[:200]}")
+        extracted_json_string = str(content_from_call_tool_result) # Last resort
+
+    if not extracted_json_string: # After all attempts, if still no string
+        error_msg = "Could not extract any usable JSON string from tool result content."
+        log.error(f"ROBUST_PARSE_V_FINAL: {error_msg} Original raw content preview: {str(content_from_call_tool_result)[:200]}")
+        return {
+            "success": False, "error": error_msg, "error_type": "NoJSONStringExtracted_MCPC_Final",
+            "original_content_preview": str(content_from_call_tool_result)[:200]
+        }
+
+    # Log the string that will be attempted for JSON parsing
+    log.info(
+        f"ROBUST_PARSE_V_FINAL: Attempting to parse JSON from extracted string (length: {len(extracted_json_string)}): "
+        f"'{extracted_json_string[:200]}{'...[TRUNCATED PREVIEW]' if len(extracted_json_string) > 200 else ''}'"
+    )
+    # If this log shows `{"wo...` with a very short length, the problem is upstream (MCP server/library).
+
+    candidate_for_json = _strip_markdown_fences(extracted_json_string) # For LLM-generated JSON that might include fences
+    candidate_for_json = textwrap.dedent(candidate_for_json).strip()
+
+    if not candidate_for_json:
+        error_msg = "Extracted JSON string became empty after stripping markdown/dedenting."
+        log.error(f"ROBUST_PARSE_V_FINAL: {error_msg} Original extracted string: '{extracted_json_string[:200]}...'")
+        return {
+            "success": False, "error": error_msg, "error_type": "EmptyAfterCleaning_MCPC",
+            "original_extracted_string_preview": extracted_json_string[:200]
+        }
+    
+    try:
+        parsed_data = json.loads(candidate_for_json)
+        
+        if not isinstance(parsed_data, dict):
+            log.info(f"ROBUST_PARSE_V_FINAL: Parsed to valid non-dictionary JSON (type: {type(parsed_data)}). Wrapping.")
+            return {"success": True, "data": parsed_data, "_mcp_client_non_dict_payload_note": "Original tool payload was valid JSON but not a dictionary."}
+
+        if "success" not in parsed_data:
+            log.warning(
+                f"ROBUST_PARSE_V_FINAL: Parsed dict has no 'success' key. Assuming UMS tool success or non-UMS payload. Adding 'success: True'. Keys: {list(parsed_data.keys())}"
+            )
+            if not ("error" in parsed_data and "error_type" in parsed_data):
+                 parsed_data["success"] = True
+        
+        log.debug(f"ROBUST_PARSE_V_FINAL: Successfully parsed to dict. Success key from payload: {parsed_data.get('success', 'N/A')}")
+        return parsed_data
+
+    except json.JSONDecodeError as e:
+        error_msg = f"JSONDecodeError: {e}. Input to json.loads (first 200 chars): '{candidate_for_json[:200]}...'"
+        log.error(f"ROBUST_PARSE_V_FINAL: {error_msg}")
+        if len(candidate_for_json) < 2000: log.error(f"ROBUST_PARSE_V_FINAL: Full candidate string that failed json.loads: {candidate_for_json}")
+        else: log.error(f"ROBUST_PARSE_V_FINAL: Candidate string (first 2000 chars) for failed json.loads: {candidate_for_json[:2000]}...")
+        return {
+            "success": False, "error": error_msg, "error_type": "JSONDecodeError_MCPC_Final",
+            "final_candidate_preview": candidate_for_json[:200],
+            "original_extracted_string_preview": extracted_json_string[:200]
+        }
+    except Exception as e_final_parse:
+        error_msg = f"Unexpected error during final parsing attempt: {e_final_parse}"
+        log.error(f"ROBUST_PARSE_V_FINAL: {error_msg}. Candidate: '{candidate_for_json[:200]}...'", exc_info=True)
+        return {"success": False, "error": error_msg, "error_type": "GenericFinalParseError_MCPC_Final"}
+
 
 # --- Directory Constants ---
 PROJECT_ROOT = Path(__file__).parent.resolve()
@@ -7440,6 +7543,126 @@ class MCPClient:
         finally:
             pass  # Context managers handle exit
 
+    async def _execute_tool_and_parse_for_agent(
+        self, server_name: str, tool_name_mcp: str, arguments: Dict[str, Any], request_timeout: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        INTERNAL USE BY AGENT MASTER LOOP.
+        Executes a tool using the standard `execute_tool` method (which returns CallToolResult)
+        and then robustly parses its content into a standardized dictionary envelope suitable
+        for the AgentMasterLoop.
+
+        Returns:
+            A dictionary:
+            {
+                "success": bool,
+                "data": Any (parsed UMS payload if UMS tool, or original content if non-JSON success),
+                "error_type": Optional[str],
+                "error_message": Optional[str],
+                "status_code": Optional[int], # If available from MCP layer
+                "details": Optional[Any]      # Additional error details
+            }
+        """
+        self.logger.debug(f"MCPC._exec_tool_and_parse_FOR_AGENT: Called for '{tool_name_mcp}' on '{server_name}'")
+        
+        # Initialize a default error envelope
+        standard_agent_envelope: Dict[str, Any] = {
+            "success": False, "data": None, "error_type": "AgentSideWrapperError_MCPC",
+            "error_message": "Initial error in _execute_tool_and_parse_for_agent wrapper.",
+            "status_code": None, "details": None
+        }
+
+        try:
+            # 1. Call the original execute_tool.
+            #    The original execute_tool handles retries, circuit breaking, and returns CallToolResult.
+            raw_call_tool_result_obj: CallToolResult = await self.execute_tool(
+                server_name, tool_name_mcp, arguments
+                # request_timeout is not directly passed here; original execute_tool's retry logic might handle its own timeout mechanisms
+                # or the underlying session.call_tool timeout is used.
+            )
+            self.logger.debug(
+                f"MCPC._exec_tool_and_parse_FOR_AGENT: Raw CallToolResult from self.execute_tool for '{tool_name_mcp}': "
+                f"isError={raw_call_tool_result_obj.isError}, Content Type={type(raw_call_tool_result_obj.content)}, "
+                f"Content Preview: {str(raw_call_tool_result_obj.content)[:200]}"
+            )
+
+            # Preserve MCP status code if available (e.g., from HTTP errors caught by MCP layer)
+            # The CallToolResult might not have status_code directly, but underlying errors might.
+            # For now, we rely on robust_parse to extract it if embedded in error content.
+            
+            # 2. Robustly parse the content from CallToolResult.
+            #    robust_parse_mcp_tool_content returns a dict:
+            #    - On successful parsing of UMS JSON: {"success": True, "actual_ums_key1": ..., "actual_ums_key2": ...}
+            #    - On successful parsing of non-dict JSON (e.g. string from summarize_text): {"success": True, "_raw_non_dict_data": "string_content"}
+            #    - On parsing failure: {"success": False, "error": "parse error msg", "error_type": "ParseErrorType", ...}
+            parsed_dict_from_robust_parse = robust_parse_mcp_tool_content(raw_call_tool_result_obj.content)
+            self.logger.debug(
+                f"MCPC._exec_tool_and_parse_FOR_AGENT: Result from robust_parse for '{tool_name_mcp}': "
+                f"Success Flag in Parsed: {parsed_dict_from_robust_parse.get('success', 'N/A')}, "
+                f"Error Preview in Parsed: {str(parsed_dict_from_robust_parse.get('error', 'N/A'))[:100]}"
+            )
+
+            # 3. Construct the final standard_agent_envelope for the agent
+            if raw_call_tool_result_obj.isError:
+                # MCP transport layer reported an error (e.g., server unavailable after retries).
+                standard_agent_envelope["success"] = False
+                # The `parsed_dict_from_robust_parse` might be an error dict itself if content was an error message.
+                if isinstance(parsed_dict_from_robust_parse, dict) and not parsed_dict_from_robust_parse.get("success", True):
+                    standard_agent_envelope["error_message"] = parsed_dict_from_robust_parse.get("error", f"Tool '{tool_name_mcp}' failed at MCP layer AND content parsing.")
+                    standard_agent_envelope["error_type"] = parsed_dict_from_robust_parse.get("error_type", "MCPTransportAndContentError_MCPC")
+                    standard_agent_envelope["details"] = parsed_dict_from_robust_parse.get("details")
+                else: # MCP error, but content parsing itself didn't yield a specific error struct.
+                    error_content_str = str(raw_call_tool_result_obj.content) if raw_call_tool_result_obj.content is not None else "No content from MCP error"
+                    standard_agent_envelope["error_message"] = f"Tool '{tool_name_mcp}' failed at MCP transport layer. Error content: {error_content_str[:150]}"
+                    standard_agent_envelope["error_type"] = "MCPTransportError_MCPC"
+                # `data` might still contain the (potentially unparsed or error) content from MCP
+                standard_agent_envelope["data"] = parsed_dict_from_robust_parse if isinstance(parsed_dict_from_robust_parse, dict) else {"_raw_content_on_mcp_error": str(raw_call_tool_result_obj.content)}
+
+            elif isinstance(parsed_dict_from_robust_parse, dict):
+                # MCP transport OK. The result of robust_parse dictates the envelope.
+                # It is ALREADY in the standard envelope format if robust_parse created an error dict.
+                # Or, it's the UMS tool's payload if robust_parse successfully parsed UMS JSON.
+                standard_agent_envelope = parsed_dict_from_robust_parse.copy()
+
+                # If UMS payload had success=True, but robust_parse had to wrap non-dict JSON,
+                # ensure `data` field holds the actual data.
+                if standard_agent_envelope.get("success") and "_raw_non_dict_data" in standard_agent_envelope:
+                    standard_agent_envelope["data"] = standard_agent_envelope.pop("_raw_non_dict_data")
+                # If UMS payload was a success dict but didn't explicitly include a "data" field (e.g. just {"success": true}),
+                # then standard_agent_envelope["data"] will be None (from the initial envelope def), which is fine.
+                # If UMS payload was a success dict with its own data, it's already in standard_agent_envelope["data"]
+
+            elif parsed_dict_from_robust_parse is not None: # Parsed to non-dict (e.g. string summary) and robust_parse didn't make it an error.
+                standard_agent_envelope["success"] = True
+                standard_agent_envelope["data"] = parsed_dict_from_robust_parse
+                standard_agent_envelope["error_type"] = None
+                standard_agent_envelope["error_message"] = None
+                self.logger.debug(f"MCPC._exec_tool_and_parse_FOR_AGENT: Tool '{tool_name_mcp}' returned non-dict success payload. Type: {type(parsed_dict_from_robust_parse)}")
+            
+            else: # parsed_dict_from_robust_parse is None (robust_parse failed completely and returned None - should be rare)
+                standard_agent_envelope["success"] = False
+                standard_agent_envelope["error_message"] = f"Tool '{tool_name_mcp}' executed by MCP, but robust_parse_mcp_tool_content returned None. This is unexpected."
+                standard_agent_envelope["error_type"] = "InternalParsingWrapperFailure_MCPC"
+                self.logger.error(f"MCPC._exec_tool_and_parse_FOR_AGENT: CRITICAL - robust_parse_mcp_tool_content returned None for tool '{tool_name_mcp}'. Raw CallToolResult content was: {str(raw_call_tool_result_obj.content)[:200]}")
+
+            return standard_agent_envelope
+
+        except RuntimeError as e_rte: # From original execute_tool (e.g. circuit breaker, retries exhausted)
+            self.logger.error(f"MCPC._exec_tool_and_parse_FOR_AGENT: Runtime error from underlying self.execute_tool for '{tool_name_mcp}': {e_rte}", exc_info=False)
+            standard_agent_envelope.update({
+                "success": False, "error_message": f"Tool execution for '{tool_name_mcp}' failed after retries or due to server issue: {e_rte}",
+                "error_type": "ToolMaxRetriesOrServerError_MCPC" 
+            })
+            return standard_agent_envelope
+        except Exception as e_outer_wrapper: # Catch-all for unexpected errors *within this wrapper itself*
+            self.logger.error(f"MCPC._exec_tool_and_parse_FOR_AGENT: Unexpected error wrapping execute_tool for '{tool_name_mcp}': {e_outer_wrapper}", exc_info=True)
+            standard_agent_envelope.update({
+                "success": False, "error_message": f"Unexpected error processing tool '{tool_name_mcp}' for agent: {e_outer_wrapper}",
+                "error_type": "AgentSideToolWrapperUnexpectedError_MCPC"
+            })
+            return standard_agent_envelope
+        
+
     @asynccontextmanager
     async def tool_execution_context(self, tool_name, tool_args, server_name):
         """Context manager for tool execution metrics and tracing.
@@ -10016,7 +10239,7 @@ class MCPClient:
                                         log.debug(f"MCPC: Raw content from CallToolResult for '{original_mcp_tool_name_to_execute}': Type {type(raw_content_from_mcp_call)}, Preview: {str(raw_content_from_mcp_call)[:200]}")
                                         
                                         # Use the integrated robust_parse_mcp_tool_content
-                                        parsed_ums_payload_dict = await robust_parse_mcp_tool_content(raw_content_from_mcp_call)
+                                        parsed_ums_payload_dict = robust_parse_mcp_tool_content(raw_content_from_mcp_call)
                                         tool_execution_output_content = parsed_ums_payload_dict # This is the UMS dict or error dict
                                         
                                         # Determine error flag based on parsed_ums_payload_dict and mcp_call_tool_result_object.isError
@@ -10215,87 +10438,74 @@ class MCPClient:
 
     async def process_agent_llm_turn(
         self,
-        prompt_messages: List[Dict[str, Any]],
-        tool_schemas: List[Dict[str, Any]],
-        model_name: str,
+        prompt_messages: List[Dict[str, Any]], # This is InternalMessageList
+        tool_schemas: List[Dict[str, Any]],    # LLM-formatted schemas
+        model_name: str,                       # User-facing model name
         ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
     ) -> Dict[str, Any]:
         self.safe_print(f"MCPC: Processing LLM turn for Agent. Model: {model_name}. Provided Tools: {len(tool_schemas) if tool_schemas else 'None'}")
 
-        logger_to_use = getattr(self, "logger", log)  # Use instance logger or global log
+        logger_to_use = getattr(self, "logger", log) 
 
         current_agent_internal_loop = "N/A"
         if self.agent_loop_instance and hasattr(self.agent_loop_instance, "state") and hasattr(self.agent_loop_instance.state, "current_loop"):
             current_agent_internal_loop = str(self.agent_loop_instance.state.current_loop)
 
         # Detailed logging of input prompt messages and tools for the agent's LLM turn
-        logger_to_use.info(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}) DETAILS (BEGIN) ==================")
-        logger_to_use.info(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): Model for this turn: {model_name}")
-        logger_to_use.info(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): Type of prompt_messages: {type(prompt_messages)}")
+        logger_to_use.info(f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}) DETAILS (BEGIN) ==================")
+        logger_to_use.info(f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): Model for this turn: {model_name}")
+        logger_to_use.info(f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): Type of prompt_messages: {type(prompt_messages)}")
         if isinstance(prompt_messages, list) and prompt_messages:
             logger_to_use.debug(
-                f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): First prompt message role: {prompt_messages[0].get('role', 'N/A')}"
+                f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): First prompt message role: {prompt_messages[0].get('role', 'N/A')}"
             )
             try:
-                # Log the first 500 chars of the first message content for context
                 first_msg_content_str = json.dumps(prompt_messages[0].get("content", ""), default=str, ensure_ascii=False)
                 logger_to_use.debug(
-                    f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): First prompt message content preview (first 500 chars): {first_msg_content_str[:500]}..."
+                    f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): First prompt message content preview (first 500 chars): {first_msg_content_str[:500]}..."
                 )
             except Exception as e_log_prompt:
                 logger_to_use.warning(
-                    f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): Could not serialize first prompt message content for logging: {e_log_prompt}"
+                    f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): Could not serialize first prompt message content for logging: {e_log_prompt}"
                 )
         logger_to_use.info(
-            f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): Number of tools provided: {len(tool_schemas) if tool_schemas else 0}"
+            f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): Number of tools provided: {len(tool_schemas) if tool_schemas else 0}"
         )
         if tool_schemas:
             try:
                 tool_names_for_log = [
                     t.get("name") or (t.get("function", {}).get("name") if isinstance(t.get("function"), dict) else "UnknownToolName")
-                    for t in tool_schemas[:5]
+                    for t in tool_schemas[:5] # Log first 5 for brevity
                 ]
-                logger_to_use.debug(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): Sample tool names for LLM: {tool_names_for_log}...")
+                logger_to_use.debug(f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): Sample tool names for LLM: {tool_names_for_log}...")
             except Exception as e_log_tools:
                 logger_to_use.warning(
-                    f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}): Could not serialize sample tool names for logging: {e_log_tools}"
+                    f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): Could not serialize sample tool names for logging: {e_log_tools}"
                 )
-        logger_to_use.info(f"MCPC AGENT LLM PROMPT (Turn {current_agent_internal_loop}) DETAILS (END)   ==================")
+        logger_to_use.info(f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}) DETAILS (END)   ==================")
 
-        original_graph_node_messages: Optional[List[Dict[str, Any]]] = None
+        original_graph_node_messages: Optional[List[Dict[str, Any]]] = None # InternalMessageList
         original_graph_node_model: Optional[str] = None
 
-        # Temporarily set the conversation graph's current node messages for this LLM turn
         if hasattr(self, "conversation_graph") and self.conversation_graph and self.conversation_graph.current_node:
             original_graph_node_messages = self.conversation_graph.current_node.messages.copy()
             original_graph_node_model = self.conversation_graph.current_node.model
-            self.conversation_graph.current_node.messages = cast("InternalMessageList", prompt_messages)  # Prompt messages are already List[Dict]
+            self.conversation_graph.current_node.messages = cast("InternalMessageList", prompt_messages)
             self.conversation_graph.current_node.model = model_name
-            log.debug(f"MCPC: Temporarily set conversation graph for agent turn (Node: {self.conversation_graph.current_node.id}).")
+            logger_to_use.debug(f"MCPC: Temporarily set conversation graph for agent turn (Node: {self.conversation_graph.current_node.id}).")
         else:
-            log.error("MCPC: Conversation graph or current_node not available for agent LLM turn.")
+            logger_to_use.error("MCPC: Conversation graph or current_node not available for agent LLM turn.")
             return {
                 "decision": "error",
                 "message": "Internal MCPClient state error: Conversation graph unavailable for agent turn.",
-                "error_type_for_agent": "InternalError",  # Agent should recognize this
+                "error_type_for_agent": "InternalError",
             }
 
         full_text_response_accumulated: str = ""
-        # llm_requested_tool_calls stores tools LLM *wants* to call but MCPC *doesn't* execute itself
-        # (e.g., agent-internal tools). Structure: {"id": ..., "name": original_mcp_name, "input": ...}
-        llm_requested_tool_calls: List[Dict[str, Any]] = []
-        # executed_tool_details_for_agent stores details of UMS/Server tools MCPC *did* execute this turn.
-        # Structure: {"tool_name": original_mcp_name, "arguments": ..., "result": ums_payload_dict}
-
+        llm_requested_tool_calls: List[Dict[str, Any]] = [] 
         executed_tool_details_for_agent: Optional[Dict[str, Any]] = None 
-        # It should store:
-        # {
-        #     "tool_name": original_mcp_name_of_executed_tool,
-        #     "arguments": arguments_sent_to_tool,
-        #     "result": <THE_ACTUAL_UMS_TOOL_PAYLOAD_DICTIONARY> 
-        # }
 
-        final_decision: Dict[str, Any] = { # Default error decision
+        final_decision: Dict[str, Any] = {
             "decision": "error",
             "message": "MCPClient: No actionable decision derived from LLM stream for agent.",
             "error_type_for_agent": "LLMOutputError",
@@ -10304,227 +10514,211 @@ class MCPClient:
         llm_stop_reason: Optional[str] = "unknown_pre_stream"
 
         try:
-            # process_streaming_query is called with messages_override and tools_override.
-            # It uses the agent's prepared prompt and tool list directly.
-            # _stream_wrapper standardizes events from process_streaming_query.
             async for event_type, event_data in self._stream_wrapper(
-                self.process_streaming_query(  # This is MCPClient's own method
-                    query="",  # Query is embedded within prompt_messages for agent turns
+                self.process_streaming_query(
+                    query="", 
                     model=model_name,
                     messages_override=cast("InternalMessageList", prompt_messages),
                     tools_override=tool_schemas,
-                    ui_websocket_sender=ui_websocket_sender,  # For relaying agent's LLM stream to UI
+                    ui_websocket_sender=ui_websocket_sender,
                 )
             ):
-                # Relay events to UI if sender is provided
                 if ui_websocket_sender:
-                    if event_type in [
-                        "text_chunk",
-                        "tool_call_start",
-                        "tool_call_input_chunk",
-                        "tool_call_end",
-                        "status",
-                        "error",
-                        "final_stats",
-                        "mcp_tool_executed_for_agent",  # Ensure this new event is relayed
-                    ]:
-                        await self._relay_agent_llm_event_to_ui(ui_websocket_sender, event_type, event_data)
+                    await self._relay_agent_llm_event_to_ui(ui_websocket_sender, event_type, event_data)
 
-                # Process standardized events from _stream_wrapper
                 if event_type == "text_chunk":
                     full_text_response_accumulated += str(event_data)
-                elif event_type == "tool_call_end":
-                    # This event from _stream_wrapper means the LLM *requested* a tool call.
-                    # Event data: {"id": tool_id, "name": original_mcp_tool_name, "parsed_input": ...}
-                    # MCPClient does NOT execute these tools if they are agent-internal.
-                    # It collects them here for AgentMasterLoop to handle.
+                elif event_type == "tool_call_end": 
                     if isinstance(event_data, dict) and event_data.get("id") and event_data.get("name"):
-                        tool_request_obj = {
+                        llm_requested_tool_calls.append({
                             "id": event_data["id"],
-                            "name": event_data["name"],  # This is the original MCP name
+                            "name": event_data["name"], 
                             "input": event_data.get("parsed_input", {}),
-                        }
-                        llm_requested_tool_calls.append(tool_request_obj)
-                        log.debug(f"MCPC (Agent Turn Stream): LLM requested tool_call to be handled by AML: {tool_request_obj}")
+                        })
+                        logger_to_use.debug(f"MCPC (Agent Turn Stream): LLM requested tool call: {event_data['name']}")
                     else:
-                        log.warning(f"MCPC (Agent Turn Stream): Malformed 'tool_call_end' event from LLM stream for AML processing: {event_data}")
-
+                        logger_to_use.warning(f"MCPC (Agent Turn Stream): Malformed 'tool_call_end' event: {event_data}")
+                
                 elif event_type == "mcp_tool_executed_for_agent":
-                    # event_data structure here is:
-                    # {"id": tool_use_id_from_llm, "name": original_mcp_name, 
-                    #  "input": args_sent_to_tool, "result": <ACTUAL_UMS_RESULT_DICT_OR_ERROR_DICT>}
                     if isinstance(event_data, dict) and event_data.get("name"):
-                        # The "result" key in event_data already holds the direct UMS payload dictionary
-                        # (or an error dictionary if the UMS tool failed).
-                        ums_payload_dict_from_event = event_data.get("result", {})
-                        
-                        # Store the essential details for AgentMasterLoop
-                        executed_tool_details_for_agent = {
-                            "tool_name": event_data["name"],  # This is the original MCP name
-                            "arguments": event_data.get("input", {}),
-                            "result": ums_payload_dict_from_event, # This is the direct UMS payload dict
-                        }
-                        log.info(
-                            f"MCPC (Agent Turn Stream): Captured MCPC-executed UMS tool details for AML. "
-                            f"Tool='{executed_tool_details_for_agent['tool_name']}', "
-                            f"UMS Result Success: {ums_payload_dict_from_event.get('success') if isinstance(ums_payload_dict_from_event, dict) else 'N/A'}"
-                        )
+                        if executed_tool_details_for_agent is None:
+                            executed_tool_details_for_agent = {
+                                "tool_name": event_data["name"],
+                                "arguments": event_data.get("input", {}),
+                                "result": event_data.get("result", {"success": False, "error": "Result missing from mcp_tool_executed_for_agent event"}),
+                            }
+                            log.info(
+                                f"MCPC (Agent Turn Stream): Captured MCPC-executed UMS tool for AML. "
+                                f"Tool='{executed_tool_details_for_agent['tool_name']}'"
+                            )
+                        else:
+                            log.warning(
+                                f"MCPC (Agent Turn Stream): Multiple UMS tools executed by MCPC this turn. "
+                                f"Already captured '{executed_tool_details_for_agent.get('tool_name')}', "
+                                f"ignoring subsequent '{event_data.get('name')}' for direct AML decision (it's in history)."
+                            )
                     else:
-                        log.warning(f"MCPC (Agent Turn Stream): Malformed 'mcp_tool_executed_for_agent' event: {event_data}")
+                        logger_to_use.warning(f"MCPC (Agent Turn Stream): Malformed 'mcp_tool_executed_for_agent' event: {event_data}")
 
                 elif event_type == "error":
                     llm_error_message = str(event_data)
-                    log.error(f"MCPC (Agent Turn Stream): Error event received from LLM stream: {llm_error_message}")
-                    break  # Stop processing stream on error
+                    logger_to_use.error(f"MCPC (Agent Turn Stream): Error event from LLM stream: {llm_error_message}")
+                    break 
                 elif event_type == "final_stats":
                     llm_stop_reason = event_data.get("stop_reason", "unknown_from_final_stats")
-                    log.debug(f"MCPC (Agent Turn Stream): Final stats received. LLM Stop reason for this turn: {llm_stop_reason}")
-                    # The break here is crucial. The stream is done after final_stats.
+                    logger_to_use.debug(f"MCPC (Agent Turn Stream): Final stats received. LLM Stop reason for this turn: {llm_stop_reason}")
                     break
-            # End of async for loop consuming the stream
+            # End of stream consumption loop
 
-            # --- Formulate the final decision based on collected stream data & priorities ---
+            # --- Formulate the final decision for AgentMasterLoop ---
             if llm_error_message:
                 final_decision = {"decision": "error", "message": llm_error_message, "error_type_for_agent": "LLMError"}
-
-            # PRIORITY 1: Agent-internal tool requested by LLM (e.g., agent:update_plan)
-            # This means the LLM yielded a tool call that MCPC *did not* execute (e.g., AGENT_TOOL_UPDATE_PLAN).
-            # `llm_stop_reason` would likely be `agent_internal_tool_request` if `process_streaming_query` set it correctly.
-            elif llm_requested_tool_calls:  # If LLM wants AML to call a tool
-                # We prioritize the first such request if multiple were made (should be rare for OpenAI non-parallel).
-                first_agent_tool_request = llm_requested_tool_calls[0]
-                if len(llm_requested_tool_calls) > 1:
-                    log.warning(
-                        f"MCPC (Agent Turn): LLM decided multiple non-UMS/agent-internal tool calls "
-                        f"({len(llm_requested_tool_calls)}). Agent will receive the first: "
-                        f"{first_agent_tool_request.get('name', 'Unknown')}"
+            
+            # PRIORITY 1: LLM explicitly requested AGENT_TOOL_UPDATE_PLAN AND provided valid arguments
+            elif llm_requested_tool_calls and any(tc.get("name") == AGENT_TOOL_UPDATE_PLAN for tc in llm_requested_tool_calls):
+                agent_plan_update_request = next((tc for tc in llm_requested_tool_calls if tc.get("name") == AGENT_TOOL_UPDATE_PLAN), None)
+                
+                if agent_plan_update_request and isinstance(agent_plan_update_request.get("input", {}).get("plan"), list):
+                    final_decision = {
+                        "decision": "call_tool", 
+                        "tool_name": AGENT_TOOL_UPDATE_PLAN, 
+                        "arguments": agent_plan_update_request.get("input", {}),
+                        "tool_use_id": agent_plan_update_request.get("id"),
+                    }
+                    logger_to_use.info(
+                        f"MCPC (Agent Turn): LLM explicitly requested '{AGENT_TOOL_UPDATE_PLAN}' with a valid plan list. AML will handle."
                     )
-                final_decision = {
-                    "decision": "call_tool",  # Signals AgentMasterLoop to execute this itself.
-                    "tool_name": first_agent_tool_request.get("name"),  # Original MCP name
-                    "arguments": first_agent_tool_request.get("input", {}),
-                    "tool_use_id": first_agent_tool_request.get("id"),
-                }
-                log.info(
-                    f"MCPC (Agent Turn): LLM requested agent-internal/direct-AML tool "
-                    f"'{first_agent_tool_request.get('name')}'. AML will handle this as primary decision."
+                else: # LLM requested agent:update_plan but "plan" arg is missing or not a list
+                    malformed_input_content = agent_plan_update_request.get("input") if agent_plan_update_request else "N/A"
+                    logger_to_use.warning(
+                        f"MCPC (Agent Turn): LLM requested '{AGENT_TOOL_UPDATE_PLAN}' but provided invalid/missing 'plan' list in arguments. "
+                        f"Input received: {str(malformed_input_content)[:200]}. Converting to thought and forcing replan."
+                    )
+                    final_decision = {
+                        "decision": "thought_process",
+                        "content": f"LLM Action: Attempted to call {AGENT_TOOL_UPDATE_PLAN} but failed to provide a valid 'plan' list in arguments. LLM's textual output this turn may contain reasoning: {full_text_response_accumulated}",
+                        "_mcp_client_force_replan_after_thought_": True 
+                    }
+            
+            # PRIORITY 1.5: LLM stop reason is 'agent_internal_tool_request' (often implies AGENT_TOOL_UPDATE_PLAN intent)
+            # but NO valid agent:update_plan tool_call (with list for 'plan') was parsed.
+            elif llm_stop_reason == "agent_internal_tool_request" and not any(
+                tc.get("name") == AGENT_TOOL_UPDATE_PLAN and isinstance(tc.get("input", {}).get("plan"), list) 
+                for tc in llm_requested_tool_calls
+            ):
+                logger_to_use.warning(
+                    f"MCPC (Agent Turn): LLM stop_reason was 'agent_internal_tool_request' but no valid '{AGENT_TOOL_UPDATE_PLAN}' "
+                    f"tool call with a plan list was found in `llm_requested_tool_calls` (Actual tool_calls: {llm_requested_tool_calls}). "
+                    f"This suggests LLM intended plan update but failed to format tool call correctly. "
+                    f"Converting LLM's text output to a thought and forcing replan."
                 )
+                final_decision = {
+                    "decision": "thought_process",
+                    "content": f"LLM Action: Indicated plan update intent (stop_reason: {llm_stop_reason}) but did not provide a valid '{AGENT_TOOL_UPDATE_PLAN}' tool call with a plan list. LLM's textual output this turn may contain reasoning: {full_text_response_accumulated}",
+                    "_mcp_client_force_replan_after_thought_": True
+                }
 
-                # Log if a UMS tool was *also* executed by MCPC in this same LLM turn (e.g. Anthropic parallel use).
-                # The UMS tool's result is already in history; the actionable decision is the agent-internal one.
-                if executed_tool_details_for_agent:
-                    log.info(
-                        f"MCPC (Agent Turn): Note - A UMS tool ('{executed_tool_details_for_agent.get('tool_name')}') "
-                        "was also executed by MCPC this turn. Its result is in history. "
-                        f"Agent will primarily act on '{first_agent_tool_request.get('name')}'."
-                    )
-
-            # PRIORITY 2: UMS/Server tool was executed by MCPClient (and no overriding agent-internal request)
+            # PRIORITY 2: UMS/Server tool was executed by MCPC (e.g., Anthropic parallel call)
             elif executed_tool_details_for_agent:
                 final_decision = {
-                    "decision": "tool_executed_by_mcp",  # Signals AML to use this result directly.
-                    "tool_name": executed_tool_details_for_agent.get("tool_name"),  # Original MCP name
+                    "decision": "tool_executed_by_mcp",
+                    "tool_name": executed_tool_details_for_agent.get("tool_name"), 
                     "arguments": executed_tool_details_for_agent.get("arguments"),
-                    "result": executed_tool_details_for_agent.get("result"),  # Direct UMS result payload
+                    "result": executed_tool_details_for_agent.get("result"), 
                 }
-                log.info(
+                logger_to_use.info(
                     f"MCPC (Agent Turn): LLM initiated UMS tool '{executed_tool_details_for_agent.get('tool_name')}' "
-                    "was executed by MCPClient. Passing its result to AML."
+                    "was executed by MCPClient. Passing its result to AML for side-effects."
                 )
-
-            # PRIORITY 3: LLM signaled overall goal completion (text-based)
+            
+            # PRIORITY 3: Other (non-agent:update_plan, non-UMS) tool call requested by LLM
+            # This block will only be hit if AGENT_TOOL_UPDATE_PLAN wasn't requested or was malformed (handled by Prio 1/1.5)
+            elif llm_requested_tool_calls: 
+                first_other_tool_request = llm_requested_tool_calls[0] # Taking the first one
+                logger_to_use.warning(f"MCPC (Agent Turn): LLM requested a non-UMS, non-agent:update_plan tool call: '{first_other_tool_request.get('name')}'. AML to handle.")
+                final_decision = {
+                    "decision": "call_tool",
+                    "tool_name": first_other_tool_request.get("name"), 
+                    "arguments": first_other_tool_request.get("input", {}),
+                    "tool_use_id": first_other_tool_request.get("id"),
+                }
+            
+            # PRIORITY 4: LLM signaled overall goal completion (text-based)
             elif full_text_response_accumulated.lower().startswith("goal achieved:"):
                 summary = full_text_response_accumulated[len("goal achieved:") :].strip()
                 final_decision = {"decision": "complete", "summary": summary}
-                log.info(f"MCPC (Agent Turn): LLM signaled overall goal completion. Summary: {summary[:100]}...")
+                logger_to_use.info(f"MCPC (Agent Turn): LLM signaled overall goal completion. Summary: {summary[:100]}...")
 
-            # PRIORITY 4: LLM provided a plan update via text (heuristic parsing)
-            # Ensure no higher priority decision (tool calls requested or executed) was made
+            # PRIORITY 5: LLM provided a plan update via text (heuristic parsing)
             elif (
-                (
-                    "plan:" in full_text_response_accumulated.lower()
-                    or "steps:" in full_text_response_accumulated.lower()
-                    or "```json" in full_text_response_accumulated
-                )
-                and not llm_requested_tool_calls
-                and not executed_tool_details_for_agent
+                ("plan:" in full_text_response_accumulated.lower() or "steps:" in full_text_response_accumulated.lower() or "```json" in full_text_response_accumulated)
+                and not llm_requested_tool_calls # Ensure no tool call was also requested (Prio 1/3 would catch it)
+                and not executed_tool_details_for_agent # Ensure no UMS tool was executed (Prio 2 would catch it)
             ):
                 try:
                     json_match = re.search(r"```json\s*([\s\S]*?)\s*```", full_text_response_accumulated)
                     if json_match:
                         plan_json_str = json_match.group(1)
-                        parsed_plan_list = json.loads(plan_json_str)
+                        parsed_plan_list = json.loads(plan_json_str) 
                         if isinstance(parsed_plan_list, list):
-                            # AgentMasterLoop expects list of dicts for plan steps, uses Pydantic to validate
-                            validated_steps_data = [PlanStep(**step_data).model_dump(exclude_none=True) for step_data in parsed_plan_list]
+                            # Pass the raw list of dicts; AML will validate with PlanStep
                             final_decision = {
-                                "decision": "plan_update",  # This specific decision type implies text-based plan
-                                "updated_plan_steps": validated_steps_data,
+                                "decision": "plan_update", 
+                                "updated_plan_steps": parsed_plan_list, 
                                 "original_text": full_text_response_accumulated,
                             }
-                            log.info(f"MCPC (Agent Turn): Parsed structured plan from LLM stream text ({len(validated_steps_data)} steps) for AML.")
-                        else:  # Parsed JSON but not a list, treat as thought
-                            log.warning(
-                                f"MCPC (Agent Turn): LLM text contained JSON but not a list for plan. Treating as thought. Content: {full_text_response_accumulated[:200]}..."
-                            )
+                            logger_to_use.info(f"MCPC (Agent Turn): Parsed structured plan from LLM stream text ({len(parsed_plan_list)} steps) for AML.")
+                        else: 
+                            logger_to_use.warning(f"MCPC (Agent Turn): LLM text contained JSON but not a list for plan. Treating as thought. Content: {full_text_response_accumulated[:200]}...")
                             final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
-                    else:  # No JSON block found, treat as thought
+                    else: 
+                        logger_to_use.debug(f"MCPC (Agent Turn): Text resembled plan keywords but no JSON block found. Treating as thought. Text: {full_text_response_accumulated[:200]}...")
                         final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
-                except (json.JSONDecodeError, ValidationError) as e:
-                    log.warning(
-                        f"MCPC (Agent Turn): Failed to parse plan from LLM stream text (error: {e}). Treating as thought. Text: {full_text_response_accumulated[:200]}..."
-                    )
+                except (json.JSONDecodeError) as e: # Only catch JSONDecodeError for plan parsing
+                    logger_to_use.warning(f"MCPC (Agent Turn): Failed to parse plan from LLM stream text (error: {e}). Treating as thought. Text: {full_text_response_accumulated[:200]}...")
                     final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
-
-            # PRIORITY 5: LLM provided textual thought/reasoning (and no higher priority decision)
+            
+            # PRIORITY 6: LLM provided textual thought/reasoning
             elif full_text_response_accumulated and not llm_requested_tool_calls and not executed_tool_details_for_agent:
-                log.info(f"MCPC (Agent Turn): LLM stream response is textual thought/reasoning.")
+                logger_to_use.info(f"MCPC (Agent Turn): LLM stream response is textual thought/reasoning.")
                 final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
-
-            # DEFAULT: No actionable content or unhandled case (error already set if llm_error_message was present)
+            
+            # DEFAULT: No actionable content or unhandled case
             else:
-                if not llm_error_message:  # Only set default error if no specific LLM error occurred
-                    log.warning(
-                        f"MCPC (Agent Turn): LLM stream yielded no actionable content matching prioritized types. LLM Stop reason from stream: {llm_stop_reason}"
+                if not llm_error_message: 
+                    logger_to_use.warning(
+                        f"MCPC (Agent Turn): LLM stream yielded no actionable content matching prioritized types. LLM Stop reason from stream: {llm_stop_reason}. Accumulated text: '{full_text_response_accumulated[:100]}...'"
                     )
                     final_decision = {
                         "decision": "error",
-                        "message": f"LLM stream provided no actionable decision (text, prioritized tool request, or recognized command). LLM stop reason for this turn: {llm_stop_reason}",
+                        "message": f"LLM stream provided no actionable decision (text, prioritized tool request, or recognized command). LLM stop reason for this turn: {llm_stop_reason}. Text: {full_text_response_accumulated[:100]}",
                         "error_type_for_agent": "LLMOutputError",
                     }
-            # --- End of formulating final_decision ---
-
+        
         except asyncio.CancelledError:
-            log.warning("MCPC (Agent Turn): LLM turn processing stream was cancelled by MCPClient or external signal.")
-            final_decision = {
-                "decision": "error",
-                "message": "LLM turn stream processing cancelled by MCPClient.",
-                "error_type_for_agent": "CancelledError",
-            }
+            logger_to_use.warning("MCPC (Agent Turn): LLM turn processing stream was cancelled by MCPClient or external signal.")
+            final_decision = { "decision": "error", "message": "LLM turn stream processing cancelled by MCPClient.", "error_type_for_agent": "CancelledError"}
         except Exception as e:
-            log.error(f"MCPC (Agent Turn): Unexpected error processing LLM turn stream for agent: {e}", exc_info=True)
-            final_decision = {
-                "decision": "error",
-                "message": f"Unexpected error processing LLM stream for agent: {e}",
-                "error_type_for_agent": "InternalError",
-            }
+            logger_to_use.error(f"MCPC (Agent Turn): Unexpected error processing LLM turn stream for agent: {e}", exc_info=True)
+            final_decision = { "decision": "error", "message": f"Unexpected error processing LLM stream for agent: {e}", "error_type_for_agent": "InternalError"}
         finally:
-            # Restore original conversation graph state
             if hasattr(self, "conversation_graph") and self.conversation_graph and self.conversation_graph.current_node:
                 if original_graph_node_messages is not None:
                     self.conversation_graph.current_node.messages = original_graph_node_messages
                 if original_graph_node_model is not None:
                     self.conversation_graph.current_node.model = original_graph_node_model
-                log.debug("MCPC: Restored original conversation graph state after agent LLM turn.")
+                logger_to_use.debug("MCPC: Restored original conversation graph state after agent LLM turn.")
 
-        # Log the final decision being passed back to AgentMasterLoop
-        decision_log_preview = str(
-            final_decision.get("message")
-            or final_decision.get("content")
-            or final_decision.get("tool_name")
-            or final_decision.get("updated_plan_steps")
-        )[:150]
-        log.info(
+        decision_log_preview_parts = []
+        if final_decision.get("message"): decision_log_preview_parts.append(str(final_decision["message"]))
+        if final_decision.get("content"): decision_log_preview_parts.append(str(final_decision["content"]))
+        if final_decision.get("tool_name"): decision_log_preview_parts.append(f"Tool: {final_decision['tool_name']}")
+        if final_decision.get("updated_plan_steps") and isinstance(final_decision["updated_plan_steps"], list):
+            decision_log_preview_parts.append(f"Plan Steps: {len(final_decision['updated_plan_steps'])}")
+        
+        decision_log_preview = " | ".join(filter(None, decision_log_preview_parts))[:150]
+        
+        logger_to_use.info(
             f"MCPC (Agent Turn): Final decision for AgentMasterLoop: Type='{final_decision.get('decision', 'UNKNOWN DECISION TYPE')}'. Preview: '{decision_log_preview}...'"
         )
         return final_decision
@@ -10575,6 +10769,7 @@ class MCPClient:
                 return False
         return True  # Already initialized
 
+
     async def start_agent_task(
         self,
         goal: str,
@@ -10591,120 +10786,130 @@ class MCPClient:
             log.warning("MCPC: Agent task is already running.")
             return {"success": False, "message": "Agent is already running.", "status": self.agent_status}
 
-        # 1. Initialize AgentMasterLoop instance and load its persistent state if not already done.
-        #    _initialize_agent_if_needed calls agent_loop_instance.initialize(), which loads
-        #    from file or creates a fresh AgentState.
+        # 1. Initialize AgentMasterLoop instance.
+        #    _initialize_agent_if_needed will call agent_loop_instance.initialize(),
+        #    which handles loading its persistent state (like UMS workflow_id)
+        #    and validating/resetting it if necessary.
         if not await self._initialize_agent_if_needed(default_llm_model_override=llm_model_override):
-            # Error messages are logged by _initialize_agent_if_needed
-            return {"success": False, "message": "Agent initialization failed.", "status": "error_initializing_agent"}
+            # Error messages are logged by _initialize_agent_if_needed or AML.initialize()
+            log.error("MCPC: Agent initialization failed. Cannot start agent task.")
+            self.agent_status = "error_initializing_agent" # Update MCPClient status
+            return {"success": False, "message": "Agent initialization failed.", "status": self.agent_status}
 
-        if not self.agent_loop_instance: # Should be caught by above, but defensive check
-            log.critical("MCPC: Agent loop instance is None after _initialize_agent_if_needed. This is unexpected.")
-            return {"success": False, "message": "Internal error: Agent loop instance unavailable post-initialization.", "status": "error_internal_agent_missing"}
+        # Ensure agent_loop_instance is available after initialization.
+        if not self.agent_loop_instance:
+            log.critical("MCPC: CRITICAL - Agent loop instance is None after successful _initialize_agent_if_needed. This is an internal logic error.")
+            self.agent_status = "error_internal_agent_missing"
+            return {"success": False, "message": "Internal error: Agent loop instance unavailable post-initialization.", "status": self.agent_status}
 
-        # At this point, self.agent_loop_instance.state is the loaded or fresh state.
-        
-        self.agent_goal = goal # Store the overall goal for this specific run/activation
-        self.agent_status = "starting" # MCPClient's high-level status
-        self.agent_last_message = "Agent task initiated by MCPClient."
-        self.agent_current_loop = 0 # Tracks loops completed by MCPClient for *this run*
-        self.agent_max_loops = max_loops # Max loops for *this run*
+        # At this point, self.agent_loop_instance.state is the loaded, validated, and potentially
+        # reset (for workflow-specific parts) state from AML.initialize().
 
-        # 2. Reset run-specific state on the *existing, loaded* agent_loop_instance.state
+        # 2. Set/Reset MCPClient's run-specific agent properties.
+        #    These are for MCPClient to track the current agent "run".
+        self.agent_goal = goal  # The overall goal for *this specific run/activation*
+        self.agent_status = "starting" # MCPClient's high-level status of the agent task
+        self.agent_last_message = "Agent task initiated by MCPClient." # MCPClient's general message
+        self.agent_current_loop = 0  # Loops completed by MCPClient for *this current run*
+        self.agent_max_loops = max_loops # Max loops for *this current run*
+
+        # 3. Reset run-specific state on the AgentMasterLoop's *existing, loaded* state object.
         #    Do NOT re-assign self.agent_loop_instance.state to a new AgentState object here.
-        #    Persisted UMS-related state (workflow_id, goal_stack, tool_stats, etc.)
-        #    is preserved from the agent_loop_instance.initialize() call.
+        #    The self.agent_loop_instance.state object was already prepared by AML.initialize().
         
         agent_internal_state = self.agent_loop_instance.state # Get a reference for clarity
 
-        agent_internal_state.current_loop = 0 # Reset AML's internal processing loop counter for this new run.
-        agent_internal_state.goal_achieved_flag = False # Reset for this run.
+        # Reset AML's internal processing loop counter FOR THIS NEW RUN.
+        agent_internal_state.current_loop = 0
+        # Reset goal_achieved_flag FOR THIS NEW RUN.
+        agent_internal_state.goal_achieved_flag = False
+        # Reset error tracking FOR THIS NEW RUN.
         agent_internal_state.consecutive_error_count = 0
-        agent_internal_state.last_error_details = None
-        agent_internal_state.last_meta_feedback = None # Cleared at the start of a run
+        agent_internal_state.last_error_details = None # Cleared as the new run starts
+        # Clear any meta-feedback from a previous run/task.
+        agent_internal_state.last_meta_feedback = None
         
-        # needs_replan will be determined by AgentMasterLoop.run_main_loop based on the
-        # new `overall_goal` and the existing (loaded) state.
-        # For example, if a workflow_id is loaded but no current_goal_id, run_main_loop
-        # will set a plan to establish a root goal, effectively not needing a replan immediately.
-        # If workflow_id is not loaded, run_main_loop sets a plan to create a new workflow.
-        agent_internal_state.needs_replan = False 
+        # `needs_replan` should be determined by AML.initialize() or the first run_main_loop call.
+        # If AML.initialize() determined the loaded workflow is invalid, it will reset workflow_id
+        # and the first run_main_loop will set a plan to create a new workflow (needs_replan=False).
+        # If a valid workflow IS loaded, AML.initialize() might have set needs_replan if the goal stack was problematic.
+        # For a truly new task, we often want the agent to start with a fresh assessment, so setting
+        # needs_replan to False here is generally correct, allowing run_main_loop to set the initial plan.
+        agent_internal_state.needs_replan = False
 
+        # Set a clear initial action summary for this new run.
         agent_internal_state.last_action_summary = f"New agent task directive from MCPClient. Goal: '{goal[:70]}...'"
         
-        # These counters are for meta-cognitive triggers and should arguably persist or have their
-        # own reset logic within AML's periodic tasks if they become stale.
-        # For now, let's keep them, as they reflect ongoing cognitive load.
-        # agent_internal_state.successful_actions_since_reflection = 0.0 
-        # agent_internal_state.successful_actions_since_consolidation = 0.0
-        # Periodic task counters like loops_since_optimization should also persist.
-
+        # Log the state of critical AML properties *after* MCPClient's run-specific resets.
         log.info(
-            f"MCPC: Agent run-specific state reset for task '{goal[:50]}...'. "
-            f"AML Internal Loop: {agent_internal_state.current_loop}. "
-            f"Loaded WF ID: {_fmt_id(agent_internal_state.workflow_id)}, "
-            f"Loaded Current UMS Goal ID: {_fmt_id(agent_internal_state.current_goal_id)}, "
-            f"Loaded Goal Stack Depth: {len(agent_internal_state.goal_stack)}, "
-            f"Loaded Plan Steps: {len(agent_internal_state.current_plan) if agent_internal_state.current_plan else 0}"
+            f"MCPC: Agent run-specific state (re)set for new task '{goal[:50]}...'. "
+            f"AML Internal Loop (target for next turn): {agent_internal_state.current_loop + 1}. "
+            f"Effective WF ID from AML state: {_fmt_id(agent_internal_state.workflow_id)}. "
+            f"Effective Current UMS Goal ID from AML state: {_fmt_id(agent_internal_state.current_goal_id)}. "
+            f"AML Goal Stack Depth: {len(agent_internal_state.goal_stack)}. "
+            f"AML Plan Steps: {len(agent_internal_state.current_plan) if agent_internal_state.current_plan else 0}. "
+            f"AML NeedsReplan: {agent_internal_state.needs_replan}"
         )
 
-        # 3. Define the agent runner wrapper
-        agent_loop_instance_ref = self.agent_loop_instance # For closure in agent_runner_wrapper
+        # 4. Define the agent runner wrapper
+        agent_loop_instance_ref = self.agent_loop_instance # Closure for the wrapper
 
         async def agent_runner_wrapper():
+            nonlocal ui_websocket_sender # Ensure access to outer scope ui_websocket_sender
             try:
-                self.agent_status = "running" # MCPClient's status
+                self.agent_status = "running" # MCPClient's status updated
                 log.info(f"MCPC Agent Task (Wrapper): Starting self-driving agent for goal: '{self.agent_goal}' (Max Loops: {max_loops})")
                 
-                # AgentMasterLoop.run_main_loop is the entry point for the agent's processing cycle.
-                # It now receives the `overall_goal` for this specific run.
+                # `run_self_driving_agent` will now correctly use the prepared `agent_loop_instance_ref`
                 await self.run_self_driving_agent(
                     agent_loop=agent_loop_instance_ref,
-                    overall_goal=self.agent_goal, # Pass the goal for *this run*
-                    max_agent_loops=max_loops,
+                    overall_goal=self.agent_goal, 
+                    max_agent_loops=max_loops, # Max loops for this run
                     ui_websocket_sender=ui_websocket_sender,
                 )
                 
                 # After run_self_driving_agent completes (normally or by max loops)
+                # Check the agent_loop_instance_ref's state to determine final MCPClient status
                 if agent_loop_instance_ref.state.goal_achieved_flag:
                     self.agent_status = "completed"
                     self.agent_last_message = "Agent achieved its overall goal."
                     log.info(f"MCPC Agent Task (Wrapper): Goal '{self.agent_goal}' achieved.")
-                elif agent_loop_instance_ref._shutdown_event.is_set(): # Check AML's internal shutdown
+                elif agent_loop_instance_ref._shutdown_event.is_set(): 
                     self.agent_status = "stopped"
                     self.agent_last_message = "Agent task was stopped or shut down (AML signal)."
                     log.info(f"MCPC Agent Task (Wrapper): Agent for goal '{self.agent_goal}' was stopped/shut down (AML signal).")
                 else: # Max loops reached or other non-error termination by AML
                     self.agent_status = "max_loops_reached"
-                    self.agent_last_message = f"Agent reached max loops ({max_loops}) or stopped for other reasons."
+                    self.agent_last_message = f"Agent reached max MCPC-driven loops ({max_loops}) or stopped for other reasons."
                     log.info(f"MCPC Agent Task (Wrapper): Agent for goal '{self.agent_goal}' finished (max_loops or other AML stop).")
 
             except asyncio.CancelledError:
-                self.agent_status = "stopped" # MCPClient status
+                self.agent_status = "stopped" 
                 self.agent_last_message = "Agent task was cancelled by MCPClient."
                 log.info(f"MCPC Agent Task (Wrapper): Run for goal '{self.agent_goal}' cancelled by MCPClient.")
-                # Ensure AML's shutdown is called if it wasn't already shutting down
                 if agent_loop_instance_ref and not agent_loop_instance_ref._shutdown_event.is_set():
                     log.info("MCPC Agent Task (Wrapper): Explicitly calling AML shutdown due to MCPClient cancellation.")
                     await agent_loop_instance_ref.shutdown()
             except Exception as e:
-                self.agent_status = "failed" # MCPClient status
+                self.agent_status = "failed" 
                 self.agent_last_message = f"Agent task failed with exception: {str(e)[:100]}"
                 log.error(f"MCPC Agent Task (Wrapper): Error running agent for goal '{self.agent_goal}': {e}", exc_info=True)
-                # Ensure AML's shutdown is called on unexpected error
                 if agent_loop_instance_ref and not agent_loop_instance_ref._shutdown_event.is_set():
                     log.info("MCPC Agent Task (Wrapper): Explicitly calling AML shutdown due to unhandled exception.")
                     await agent_loop_instance_ref.shutdown()
             finally:
-                # Update MCPClient's view of the agent's loop count after the task finishes
+                # Update MCPClient's view of the agent's loop count *after* the task finishes
+                # This reflects how many loops AML *actually* ran in its last session for this task.
                 self.agent_current_loop = agent_loop_instance_ref.state.current_loop if agent_loop_instance_ref else self.agent_max_loops
                 log.info(f"MCPC Agent Task (Wrapper): Finished. Final MCPC status: {self.agent_status}. AML loops completed: {self.agent_current_loop}.")
 
-        # 4. Create and start the agent runner task
+
+        # 5. Create and start the agent runner task
         self.agent_task = asyncio.create_task(agent_runner_wrapper(), name=f"mcp_agent_run_{self.agent_goal[:20].replace(' ', '_')}")
         log.info(f"MCPC: Agent task '{self.agent_task.get_name()}' created and started in background.")
         
         return {"success": True, "message": "Agent task started successfully in background.", "status": self.agent_status}
+    
 
     async def stop_agent_task(self) -> Dict[str, Any]:
         """
