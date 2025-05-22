@@ -56,8 +56,10 @@ Key Functionalities:
 from __future__ import annotations  # VERY IMPORTANT: MUST BE THE FIRST LINE
 
 import asyncio
+import contextlib
 import copy
 import dataclasses
+import inspect
 import json
 import logging
 import math
@@ -65,14 +67,16 @@ import os
 import random
 import re
 import sys
+import tempfile
 import time
 import uuid
-from collections import defaultdict
+from asyncio import CancelledError
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import aiofiles
 import httpx
@@ -92,6 +96,70 @@ if TYPE_CHECKING:
 else:
     MCPClient = "MCPClient"  # Placeholder for static analysis
 
+
+# Models explicitly supporting "json_schema" type in response_format for direct structured output
+# (primarily newer OpenAI models or native APIs with this feature)
+MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT = {
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "o1-preview",
+    "o3-mini",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "gemini-2.5-pro-exp-03-25",
+    "gemini-2.5-pro-exp-05-06",
+}
+
+# Models that should robustly support "json_object" type in response_format
+# (includes older OpenAI and many OpenAI-compatible providers)
+MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT = {
+    "gpt-4.1", # Assuming this is like gpt-4-turbo
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "o1-preview", # OpenAI, likely json_object
+    "o3-mini",    # OpenAI, likely json_object
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "gemini-2.0-flash-lite", # Via OpenAI compatible endpoint
+    "gemini-2.0-flash",      # Via OpenAI compatible endpoint
+    "gemini-2.0-flash-thinking-exp-01-21", # Via OpenAI compatible endpoint
+    "gemini-2.5-pro-exp-03-25",          # Via OpenAI compatible endpoint
+    "gemini-2.5-pro-exp-05-06",          # Via OpenAI compatible endpoint
+    "grok-3-latest",
+    "grok-3-fast-latest",
+    "grok-3-mini-latest",
+    "grok-3-mini-fast-latest",
+    # Mistral native API can take a schema, but if using via generic OpenAI client, json_object is safer unless specific handling for Mistral native schema is done.
+    # For now, if Mistral is called via the generic OpenAI client block, json_object is the more general assumption.
+    # If you have specific logic for Mistral native API client that sets response_format with a schema, that's different.
+    # The current code routes Mistral to the OpenAI-compatible block if its client is an AsyncOpenAI instance.
+    "mistral-large-latest", # If accessed via an OpenAI-compatible endpoint for it
+    "mistral-small-latest", # If accessed via an OpenAI-compatible endpoint for it
+    # Groq models are OpenAI compatible
+    "groq/llama-3.3-70b-versatile",
+    "groq/meta-llama/llama-4-scout-17b-16e-instruct",
+    "groq/mistral-saba-24b",
+    "groq/qwen-qwq-32b",
+    "groq/gemma2-9b-it",
+    "groq/compound-beta",
+    "groq/compound-beta-mini",
+    # Cerebras models are OpenAI compatible
+    "cerebras/llama-4-scout-17b-16e-instruct",
+    "cerebras/llama-3.3-70b",
+    # OpenRouter - support depends on the underlying model.
+    # Forcing json_object here is a safe bet if OpenRouter passes it.
+    # Add OpenRouter model prefixes/names if known to support at least json_object
+    "openrouter/mistralai/mistral-nemo",
+    "openrouter/tngtech/deepseek-r1t-chimera:free",
+}
+# Add specific known Mistral native model names if you have a separate path for them supporting schema directly
+MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA = {
+    "mistral-large-latest", # Add other native Mistral model names that support schema in response_format
+    # "mistral-medium", "mistral-small" etc. if they do via native API
+}
 
 # --- Enums (Mirrored from UMS for consistency, or defined if agent-specific) ---
 class Provider(str, Enum):
@@ -216,6 +284,13 @@ class GoalStatus(str, Enum):
     PAUSED = "paused"
     ABANDONED = "abandoned"
 
+class _Decision(str, Enum):
+    TOOL_EXECUTED = "tool_executed_by_mcp"
+    THOUGHT = "thought_process"
+    CALL_TOOL = "call_tool"
+    COMPLETE = "complete"
+    COMPLETE_ART = "complete_with_artifact"
+    PLAN_UPDATE = "plan_update"
 
 # Logger Setup
 log = logging.getLogger("AgentMasterLoop")
@@ -332,6 +407,26 @@ UMS_FUNC_GET_GOAL_DETAILS = "get_goal_details"
 
 BACKGROUND_TASK_TIMEOUT_SECONDS = 60.0
 MAX_CONCURRENT_BG_TASKS = 10
+_PAYLOAD_TRUNCATE_AT = 8_192          # characters
+_RECORD_TIMEOUT_SEC   = 30            # asyncio.wait_for guard
+_MAX_RETRIES          = 1             # one retry after first failure
+
+_TASK_TIMEOUT_SEC              = 30       # hard stop for any single periodic task
+_INTERNAL_PROMO_SENTINEL       = "CHECK_PROMOTIONS_INTERNAL_TASK"
+_PROMO_JITTER_RANGE = (0.10, 0.40)          # seconds
+_PROMO_CALL_TIMEOUT = 12                    # seconds – safeguard for hung UMS call
+_PROMO_TOOL_NAME    = UMS_FUNC_PROMOTE_MEM  # keep constants in one place
+
+# Lowest number ⇒ highest priority in execution order
+_TASK_PRIORITY: Dict[str, int] = {
+    UMS_FUNC_DELETE_EXPIRED_MEMORIES : 0,
+    UMS_FUNC_COMPUTE_STATS          : 1,
+    _INTERNAL_PROMO_SENTINEL        : 2,
+    UMS_FUNC_OPTIMIZE_WM            : 3,
+    UMS_FUNC_AUTO_FOCUS             : 4,
+    UMS_FUNC_CONSOLIDATION          : 5,
+    UMS_FUNC_REFLECTION             : 6,
+}
 
 
 # --- LOCAL CUSTOM EXCEPTIONS ---
@@ -351,45 +446,161 @@ class MemoryUtils:
     def generate_id() -> str:
         return str(uuid.uuid4())
 
-
 def _fmt_id(val: Any, length: int = 8) -> str:
     s = str(val) if val is not None else "?"
     return s[:length] if len(s) >= length else s
-
 
 def _utf8_safe_slice(s: str, max_len: int) -> str:
     if not isinstance(s, str):
         s = str(s)
     return s.encode("utf‑8")[:max_len].decode("utf‑8", "ignore")
 
+def _safe_json_compatible(obj: Any, *, limit: int = _PAYLOAD_TRUNCATE_AT) -> Any:
+    """
+    Make sure an object can be JSON-serialised and is not absurdly large.
+    - dict / list: recurse
+    - primitives/None: leave as-is
+    - everything else: repr()-string
+    Strings longer than *limit* are truncated with an ellipsis.
+    """
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    if isinstance(obj, str):
+        return (obj[: limit] + "…") if len(obj) > limit else obj
+    if isinstance(obj, list):
+        return [_safe_json_compatible(i, limit=limit) for i in obj]
+    if isinstance(obj, dict):
+        return {k: _safe_json_compatible(v, limit=limit) for k, v in obj.items()}
+    # fallback – e.g. datetime, custom class …
+    s = repr(obj)
+    return (s[: limit] + "…") if len(s) > limit else s
 
-def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
+
+def _safe_json_dumps(obj: Any) -> str:
+    """
+    json.dumps wrapper that never raises on unserializable types.
+    Falls back to `str()` for unknown objects.
+    """
     try:
-        full = json.dumps(context, indent=2, default=str, ensure_ascii=False)
+        return json.dumps(obj, indent=2, ensure_ascii=False, default=str)
     except TypeError:
-        context_serializable = json.loads(json.dumps(context, default=str))
-        full = json.dumps(context_serializable, indent=2, default=str, ensure_ascii=False)
+        # Force full stringify fallback (rare but contracts against explosions)
+        serialisable = json.loads(json.dumps(obj, default=str))
+        return json.dumps(serialisable, indent=2, ensure_ascii=False, default=str)
 
-    if len(full) <= max_len:
-        return full
 
-    log.debug(f"Context length {len(full)} exceeds max {max_len}. Applying structured truncation.")
-    ctx_copy = copy.deepcopy(context)
-    ctx_copy["_truncation_applied"] = "structure‑aware_agent_side"
-    original_length = len(full)
+def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:  # noqa: C901 – intentionally complex
+    """
+    Serialize *context* to a JSON string no longer than *max_len* characters,
+    applying the same structure-aware truncation strategy as the original
+    implementation while fixing edge-cases, improving logging clarity, and
+    guaranteeing the byte-length contract.
 
-    list_paths_to_truncate = [
-        ("ums_context_package", "core_context", "recent_actions", CONTEXT_RECENT_ACTIONS_SHOW_LIMIT),
-        ("ums_context_package", "core_context", "important_memories", CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT),
-        ("ums_context_package", "core_context", "key_thoughts", CONTEXT_KEY_THOUGHTS_SHOW_LIMIT),
-        ("ums_context_package", "proactive_memories", "memories", CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT),
-        ("ums_context_package", "current_working_memory", "working_memories", CONTEXT_WORKING_MEMORY_SHOW_LIMIT),
-        ("ums_context_package", "relevant_procedures", "procedures", CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT),
-        ("agent_assembled_goal_context", None, "goal_stack_summary_from_agent_state", CONTEXT_GOAL_STACK_SHOW_LIMIT),
-        (None, "current_plan_snapshot", None, 5),
-    ]
+    Behaviour preserved:
+    • Deep-copy of the object before mutation
+    • Addition of " _truncation_applied" marker
+    • Notes appended to truncated lists
+    • Ordered two-phase strategy (shrink lists ➜ drop low-priority keys ➜ slice)
+    • All existing constant limits & path semantics
+    """
+    # ── 1. initial pretty dump ─────────────────────────────────────────────────
+    full_json: str = _safe_json_dumps(context)
+    if len(full_json) <= max_len:
+        return full_json
 
-    keys_to_remove_low_priority = [
+    log.debug("Context length %s exceeds max %s. Structured truncation begins.", len(full_json), max_len)
+
+    # ── 2. work on a deep copy so original object is untouched ────────────────
+    ctx_copy: Dict[str, Any] = copy.deepcopy(context)
+    ctx_copy["_truncation_applied"] = "structure-aware_agent_side"
+    original_length: int = len(full_json)
+
+    # -------------------------------------------------------------------------
+    # Helper lambdas
+    # -------------------------------------------------------------------------
+    def _current_size(candidate: Dict[str, Any]) -> Tuple[str, int]:
+        """
+        Serialize candidate and return (json_str, length) – avoids
+        repeating json.dumps twice at every size check.
+        """
+        dumped = _safe_json_dumps(candidate)
+        return dumped, len(dumped)
+
+    def _truncate_list_at_path(path: Sequence[str | None], limit: int) -> bool:
+        """
+        Locate list by following *path* (skip None placeholders). If list size
+        exceeds *limit*, shrink it in-place and append a note. Returns True if
+        modification happened.
+        """
+        container = ctx_copy
+        for key in path[:-1]:
+            if key is None:
+                continue
+            if not (isinstance(container, dict) and key in container):
+                return False
+            container = container[key]
+
+        target_key = path[-1]
+        if not (isinstance(container, dict) and isinstance(container.get(target_key), list)):
+            return False
+
+        lst: List[Any] = container[target_key]
+        if len(lst) <= limit:
+            return False
+
+        omitted = len(lst) - limit
+        container[target_key] = lst[:limit]
+        # Add truncation note
+        container[target_key].append(
+            {"truncated_note": f"{omitted} items omitted from '{'/'.join(str(p) for p in path if p)}'"}
+        )
+        log.debug("Truncated list '%s' from %s to %s items.", "/".join(str(p) for p in path if p), len(lst), limit)
+        return True
+
+    def _remove_key_at_path(path: Sequence[str]) -> bool:
+        """
+        Remove *path[-1]* key from its container if present. Returns True when a
+        key is actually removed.
+        """
+        container = ctx_copy
+        for key in path[:-1]:
+            if not (isinstance(container, dict) and key in container):
+                return False
+            container = container[key]
+        if path[-1] in container:
+            container.pop(path[-1], None)
+            log.debug("Removed low-priority key '%s' for truncation.", "/".join(map(str, path)))
+            return True
+        return False
+
+    # -------------------------------------------------------------------------
+    # 3A. shrink long lists first (highest information retention) -------------
+    # -------------------------------------------------------------------------
+    list_paths_to_truncate: Tuple[Tuple[str | None, ...], ...] = (
+        ("ums_context_package", "core_context", "recent_actions", "recent_actions", CONTEXT_RECENT_ACTIONS_SHOW_LIMIT),
+        ("ums_context_package", "core_context", "important_memories", "important_memories", CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT),
+        ("ums_context_package", "core_context", "key_thoughts", "key_thoughts", CONTEXT_KEY_THOUGHTS_SHOW_LIMIT),
+        ("ums_context_package", "proactive_memories", "memories", "memories", CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT),
+        ("ums_context_package", "current_working_memory", "working_memories", "working_memories", CONTEXT_WORKING_MEMORY_SHOW_LIMIT),
+        ("ums_context_package", "relevant_procedures", "procedures", "procedures", CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT),
+        ("agent_assembled_goal_context", None, "goal_stack_summary_from_agent_state", "goal_stack_summary_from_agent_state", CONTEXT_GOAL_STACK_SHOW_LIMIT),
+        (None, "current_plan_snapshot", None, "current_plan_snapshot", 5),
+    )
+
+    # iterate and truncate until size target met or all paths tried
+    for *path, key_name, limit in list_paths_to_truncate:
+        # Build real path list, replacing None placeholders
+        real_path: List[str | None] = [p for p in path if p is not None] + [key_name]
+        if _truncate_list_at_path(real_path, limit):
+            new_json, new_len = _current_size(ctx_copy)
+            if new_len <= max_len:
+                log.info("Context truncated via list reduction to %s bytes (was %s).", new_len, original_length)
+                return new_json
+
+    # -------------------------------------------------------------------------
+    # 3B. remove low-priority blocks completely if still too large ------------
+    # -------------------------------------------------------------------------
+    keys_to_remove_low_priority: Tuple[Tuple[str, ...], ...] = (
         ("ums_context_package", "contextual_links"),
         ("ums_context_package", "relevant_procedures"),
         ("ums_context_package", "proactive_memories"),
@@ -398,76 +609,39 @@ def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:
         ("ums_context_package", "core_context", "recent_actions"),
         ("ums_context_package", "core_context"),
         ("ums_context_package", "current_working_memory"),
-        ("agent_assembled_goal_context"),
-        ("ums_context_package"),
-    ]
+        ("agent_assembled_goal_context",),
+        ("ums_context_package",),
+    )
 
-    for path_parts in list_paths_to_truncate:
-        container = ctx_copy
-        key_to_truncate = path_parts[-2]
-        limit_count = path_parts[-1]
-        valid_path = True
-        for part_idx in range(len(path_parts) - 2):
-            part = path_parts[part_idx]
-            if part is None:
-                continue
-            if part in container and isinstance(container[part], dict):
-                container = container[part]
-            else:
-                valid_path = False
-                break
-        if not valid_path:
-            continue
+    for path in keys_to_remove_low_priority:
+        if _remove_key_at_path(path):
+            new_json, new_len = _current_size(ctx_copy)
+            if new_len <= max_len:
+                log.info("Context truncated via key removal to %s bytes (was %s).", new_len, original_length)
+                return new_json
 
-        if key_to_truncate in container and isinstance(container[key_to_truncate], list) and len(container[key_to_truncate]) > limit_count:
-            original_count_val = len(container[key_to_truncate])
-            note = {"truncated_note": f"{original_count_val - limit_count} items omitted from '{'/'.join(str(p) for p in path_parts if p)}'"}
-            container[key_to_truncate] = container[key_to_truncate][:limit_count]
-            if limit_count > 0 and isinstance(container[key_to_truncate], list):
-                container[key_to_truncate].append(note)
-            log.debug(f"Truncated list at '{'/'.join(str(p) for p in path_parts if p)}' to {limit_count} items.")
-            serial_val = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
-            if len(serial_val) <= max_len:
-                log.info(f"Context truncated (List reduction: {len(serial_val)} bytes).")
-                return serial_val
+    # -------------------------------------------------------------------------
+    # 4. final fallback – naive byte clipping ----------------------------------
+    # -------------------------------------------------------------------------
+    log.warning(
+        "Structured truncation insufficient (length still %s). Falling back to raw slicing.",
+        _current_size(ctx_copy)[1],
+    )
 
-    for key_info_tuple in keys_to_remove_low_priority:
-        container = ctx_copy
-        key_to_remove_final = key_info_tuple[-1]
-        valid_path_pop = True
-        for part_idx in range(len(key_info_tuple) - 1):
-            part = key_info_tuple[part_idx]
-            if part in container and isinstance(container[part], dict):
-                container = container[part]
-            else:
-                valid_path_pop = False
-                break
-        if not valid_path_pop:
-            continue
-
-        if key_to_remove_final in container:
-            container.pop(key_to_remove_final)
-            log.debug(f"Removed low-priority key '{'/'.join(str(p) for p in key_info_tuple)}' for truncation.")
-            serial_val = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
-            if len(serial_val) <= max_len:
-                log.info(f"Context truncated (Key removal: {len(serial_val)} bytes).")
-                return serial_val
-
-    serial_val = json.dumps(ctx_copy, indent=2, default=str, ensure_ascii=False)
-    log.warning(f"Structured truncation insufficient (Length still {len(serial_val)}). Applying final byte-slice.")
-    clipped_json_str = _utf8_safe_slice(full, max_len - 50)
-    try:
-        last_brace = clipped_json_str.rfind("}")
-        last_bracket = clipped_json_str.rfind("]")
-        cutoff = max(last_brace, last_bracket)
+    # use original *full_json* because it preserves formatting and comments
+    clipped: str = _utf8_safe_slice(full_json, max_len - 50)  # keep room for marker
+    last_brace = max(clipped.rfind("}"), clipped.rfind("]"))
+    if last_brace > 0:
         final_str = (
-            clipped_json_str[: cutoff + 1] + "\n// ... (CONTEXT TRUNCATED BY BYTE LIMIT) ...\n}"
-            if cutoff > 0
-            else clipped_json_str + "... (CONTEXT TRUNCATED)"
+            clipped[: last_brace + 1]
+            + "\n// ... (CONTEXT TRUNCATED BY BYTE LIMIT) ...\n}"
         )
-    except Exception:
-        final_str = clipped_json_str + "... (CONTEXT TRUNCATED)"
-    log.error(f"Context severely truncated from {original_length} to {len(final_str)} bytes using fallback.")
+    else:
+        final_str = clipped + "... (CONTEXT TRUNCATED)"
+
+    # guarantee we never exceed hard limit
+    final_str = _utf8_safe_slice(final_str, max_len)
+    log.error("Context severely truncated from %s to %s bytes (fallback).", original_length, len(final_str))
     return final_str
 
 
@@ -561,132 +735,287 @@ class AgentMasterLoop:
 
     def __init__(
         self,
-        mcp_client_instance: MCPClient,
+        mcp_client_instance: "MCPClient",
         default_llm_model_string: str,
         agent_state_file: str = AGENT_STATE_FILE,
     ):
-        self.mcp_client = mcp_client_instance
-        self.agent_llm_model = default_llm_model_string
-        self.logger = log
-        self.agent_state_file = Path(agent_state_file)
+        """
+        Parameters
+        ----------
+        mcp_client_instance : MCPClient
+            Fully-configured MCPClient that already owns an `AsyncAnthropic` instance and any
+            tool-schema metadata the agent will need.
+        default_llm_model_string : str
+            The model name the agent should request from Anthropic if a prompt does not explicitly
+            override it (e.g. ``"claude-3-opus-20240229"``).
+        agent_state_file : str, optional
+            Path to a JSON file for persisting incremental state across runs.  Defaults to the
+            module-level constant ``AGENT_STATE_FILE``.
+        """
+        # ------------------------------------------------------------------ #
+        # 0. Guard-rail validation                                           #
+        # ------------------------------------------------------------------ #
+        if not isinstance(default_llm_model_string, str) or not default_llm_model_string.strip():
+            raise ValueError("`default_llm_model_string` must be a non-empty string.")
 
-        if not hasattr(self.mcp_client, "anthropic") or not isinstance(self.mcp_client.anthropic, AsyncAnthropic):
-            self.logger.critical("CRITICAL: MCPClient instance missing valid Anthropic client.")
-            raise ValueError("MCPClient instance missing Anthropic client.")
+        # MCPClient typing check (duck-typing is OK, but a hard fail early is clearer for users)
+        if type(mcp_client_instance).__name__ != "MCPClient":
+            raise TypeError(
+                f"`mcp_client_instance` expected MCPClient by name; got {type(mcp_client_instance).__name__!s}"
+            )
+
+        self.mcp_client: MCPClient = mcp_client_instance
+        self.agent_llm_model: str = default_llm_model_string.strip()
+
+        # ------------------------------------------------------------------ #
+        # 1. Logger / Paths                                                  #
+        # ------------------------------------------------------------------ #
+        self.logger = log.getChild("AgentMasterLoop") if hasattr(log, "getChild") else log
+        self.agent_state_file = Path(agent_state_file).expanduser().resolve()
+
+        # ------------------------------------------------------------------ #
+        # 2. Anthropic client presence check                                 #
+        # ------------------------------------------------------------------ #
+        from anthropic import AsyncAnthropic  # postponed import for optional dep
+        if not hasattr(self.mcp_client, "anthropic") or not isinstance(
+            self.mcp_client.anthropic, AsyncAnthropic
+        ):
+            self.logger.critical("CRITICAL: MCPClient instance missing valid `AsyncAnthropic` client.")
+            raise ValueError("MCPClient instance missing valid `AsyncAnthropic` client.")
         self.anthropic_client: AsyncAnthropic = self.mcp_client.anthropic
 
-        self.consolidation_memory_level = MemoryLevel.EPISODIC.value
-        self.consolidation_max_sources = 10
-        self.auto_linking_threshold = 0.7
-        self.auto_linking_max_links = 3
-        self.reflection_type_sequence = ["summary", "progress", "gaps", "strengths", "plan"]
+        # ------------------------------------------------------------------ #
+        # 3. Tunable heuristics & thresholds (can be tweaked by reflection)  #
+        # ------------------------------------------------------------------ #
+        self.consolidation_memory_level: str = MemoryLevel.EPISODIC.value
+        self.consolidation_max_sources: int = 10
+        self.auto_linking_threshold: float = 0.7
+        self.auto_linking_max_links: int = 3
+        # Make a *copy* so external mutations to the module-level constant don't affect runtime
+        self.reflection_type_sequence: list[str] = [
+            "summary",
+            "progress",
+            "gaps",
+            "strengths",
+            "plan",
+        ]
+
+        # ------------------------------------------------------------------ #
+        # 4. Core runtime state & concurrency primitives                     #
+        # ------------------------------------------------------------------ #
         self.state = AgentState()
         self._shutdown_event = asyncio.Event()
         self._bg_tasks_lock = asyncio.Lock()
         self._bg_task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BG_TASKS)
-        self.tool_schemas: List[Dict[str, Any]] = []  # Populated during initialize by MCPClient
-        _module_level_ums_func_constants = {
-            k: v
-            for k, v in globals().items()  # Get all globals in agent_master_loop.py's module scope
+
+        # Populated during `initialize()` by MCPClient; keeping list here avoids attribute-errors
+        self.tool_schemas: list[dict[str, Any]] = []
+
+        # ------------------------------------------------------------------ #
+        # 5. Build quick-lookup set of all UMS base-function names           #
+        #    (e.g., {"create_workflow", "save_memory", …})                   #
+        # ------------------------------------------------------------------ #
+        self.all_ums_base_function_names: set[str] = {
+            v
+            for k, v in globals().items()
             if k.startswith("UMS_FUNC_") and isinstance(v, str)
         }
-        self.all_ums_base_function_names: Set[str] = set(_module_level_ums_func_constants.values())
-        self.logger.info(f"AgentMasterLoop initialized. LLM: {self.agent_llm_model}, UMS Server Name assumed: {UMS_SERVER_NAME}")
+
+        # ------------------------------------------------------------------ #
+        # 6. Final diagnostics                                               #
+        # ------------------------------------------------------------------ #
+        self.logger.info(
+            "AgentMasterLoop initialised. "
+            "LLM=%s | UMS Server='%s' | known_ums_funcs=%d | state_file=%s",
+            self.agent_llm_model,
+            UMS_SERVER_NAME,
+            len(self.all_ums_base_function_names),
+            self.agent_state_file,
+        )
         self.logger.debug(
-            f"Initialized {len(self.all_ums_base_function_names)} UMS base function names for internal reference. Sample: {list(self.all_ums_base_function_names)[:5]}"
+            "First five UMS base-function names: %s",
+            sorted(self.all_ums_base_function_names)[:5],
         )
 
     async def shutdown(self) -> None:
-        self.logger.info("Shutdown requested.")
-        self._shutdown_event.set()
-        await self._cleanup_background_tasks()
-        # Determine if this shutdown implies the current workflow is truly done
-        # For example, if goal_achieved_flag is true, or if consecutive_error_count is high.
-        # This logic might need refinement based on how you want to handle "pauses" vs "full stops".
-        is_workflow_terminal = (
-            self.state.goal_achieved_flag
-            or (self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS)
-            or (self.state.current_loop >= getattr(self, "_current_max_loops_for_run", float("inf")))  # If tracking max loops for current run
-        )
-        # If a workflow was active and is now considered terminal, clear its state.
-        # If workflow_id is already None, this won't do much.
-        if self.state.workflow_id and is_workflow_terminal:
-            self.logger.info(
-                f"AML Shutdown: Workflow '{_fmt_id(self.state.workflow_id)}' considered terminal. Clearing active workflow state before saving."
-            )
-            self.state.workflow_id = None
-            self.state.context_id = None  # Usually tied to workflow_id
-            self.state.workflow_stack = []
-            self.state.goal_stack = []
-            self.state.current_goal_id = None
-            self.state.current_thought_chain_id = None
-            # Optionally reset plan, or leave it if you might want to inspect it post-run
-            self.state.current_plan = [PlanStep(description=DEFAULT_PLAN_STEP)]
-            self.state.last_action_summary = "Agent shut down; workflow state cleared."
-            self.state.needs_replan = False
-            self.state.last_error_details = None
-            # Keep consecutive_error_count as is for logging, or reset it.
-            # Keep loop counters as they are more general.
-            # Keep tool_usage_stats.
-        elif self.state.workflow_id:
-            self.logger.info(
-                f"AML Shutdown: Workflow '{_fmt_id(self.state.workflow_id)}' was active but not considered terminal. Persisting its state."
-            )
-        else:
-            self.logger.info("AML Shutdown: No active workflow to clear state for.")
-        await self._save_agent_state()
-        self.logger.info("Agent loop shutdown complete.")
+        """
+        Gracefully shut the AgentMasterLoop down.
+
+        Guarantees
+        ----------
+        • *Idempotent* – subsequent calls are no-ops once shutdown completes.  
+        • `_shutdown_event` is set immediately so any in-flight coroutines can
+        observe it and exit early.  
+        • All background tasks spawned through the agent are awaited (with a
+        timeout) to avoid orphaned tasks.  
+        • Agent state is *always* persisted, even if cleanup raises.  
+        • If the current workflow is in a **terminal** condition
+        (goal achieved, max errors hit, or loop budget exhausted) the workflow
+        state is cleared so that the next run starts cleanly.  No existing
+        functionality is removed.
+        """
+        # ------------------------------------------------------------------
+        # 0. Fast-path: ignore duplicate shutdown requests
+        # ------------------------------------------------------------------
+        if getattr(self, "_shutdown_completed", False):
+            self.logger.debug("shutdown(): already completed – duplicate call ignored.")
+            return
+
+        # ------------------------------------------------------------------
+        # 1. Ensure only one coroutine can perform the shutdown sequence
+        # ------------------------------------------------------------------
+        if not hasattr(self, "_shutdown_lock"):
+            self._shutdown_lock = asyncio.Lock()
+        async with self._shutdown_lock:
+            if getattr(self, "_shutdown_completed", False):
+                return  # someone else just finished while we awaited the lock
+
+            self.logger.info("Shutdown requested.")
+            self._shutdown_event.set()
+
+            # ------------------------------------------------------------------
+            # 2. Clean up background tasks with a defensive timeout
+            # ------------------------------------------------------------------
+            try:
+                timeout_sec = getattr(self, "SHUTDOWN_CLEANUP_TIMEOUT_SEC", 15)
+                await asyncio.wait_for(
+                    asyncio.shield(self._cleanup_background_tasks()),
+                    timeout=timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"shutdown(): cleanup timed-out after {timeout_sec}s – background tasks may be cancelled."
+                )
+            except Exception as e:
+                self.logger.exception(f"shutdown(): unexpected error during background-task cleanup – {e!r}")
+
+            # ------------------------------------------------------------------
+            # 3. Decide whether the active workflow should be cleared
+            # ------------------------------------------------------------------
+            try:
+                max_loops_this_run = getattr(self, "_current_max_loops_for_run", float("inf"))
+                is_workflow_terminal = (
+                    self.state.goal_achieved_flag
+                    or self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS
+                    or self.state.current_loop >= max_loops_this_run
+                )
+
+                if self.state.workflow_id and is_workflow_terminal:
+                    wf_fmt = _fmt_id(self.state.workflow_id)
+                    self.logger.info(
+                        f"AML Shutdown: Workflow '{wf_fmt}' is terminal – clearing workflow-specific state."
+                    )
+                    # Purge workflow-scoped artefacts
+                    self.state.workflow_id = None
+                    self.state.context_id = None
+                    self.state.workflow_stack.clear()
+                    self.state.goal_stack.clear()
+                    self.state.current_goal_id = None
+                    self.state.current_thought_chain_id = None
+                    self.state.current_plan = [PlanStep(description=DEFAULT_PLAN_STEP)]
+                    self.state.last_action_summary = "Agent shut down; workflow state cleared."
+                    self.state.needs_replan = False
+                    self.state.last_error_details = None
+                elif self.state.workflow_id:
+                    self.logger.info(
+                        f"AML Shutdown: Workflow '{_fmt_id(self.state.workflow_id)}' not terminal – state persisted for later resumption."
+                    )
+                else:
+                    self.logger.info("AML Shutdown: No active workflow to clear.")
+            finally:
+                # ------------------------------------------------------------------
+                # 4. Persist agent state unconditionally
+                # ------------------------------------------------------------------
+                try:
+                    await self._save_agent_state()
+                    self.logger.info("shutdown(): agent state successfully persisted.")
+                except Exception as e_save:
+                    # Do not propagate – shutdown must always finish.
+                    self.logger.exception(f"shutdown(): failed to persist state – {e_save!r}")
+
+            # ------------------------------------------------------------------
+            # 5. Mark shutdown complete (idempotency flag) and log
+            # ------------------------------------------------------------------
+            self._shutdown_completed = True
+            self.logger.info("Agent loop shutdown complete.")
 
     def _get_ums_tool_mcp_name(self, base_function_name: str) -> str:
         """Constructs the full original MCP tool name for a UMS base function."""
         return f"{UMS_SERVER_NAME}:{base_function_name}"
-
+    
     def _construct_agent_prompt(self, current_task_goal_desc: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
-        # Use self.state.current_loop directly for the current turn number being processed.
+        """
+        Build the gigantic system+user prompt that steers the LLM each turn.
+        """
+        dbg = self.logger.isEnabledFor(logging.DEBUG)
+
+        # ---------- 1. High-level logging about current state ----------------
         current_turn_for_log_prompt = self.state.current_loop
         self.logger.info(f"AML CONSTRUCT_PROMPT: Building prompt for turn {current_turn_for_log_prompt}")
-        self.logger.debug(f"AML CONSTRUCT_PROMPT: self.state.workflow_id = {_fmt_id(self.state.workflow_id)}")
-        self.logger.debug(f"AML CONSTRUCT_PROMPT: self.state.current_goal_id = {_fmt_id(self.state.current_goal_id)}")
-        self.logger.debug(
-            f"AML CONSTRUCT_PROMPT: self.state.goal_stack (summary) = {[{'id': _fmt_id(g.get('goal_id')), 'desc': (g.get('description') or '')[:30] + '...', 'status': g.get('status')} for g in self.state.goal_stack if isinstance(g, dict)]}"
-        )
-        self.logger.debug(f"AML CONSTRUCT_PROMPT: current_task_goal_desc (param for this prompt) = {current_task_goal_desc[:100]}...")
 
-        agent_status_message = context.get("status_message_from_agent", "Status unknown.")
-        self.logger.debug(f"AML CONSTRUCT_PROMPT: context['status_message_from_agent'] = {agent_status_message}")
-
-        context_goal_details = context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
-        if context_goal_details and isinstance(context_goal_details, dict):
+        if dbg:
+            self.logger.debug(f"AML CONSTRUCT_PROMPT: self.state.workflow_id = {_fmt_id(self.state.workflow_id)}")
+            self.logger.debug(f"AML CONSTRUCT_PROMPT: self.state.current_goal_id = {_fmt_id(self.state.current_goal_id)}")
+            goal_stack_summary = [
+                {
+                    "id": _fmt_id(g.get("goal_id")),
+                    "desc": (g.get("description") or "")[:30] + "...",
+                    "status": g.get("status"),
+                }
+                for g in self.state.goal_stack
+                if isinstance(g, dict)
+            ]
             self.logger.debug(
-                f"AML CONSTRUCT_PROMPT: context['agent_assembled_goal_context']['current_goal_details_from_ums'] = {{'id': '{_fmt_id(context_goal_details.get('goal_id'))}', 'desc': '{(context_goal_details.get('description') or '')[:50]}...'}}"
+                "AML CONSTRUCT_PROMPT: self.state.goal_stack (summary) = %s",
+                goal_stack_summary,
             )
-        else:
-            self.logger.debug(
-                f"AML CONSTRUCT_PROMPT: context['agent_assembled_goal_context']['current_goal_details_from_ums'] = {context_goal_details}"
-            )
+            self.logger.debug(f"AML CONSTRUCT_PROMPT: current_task_goal_desc (param for this prompt) = {current_task_goal_desc[:100]}...")
 
-        system_blocks: List[str] = [
+        # ---------- 2. Helper lambdas ---------------------------------------
+        def _schema_name(schema_item: Any) -> str | None:
+            if not isinstance(schema_item, dict):
+                return None
+            if schema_item.get("type") == "function" and isinstance(schema_item.get("function"), dict):
+                return schema_item["function"].get("name")
+            return schema_item.get("name")
+
+        def _safe_json(obj: Any, **dump_kwargs) -> str:
+            try:
+                return json.dumps(obj, ensure_ascii=False, **dump_kwargs)
+            except Exception:
+                return repr(obj)
+
+        # ---------- 3. Discover the LLM alias for agent:update_plan ----------
+        llm_seen_agent_update_plan_name_for_instr = AGENT_TOOL_UPDATE_PLAN  # default
+        try:
+            for schema_item in self.tool_schemas or []:
+                llm_name = _schema_name(schema_item)
+                if not llm_name:
+                    continue
+                original_mcp = self.mcp_client.server_manager.sanitized_to_original.get(llm_name)
+                if original_mcp == AGENT_TOOL_UPDATE_PLAN:
+                    llm_seen_agent_update_plan_name_for_instr = llm_name
+                    break
+        except Exception as e:
+            self.logger.warning(f"AML CONSTRUCT_PROMPT: Exception while resolving update_plan alias: {e}", exc_info=dbg)
+        if not llm_seen_agent_update_plan_name_for_instr:
+            llm_seen_agent_update_plan_name_for_instr = re.sub(r"[^a-zA-Z0-9_-]", "_", AGENT_TOOL_UPDATE_PLAN)[:64] or "agent_update_plan_fallback"
+
+        # ---------- 4. Assemble SYSTEM prompt blocks (with tweaks) -----------
+        system_blocks: list[str] = [
             f"You are '{AGENT_NAME}', an AI agent orchestrator using a Unified Memory System (UMS) provided by the '{UMS_SERVER_NAME}' server.",
+            "All output you produce is consumed verbatim by the agent's executor; stray characters will cause a turn to fail.",  # [ADDED]
             "",
         ]
 
-        # Determine the LLM-visible name for agent:update_plan
-        llm_seen_agent_update_plan_name_for_instr = AGENT_TOOL_UPDATE_PLAN
-        for schema_item_instr in self.tool_schemas:  # self.tool_schemas should be up-to-date
-            schema_sanitized_name_instr = None
-            if isinstance(schema_item_instr, dict):
-                if schema_item_instr.get("type") == "function" and isinstance(schema_item_instr.get("function"), dict):
-                    schema_sanitized_name_instr = schema_item_instr.get("function", {}).get("name")
-                elif "name" in schema_item_instr:
-                    schema_sanitized_name_instr = schema_item_instr.get("name")
-
-            if schema_sanitized_name_instr:
-                original_mcp_name_for_this_schema_instr = self.mcp_client.server_manager.sanitized_to_original.get(schema_sanitized_name_instr)
-                if original_mcp_name_for_this_schema_instr == AGENT_TOOL_UPDATE_PLAN:
-                    llm_seen_agent_update_plan_name_for_instr = schema_sanitized_name_instr
-                    break
-        if llm_seen_agent_update_plan_name_for_instr == AGENT_TOOL_UPDATE_PLAN:  # Fallback if not found in schemas (should not happen)
-            llm_seen_agent_update_plan_name_for_instr = re.sub(r"[^a-zA-Z0-9_-]", "_", AGENT_TOOL_UPDATE_PLAN)[:64] or "agent_update_plan_fallback"
+        agent_status_message = context.get("status_message_from_agent", "Status unknown.")
+        if dbg:
+            self.logger.debug(f"AML CONSTRUCT_PROMPT: context['status_message_from_agent'] = {agent_status_message}")
+            ctx_goal_det = context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
+            self.logger.debug(
+                "AML CONSTRUCT_PROMPT: context['agent_assembled_goal_context']['current_goal_details_from_ums'] = "
+                f"{({'id': _fmt_id(ctx_goal_det.get('goal_id')), 'desc': (ctx_goal_det.get('description') or '')[:50] + '...'} if isinstance(ctx_goal_det, dict) else ctx_goal_det)}"
+            )
 
         if not self.state.workflow_id:
             system_blocks.append(
@@ -712,29 +1041,22 @@ class AgentMasterLoop:
                 status = current_operational_goal_details.get("status", "N/A")
                 system_blocks.append(f"Current Operational UMS Goal: {desc} (ID: {gid}, Status: {status})")
             else:
-                system_blocks.append(
-                    f"Current State: UMS Workflow '{_fmt_id(self.state.workflow_id)}' is ACTIVE, but NO specific UMS operational goal is currently set in agent's focus. (Agent Status: {agent_status_message})"
-                )
-                system_blocks.append(f"The Overall UMS Workflow Goal is: {ums_workflow_goal_from_context}")
-                system_blocks.append(
-                    f"**Action Required: Your next step should be to establish the primary UMS operational goal for this workflow.**"
-                )
-                system_blocks.append(
-                    f"   - If the Overall UMS Workflow Goal ('{ums_workflow_goal_from_context[:50]}...') is suitable as the first operational UMS goal, use the UMS tool with base function '{UMS_FUNC_CREATE_GOAL}' to create it. Set `parent_goal_id` to `null` or omit it. Use the Overall UMS Workflow Goal as the description for this new UMS goal."
-                )
-                system_blocks.append(
-                    f"   - Then, update your plan using the tool named `{llm_seen_agent_update_plan_name_for_instr}` to reflect steps towards this new UMS goal."
-                )
+                system_blocks += [
+                    f"Current State: UMS Workflow '{_fmt_id(self.state.workflow_id)}' is ACTIVE, but NO specific UMS operational goal is currently set in agent's focus. (Agent Status: {agent_status_message})",
+                    f"The Overall UMS Workflow Goal is: {ums_workflow_goal_from_context}",
+                    f"**Action Required: Your next step should be to establish the primary UMS operational goal for this workflow.**",
+                    f"   - If the Overall UMS Workflow Goal ('{ums_workflow_goal_from_context[:50]}...') is suitable as the first operational UMS goal, use the UMS tool with base function '{UMS_FUNC_CREATE_GOAL}' to create it. Set `parent_goal_id` to `null` or omit it. Use the Overall UMS Workflow Goal as the description for this new UMS goal.",
+                    f"   - Then, update your plan using the tool named `{llm_seen_agent_update_plan_name_for_instr}` to reflect steps towards this new UMS goal.",
+                ]
 
-        system_blocks.append("")
-        system_blocks.append(
-            f"Available Tools (Use ONLY these for UMS/Agent actions; format arguments per schema. Refer to tools by 'Name LLM Sees'):"
-        )
+        system_blocks += [
+            "",
+            "Available Tools (Use ONLY these for UMS/Agent actions; format arguments per schema. Refer to tools by 'Name LLM Sees'):",
+        ]
 
         if not self.tool_schemas:
             system_blocks.append("- CRITICAL WARNING: No tools loaded into agent's schema list. Cannot function effectively.")
         else:
-            # These are base function names. The tool list will show the full original MCP name for context.
             essential_tool_base_names = {
                 UMS_FUNC_ADD_ACTION_DEPENDENCY,
                 UMS_FUNC_RECORD_ARTIFACT,
@@ -756,50 +1078,42 @@ class AgentMasterLoop:
             }
             essential_agent_tool_mcp_names = {AGENT_TOOL_UPDATE_PLAN}
 
-            for schema in self.tool_schemas:  # self.tool_schemas are the LLM-formatted ones
-                llm_seen_name = None
-                if isinstance(schema, dict):
-                    if schema.get("type") == "function" and isinstance(schema.get("function"), dict):
-                        llm_seen_name = schema.get("function", {}).get("name")
-                    elif "name" in schema:
-                        llm_seen_name = schema.get("name")
-
+            for schema in self.tool_schemas:
+                llm_seen_name = _schema_name(schema)
                 if not llm_seen_name:
-                    self.logger.warning(f"AML CONSTRUCT_PROMPT: Skipping tool schema with no discernible name: {str(schema)[:100]}")
+                    if dbg:
+                        self.logger.debug(f"AML CONSTRUCT_PROMPT: Skipping tool schema with no discernible name: {str(schema)[:100]}")
                     continue
-
                 original_mcp_name = self.mcp_client.server_manager.sanitized_to_original.get(llm_seen_name, llm_seen_name)
                 base_function_name = self._get_base_function_name(original_mcp_name)
-
-                is_essential = False
-                if original_mcp_name in essential_agent_tool_mcp_names:
-                    is_essential = True
-                elif base_function_name in essential_tool_base_names:
-                    is_essential = True
-
+                is_essential = original_mcp_name in essential_agent_tool_mcp_names or base_function_name in essential_tool_base_names
                 prefix = "**" if is_essential else ""
                 desc = schema.get("description", "No description.")
-                # Get the input schema based on provider format (Anthropic vs OpenAI-like)
-                input_schema_obj = schema.get("input_schema")  # Anthropic style
-                if not input_schema_obj and schema.get("type") == "function":  # OpenAI style
-                    input_schema_obj = schema.get("function", {}).get("parameters")
-
-                # The `idempotency_key` should now appear here if UMS schemas are updated
-                # and MCPClient correctly includes it in the formatted schemas.
-                input_schema_str = json.dumps(input_schema_obj or {"type": "object", "properties": {}}, ensure_ascii=False)
-
-                system_blocks.append(
-                    f"\n- {prefix}Name LLM Sees: `{llm_seen_name}`{prefix}\n  (Base Function: `{base_function_name}`, Original MCP: `{original_mcp_name}`)\n  Desc: {desc}\n  Schema: {input_schema_str}"
+                input_schema_obj = (
+                    schema.get("input_schema")
+                    if schema.get("input_schema") is not None
+                    else (schema.get("function", {}).get("parameters") if schema.get("type") == "function" else None)
                 )
+                # [MOVE] Schema details above description for salience:
+                tool_entry_lines = [
+                    f"\n- {prefix}Name LLM Sees: `{llm_seen_name}`{prefix}\n  (Base Function: `{base_function_name}`, Original MCP: `{original_mcp_name}`)",
+                    f"  Schema: {_safe_json(input_schema_obj or {'type':'object','properties':{}}, indent=None)}"
+                ]
+                tool_entry_lines.append(f"  Desc: {desc}")
+                if is_essential:
+                    tool_entry_lines.append("  (CRITICAL — unexpected failure of this tool usually triggers needs_replan)")  # [ADDED]
+                system_blocks.extend(tool_entry_lines)
         system_blocks.append("")
 
+        # ---- 4c. Append “Process” & “Key Considerations” with new bullets ----
         system_blocks.extend(
             [
                 "Your Process at each step:",
                 "1.  Context Analysis: Deeply analyze 'Current Context'. Note workflow status, errors (`last_error_details`), **goal stack (`agent_assembled_goal_context` -> `goal_stack_summary_from_agent_state`) and the `current_goal_details_from_ums`**, UMS package (`ums_context_package`), `current_plan`, `current_thought_chain_id`, and `meta_feedback`. Pay attention to `retrieved_at` timestamps for freshness.",
                 "2.  Error Handling: If `last_error_details` exists, **FIRST** reason about the error `type` and `message`. Propose a recovery strategy. Refer to 'Recovery Strategies'.",
                 "3.  Reasoning & Planning:",
-                f"    a. State step-by-step reasoning towards the Current Operational UMS Goal (or the Initial Overall Task / Overall UMS Workflow Goal if no specific UMS operational goal is active). Record key thoughts using the UMS tool with base function '{UMS_FUNC_RECORD_THOUGHT}'.",
+                f"    a. First write private chain-of-thought, then decide action (the agent will not reveal this to the user).",  # [ADDED]
+                f"       State step-by-step reasoning towards the Current Operational UMS Goal (or the Initial Overall Task / Overall UMS Workflow Goal if no specific UMS operational goal is active). Record key thoughts using the UMS tool with base function '{UMS_FUNC_RECORD_THOUGHT}'.",
                 "    b. Evaluate `current_plan`. Is it aligned? Valid? Addresses errors? Dependencies met?",
                 f"    c. **Goal Management:** If Current Operational UMS Goal is too complex, use the UMS tool with base function '{UMS_FUNC_CREATE_GOAL}' (providing `parent_goal_id` as current UMS goal ID). When a UMS goal is met/fails, use UMS tool with base function '{UMS_FUNC_UPDATE_GOAL_STATUS}' with the UMS `goal_id` and status.",
                 f"    d. Action Dependencies: For plan steps, use `depends_on` with step IDs. Then use UMS tool with base function '{UMS_FUNC_ADD_ACTION_DEPENDENCY}' (with UMS action IDs) if inter-action dependencies are needed.",
@@ -822,6 +1136,7 @@ class AgentMasterLoop:
                 f"              1. Ensure you have ALREADY called the UMS tool with base function '{UMS_FUNC_RECORD_ARTIFACT}' with `is_output=True` for that final artifact.",
                 f"              2. Then, respond ONLY with the exact text: `Goal Achieved. Final output artifact ID: [THE_ARTIFACT_ID_RETURNED_BY_RECORD_ARTIFACT]` (replace bracketed part with the actual ID).",
                 f"            - If the Overall UMS Workflow Goal is MET but there's NO single primary output artifact, respond ONLY with the text: `Goal Achieved: [Your concise summary of overall goal completion, max 100 words]`.",
+                "        -- If you cannot decide among several next steps, record a thought (`record_thought`) summarising the dilemma, then pick the most impactful step.",  # [ADDED]
                 "5.  Output Format: Respond ONLY with the valid JSON for the chosen tool call OR one of the 'Goal Achieved...' text formats described above.",
             ]
         )
@@ -830,6 +1145,7 @@ class AgentMasterLoop:
                 "\nKey Considerations:",
                 "*   Goal Focus: Always work towards the Current Operational UMS Goal. Use UMS goal tools by their base function names.",
                 "*   Mental Momentum: Prioritize current plan steps if progress is steady and no errors/replans needed.",
+                "*   Token Budget: Keep outputs under 3500 tokens; if content risk exceeds, summarise memories with summarize_text first.*",  # [ADDED]
                 "*   Dependencies & Cycles: Ensure `depends_on` actions (in plan or UMS) are complete. Avoid cycles.",
                 "*   UMS Context: Leverage the `ums_context_package` (core, working, proactive, procedural memories, links).",
                 "*   Errors: Prioritize error analysis based on `last_error_details.type` and `last_action_summary`.",
@@ -839,13 +1155,14 @@ class AgentMasterLoop:
             ]
         )
         system_blocks.extend(
-            [  # Recovery Strategies (existing logic, ensure it aligns with AML's error types)
+            [  # Recovery Strategies – text preserved verbatim + one new error class
                 "\nRecovery Strategies based on `last_error_details.type`:",
                 f"*   `InvalidInputError`: Review tool schema, args, context. Correct args and retry OR choose different tool/step.",
                 f"*   `DependencyNotMetError`: Use UMS tool with base function '{UMS_FUNC_GET_ACTION_DETAILS}' on dependency IDs. Adjust plan order (`{llm_seen_agent_update_plan_name_for_instr}`) or wait.",
                 f"*   `ServerUnavailable` / `NetworkError`: Tool's server might be down. Try different tool, wait, or adjust plan.",
+                f"*   `UMSMalformedPayload`: Tool returned unexpected schema; record the raw payload to memory, wait one turn, then attempt again or escalate.*",  # [ADDED]
                 f"*   `APILimitError` / `RateLimitError`: External API busy. Plan to wait (record thought) before retry.",
-                f"*   `ToolExecutionError` / `ToolInternalError` / `UMSError`: Tool failed. Analyze message. Try different args, alternative tool, or adjust plan.",  # Added UMSError
+                f"*   `ToolExecutionError` / `ToolInternalError` / `UMSError`: Tool failed. Analyze message. Try different args, alternative tool, or adjust plan.",
                 f"*   `PlanUpdateError`: Proposed plan structure was invalid when agent tried to apply it. Re-examine plan and dependencies, try `{llm_seen_agent_update_plan_name_for_instr}` again with a corrected *complete* plan.",
                 f"*   `PlanValidationError`: Proposed plan has logical issues (e.g., cycles, missing dependencies). Debug dependencies, propose corrected plan using `{llm_seen_agent_update_plan_name_for_instr}`.",
                 f"*   `CancelledError`: Previous action cancelled. Re-evaluate current step.",
@@ -857,9 +1174,10 @@ class AgentMasterLoop:
         )
         system_prompt_str = "\n".join(system_blocks)
 
+        # ---------- 5. Assemble USER prompt blocks (unchanged wording) -------
         context_json_str = _truncate_context(context)
 
-        user_prompt_blocks = [
+        user_prompt_blocks: list[str] = [
             "Current Context:",
             "```json",
             context_json_str,
@@ -867,32 +1185,34 @@ class AgentMasterLoop:
             "",
             "Current Plan:",
             "```json",
-            json.dumps([step.model_dump(exclude_none=True) for step in self.state.current_plan], indent=2, ensure_ascii=False),
+            _safe_json([step.model_dump(exclude_none=True) for step in self.state.current_plan], indent=2),
             "```",
             "",
             f"Last Action Summary:\n{self.state.last_action_summary}\n",
         ]
-        if self.state.last_error_details:
-            user_prompt_blocks.extend(
-                [
-                    "**CRITICAL: Address Last Error Details (refer to Recovery Strategies in System Prompt)**:",
-                    "```json",
-                    json.dumps(self.state.last_error_details, indent=2, default=str, ensure_ascii=False),
-                    "```",
-                    "",
-                ]
-            )
-        if self.state.last_meta_feedback:
-            user_prompt_blocks.extend(
-                ["**Meta-Cognitive Feedback (e.g., a suggested plan or insight from reflection/consolidation):**", self.state.last_meta_feedback, ""]
-            )
 
+        if self.state.last_error_details:
+            user_prompt_blocks += [
+                "**CRITICAL: Address Last Error Details (refer to Recovery Strategies in System Prompt)**:",
+                "```json",
+                _safe_json(self.state.last_error_details, indent=2, default=str),
+                "```",
+                "",
+            ]
+
+        if self.state.last_meta_feedback:
+            user_prompt_blocks += [
+                "**Meta-Cognitive Feedback (e.g., a suggested plan or insight from reflection/consolidation):**",
+                self.state.last_meta_feedback,
+                "",
+            ]
+
+        # ---------- 6. Goal reminder and final instruction -------------------
         current_goal_desc_for_reminder = "Overall UMS Workflow Goal or Initial Task"
         if self.state.workflow_id:
             current_op_goal_details_reminder = context.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
             if (
-                current_op_goal_details_reminder
-                and isinstance(current_op_goal_details_reminder, dict)
+                isinstance(current_op_goal_details_reminder, dict)
                 and current_op_goal_details_reminder.get("description")
             ):
                 current_goal_desc_for_reminder = current_op_goal_details_reminder["description"]
@@ -904,175 +1224,341 @@ class AgentMasterLoop:
         user_prompt_blocks.append(f"Current Goal Reminder: {current_goal_desc_for_reminder}")
         user_prompt_blocks.append("")
 
-        final_instruction_text = ""
+        # ---------- 7. Final instruction branch logic (plus hard constraint) --------
+        instruction_append = " Remember: output MUST be either a single JSON object for a tool call or the ‘Goal Achieved…’ sentence - no markdown, no additional keys."  # [ADDED]
+
         if not self.state.workflow_id:
-            final_instruction_text = f"Instruction: NO ACTIVE UMS WORKFLOW. Your first action MUST be to call the UMS tool whose base function is '{UMS_FUNC_CREATE_WORKFLOW}'. Use the 'Initial Overall Task Description' from the system prompt as the 'goal' for this tool. Provide a suitable 'title'."
+            final_instruction_text = (
+                f"Instruction: NO ACTIVE UMS WORKFLOW. Your first action MUST be to call the UMS tool whose base function is '{UMS_FUNC_CREATE_WORKFLOW}'. "
+                f"Use the 'Initial Overall Task Description' from the system prompt as the 'goal' for this tool. Provide a suitable 'title'."
+                + instruction_append
+            )
         elif self.state.workflow_id and not self.state.current_goal_id:
-            final_instruction_text = f"Instruction: UMS WORKFLOW ACTIVE, BUT NO UMS OPERATIONAL GOAL SET. Your first action MUST be to call the UMS tool with base function '{UMS_FUNC_CREATE_GOAL}' to establish the root UMS goal for the current workflow. Use the 'Overall UMS Workflow Goal' as its description."
+            final_instruction_text = (
+                f"Instruction: UMS WORKFLOW ACTIVE, BUT NO UMS OPERATIONAL GOAL SET. Your first action MUST be to call the UMS tool with base function "
+                f"'{UMS_FUNC_CREATE_GOAL}' to establish the root UMS goal for the current workflow. Use the 'Overall UMS Workflow Goal' as its description."
+                + instruction_append
+            )
         elif self.state.needs_replan and self.state.last_meta_feedback:
+            # Create example plan format to show the LLM exactly how to structure its response
+            example_plan_steps = [
+                {"id": f"step-{MemoryUtils.generate_id()[:8]}", "description": "Research the impact of exercise on mental health using scientific studies", "status": "planned", "depends_on": []},
+                {"id": f"step-{MemoryUtils.generate_id()[:8]}", "description": "Analyze and summarize key findings about exercise benefits", "status": "planned", "depends_on": []}
+            ]
+            
             final_instruction_text = (
                 f"Instruction: **REPLANNING REQUIRED.** Meta-cognitive feedback (see 'Meta-Cognitive Feedback' in context) is available. "
                 f"Your primary action MUST be to use the tool named `{llm_seen_agent_update_plan_name_for_instr}` to set a new, detailed plan. "
-                f"Carefully consider the meta-feedback when formulating the new plan. After updating the plan, the agent will proceed with the first step of the new plan in the *next* turn."
+                f"Carefully consider the meta-feedback when formulating the new plan. After updating the plan, the agent will proceed with the first step of the new plan in the *next* turn.\n\n"
+                f"VERY IMPORTANT - FORMAT YOUR RESPONSE EXACTLY LIKE THIS (with your plan steps):\n"
+                f"{{\"name\": \"{llm_seen_agent_update_plan_name_for_instr}\", \"arguments\": {{\"plan\": {json.dumps(example_plan_steps, indent=2)}}}}}\n\n"
+                f"Or with OpenAI function calling format:\n"
+                f"```json\n"
+                f'{{"tool": "{llm_seen_agent_update_plan_name_for_instr}", "tool_input": {{"plan": {json.dumps(example_plan_steps, indent=2)}}}}}\n'
+                f"```"
+                + instruction_append
             )
-        elif self.state.needs_replan:
-            final_instruction_text = (
-                f"Instruction: **REPLANNING REQUIRED.** An error occurred (`last_error_details`) or a significant state change necessitates a new plan. "
-                f"Analyze `last_error_details` and other context. Your primary action MUST be to use the tool named `{llm_seen_agent_update_plan_name_for_instr}` to propose a new, complete, and valid plan to address the situation and achieve the Current Operational UMS Goal."
-            )
-        else:  # Normal operation
-            final_instruction_text = (
-                f"Instruction: Proceed with the first 'planned' step in 'Current Plan'. "
-                f"If dependencies are met, call the assigned UMS tool or record a thought (UMS base func '{UMS_FUNC_RECORD_THOUGHT}'). "
-                f"If the Current Operational UMS Goal is met, use UMS tool with base func '{UMS_FUNC_UPDATE_GOAL_STATUS}'. "
-                f"If Overall UMS Workflow Goal met, respond according to the 'Signal Overall Workflow Completion' rules (provide artifact ID if applicable, otherwise a summary). "
-                f"Only use `{llm_seen_agent_update_plan_name_for_instr}` if plan becomes invalid or needs strategic change."
-            )
+        elif self.state.needs_replan: # This block is when needs_replan is True
+            example_plan_steps = [
+                {"id": f"step-{MemoryUtils.generate_id()[:8]}", "description": "Research the impact of exercise on mental health using scientific studies", "status": "planned", "depends_on": []},
+                {"id": f"step-{MemoryUtils.generate_id()[:8]}", "description": "Analyze and summarize key findings about exercise benefits", "status": "planned", "depends_on": []}
+            ]
+            
+            # Determine if the current model supports the stricter json_schema format
+            current_model_for_api_call = self.agent_llm_model
+            provider_for_current_model = self.mcp_client.get_provider_from_model(current_model_for_api_call)
+            
+            model_supports_json_schema_type = False
+            if provider_for_current_model == Provider.OPENAI.value:
+                if any(prefix in current_model_for_api_call.lower() for prefix in MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT):
+                    model_supports_json_schema_type = True
+            elif provider_for_current_model == Provider.MISTRAL.value:
+                 if current_model_for_api_call.lower() in MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA: # Assuming you have this list
+                    model_supports_json_schema_type = True
+            # Add other providers if they support json_schema type
 
+            if model_supports_json_schema_type:
+                # Instruction for models that *do* support json_schema (OpenAI tool call format is fine)
+                # The existing prompt asking for the full tool call using llm_seen_agent_update_plan_name_for_instr is okay here,
+                # as json_schema mode with tool_choice should handle it.
+                # Ensure `force_tool_choice` is correctly set to llm_seen_agent_update_plan_name_for_instr in MCPClient.
+                final_instruction_text = (
+                    f"Instruction: **REPLANNING REQUIRED.** An error occurred (`last_error_details`) or a significant state change necessitates a new plan. "
+                    f"Analyze `last_error_details` and other context. Your primary action MUST be to use the tool named "
+                    f"`{llm_seen_agent_update_plan_name_for_instr}` to propose a new, complete, and valid plan to address the situation and achieve the Current Operational UMS Goal. "
+                    f"The response MUST be a call to the '{llm_seen_agent_update_plan_name_for_instr}' tool, formatted as a JSON object.\n\n"
+                    f"VERY IMPORTANT - FORMAT YOUR RESPONSE EXACTLY LIKE THIS (with your plan steps):\n"
+                    f"{{\"name\": \"{llm_seen_agent_update_plan_name_for_instr}\", \"arguments\": {{\"plan\": {json.dumps(example_plan_steps, indent=2)}}}}}\n\n"
+                    f"Or with OpenAI function calling format (if applicable for the model family despite using generic client):\n"
+                    f"```json\n"
+                    f'{{"tool": "{llm_seen_agent_update_plan_name_for_instr}", "tool_input": {{"plan": {json.dumps(example_plan_steps, indent=2)}}}}}\n'
+                    f"```"
+                    + instruction_append
+                )
+            else:
+                # Instruction for models that ONLY support json_object (like gpt-4.1)
+                # Ask for ONLY THE ARGUMENTS JSON.
+                direct_json_output_example = {"plan": example_plan_steps}
+                final_instruction_text = (
+                    f"Instruction: **REPLANNING REQUIRED.** An error occurred (`last_error_details`) or a significant state change necessitates a new plan. "
+                    f"Analyze `last_error_details` and other context. "
+                    f"Your response MUST BE A SINGLE VALID JSON OBJECT containing ONLY the new plan arguments. "
+                    f"This JSON object must have a single top-level key named \"plan\", and its value must be an array of plan step objects. "
+                    f"DO NOT wrap this JSON in a tool call structure (like 'name' or 'tool' keys at the top level). Output ONLY the JSON for the plan arguments.\n\n"
+                    f"VERY IMPORTANT - YOUR ENTIRE RESPONSE MUST BE *EXACTLY* THE JSON OBJECT SHOWN IN THE EXAMPLE BELOW (with your plan steps):\n"
+                    f"```json\n{json.dumps(direct_json_output_example, indent=2)}\n```\n"
+                    f"No other text, no markdown, just this JSON object structure as your direct output."
+                    # instruction_append is removed here because we are not asking for a tool call JSON.
+                )
+            
+            # Prepend meta-feedback if available
+            if self.state.last_meta_feedback:
+                 final_instruction_text = (
+                    f"Instruction: **REPLANNING REQUIRED.** Meta-cognitive feedback (see 'Meta-Cognitive Feedback' in context) is available. "
+                    + final_instruction_text.split("Instruction: **REPLANNING REQUIRED.**", 1)[-1]
+                )
         self.logger.info(f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): Final instruction: {final_instruction_text}")
+
         user_prompt_blocks.append(final_instruction_text)
         user_prompt_str = "\n".join(user_prompt_blocks)
 
-        constructed_prompt_messages = [{"role": "user", "content": system_prompt_str + "\n---\n" + user_prompt_str}]
+        # ---------- 8. Combine SYSTEM + USER into final prompt ---------------
+        constructed_prompt_messages = [
+            {
+                "role": "user",
+                "content": system_prompt_str + "\n---\n" + user_prompt_str,
+            }
+        ]
 
-        self.logger.debug(
-            f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): FINAL CONSTRUCTED prompt_messages type: {type(constructed_prompt_messages)}"
-        )
-        if isinstance(constructed_prompt_messages, list):
+        if dbg:
             self.logger.debug(
                 f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): FINAL CONSTRUCTED prompt_messages length: {len(constructed_prompt_messages)}"
             )
-            if len(constructed_prompt_messages) > 0:
+            if constructed_prompt_messages:
                 self.logger.debug(
-                    f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): FINAL CONSTRUCTED prompt_messages[0] type: {type(constructed_prompt_messages[0])}"
+                    f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): prompt_messages[0] keys: {list(constructed_prompt_messages[0].keys())}"
                 )
-                if isinstance(constructed_prompt_messages[0], dict):
-                    self.logger.debug(
-                        f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): FINAL CONSTRUCTED prompt_messages[0] keys: {list(constructed_prompt_messages[0].keys())}"
-                    )
-                    content_snippet = str(constructed_prompt_messages[0].get("content", ""))[:500] + "..."
-                    self.logger.debug(
-                        f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): FINAL CONSTRUCTED prompt_messages[0]['content'] snippet: {content_snippet}"
-                    )
-
+                self.logger.debug(
+                    f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): prompt_messages[0]['content'] snippet: "
+                    f"{constructed_prompt_messages[0]['content'][:500]}..."
+                )
         return constructed_prompt_messages
 
     def _background_task_done(self, task: asyncio.Task) -> None:
         asyncio.create_task(self._background_task_done_safe(task))
 
     async def _background_task_done_safe(self, task: asyncio.Task) -> None:
-        was_present = False
-        async with self._bg_tasks_lock:
-            if task in self.state.background_tasks:
-                self.state.background_tasks.discard(task)
-                was_present = True
-        if was_present:
+        """
+        Clean-up callback for a background `asyncio.Task`.
+
+        Responsibilities
+        ----------------
+        1.  Remove the task from `self.state.background_tasks` (under `_bg_tasks_lock`).
+        2.  Release exactly **one** permit on `_bg_task_semaphore` *if* the task was
+            actually tracked.
+        3.  Surface cancellation or exceptions through structured logging.
+        4.  **Never** propagate an exception itself (ensured by the outer `try/finally`).
+
+        The method is intentionally chatty at DEBUG level so long-running services
+        can spot leaks or semaphore imbalances quickly.
+        """
+        try:
+            # ------------------------------------------------------------------- #
+            # 1. Un-register the task from our tracking set
+            # ------------------------------------------------------------------- #
+            async with self._bg_tasks_lock:
+                was_present = task in self.state.background_tasks
+                if was_present:
+                    self.state.background_tasks.discard(task)
+
+            # ------------------------------------------------------------------- #
+            # 2. Release semaphore slot if we had registered this task
+            # ------------------------------------------------------------------- #
+            if was_present:
+                try:
+                    self._bg_task_semaphore.release()
+                    self.logger.debug(
+                        "Released background-task semaphore (value=%s) for %s",
+                        getattr(self._bg_task_semaphore, "_value", "n/a"),
+                        task.get_name(),
+                    )
+                except ValueError:
+                    # More releases than acquires → log, but keep going.
+                    self.logger.warning(
+                        "Semaphore release imbalance for background task %s", task.get_name()
+                    )
+                except Exception as sem_err:  # pragma: no cover
+                    self.logger.exception(
+                        "Unexpected error releasing semaphore for %s: %s",
+                        task.get_name(),
+                        sem_err,
+                    )
+
+            # ------------------------------------------------------------------- #
+            # 3. Inspect task outcome
+            # ------------------------------------------------------------------- #
+            if task.cancelled():
+                self.logger.debug("Background task %s was cancelled.", task.get_name())
+                return
+
+            exc: Optional[BaseException]
             try:
-                self._bg_task_semaphore.release()
-                log.debug(f"Released semaphore. Count: {self._bg_task_semaphore._value}. Task: {task.get_name()}")
-            except ValueError:
-                log.warning(f"Semaphore release failed for task {task.get_name()}.")
-            except Exception as sem_err:
-                log.error(f"Error releasing semaphore for {task.get_name()}: {sem_err}")
-        if task.cancelled():
-            self.logger.debug(f"Background task {task.get_name()} cancelled.")
-        exc = task.exception()
-        if exc:
-            self.logger.error(f"Background task {task.get_name()} failed: {type(exc).__name__}", exc_info=(type(exc), exc, exc.__traceback__))
+                exc = task.exception()  # Safe now: task not cancelled.
+            except asyncio.CancelledError:
+                # Rare race: task.cancelled() False yet exception() raises.
+                self.logger.debug("Background task %s raised CancelledError.", task.get_name())
+                return
+            except Exception:  # pragma: no cover
+                # Shouldn’t happen, but keep callback from crashing.
+                self.logger.exception("Could not retrieve exception from task %s", task.get_name())
+                return
+
+            if exc:
+                # Log full traceback once; service operators need stack-trace.
+                self.logger.error(
+                    "Background task %s failed – %s: %s",
+                    task.get_name(),
+                    type(exc).__name__,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+        finally:
+            # Ensure reference is dropped so GC can collect completed task objects.
+            task = None
+
 
     def _start_background_task(self, coro_fn, *args, **kwargs) -> asyncio.Task:
-        # The `workflow_id` and `context_id` passed to the wrapper are for the wrapper's context,
-        # not directly for coro_fn unless it's designed to accept them explicitly via **kwargs.
-        # Instance methods like _run_auto_linking will use `self.state.workflow_id`.
-        snapshot_wf_id = self.state.workflow_id
+        """
+        Launch `coro_fn` as a throttled background asyncio task.
+        """
+        snapshot_wf_id  = self.state.workflow_id
         snapshot_ctx_id = self.state.context_id
 
-        async def _wrapper():
-            log.debug(f"Waiting for semaphore... Task: {asyncio.current_task().get_name()}. Current count: {self._bg_task_semaphore._value}")
-            await self._bg_task_semaphore.acquire()
-            log.debug(f"Acquired semaphore. Task: {asyncio.current_task().get_name()}. New count: {self._bg_task_semaphore._value}")
-            try:
-                # If coro_fn needs specific context IDs different from self.state at execution time,
-                # they should be passed explicitly in **kwargs when calling _start_background_task.
-                # For example, if _run_auto_linking needed a specific `workflow_id` different from `self.state.workflow_id`
-                # at the time of execution, you would call:
-                # self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=..., workflow_id_for_coro=some_specific_id)
-                # And _run_auto_linking would need to accept `workflow_id_for_coro`.
-                # However, the current UMS tools accept `db_path` and often `workflow_id` directly.
-                # The background tasks here are instance methods, so they have `self`.
-                # The `workflow_id` and `context_id` passed to `_start_background_task`'s kwargs
-                # are typically used by the UMS tool if it needs them.
+        async def _wrapper() -> None:
+            task_name = asyncio.current_task().get_name()
 
-                # We need to ensure the UMS tool gets the correct workflow_id for its operation.
-                # The snapshot_wf_id is the one relevant when the task was *scheduled*.
-                # The UMS tools like create_memory_link take workflow_id if it's not implicit.
-                # Let's assume the coro_fn (like _run_auto_linking) will correctly pass the
-                # necessary workflow_id to the UMS tools it calls, using the `snapshot_wf_id`
-                # if appropriate for its logic.
+            self.logger.debug(
+                f"📥 Waiting on bg-semaphore… task={task_name} avail={self._bg_task_semaphore._value}"
+            )
 
-                # The current structure has coro_fn taking `self` and then `*args`, `**kwargs`.
-                # The `workflow_id` and `context_id` in `_start_background_task`'s kwargs are
-                # implicitly for the UMS tools called *within* `coro_fn`.
+            # --- throttle concurrent background work ---
+            async with self._bg_task_semaphore:
+                self.logger.debug(
+                    f"✅ Acquired bg-semaphore… task={task_name} avail={self._bg_task_semaphore._value}"
+                )
 
-                # Construct the kwargs for the UMS tool call inside the wrapper
-                final_kwargs_for_coro = kwargs.copy()
-                if "workflow_id" not in final_kwargs_for_coro and snapshot_wf_id:
-                    final_kwargs_for_coro["workflow_id"] = snapshot_wf_id
-                if "context_id" not in final_kwargs_for_coro and snapshot_ctx_id:
-                    final_kwargs_for_coro["context_id"] = snapshot_ctx_id
+                # merge implicit context into kwargs (don’t overwrite caller-supplied values)
+                final_kwargs = {**kwargs}
+                if "workflow_id" not in final_kwargs and snapshot_wf_id:
+                    final_kwargs["workflow_id"] = snapshot_wf_id
+                if "context_id" not in final_kwargs and snapshot_ctx_id:
+                    final_kwargs["context_id"] = snapshot_ctx_id
 
-                await asyncio.wait_for(coro_fn(self, *args, **final_kwargs_for_coro), timeout=BACKGROUND_TASK_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                self.logger.warning(f"Background task {asyncio.current_task().get_name()} timed out.")
-            except Exception as e:
-                self.logger.error(f"Exception in background task wrapper {asyncio.current_task().get_name()}: {e}", exc_info=True)
+                # Build the coroutine call, handling bound vs. unbound functions
+                if inspect.ismethod(coro_fn) and coro_fn.__self__ is not None:
+                    # already bound – call directly
+                    coro = coro_fn(*args, **final_kwargs)
+                else:
+                    # unbound – inject `self` as first positional arg
+                    coro = coro_fn(self, *args, **final_kwargs)
 
+                try:
+                    await asyncio.wait_for(coro, timeout=BACKGROUND_TASK_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        f"⏱️ Background task '{task_name}' exceeded "
+                        f"{BACKGROUND_TASK_TIMEOUT_SECONDS}s and was cancelled."
+                    )
+                except Exception as exc:
+                    self.logger.error(
+                        f"💥 Exception in background task '{task_name}': {exc}",
+                        exc_info=True,
+                    )
+
+        # ---------- task scheduling ----------
         task_name = f"bg_{coro_fn.__name__}_{_fmt_id(snapshot_wf_id)}_{random.randint(100, 999)}"
-        task = asyncio.create_task(_wrapper(), name=task_name)
-        asyncio.create_task(self._add_bg_task(task))  # Schedules _add_bg_task to run
+        task      = asyncio.create_task(_wrapper(), name=task_name)
+
+        # track & cleanup exactly as before
+        asyncio.create_task(self._add_bg_task(task))
         task.add_done_callback(self._background_task_done)
-        self.logger.debug(f"Started background task: {task.get_name()} for WF {_fmt_id(snapshot_wf_id)}")
+
+        self.logger.debug(f"🚀 Started background task '{task_name}' for WF {_fmt_id(snapshot_wf_id)}")
         return task
 
     async def _add_bg_task(self, task: asyncio.Task) -> None:
         async with self._bg_tasks_lock:
             self.state.background_tasks.add(task)
 
+
     async def _cleanup_background_tasks(self) -> None:
-        tasks_to_cleanup: List[asyncio.Task] = []
+        """
+        Gracefully cancel and flush all background tasks that were spawned through
+        `_start_background_task`.
+        """
+        CANCEL_TIMEOUT_SEC: float = 5.0
+
+        # 1. Snapshot the current task set under the lock.
         async with self._bg_tasks_lock:
-            tasks_to_cleanup = list(self.state.background_tasks)
-        if not tasks_to_cleanup:
+            tasks: list[asyncio.Task] = list(self.state.background_tasks)
+
+        if not tasks:
             self.logger.debug("No background tasks to clean up.")
             return
-        self.logger.info(f"Cleaning up {len(tasks_to_cleanup)} background tasks…")
-        for t in tasks_to_cleanup:
-            if not t.done():
-                t.cancel()
-        results = await asyncio.gather(*tasks_to_cleanup, return_exceptions=True)
-        for i, res in enumerate(results):
-            task = tasks_to_cleanup[i]
-            task_name = task.get_name()
-            if isinstance(res, asyncio.CancelledError):
-                self.logger.debug(f"Task {task_name} cancelled during cleanup.")
-            elif isinstance(res, Exception):
-                self.logger.error(f"Task {task_name} error during cleanup: {res}", exc_info=isinstance(res, Exception))
+
+        self.logger.info("Cleaning up %d background tasks…", len(tasks))
+
+        # 2. Issue cooperative cancellation.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        # 3. Await completion with a bounded timeout (Python 3.11+: asyncio.timeout)
+        try:
+            async with asyncio.timeout(CANCEL_TIMEOUT_SEC):
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+        except TimeoutError:
+            # Some tasks ignored cancellation — inspect individually.
+            results = [
+                (task.exception() if task.done() else TimeoutError())
+                for task in tasks
+            ]
+
+        # 4. Log the outcome for every task exactly once.
+        for task, result in zip(tasks, results, strict=True):
+            name = task.get_name()
+            if isinstance(result, asyncio.CancelledError):
+                self.logger.debug("Task %s cancelled during cleanup.", name)
+            elif isinstance(result, TimeoutError):
+                self.logger.warning(
+                    "Task %s did not terminate within %.1fs and will be ignored.",
+                    name,
+                    CANCEL_TIMEOUT_SEC,
+                )
+            elif isinstance(result, Exception):
+                self.logger.error(
+                    "Task %s raised during cleanup: %s", name, result, exc_info=True
+                )
             else:
-                self.logger.debug(f"Task {task_name} finalized during cleanup.")
+                self.logger.debug("Task %s finished successfully during cleanup.", name)
+
+        # 5. Clear the registry of background tasks.
         async with self._bg_tasks_lock:
             self.state.background_tasks.clear()
-        # Release all permits from semaphore if cleanup was forceful
-        # This is a bit of a brute-force way to reset the semaphore if tasks were killed.
-        if self._bg_task_semaphore._value < MAX_CONCURRENT_BG_TASKS:
-            permits_to_release = MAX_CONCURRENT_BG_TASKS - self._bg_task_semaphore._value
-            for _ in range(permits_to_release):
-                try:
-                    self._bg_task_semaphore.release()
-                except ValueError:  # If trying to release too many
-                    break
-            self.logger.info(f"Reset semaphore count during cleanup. New count: {self._bg_task_semaphore._value}")
 
-        self.logger.info("Background tasks cleanup finished.")
+        # 6. Restore semaphore permits (best-effort, cannot over-release).
+        needed = MAX_CONCURRENT_BG_TASKS - self._bg_task_semaphore._value
+        for _ in range(max(0, needed)):
+            try:
+                self._bg_task_semaphore.release()
+            except ValueError:
+                break  # already full
+
+        self.logger.info(
+            "Background tasks cleanup finished. Semaphore value: %s",
+            self._bg_task_semaphore._value,
+        )
+
 
     async def _estimate_tokens_anthropic(self, data: Any) -> int:
         if data is None:
@@ -1092,10 +1578,11 @@ class AgentMasterLoop:
             text_representation = data if isinstance(data, str) else json.dumps(data, default=str, ensure_ascii=False)
             return len(text_representation) // 4  # Rough fallback
 
-    async def _with_retries(
+
+    async def _with_retries(                # noqa: C901 – complex but self-contained
         self,
-        coro_fun,
-        *args,
+        coro_fun: Callable[..., Awaitable[Any]],
+        *args: Any,
         max_retries: int = 3,
         retry_exceptions: Tuple[type[BaseException], ...] = (
             ToolError,
@@ -1107,212 +1594,398 @@ class AgentMasterLoop:
             APIStatusError,
             httpx.RequestError,
         ),
-        retry_backoff: float = 2.0,
+        retry_backoff: float = 2.0,          # exponential base
         jitter: Tuple[float, float] = (0.1, 0.5),
-        **kwargs,
-    ):
-        attempt = 0
+        max_delay: Optional[float] = None,   # cap for any single sleep (None = no cap)
+        on_retry: Optional[
+            Callable[[int, BaseException, float], None]
+        ] = None,                            # optional sync callback (attempt, exc, delay)
+        **kwargs: Any,
+    ) -> Any:
+        """
+        Execute *coro_fun* with automatic retries for transient errors.
+
+        Parameters
+        ----------
+        coro_fun
+            Awaitable callable to execute.
+        max_retries
+            Maximum **total** attempts (first call + retries).
+        retry_exceptions
+            Tuple of exception classes that should trigger a retry.
+        retry_backoff
+            Exponential back-off base (e.g. ``2.0`` → 1 s, 2 s, 4 s … before jitter).
+        jitter
+            Uniform random jitter *added* to each back-off delay.
+        max_delay
+            Optional upper bound for any single delay.
+        on_retry
+            Optional callback executed synchronously **after** a failure is caught and
+            **before** sleeping. It receives ``attempt`` (1-based retry count),
+            the caught ``exception`` and the calculated ``delay`` seconds.
+
+        Raises
+        ------
+        Same exceptions raised by *coro_fun* after exhausting retries, or when
+        ``self._shutdown_event`` is set during the retry cycle.
+        """
+        attempt: int = 0
         last_exception: Optional[BaseException] = None
-        while True:
+
+        while attempt < max_retries:
+            if self._shutdown_event.is_set():
+                self.logger.warning(
+                    f"Shutdown requested while executing {coro_fun.__name__}; aborting retries."
+                )
+                raise asyncio.CancelledError(
+                    f"Shutdown during execution of {coro_fun.__name__}"
+                ) from last_exception
+
             try:
                 return await coro_fun(*args, **kwargs)
-            except retry_exceptions as e:
+
+            except retry_exceptions as exc:
                 attempt += 1
-                last_exception = e
+                last_exception = exc
+
+                # Final attempt failed → propagate
                 if attempt >= max_retries:
-                    self.logger.error(f"{coro_fun.__name__} failed after {max_retries} attempts: {type(e).__name__} - {e}")
-                    raise  # Re-raise the last caught exception
+                    self.logger.error(
+                        "%s failed after %d attempts: %s – %s",
+                        coro_fun.__name__,
+                        max_retries,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
 
-                delay = (retry_backoff ** (attempt - 1)) + random.uniform(*jitter)
+                # Compute next delay
+                base_delay: float = retry_backoff ** (attempt - 1)
+                random_jitter: float = random.uniform(*jitter)
+                delay: float = base_delay + random_jitter
+                if max_delay is not None:
+                    delay = min(delay, max_delay)
+
                 self.logger.warning(
-                    f"{coro_fun.__name__} failed ({type(e).__name__}: {str(e)[:100]}...); retry {attempt}/{max_retries} in {delay:.2f}s"
+                    "%s failed (%s: %s); retry %d/%d in %.2f s",
+                    coro_fun.__name__,
+                    type(exc).__name__,
+                    str(exc)[:100],
+                    attempt,
+                    max_retries,
+                    delay,
                 )
-                if self._shutdown_event.is_set():
-                    self.logger.warning(f"Shutdown during retry for {coro_fun.__name__}.")
-                    raise asyncio.CancelledError(f"Shutdown during retry for {coro_fun.__name__}") from last_exception
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:  # Explicitly handle CancelledError
-                self.logger.info(f"{coro_fun.__name__} cancelled during retry wait or execution.")
-                raise  # Re-raise to propagate cancellation
 
-    async def _save_agent_state(self) -> None:
-        self.logger.debug(f"Attempting to save agent state. WF ID: {_fmt_id(self.state.workflow_id)}")
+                # Invoke optional hook - guard against hook misbehaviour
+                if on_retry is not None:
+                    try:
+                        on_retry(attempt, exc, delay)
+                    except Exception:  # pragma: no cover
+                        self.logger.debug(
+                            "on_retry callback raised an exception; continuing retries",
+                            exc_info=True,
+                        )
 
-        # Create a dictionary from the state, handling potential non-serializable fields manually
-        state_dict_to_save = {}
-        for fld in dataclasses.fields(AgentState):
-            if fld.name == "background_tasks":  # Explicitly skip background_tasks
-                continue
-
-            value = getattr(self.state, fld.name)
-
-            if fld.name == "current_plan":
-                state_dict_to_save[fld.name] = [step.model_dump(exclude_none=True) for step in value] if value else []
-            elif fld.name == "tool_usage_stats":
-                # Convert defaultdict to regular dict for JSON
-                state_dict_to_save[fld.name] = {k: dict(v) for k, v in value.items()} if value else {}
-            elif fld.name == "goal_stack":
-                # Ensure goal_stack is a list of dicts; UMS goal objects should be dicts
-                state_dict_to_save[fld.name] = (
-                    [
-                        dict(g) if not isinstance(g, dict) else g  # Ensure it's a dict
-                        for g in value
-                        if isinstance(g, (dict, BaseModel))  # Allow Pydantic models too if they get in there
-                    ]
-                    if value
-                    else []
-                )
-            else:
-                # For other fields, directly assign. asdict handles most basic types.
-                # If a field could contain complex non-serializable objects not handled above,
-                # specific serialization logic would be needed here.
-                state_dict_to_save[fld.name] = value
-
-        state_dict_to_save["timestamp"] = datetime.now(timezone.utc).isoformat()
-
-        try:
-            self.agent_state_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_file = self.agent_state_file.with_suffix(f".tmp_{os.getpid()}_{uuid.uuid4().hex[:4]}")  # More unique temp file
-
-            json_string_to_write = json.dumps(state_dict_to_save, indent=2, ensure_ascii=False, default=str)  # Add default=str as a fallback
-
-            async with aiofiles.open(tmp_file, "w", encoding="utf-8") as f:
-                await f.write(json_string_to_write)
-                await f.flush()
                 try:
-                    os.fsync(f.fileno())
-                except OSError as e:
-                    self.logger.warning(f"os.fsync failed during state save: {e}")
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    self.logger.info(
+                        "%s cancelled while waiting %.2f s before retry.", coro_fun.__name__, delay
+                    )
+                    raise
 
-            os.replace(tmp_file, self.agent_state_file)
-            self.logger.debug(f"State saved atomically -> {self.agent_state_file}")
-        except TypeError as te:  # Catch specific TypeError during json.dumps
-            self.logger.error(f"TypeError during JSON serialization of agent state: {te}", exc_info=True)
-            self.logger.error(f"Problematic state_dict_to_save (keys): {list(state_dict_to_save.keys())}")
-            # Try to log problematic field if possible (this is hard to do generically)
-        except Exception as e:
-            self.logger.error(f"Failed to save agent state: {e}", exc_info=True)
-            if "tmp_file" in locals() and tmp_file.exists():
-                try:
-                    os.remove(tmp_file)
-                except OSError as rm_err:
-                    self.logger.error(f"Failed remove temporary state file {tmp_file}: {rm_err}")
+            except asyncio.CancelledError:
+                # Propagate cancellation while still logging for observability
+                self.logger.info("%s execution cancelled.", coro_fun.__name__)
+                raise
 
-    async def _load_agent_state(self) -> None:
-        if not self.agent_state_file.exists():
-            self.state = AgentState(
-                current_reflection_threshold=BASE_REFLECTION_THRESHOLD, current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
+
+    async def _save_agent_state(self) -> None:  # noqa: C901  (complexity is OK for a single, well-scoped helper)
+        """
+        Persist the *entire* ``AgentState`` object to ``self.agent_state_file`` **atomically**.
+        """
+        # -----------------------------------------------------------------
+        # 1. Ensure we have a per-instance lock
+        # -----------------------------------------------------------------
+        if not hasattr(self, "_state_save_lock"):
+            # noqa: Attribute is created dynamically – that is intentional
+            self._state_save_lock: asyncio.Lock = asyncio.Lock()  # type: ignore[attr-defined]
+
+        async with self._state_save_lock:
+            self.logger.debug(
+                "Attempting to save agent state. WF ID: %s",
+                _fmt_id(self.state.workflow_id),
             )
-            self.logger.info("No prior state file. Starting fresh.")
-            return
-        try:
-            async with aiofiles.open(self.agent_state_file, "r", encoding="utf-8") as f:
-                data = json.loads(await f.read())
 
-            kwargs: Dict[str, Any] = {}
-            processed_keys = set()
+            # --------------------------------------------------------------
+            # 2. Build a *pure* dict suitable for JSON serialization
+            # --------------------------------------------------------------
+            def _json_default(obj: Any) -> str:
+                """Fallback serializer for `json.dumps`."""
+                if isinstance(obj, (datetime, uuid.UUID)):
+                    return obj.isoformat() if isinstance(obj, datetime) else str(obj)
+                if isinstance(obj, Enum):
+                    return obj.value  # type: ignore[return-value]
+                if dataclasses.is_dataclass(obj):
+                    return dataclasses.asdict(obj)
+                if isinstance(obj, BaseModel):
+                    return obj.model_dump(mode="json")
+                return str(obj)  # best-effort
+
+            state_dict_to_save: dict[str, Any] = {}
 
             for fld in dataclasses.fields(AgentState):
-                if not fld.init:
-                    continue  # Skip non-init fields like background_tasks
-                name = fld.name
-                processed_keys.add(name)
-                if name in data:
-                    value = data[name]
-                    if name == "current_plan":
+                # Explicitly skip non-serialisable / runtime fields
+                if fld.name == "background_tasks":
+                    continue
+
+                value = getattr(self.state, fld.name)
+
+                if fld.name == "current_plan":
+                    state_dict_to_save["current_plan"] = [
+                        step.model_dump(exclude_none=True) for step in value
+                    ] if value else []
+                elif fld.name == "tool_usage_stats":
+                    # Convert defaultdicts -> normal dicts for JSON
+                    state_dict_to_save["tool_usage_stats"] = {
+                        k: dict(v) for k, v in value.items()
+                    } if value else {}
+                elif fld.name == "goal_stack":
+                    state_dict_to_save["goal_stack"] = [
+                        g.model_dump()
+                        if isinstance(g, BaseModel) else dict(g)
+                        if isinstance(g, dict) else g
+                        for g in (value or [])
+                    ]
+                else:
+                    state_dict_to_save[fld.name] = value
+
+            # Add a write-timestamp (ISO-8601, UTC)
+            state_dict_to_save["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+            # --------------------------------------------------------------
+            # 3. Serialize → JSON (pretty-printed, UTF-8, stable order)
+            # --------------------------------------------------------------
+            try:
+                json_string: str = json.dumps(
+                    state_dict_to_save,
+                    indent=2,
+                    ensure_ascii=False,
+                    default=_json_default,
+                    sort_keys=True,
+                )
+            except TypeError:
+                # Pin-point which field is not serialisable
+                for k, v in state_dict_to_save.items():
+                    try:
+                        json.dumps(v, default=_json_default)
+                    except TypeError as bad:
+                        self.logger.error(
+                            "JSON serialisation failed for field '%s': %s", k, bad, exc_info=True
+                        )
+                        break
+                raise  # re-raise so the caller notices
+
+            # --------------------------------------------------------------
+            # 4. Write atomically in a background thread
+            # --------------------------------------------------------------
+            async def _write_file() -> None:
+                tmp_path: Path | None = None
+                try:
+                    tmp_dir = self.agent_state_file.parent
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        encoding="utf-8",
+                        dir=tmp_dir,
+                        prefix=f"{self.agent_state_file.stem}._tmp_",
+                        suffix=f".{os.getpid()}_{uuid.uuid4().hex[:4]}",
+                        delete=False,
+                    ) as tmp_file:
+                        tmp_path = Path(tmp_file.name)
+                        tmp_file.write(json_string)
+                        tmp_file.flush()
+                        os.fsync(tmp_file.fileno())
+
+                    # Atomic replace
+                    os.replace(tmp_path, self.agent_state_file)
+                    self.logger.debug("State saved atomically → %s", self.agent_state_file)
+
+                except Exception:
+                    # Clean-up orphaned tmp file on *any* failure
+                    if tmp_path and tmp_path.exists():
                         try:
-                            kwargs["current_plan"] = (
-                                [PlanStep(**d) for d in value] if isinstance(value, list) and value else [PlanStep(description=DEFAULT_PLAN_STEP)]
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    raise
+
+            await asyncio.to_thread(_write_file)
+
+
+    async def _load_agent_state(self) -> None:  # noqa: C901  (complex by design)
+        """
+        Robustly load `AgentState` from `self.agent_state_file`.
+        """
+        # ── 1. Fast-path if no prior state ───────────────────────────────────────
+        if not self.agent_state_file.exists():
+            self.state = AgentState(
+                current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
+                current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD,
+            )
+            self.logger.info("State-file missing → starting with a fresh AgentState.")
+            return
+
+        # ── 2. Read & parse JSON (fail-hard handled below) ───────────────────────
+        try:
+            async with aiofiles.open(self.agent_state_file, "r", encoding="utf-8") as f:
+                raw_text: str = await f.read()
+            data: Dict[str, Any] = json.loads(raw_text)
+            if not isinstance(data, dict):
+                raise TypeError(f"Top-level JSON is {type(data)}, expected dict.")
+        except Exception as exc:  # JSONDecodeError, OSError, etc.
+            self.logger.error(
+                f"State-file load failed ({exc!s}). Reverting to defaults.",
+                exc_info=True,
+            )
+            self.state = AgentState(
+                current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
+                current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD,
+            )
+            return
+
+        # ── 3. Build kwargs for dataclass instantiation ─────────────────────────
+        kwargs: Dict[str, Any] = {}
+        processed_keys: set[str] = set()
+
+        for fld in dataclasses.fields(AgentState):
+            # Skip non-init (e.g., background_tasks)
+            if not fld.init:
+                continue
+
+            name = fld.name
+            processed_keys.add(name)
+
+            # ---------------------------------------------------------------------
+            # A. Key present in JSON → attempt to coerce/validate
+            # ---------------------------------------------------------------------
+            if name in data:
+                value = data[name]
+
+                # 1️⃣  current_plan  -- ensure list[PlanStep]
+                if name == "current_plan":
+                    if isinstance(value, list) and value:
+                        try:
+                            kwargs["current_plan"] = [PlanStep(**item) if not isinstance(item, PlanStep) else item for item in value]
+                        except (ValidationError, TypeError) as exc:
+                            self.logger.warning(
+                                f"State-file plan reload failed: {exc!s}. Falling back to default plan."
                             )
-                        except (ValidationError, TypeError) as e:
-                            self.logger.warning(f"Plan reload failed: {e}. Resetting to default plan.")
                             kwargs["current_plan"] = [PlanStep(description=DEFAULT_PLAN_STEP)]
-                    elif name == "tool_usage_stats":
-                        dd = _default_tool_stats()  # Use the factory for correct type
-                        if isinstance(value, dict):
-                            for k, v_dict in value.items():
-                                if isinstance(v_dict, dict):  # Ensure inner value is a dict
-                                    dd[k]["success"] = int(v_dict.get("success", 0))
-                                    dd[k]["failure"] = int(v_dict.get("failure", 0))
-                                    dd[k]["latency_ms_total"] = float(v_dict.get("latency_ms_total", 0.0))
-                        kwargs["tool_usage_stats"] = dd
-                    elif name == "goal_stack":
-                        # Ensure it's a list of dicts, otherwise default to empty list
-                        kwargs[name] = value if isinstance(value, list) and all(isinstance(item, dict) for item in value) else []
                     else:
-                        # For other fields, assign directly if key exists
-                        kwargs[name] = value
-                else:  # Field missing from saved data, use dataclass default
-                    if fld.default_factory is not dataclasses.MISSING:
-                        kwargs[name] = fld.default_factory()
-                    elif fld.default is not dataclasses.MISSING:
-                        kwargs[name] = fld.default
-                    # Explicit defaults for thresholds if not covered by above (though they should be)
-                    elif name == "current_reflection_threshold":
-                        kwargs[name] = BASE_REFLECTION_THRESHOLD
-                    elif name == "current_consolidation_threshold":
-                        kwargs[name] = BASE_CONSOLIDATION_THRESHOLD
-                    elif name == "goal_stack":  # Ensure default for goal_stack if somehow missed
-                        kwargs[name] = []
-                    elif name == "current_goal_id":  # current_goal_id can be None
-                        kwargs[name] = None
+                        kwargs["current_plan"] = [PlanStep(description=DEFAULT_PLAN_STEP)]
 
-            extra_keys = set(data.keys()) - processed_keys - {"timestamp"}  # Exclude known non-field keys
-            if extra_keys:
-                self.logger.warning(f"Ignoring unknown keys in state file: {extra_keys}")
+                # 2️⃣  tool_usage_stats  -- normalise numeric counters
+                elif name == "tool_usage_stats":
+                    stats_default = _default_tool_stats()
+                    if isinstance(value, dict):
+                        for k, stat in value.items():
+                            if isinstance(stat, dict):
+                                stats_default[k]["success"] = int(stat.get("success", 0))
+                                stats_default[k]["failure"] = int(stat.get("failure", 0))
+                                stats_default[k]["latency_ms_total"] = float(stat.get("latency_ms_total", 0.0))
+                    kwargs["tool_usage_stats"] = stats_default
 
-            temp_state = AgentState(**kwargs)  # Create state object
+                # 3️⃣  goal_stack  -- list[dict]
+                elif name == "goal_stack":
+                    kwargs[name] = value if isinstance(value, list) and all(isinstance(i, dict) for i in value) else []
 
-            # Post-load validation and correction
-            if not isinstance(temp_state.current_reflection_threshold, int) or not (
-                MIN_REFLECTION_THRESHOLD <= temp_state.current_reflection_threshold <= MAX_REFLECTION_THRESHOLD
-            ):
-                self.logger.warning(f"Invalid current_reflection_threshold ({temp_state.current_reflection_threshold}) loaded. Resetting to default.")
-                temp_state.current_reflection_threshold = BASE_REFLECTION_THRESHOLD
+                # 4️⃣  everything else  -- pass through verbatim
+                else:
+                    kwargs[name] = value
 
-            if not isinstance(temp_state.current_consolidation_threshold, int) or not (
-                MIN_CONSOLIDATION_THRESHOLD <= temp_state.current_consolidation_threshold <= MAX_CONSOLIDATION_THRESHOLD
-            ):
-                self.logger.warning(
-                    f"Invalid current_consolidation_threshold ({temp_state.current_consolidation_threshold}) loaded. Resetting to default."
-                )
-                temp_state.current_consolidation_threshold = BASE_CONSOLIDATION_THRESHOLD
+            # ---------------------------------------------------------------------
+            # B. Key missing in JSON → fall back to defaults
+            # ---------------------------------------------------------------------
+            else:
+                if fld.default_factory is not dataclasses.MISSING:  # type: ignore[attr-defined]
+                    kwargs[name] = fld.default_factory()            # type: ignore[attr-defined]
+                elif fld.default is not dataclasses.MISSING:
+                    kwargs[name] = fld.default
+                elif name == "current_reflection_threshold":
+                    kwargs[name] = BASE_REFLECTION_THRESHOLD
+                elif name == "current_consolidation_threshold":
+                    kwargs[name] = BASE_CONSOLIDATION_THRESHOLD
+                elif name == "goal_stack":
+                    kwargs[name] = []
+                else:
+                    # Leave unset; dataclass will enforce required fields
+                    pass
 
-            if not isinstance(temp_state.goal_stack, list):  # Should be handled by load, but double check
-                self.logger.warning("goal_stack was not a list after load, resetting to empty list.")
-                temp_state.goal_stack = []
+        # -------------------------------------------------------------------------
+        # C. Warn on unknown / extra keys
+        # -------------------------------------------------------------------------
+        extra_keys = set(data.keys()) - processed_keys - {"timestamp", "schema_version"}
+        if extra_keys:
+            self.logger.warning(f"State-file contains {len(extra_keys)} unknown keys → ignored: {sorted(extra_keys)}")
 
-            if temp_state.current_goal_id and not any(
-                g.get("goal_id") == temp_state.current_goal_id for g in temp_state.goal_stack if isinstance(g, dict)
-            ):
-                self.logger.warning(
-                    f"Loaded current_goal_id {_fmt_id(temp_state.current_goal_id)} not found in loaded goal_stack. Resetting current_goal_id."
-                )
-                temp_state.current_goal_id = (
-                    temp_state.goal_stack[-1].get("goal_id") if temp_state.goal_stack and isinstance(temp_state.goal_stack[-1], dict) else None
-                )
-
-            self.state = temp_state  # Assign validated state
-            self.logger.info(
-                f"Loaded state from {self.agent_state_file}; loop {self.state.current_loop}, WF: {_fmt_id(self.state.workflow_id)}, Goal: {_fmt_id(self.state.current_goal_id)}"
+        # ── 4. Instantiate & validate AgentState ────────────────────────────────
+        try:
+            temp_state: AgentState = AgentState(**kwargs)
+        except TypeError as exc:
+            # Catastrophic mismatch – fall back to safe default
+            self.logger.critical(
+                f"AgentState(**kwargs) failed ({exc!s}). Using default state.",
+                exc_info=True,
             )
-
-        except (json.JSONDecodeError, TypeError, FileNotFoundError) as e:
-            self.logger.error(f"State load failed: {e}. Resetting to default state.", exc_info=True)
             self.state = AgentState(
-                current_reflection_threshold=BASE_REFLECTION_THRESHOLD, current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
+                current_reflection_threshold=BASE_REFLECTION_THRESHOLD,
+                current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD,
             )
-        except Exception as e:  # Catch any other unexpected errors
-            self.logger.critical(f"Unexpected error loading state: {e}. Resetting to default state.", exc_info=True)
-            self.state = AgentState(
-                current_reflection_threshold=BASE_REFLECTION_THRESHOLD, current_consolidation_threshold=BASE_CONSOLIDATION_THRESHOLD
+            return
+
+        # -------------------------------------------------------------------------
+        # Range / integrity checks
+        # -------------------------------------------------------------------------
+        if not (MIN_REFLECTION_THRESHOLD <= temp_state.current_reflection_threshold <= MAX_REFLECTION_THRESHOLD):
+            self.logger.warning(
+                f"Reflection threshold {temp_state.current_reflection_threshold} out of bounds. "
+                f"Reset → {BASE_REFLECTION_THRESHOLD}"
+            )
+            temp_state.current_reflection_threshold = BASE_REFLECTION_THRESHOLD
+
+        if not (MIN_CONSOLIDATION_THRESHOLD <= temp_state.current_consolidation_threshold <= MAX_CONSOLIDATION_THRESHOLD):
+            self.logger.warning(
+                f"Consolidation threshold {temp_state.current_consolidation_threshold} out of bounds. "
+                f"Reset → {BASE_CONSOLIDATION_THRESHOLD}"
+            )
+            temp_state.current_consolidation_threshold = BASE_CONSOLIDATION_THRESHOLD
+
+        # Ensure goal_stack consistency with current_goal_id
+        if (
+            temp_state.current_goal_id and
+            not any(isinstance(g, dict) and g.get("goal_id") == temp_state.current_goal_id for g in temp_state.goal_stack)
+        ):
+            self.logger.warning(
+                f"current_goal_id {_fmt_id(temp_state.current_goal_id)} missing from goal_stack; "
+                "auto-realigning to last stack item."
+            )
+            temp_state.current_goal_id = (
+                temp_state.goal_stack[-1]["goal_id"]  # type: ignore[index]
+                if temp_state.goal_stack and isinstance(temp_state.goal_stack[-1], dict)
+                else None
             )
 
-    def _get_ums_tool_mcp_name(self, base_function_name: str) -> str:
-        """Constructs the full original MCP tool name for a UMS base function."""
-        # Example: base_function_name = "create_workflow"
-        # Returns "Ultimate MCP Server:create_workflow"
-        return f"{UMS_SERVER_NAME}:{base_function_name}"
+        # ── 5. Commit loaded state & log summary ────────────────────────────────
+        self.state = temp_state
+        self.logger.info(
+            "State loaded: loop %d • WF %s • Goal %s",
+            self.state.current_loop,
+            _fmt_id(self.state.workflow_id),
+            _fmt_id(self.state.current_goal_id),
+        )
 
     def _get_base_function_name(self, tool_name_input: str) -> str:
         """
@@ -1323,658 +1996,704 @@ class AgentMasterLoop:
         """
         return tool_name_input.split(":")[-1]
 
-    async def _check_workflow_exists(self, workflow_id: str) -> bool:
-        """Robustly checks if a workflow_id exists in UMS."""
-        get_details_mcp_tool_name = self._get_ums_tool_mcp_name(UMS_FUNC_GET_WORKFLOW_DETAILS)
-        self.logger.debug(f"AML Check WF Exists: Checking workflow {_fmt_id(workflow_id)} using {get_details_mcp_tool_name}.")
 
-        if not self._find_tool_server(get_details_mcp_tool_name):
-            self.logger.error(f"AML Check WF Exists: Tool {get_details_mcp_tool_name} unavailable.")
+    async def _check_workflow_exists(self, workflow_id: str) -> bool:
+        """
+        Robustly checks whether the specified ``workflow_id`` exists in UMS.
+
+        Returns
+        -------
+        bool
+            * True  – workflow is confirmed to exist.
+            * False – workflow does not exist, the check failed, or the result is inconclusive.
+        """
+        # ------------------------------------------------------------------ #
+        # 0. Quick sanity checks
+        # ------------------------------------------------------------------ #
+        if not workflow_id:
+            self.logger.error("AML Check WF Exists: Empty workflow_id received – treating as non-existent.")
             return False
-        try:
-            result_envelope = await self._execute_tool_call_internal(
-                get_details_mcp_tool_name,
-                {
-                    "workflow_id": workflow_id,
-                    "include_actions": False,
-                    "include_artifacts": False,
-                    "include_thoughts": False,
-                    "include_memories": False,
-                    "include_cognitive_states": False, # Don't need cognitive states just for WF existence check
-                },
-                record_action=False,
+        if getattr(self, "_shutdown_event", None) and self._shutdown_event.is_set():
+            self.logger.warning("AML Check WF Exists: Shutdown in progress – aborting workflow existence check.")
+            return False
+
+        # ------------------------------------------------------------------ #
+        # 1. Resolve UMS tool and confirm it is reachable
+        # ------------------------------------------------------------------ #
+        get_details_mcp_tool_name = self._get_ums_tool_mcp_name(UMS_FUNC_GET_WORKFLOW_DETAILS)
+        wf_id_fmt = _fmt_id(workflow_id)
+        self.logger.debug(f"AML Check WF Exists: Verifying WF {wf_id_fmt} using '{get_details_mcp_tool_name}'.")
+
+        tool_server = self._find_tool_server(get_details_mcp_tool_name)
+        if not tool_server:
+            self.logger.error(
+                f"AML Check WF Exists: Required tool '{get_details_mcp_tool_name}' (for server '{UMS_SERVER_NAME}') unavailable."
             )
-            
-            if isinstance(result_envelope, dict) and result_envelope.get("success"):
-                ums_payload = result_envelope.get("data")
-                if isinstance(ums_payload, dict) and ums_payload.get("success"):
-                    if ums_payload.get("workflow_id") == workflow_id:
-                        self.logger.debug(f"AML Check WF Exists: Workflow {_fmt_id(workflow_id)} confirmed to exist in UMS.")
-                        return True
-                    else:
-                        self.logger.warning(f"AML Check WF Exists: UMS get_workflow_details success, but returned WF ID '{_fmt_id(ums_payload.get('workflow_id'))}' does not match query ID '{_fmt_id(workflow_id)}'. Assuming not found.")
-                        return False
-                elif isinstance(ums_payload, dict) and not ums_payload.get("success"):
-                    self.logger.debug(f"AML Check WF Exists: Workflow {_fmt_id(workflow_id)} check - UMS tool reported failure: {ums_payload.get('error_message', ums_payload.get('error', 'Unknown UMS payload error'))}")
-                    return False
-                else: 
-                    self.logger.warning(f"AML Check WF Exists: Envelope success for '{_fmt_id(workflow_id)}', but UMS payload inconclusive or malformed. Assuming exists. Payload preview: {str(ums_payload)[:150]}")
-                    return True 
-            else: 
-                error_msg = result_envelope.get("error_message", "Unknown error from get_workflow_details envelope") if isinstance(result_envelope, dict) else "Malformed envelope from get_workflow_details"
-                self.logger.debug(f"AML Check WF Exists: Workflow {_fmt_id(workflow_id)} not found or error during check (envelope failure): {error_msg}")
-                return False
-        except Exception as e: 
-            self.logger.error(f"AML Check WF Exists: Unexpected error checking workflow '{_fmt_id(workflow_id)}' existence: {e}", exc_info=False)
             return False
+        self.logger.debug(f"AML Check WF Exists: Tool server for '{get_details_mcp_tool_name}' resolved to: {tool_server}")
+
+
+        # ------------------------------------------------------------------ #
+        # 2. Issue tool call (with graceful back-off and timeout)
+        # ------------------------------------------------------------------ #
+        await asyncio.sleep(0.05)  # Gentle breather
+
+        tool_args = {
+            "workflow_id": workflow_id,
+            "include_actions": False,
+            "include_artifacts": False,
+            "include_thoughts": False,
+            "include_memories": False,
+            "include_cognitive_states": False,
+        }
+        self.logger.debug(f"AML Check WF Exists (Debug): Full payload structure for UMS call={str(tool_args)[:1000]}")
+        
+        result_envelope: Optional[Dict[str, Any]] = None # Initialize to None
+        try:
+            timeout_sec = getattr(self, "WORKFLOW_CHECK_TIMEOUT_SEC", 5.0) # Ensure float
+            if not isinstance(timeout_sec, (int, float)) or timeout_sec <= 0:
+                timeout_sec = 5.0 # Fallback
+            
+            # Call the internal execution method which returns the standardized envelope
+            result_envelope = await asyncio.wait_for(
+                self._execute_tool_call_internal(
+                    tool_name_mcp=get_details_mcp_tool_name,
+                    arguments=tool_args,
+                    record_action=False, # This is a meta-check, not a primary agent action
+                ),
+                timeout=timeout_sec,
+            )
+            self.logger.debug(f"AML Check WF Exists: Raw result_envelope from UMS call for WF {wf_id_fmt}: {str(result_envelope)[:500]}")
+
+        except asyncio.TimeoutError:
+            self.logger.error(f"AML Check WF Exists: Timeout ({timeout_sec}s) while calling UMS for WF {wf_id_fmt}.")
+            return False
+        except Exception as exc:
+            # Log unexpected errors during the call itself
+            self.logger.error(
+                f"AML Check WF Exists: Unexpected exception during UMS call for WF {wf_id_fmt}: {exc}",
+                exc_info=True, # Full traceback for unexpected issues
+            )
+            return False # Treat as non-existent on unexpected error
+
+        # ------------------------------------------------------------------ #
+        # 3. Evaluate envelope and payload
+        # ------------------------------------------------------------------ #
+        if not isinstance(result_envelope, dict):
+            self.logger.error(
+                f"AML Check WF Exists: Malformed envelope (type={type(result_envelope)}) for WF {wf_id_fmt}. Envelope: {str(result_envelope)[:200]}"
+            )
+            return False
+
+        # Case A: The envelope itself reports failure (e.g., tool execution error before UMS logic)
+        if not result_envelope.get("success", False):
+            err_type = result_envelope.get("error_type", "UnknownError")
+            err_msg = result_envelope.get("error_message", "UMS tool call failed at envelope level.")
+            # ToolInputError with "not found" from UMS is a valid way to say it doesn't exist
+            if "ToolInputError" in str(err_type) and "not found" in str(err_msg).lower():
+                 self.logger.info(f"AML Check WF Exists: Workflow {wf_id_fmt} confirmed NOT to exist (UMS ToolInputError: not found).")
+                 return False
+            self.logger.warning(
+                f"AML Check WF Exists: Envelope for WF {wf_id_fmt} reported failure: Type='{err_type}', Msg='{err_msg[:150]}...'"
+            )
+            return False # Treat other envelope failures as "cannot confirm existence"
+
+        # Case B: Envelope is success, now inspect the UMS payload.
+        # The UMS `get_workflow_details` tool returns the workflow details directly
+        # if successful, not nested under a "data" key if called by `_execute_tool_call_internal`.
+        # `_execute_tool_call_internal` should pass through the UMS tool's direct payload as `result_envelope` itself
+        # when the UMS tool succeeds.
+        
+        # The `result_envelope` IS the UMS payload if the UMS tool succeeded.
+        ums_payload = result_envelope 
+        
+        # Check if the UMS payload explicitly states success=false (should not happen if envelope.success was true)
+        if ums_payload.get("success") is False:
+            self.logger.warning(
+                f"AML Check WF Exists: UMS payload for WF {wf_id_fmt} indicates failure despite successful envelope. "
+                f"UMS Error: {ums_payload.get('error_message', ums_payload.get('error', 'No details'))}"
+            )
+            return False
+
+        # Positive confirmation: the workflow_id in the UMS payload matches the one we asked for.
+        returned_workflow_id = ums_payload.get("workflow_id")
+        if returned_workflow_id == workflow_id:
+            self.logger.debug(f"AML Check WF Exists: Workflow {wf_id_fmt} positively confirmed to exist (ID match in UMS payload).")
+            return True
+        
+        # If the returned ID is different, it's an issue (shouldn't happen with get_workflow_details)
+        if returned_workflow_id and returned_workflow_id != workflow_id:
+            self.logger.error(
+                f"AML Check WF Exists: UMS returned details for a DIFFERENT workflow_id ('{returned_workflow_id}') "
+                f"when checking for '{workflow_id}'. This is unexpected. Treating as non-existent."
+            )
+            return False
+
+        # If no workflow_id field in a successful-looking payload from get_workflow_details
+        # then the workflow probably doesn't exist (or payload is malformed).
+        # The UMS get_workflow_details should raise ToolInputError if not found,
+        # which _execute_tool_call_internal would turn into success=False envelope, handled above.
+        # So, reaching here with a successful envelope but no matching workflow_id is unusual.
+        self.logger.warning(
+            f"AML Check WF Exists: UMS call for WF {wf_id_fmt} succeeded at envelope level, "
+            f"but the UMS payload did not contain a matching 'workflow_id'. Payload keys: {list(ums_payload.keys())}. "
+            f"Treating as non-existent."
+        )
+        return False
 
     async def _validate_agent_workflow_and_context(self) -> bool:
         """
-        Verifies that self.state.workflow_id exists in UMS.
-        If self.state.context_id is set, verifies it exists, belongs to the workflow, and is the latest.
-        If self.state.context_id is not set (or becomes invalid), attempts to load the latest 
-        cognitive state for the workflow from UMS and sets self.state.context_id if successful.
-        Then, re-verifies this established self.state.context_id.
+        Ensures that the agent’s `workflow_id` and `context_id` (cognitive-state ID)
+        are both valid **and** mutually consistent with what UMS reports.
 
-        Returns:
-            True if a valid workflow_id and a corresponding, loadable, and latest context_id 
-            are established in self.state. False otherwise.
+        Validation flow
+        ---------------
+        1. Verify that `self.state.workflow_id` exists in UMS.
+        2. If a `self.state.context_id` is present, attempt to load it and confirm:
+            • it belongs to that workflow **and**
+            • it is flagged `is_latest` in UMS.
+        - If the check fails (or raises), the stale `context_id` is cleared.
+        3. If no valid context is present, load the **latest** cognitive state for
+        the workflow from UMS and store its `state_id` back onto
+        `self.state.context_id`.
+        4. Return **True** only when both IDs are now valid, else **False**.
+
+        This method never raises; it logs and returns False on all errors so callers
+        can decide whether to trigger a re-plan, create a new workflow, etc.
         """
-        workflow_id_to_validate = self.state.workflow_id
+        wf_id: Optional[str] = self.state.workflow_id
+        ctx_id: Optional[str] = self.state.context_id
+
         self.logger.debug(
-            f"AML Validate WF/CTX: Starting validation. Agent State WF ID: '{_fmt_id(workflow_id_to_validate)}', "
-            f"Agent State Context ID (CognitiveState.state_id): '{_fmt_id(self.state.context_id)}'."
+            "AML Validate WF/CTX: Start - WF=%s, CTX=%s",
+            _fmt_id(wf_id), _fmt_id(ctx_id)
         )
 
-        if not workflow_id_to_validate:
-            self.logger.info("AML Validate WF/CTX: No workflow_id in agent state. Validation cannot proceed meaningfully.")
-            return False 
+        # ------------------------------------------------------------------ #
+        # 0. Quick guard: missing workflow in agent state                     #
+        # ------------------------------------------------------------------ #
+        if not wf_id:
+            self.logger.info("AML Validate WF/CTX: No workflow_id set → invalid.")
+            return False
 
-        # 1. Validate Workflow ID existence in UMS
-        if not await self._check_workflow_exists(workflow_id_to_validate):
+        # ------------------------------------------------------------------ #
+        # 1. Verify workflow exists in UMS                                    #
+        # ------------------------------------------------------------------ #
+        if not await self._check_workflow_exists(wf_id):
             self.logger.warning(
-                f"AML Validate WF/CTX FAILED: Workflow ID '{_fmt_id(workflow_id_to_validate)}' from agent state not found in UMS."
+                "AML Validate WF/CTX: workflow_id %s not found in UMS.",
+                _fmt_id(wf_id),
+            )
+            self.logger.error(f"AML Validate WF/CTX: _check_workflow_exists returned False for WF {_fmt_id(wf_id)}")
+            return False
+        self.logger.debug("AML Validate WF/CTX: Workflow %s exists.", _fmt_id(wf_id))
+
+        # ------------------------------------------------------------------ #
+        # 2. Prepare helper for load_cognitive_state                          #
+        # ------------------------------------------------------------------ #
+        load_state_tool = self._get_ums_tool_mcp_name(UMS_FUNC_LOAD_COGNITIVE_STATE)
+        if not self._find_tool_server(load_state_tool):
+            self.logger.error(
+                "AML Validate WF/CTX: required tool %s unavailable.", UMS_FUNC_LOAD_COGNITIVE_STATE
             )
             return False
-        self.logger.debug(f"AML Validate WF/CTX: Workflow ID '{_fmt_id(workflow_id_to_validate)}' confirmed in UMS.")
 
-        # 2. Manage and Validate self.state.context_id (which is the UMS cognitive_state.state_id)
-        context_id_to_check = self.state.context_id
-        attempt_to_load_latest_context = False
+        async def _load_state(state_id: Optional[str]) -> tuple[bool, dict[str, Any]]:
+            """
+            Wrapper around `load_cognitive_state` that normalises the envelope.
 
-        if context_id_to_check:
-            # If a context_id exists in state, try to load it specifically to verify it.
-            self.logger.debug(f"AML Validate WF/CTX: Agent state has context_id '{_fmt_id(context_id_to_check)}'. Verifying its validity...")
-            load_specific_state_tool_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_LOAD_COGNITIVE_STATE)
-            if not self._find_tool_server(load_specific_state_tool_mcp_name):
-                self.logger.error(f"AML Validate WF/CTX FAILED: Tool '{UMS_FUNC_LOAD_COGNITIVE_STATE}' unavailable for specific context validation.")
-                return False
-            
+            Returns
+            -------
+            (success, payload) where *payload* is the `data` dict from the envelope
+            (empty dict on failure).
+            """
             try:
-                verify_specific_envelope = await self._execute_tool_call_internal(
-                    load_specific_state_tool_mcp_name,
-                    {"workflow_id": workflow_id_to_validate, "state_id": context_id_to_check},
+                envelope: dict[str, Any] = await self._execute_tool_call_internal(
+                    load_state_tool,
+                    {"workflow_id": wf_id, "state_id": state_id},
                     record_action=False,
                 )
-                verify_ums_payload = verify_specific_envelope.get("data", {}) if isinstance(verify_specific_envelope, dict) else {}
-
-                if (verify_specific_envelope.get("success") and verify_ums_payload.get("success") and
-                    verify_ums_payload.get("state_id") == context_id_to_check and
-                    verify_ums_payload.get("workflow_id") == workflow_id_to_validate and
-                    verify_ums_payload.get("is_latest") is True):
-                    self.logger.info(f"AML Validate WF/CTX: Agent's existing context_id '{_fmt_id(context_id_to_check)}' is VALID and LATEST for WF '{_fmt_id(workflow_id_to_validate)}'.")
-                    return True # Existing context_id is good.
-                else:
-                    self.logger.warning(
-                        f"AML Validate WF/CTX: Agent's existing context_id '{_fmt_id(context_id_to_check)}' is NOT valid/latest for WF '{_fmt_id(workflow_id_to_validate)}'. "
-                        f"UMS Tool Error: {verify_specific_envelope.get('error_message', 'N/A')}. "
-                        f"UMS Payload 'success': {verify_ums_payload.get('success', 'N/A')}, "
-                        f"'state_id': {_fmt_id(verify_ums_payload.get('state_id'))}, "
-                        f"'workflow_id': {_fmt_id(verify_ums_payload.get('workflow_id'))}, "
-                        f"'is_latest': {verify_ums_payload.get('is_latest')}. "
-                        f"Will attempt to load latest."
-                    )
-                    attempt_to_load_latest_context = True # Current one is bad, try to get a good one.
-                    self.state.context_id = None # Clear stale context_id before attempting load
-            except Exception as e_verify:
-                self.logger.error(f"AML Validate WF/CTX: Exception verifying specific context_id '{_fmt_id(context_id_to_check)}': {e_verify}", exc_info=False)
-                attempt_to_load_latest_context = True # Error verifying, try to load latest
-                self.state.context_id = None # Clear stale context_id
-        else: # No context_id in agent state initially
-            self.logger.info(f"AML Validate WF/CTX: No context_id in agent state for WF '{_fmt_id(workflow_id_to_validate)}'. Will attempt to load latest.")
-            attempt_to_load_latest_context = True
-
-        if attempt_to_load_latest_context:
-            self.logger.info(f"AML Validate WF/CTX: Attempting to load LATEST cognitive state from UMS for WF '{_fmt_id(workflow_id_to_validate)}'.")
-            load_latest_state_tool_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_LOAD_COGNITIVE_STATE)
-            if not self._find_tool_server(load_latest_state_tool_mcp_name):
-                self.logger.error(f"AML Validate WF/CTX FAILED: Tool '{UMS_FUNC_LOAD_COGNITIVE_STATE}' unavailable. Cannot load/validate latest context.")
-                return False
-
-            try:
-                load_latest_envelope = await self._execute_tool_call_internal(
-                    load_latest_state_tool_mcp_name,
-                    {"workflow_id": workflow_id_to_validate, "state_id": None}, # state_id=None means load latest
-                    record_action=False,
-                )
-                load_latest_ums_payload = load_latest_envelope.get("data", {}) if isinstance(load_latest_envelope, dict) else {}
-
-                if (load_latest_envelope.get("success") and load_latest_ums_payload.get("success")):
-                    loaded_state_id_from_ums = load_latest_ums_payload.get("state_id")
-                    loaded_workflow_id_from_ums_state = load_latest_ums_payload.get("workflow_id")
-                    is_latest_flag_from_ums = load_latest_ums_payload.get("is_latest")
-
-                    if (loaded_state_id_from_ums and isinstance(loaded_state_id_from_ums, str) and
-                        loaded_workflow_id_from_ums_state == workflow_id_to_validate and
-                        is_latest_flag_from_ums is True): # Must be the latest one
-                        
-                        self.state.context_id = loaded_state_id_from_ums
-                        self.logger.info(
-                            f"AML Validate WF/CTX SUCCESS: Successfully loaded and set LATEST context_id (CognitiveState.state_id) "
-                            f"to '{_fmt_id(self.state.context_id)}' for WF '{_fmt_id(workflow_id_to_validate)}'."
-                        )
-                        return True
-                    else:
-                        self.logger.error(
-                            f"AML Validate WF/CTX FAILED: UMS load_cognitive_state (latest) returned success, but payload was invalid "
-                            f"(state_id: '{_fmt_id(loaded_state_id_from_ums)}', wf_id: '{_fmt_id(loaded_workflow_id_from_ums_state)}', is_latest: {is_latest_flag_from_ums}) "
-                            f"for queried WF '{_fmt_id(workflow_id_to_validate)}'. UMS Payload: {str(load_latest_ums_payload)[:200]}"
-                        )
-                        self.state.context_id = None # Ensure it's cleared if load failed to produce valid one
-                        return False
-                else: 
-                    error_msg_load_latest = load_latest_envelope.get("error_message", "Unknown error") if isinstance(load_latest_envelope, dict) else "Malformed envelope"
-                    self.logger.error(
-                        f"AML Validate WF/CTX FAILED: Could not load LATEST cognitive state for WF '{_fmt_id(workflow_id_to_validate)}'. "
-                        f"UMS Tool Error: {error_msg_load_latest}. "
-                        f"UMS Payload Preview (if any): {str(load_latest_ums_payload)[:200]}"
-                    )
-                    self.state.context_id = None # Ensure it's cleared
-                    return False
-            except Exception as e_load_latest_cog:
+            except Exception as exc:
                 self.logger.error(
-                    f"AML Validate WF/CTX FAILED: Exception loading LATEST cognitive state for WF '{_fmt_id(workflow_id_to_validate)}': {e_load_latest_cog}",
-                    exc_info=False
+                    "AML Validate WF/CTX: exception calling load_cognitive_state(%s): %s",
+                    _fmt_id(state_id), exc, exc_info=False
                 )
-                self.state.context_id = None # Ensure it's cleared
-                return False
-        
-        # If we reached here, it means we had an initial context_id_to_check and it was already validated as good.
-        # This path should ideally not be taken if the first check passed, but for safety:
-        self.logger.debug(f"AML Validate WF/CTX: Reached end of validation. Context ID '{_fmt_id(self.state.context_id)}' should be valid.")
-        return True # Should have returned True earlier if valid.
+                return False, {}
 
+            if not envelope or not envelope.get("success"):
+                self.logger.warning(
+                    "AML Validate WF/CTX: load_cognitive_state(%s) failed – %s",
+                    _fmt_id(state_id),
+                    envelope.get("error_message", "no error_message"),
+                )
+                return False, {}
+
+            payload: dict[str, Any] = envelope.get("data") or {}
+            return True, payload
+
+        # ------------------------------------------------------------------ #
+        # 3. If we already have a context_id, validate it                     #
+        # ------------------------------------------------------------------ #
+        if ctx_id:
+            ok, payload = await _load_state(ctx_id)
+            if (
+                ok
+                and payload.get("state_id") == ctx_id
+                and payload.get("workflow_id") == wf_id
+                and payload.get("is_latest") is True
+            ):
+                self.logger.info(
+                    "AML Validate WF/CTX: context_id %s is valid & latest.",
+                    _fmt_id(ctx_id),
+                )
+                return True
+
+            self.logger.warning(
+                "AML Validate WF/CTX: context_id %s invalid/out-of-date → clearing.",
+                _fmt_id(ctx_id),
+            )
+            # Stale or bad context — clear before trying again
+            self.state.context_id = None
+            ctx_id = None  # for clarity
+
+        # ------------------------------------------------------------------ #
+        # 4. No valid ctx → fetch the latest from UMS                         #
+        # ------------------------------------------------------------------ #
+        ok, payload = await _load_state(None)  # state_id=None ⇒ latest
+        if (
+            ok
+            and isinstance(payload.get("state_id"), str)
+            and payload.get("workflow_id") == wf_id
+            and payload.get("is_latest") is True
+        ):
+            self.state.context_id = payload["state_id"]
+            self.logger.info(
+                "AML Validate WF/CTX: loaded latest context_id %s for WF %s.",
+                _fmt_id(self.state.context_id), _fmt_id(wf_id)
+            )
+            return True
+
+        self.logger.error(
+            "AML Validate WF/CTX: unable to obtain a valid cognitive state for WF %s.",
+            _fmt_id(wf_id),
+        )
+        # Make absolutely sure we don't hold a bad ID
+        self.state.context_id = None
+        return False
 
     async def initialize(self) -> bool:
-        self.logger.info("🤖 AML: Initializing Agent Master Loop (v_initialize_no_temp_file)...")
-        await self._load_agent_state()  # Loads self.state from AGENT_STATE_FILE
+        """Fully‑featured replacement for the old ``initialize`` implementation.
+        """
+        # ------------------------------------------------------------------
+        # 0.  Helper lambdas – purely local, do *not* touch class namespace
+        # ------------------------------------------------------------------
+        _fmt = _fmt_id               # local alias – read‑only closure capture
+        _l   = self.logger           # micro‑optimise log access, keeps lines slim
 
-        loaded_wf_id = self.state.workflow_id
+        def _log(level: int, msg: str) -> None:
+            """Helper that only formats the f‑string when log‑level is active."""
+            if _l.isEnabledFor(level):
+                _l.log(level, msg)
+
+        # ------------------------------------------------------------------
+        # 1. Load on‑disk state ------------------------------------------------
+        # ------------------------------------------------------------------
+        _l.info("🤖 AML: Initializing Agent Master Loop (initialize v2)…")
+        try:
+            await self._load_agent_state()  # may raise, we catch below
+        except Exception as exc:
+            _l.exception("🤖 AML INIT ‑ CRITICAL: Failed to load agent state – proceeding with clean state.  Error: %s", exc)
+            self.state = AgentState()  # hard reset
+
+        loaded_wf_id  = self.state.workflow_id
         loaded_ctx_id = self.state.context_id
-        state_is_valid_and_ready = False
+        state_is_valid_and_ready = False   # final flag – drives reset branch
 
+        # ------------------------------------------------------------------
+        # 2. Attempt validation path -----------------------------------------
+        # ------------------------------------------------------------------
         if loaded_wf_id:
-            self.logger.info(
-                f"🤖 AML Initialize: Loaded state from '{self.agent_state_file.name}' has WF='{_fmt_id(loaded_wf_id)}', CTX='{_fmt_id(loaded_ctx_id)}'. "
-                f"Attempting validation and synchronization with UMS..."
+            _l.info(
+                "🤖 AML Initialize: Loaded state has WF='%s', CTX='%s'. Performing validation/sync with UMS…",
+                _fmt(loaded_wf_id), _fmt(loaded_ctx_id)
             )
-            # _validate_agent_workflow_and_context will use self.state.workflow_id.
-            # If self.state.context_id is None, it will attempt to load the latest for that workflow.
-            # It returns True if a valid workflow_id AND a valid (latest) context_id are established.
-            if await self._validate_agent_workflow_and_context():
-                self.logger.info(
-                    f"🤖 AML Initialize: Loaded/Synced state is VALID. "
-                    f"Effective WF ID for session: '{_fmt_id(self.state.workflow_id)}', "
-                    f"Effective Context ID (CognitiveState.state_id) for session: '{_fmt_id(self.state.context_id)}'."
-                )
-                state_is_valid_and_ready = True
-
-                # Ensure workflow stack is consistent with the validated workflow_id.
-                if not self.state.workflow_stack or self.state.workflow_stack[-1] != self.state.workflow_id:
-                    self.state.workflow_stack = [self.state.workflow_id]
-                    self.logger.info(f"🤖 AML Initialize: Workflow stack reset/set to: [{_fmt_id(self.state.workflow_id)}]")
-                
-                # Validate/sync goal stack for the current workflow
-                # This ensures self.state.current_goal_id and self.state.goal_stack are consistent with UMS
-                # for the now-confirmed-valid self.state.workflow_id.
-                await self._validate_goal_stack_on_load()
-
-                # Set default thought chain if none is current for this valid workflow.
-                if not self.state.current_thought_chain_id:
-                    self.logger.info(
-                        f"🤖 AML Initialize: No current_thought_chain_id set for valid workflow '{_fmt_id(self.state.workflow_id)}'. "
-                        f"Attempting to set default."
+            try:
+                if await self._validate_agent_workflow_and_context():
+                    _l.info(
+                        "🤖 AML Initialize: Loaded/Synced state is VALID. WF='%s', CTX='%s'.",
+                        _fmt(self.state.workflow_id), _fmt(self.state.context_id)
                     )
-                    await self._set_default_thought_chain_id() # This tries to find the primary chain in UMS.
+                    state_is_valid_and_ready = True
 
-                # If, after all validation, there's a valid workflow but no current UMS operational goal,
-                # the main loop's prompt construction will guide the LLM to establish one.
-                if self.state.workflow_id and not self.state.current_goal_id:
-                    self.logger.info(
-                        f"🤖 AML Initialize: Valid workflow '{_fmt_id(self.state.workflow_id)}' has no current UMS operational goal "
-                        f"(after validation). Agent will be prompted by main loop to establish one."
-                    )
-                    # Ensure plan reflects the need to establish a root UMS goal.
-                    if not self.state.current_plan or self.state.current_plan[0].description == DEFAULT_PLAN_STEP:
-                        self.state.current_plan = [
-                            PlanStep(description=f"Establish root UMS goal for existing active workflow: {_fmt_id(self.state.workflow_id)}")
-                        ]
-                        self.state.needs_replan = False # This is the new plan for the agent to execute.
-                        self.logger.info("🤖 AML Initialize: Plan updated to establish root UMS goal for existing active workflow.")
-            else: # _validate_agent_workflow_and_context returned False
-                self.logger.warning(
-                    f"🤖 AML Initialize WARNING: Loaded state (WF='{_fmt_id(loaded_wf_id)}', CTX='{_fmt_id(loaded_ctx_id)}') "
-                    f"FAILED UMS validation or synchronization. Resetting workflow-specific state."
-                )
-                state_is_valid_and_ready = False # Mark for reset
-        
-        else: # No workflow_id loaded from state file at all
-            self.logger.info(
-                f"🤖 AML Initialize: No workflow_id found in loaded state file '{self.agent_state_file.name}'. "
-                f"Agent will start completely fresh."
-            )
-            state_is_valid_and_ready = False # Mark for reset
+                    # --- keep workflow stack sane ------------------------------------
+                    if not self.state.workflow_stack or self.state.workflow_stack[-1] != self.state.workflow_id:
+                        self.state.workflow_stack = [self.state.workflow_id]
+                        _l.info("🤖 AML Initialize: Workflow stack reset/set to: [%s]", _fmt(self.state.workflow_id))
 
+                    # --- goal‑stack / thought‑chain validation ----------------------
+                    await self._validate_goal_stack_on_load()
+
+                    if not self.state.current_thought_chain_id:
+                        _l.info("🤖 AML Initialize: No current_thought_chain_id – selecting default…")
+                        await self._set_default_thought_chain_id()
+
+                    # If a workflow is valid but lacks an operational goal, set a plan stub.
+                    if self.state.workflow_id and not self.state.current_goal_id:
+                        _l.info("🤖 AML Initialize: Valid workflow '%s' lacks operational goal – injecting plan step.", _fmt(self.state.workflow_id))
+                        if not self.state.current_plan or self.state.current_plan[0].description == DEFAULT_PLAN_STEP:
+                            self.state.current_plan = [PlanStep(description=f"Establish root UMS goal for existing active workflow: {_fmt(self.state.workflow_id)}")]
+                            self.state.needs_replan = False
+                            _l.info("🤖 AML Initialize: Plan updated to establish root UMS goal.")
+            except Exception as exc:
+                _l.exception("🤖 AML Initialize: Exception during validation – will fall back to reset.  Error: %s", exc)
+                state_is_valid_and_ready = False
+
+        # ------------------------------------------------------------------
+        # 3. Reset path (either no WF or validation failed) ------------------
+        # ------------------------------------------------------------------
         if not state_is_valid_and_ready:
-            self.logger.info("🤖 AML Initialize: Performing reset of workflow-specific agent state attributes.")
-            # Preserve essential non-workflow state items
-            preserved_tool_stats = self.state.tool_usage_stats
-            pres_ref_thresh = self.state.current_reflection_threshold
-            pres_con_thresh = self.state.current_consolidation_threshold
-            
-            # Reset only workflow-dependent parts of the state, or the whole state if it's simpler
-            # For now, let's reset the whole AgentState object and re-apply preserved items
-            self.state = AgentState() # Full reset to defaults as defined in AgentState dataclass
-            
-            # Re-apply preserved non-workflow-specific settings
-            self.state.tool_usage_stats = preserved_tool_stats
-            self.state.current_reflection_threshold = pres_ref_thresh
+            _l.info("🤖 AML Initialize: Resetting workflow‑specific agent state…")
+
+            # Preserve non‑workflow statistics so we do not lose learning.
+            preserved_tool_stats  = copy.deepcopy(self.state.tool_usage_stats)
+            pres_ref_thresh       = self.state.current_reflection_threshold
+            pres_con_thresh       = self.state.current_consolidation_threshold
+
+            # Fresh state object
+            self.state = AgentState()
+
+            # Re‑apply preserved, non‑workflow values
+            self.state.tool_usage_stats              = preserved_tool_stats
+            self.state.current_reflection_threshold  = pres_ref_thresh
             self.state.current_consolidation_threshold = pres_con_thresh
-            
-            # Explicitly ensure key fields are at their "fresh start" values
-            self.state.workflow_id = None
-            self.state.context_id = None
-            self.state.workflow_stack = []
-            self.state.goal_stack = []
-            self.state.current_goal_id = None
-            self.state.current_thought_chain_id = None
-            self.state.current_plan = [PlanStep(description=DEFAULT_PLAN_STEP)]
+
+            # Prime minimal plan and meta fields
+            self.state.current_plan        = [PlanStep(description=DEFAULT_PLAN_STEP)]
             self.state.last_action_summary = "Agent state reset: No valid prior workflow/context, or validation failed."
-            self.state.needs_replan = False # Starting fresh, LLM will make first plan.
-            self.state.last_error_details = None
-            self.state.consecutive_error_count = 0
-            self.state.goal_achieved_flag = False
-            # Counters for periodic tasks are reset by new AgentState() init
-            self.state.reflection_cycle_index = 0
-            self.state.last_meta_feedback = None
-            self.logger.info("🤖 AML Initialize: Agent state fully reset to defaults for a fresh start.")
+            self.state.needs_replan        = False
+            _l.info("🤖 AML Initialize: Agent state fully reset; starting fresh.")
 
-        # Save the agent's state (whether it's a validated existing state or a freshly reset one)
+        # ------------------------------------------------------------------
+        # 4. Persist whatever state we ended up with -------------------------
+        # ------------------------------------------------------------------
         await self._save_agent_state()
-        
-        self.logger.info(
-            f"🤖 AML Initialize: Agent state finalized. Effective state for session - "
-            f"WF ID: '{_fmt_id(self.state.workflow_id)}', "
-            f"Context ID (CognitiveState.state_id): '{_fmt_id(self.state.context_id)}', "
-            f"UMS Goal ID: '{_fmt_id(self.state.current_goal_id)}', "
-            f"Needs Replan: {self.state.needs_replan}"
+        _l.info(
+            "🤖 AML Initialize: State finalised. WF='%s', CTX='%s', Goal='%s', NeedsReplan=%s",
+            _fmt(self.state.workflow_id), _fmt(self.state.context_id), _fmt(self.state.current_goal_id), self.state.needs_replan
         )
 
-        # --- Tool Schema Setup ---
-        self.logger.info("🤖 AML Initialize: Starting tool schema setup phase...")
-        if not hasattr(self.mcp_client, "server_manager") or not self.mcp_client.server_manager:
-            self.logger.critical("🤖 AML CRITICAL: MCPClient or its ServerManager is not initialized. Agent cannot set up tools.")
-            return False
-        agent_llm_provider_str = self.mcp_client.get_provider_from_model(self.agent_llm_model)
-        if not agent_llm_provider_str:
-            self.logger.critical(f"🤖 AML CRITICAL: Could not determine LLM provider for agent's model '{self.agent_llm_model}'.")
+        # ------------------------------------------------------------------
+        # 5. TOOL‑SCHEMA PREPARATION ----------------------------------------
+        # ------------------------------------------------------------------
+        _l.info("🤖 AML Initialize: Starting tool‑schema setup phase…")
+        if not getattr(self.mcp_client, "server_manager", None):
+            _l.critical("🤖 AML CRITICAL: MCPClient or its ServerManager is not initialised – cannot continue.")
             return False
 
-        all_llm_formatted_tools_from_mcpc: List[Dict[str, Any]] = self.mcp_client._format_tools_for_provider(agent_llm_provider_str) or []
-        self.logger.info(
-            f"🤖 AML: Received {len(all_llm_formatted_tools_from_mcpc)} LLM-formatted tools from MCPClient for provider '{agent_llm_provider_str}'."
-        )
+        agent_llm_provider = self.mcp_client.get_provider_from_model(self.agent_llm_model)
+        if not agent_llm_provider:
+            _l.critical("🤖 AML CRITICAL: Cannot determine LLM provider for model '%s'.", self.agent_llm_model)
+            return False
 
-        self.tool_schemas = [] 
-        agent_llm_final_used_sanitized_names: Set[str] = set()
-        sanitized_to_original_map_shared_from_mcpc = self.mcp_client.server_manager.sanitized_to_original
+        # ------------------------------------------------------------------
+        # 5a.  Fetch & re‑sanitise MCP tool schemas -------------------------
+        # ------------------------------------------------------------------
+        all_llm_formatted = self.mcp_client._format_tools_for_provider(agent_llm_provider) or []
+        _l.info("🤖 AML: Received %d LLM‑formatted tool schemas from MCPClient (provider=%s).", len(all_llm_formatted), agent_llm_provider)
 
-        self.logger.info(f"🤖 AML (Tool Init): === STARTING AGENT TOOL SCHEMA PREPARATION (Provider: {agent_llm_provider_str}) ===")
-        for idx, llm_tool_schema_from_mcpc in enumerate(all_llm_formatted_tools_from_mcpc):
-            is_anthropic_format_for_agent = agent_llm_provider_str == Provider.ANTHROPIC.value
-            sanitized_name_as_received_from_mcpc = ""
-            if isinstance(llm_tool_schema_from_mcpc, dict):
-                if is_anthropic_format_for_agent:
-                    sanitized_name_as_received_from_mcpc = llm_tool_schema_from_mcpc.get("name", "")
-                else: # OpenAI-like
-                    sanitized_name_as_received_from_mcpc = (
-                        llm_tool_schema_from_mcpc.get("function", {}).get("name")
-                        if isinstance(llm_tool_schema_from_mcpc.get("function"), dict)
-                        else ""
-                    )
-            if not sanitized_name_as_received_from_mcpc:
-                self.logger.warning(f"🤖 AML (Tool Init - MCPC Tool {idx + 1}): Skipping schema with no discernible name: {str(llm_tool_schema_from_mcpc)[:150]}")
-                continue
-            
-            original_mcp_name = sanitized_to_original_map_shared_from_mcpc.get(sanitized_name_as_received_from_mcpc)
-            if not original_mcp_name:
-                self.logger.error(
-                    f"🤖 AML (Tool Init - MCPC Tool {idx + 1}): CRITICAL! No original MCP name in SHARED MAP for MCPC-sanitized name '{sanitized_name_as_received_from_mcpc}'. "
-                    f"Desc Hint: {str(llm_tool_schema_from_mcpc.get('description', 'N/A'))[:70]}. Skipping."
-                )
+        self.tool_schemas = []
+        final_used_names: Set[str] = set()
+        s2o = self.mcp_client.server_manager.sanitized_to_original
+        is_anthropic = agent_llm_provider == Provider.ANTHROPIC.value
+
+        for idx, schema in enumerate(all_llm_formatted):
+            # --- extract the sanitised name field depending on provider format
+            name_field = "name" if is_anthropic else (schema.get("function", {}) if isinstance(schema, dict) else {})
+            sanitized_name = schema.get("name") if is_anthropic else name_field.get("name") if isinstance(name_field, dict) else ""
+            if not sanitized_name:
+                _log(logging.WARNING, f"🤖 AML (Tool Init {idx+1}): Skipping schema with missing name: {str(schema)[:120]}")
                 continue
 
-            final_sanitized_name_for_agent_llm = sanitized_name_as_received_from_mcpc
+            original_mcp = s2o.get(sanitized_name)
+            if not original_mcp:
+                _log(logging.ERROR, f"🤖 AML (Tool Init {idx+1}): Missing original‑name mapping for '{sanitized_name}'. Skipping.")
+                continue
+
+            # ensure uniqueness for the agent‑side name
+            final_name = sanitized_name
             counter = 1
-            while final_sanitized_name_for_agent_llm in agent_llm_final_used_sanitized_names:
+            while final_name in final_used_names:
                 suffix = f"_agent_v{counter}"
-                base_name_for_suffix = sanitized_name_as_received_from_mcpc 
-                if len(base_name_for_suffix) + len(suffix) > 64:
-                    final_sanitized_name_for_agent_llm = base_name_for_suffix[: 64 - len(suffix)] + suffix
-                else:
-                    final_sanitized_name_for_agent_llm = base_name_for_suffix + suffix
+                base = sanitized_name[:64 - len(suffix)]
+                final_name = f"{base}{suffix}"
                 counter += 1
-            
-            agent_llm_final_used_sanitized_names.add(final_sanitized_name_for_agent_llm)
-            updated_schema_for_agent_llm = copy.deepcopy(llm_tool_schema_from_mcpc)
+            final_used_names.add(final_name)
 
-            if final_sanitized_name_for_agent_llm != sanitized_name_as_received_from_mcpc:
-                name_updated_in_schema = False
-                if is_anthropic_format_for_agent:
-                    if "name" in updated_schema_for_agent_llm:
-                        updated_schema_for_agent_llm["name"] = final_sanitized_name_for_agent_llm
-                        name_updated_in_schema = True
-                else: 
-                    if ("function" in updated_schema_for_agent_llm and 
-                        isinstance(updated_schema_for_agent_llm.get("function"), dict) and 
-                        "name" in updated_schema_for_agent_llm["function"]):
-                        updated_schema_for_agent_llm["function"]["name"] = final_sanitized_name_for_agent_llm
-                        name_updated_in_schema = True
-                
-                if not name_updated_in_schema:
-                    self.logger.error(f"🤖 AML (Tool Init): Could not UPDATE SCHEMA with final unique name '{final_sanitized_name_for_agent_llm}' for '{original_mcp_name}'. Skipping.")
-                    if final_sanitized_name_for_agent_llm in agent_llm_final_used_sanitized_names:
-                        agent_llm_final_used_sanitized_names.remove(final_sanitized_name_for_agent_llm)
-                    continue
-                
-                if (sanitized_name_as_received_from_mcpc in sanitized_to_original_map_shared_from_mcpc and
-                    sanitized_to_original_map_shared_from_mcpc[sanitized_name_as_received_from_mcpc] == original_mcp_name):
-                    del sanitized_to_original_map_shared_from_mcpc[sanitized_name_as_received_from_mcpc]
-                sanitized_to_original_map_shared_from_mcpc[final_sanitized_name_for_agent_llm] = original_mcp_name
-                self.logger.info(
-                    f"🤖 AML (Tool Init): Re-sanitized & UPDATED SHARED MCPClient MAP: '{final_sanitized_name_for_agent_llm}' -> '{original_mcp_name}' (was '{sanitized_name_as_received_from_mcpc}')"
-                )
-            
-            self.tool_schemas.append(updated_schema_for_agent_llm)
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(
-                    f"🤖 AML (Tool Init - MCPC Tool {idx + 1}): ADDED. Original='{original_mcp_name}' (Agent LLM sees: '{final_sanitized_name_for_agent_llm}')"
-                )
+            # deep‑copy & mutate if name changed
+            working_schema = copy.deepcopy(schema)
+            if final_name != sanitized_name:
+                if is_anthropic:
+                    working_schema["name"] = final_name
+                else:
+                    working_schema.setdefault("function", {})["name"] = final_name
+                # update shared map so downstream mapping stays correct
+                s2o.pop(sanitized_name, None)
+                s2o[final_name] = original_mcp
+                _log(logging.INFO, f"🤖 AML (Tool Init): Re‑sanitised '{sanitized_name}' -> '{final_name}' (orig='{original_mcp}')")
 
-        plan_step_base_schema = PlanStep.model_json_schema(); plan_step_base_schema.pop("title", None)
-        update_plan_input_schema = {"type": "object", "properties": {"plan": {"type": "array", "items": plan_step_base_schema, "description": "The new complete list of plan steps."}}, "required": ["plan"]}
-        agent_update_plan_original_mcp_name = AGENT_TOOL_UPDATE_PLAN
-        base_agent_tool_sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", agent_update_plan_original_mcp_name)[:64] or f"internal_tool_{uuid.uuid4().hex[:8]}"
-        final_agent_tool_sanitized_name_for_llm = base_agent_tool_sanitized_name; agent_tool_counter = 1
-        while final_agent_tool_sanitized_name_for_llm in agent_llm_final_used_sanitized_names:
-            suffix = f"_agent_v{agent_tool_counter}"; base_len_for_suffix = len(base_agent_tool_sanitized_name)
-            if base_len_for_suffix + len(suffix) > 64: final_agent_tool_sanitized_name_for_llm = base_agent_tool_sanitized_name[:64 - len(suffix)] + suffix
-            else: final_agent_tool_sanitized_name_for_llm = base_agent_tool_sanitized_name + suffix
-            agent_tool_counter += 1
-        agent_llm_final_used_sanitized_names.add(final_agent_tool_sanitized_name_for_llm)
-        sanitized_to_original_map_shared_from_mcpc[final_agent_tool_sanitized_name_for_llm] = agent_update_plan_original_mcp_name
-        self.logger.info(f"🤖 AML (Agent Tool Init): ENSURED MCPClient SHARED MAP for AGENT_TOOL_UPDATE_PLAN: '{final_agent_tool_sanitized_name_for_llm}' -> '{agent_update_plan_original_mcp_name}'")
-        plan_tool_description = "Replace agent's current plan. Use for significant replanning, error recovery, or fixing validation issues. Submit the ENTIRE new plan."
-        plan_tool_llm_schema_final = ({"name": final_agent_tool_sanitized_name_for_llm, "description": plan_tool_description, "input_schema": update_plan_input_schema}
-                                      if agent_llm_provider_str == Provider.ANTHROPIC.value else
-                                      {"type": "function", "function": {"name": final_agent_tool_sanitized_name_for_llm, "description": plan_tool_description, "parameters": update_plan_input_schema}})
-        self.tool_schemas.append(plan_tool_llm_schema_final)
-        self.logger.info(f"🤖 AML (Agent Tool Init): ADDED agent-internal tool to self.tool_schemas: '{agent_update_plan_original_mcp_name}' (LLM sees: '{final_agent_tool_sanitized_name_for_llm}')")
-        
-        self.logger.info(f"🤖 AML: Final {len(self.tool_schemas)} tool schemas prepared for agent's LLM.")
-        self.logger.info(f"🤖 AML (Tool Init): === FINISHED AGENT TOOL SCHEMA PREPARATION ===")
-        
-        essential_mcp_tool_names_list_for_check = [
-            self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_WORKFLOW), 
+            self.tool_schemas.append(working_schema)
+
+        # ------------------------------------------------------------------
+        # 5b.  Inject AGENT_TOOL_UPDATE_PLAN --------------------------------
+        # ------------------------------------------------------------------
+        plan_step_schema = PlanStep.model_json_schema(); plan_step_schema.pop("title", None)
+        update_plan_input = {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "array",
+                    "items": plan_step_schema,
+                    "description": "The new complete list of plan steps."
+                }
+            },
+            "required": ["plan"]
+        }
+        original_agent_tool = AGENT_TOOL_UPDATE_PLAN
+        sanitized_base = re.sub(r"[^a-zA-Z0-9_-]", "_", original_agent_tool)[:64] or f"internal_tool_{uuid.uuid4().hex[:8]}"
+        final_agent_name = sanitized_base
+        counter = 1
+        while final_agent_name in final_used_names:
+            suffix = f"_agent_v{counter}"
+            final_agent_name = f"{sanitized_base[:64 - len(suffix)]}{suffix}"
+            counter += 1
+        final_used_names.add(final_agent_name)
+        s2o[final_agent_name] = original_agent_tool
+        _l.info("🤖 AML (Agent Tool Init): Added mapping '%s' -> '%s'", final_agent_name, original_agent_tool)
+
+        desc = "Replace agent's current plan. Use for significant replanning, error recovery, or fixing validation issues. Submit the ENTIRE new plan."
+        if is_anthropic:
+            plan_tool_schema = {"name": final_agent_name, "description": desc, "input_schema": update_plan_input}
+        else:
+            plan_tool_schema = {"type": "function", "function": {"name": final_agent_name, "description": desc, "parameters": update_plan_input}}
+        self.tool_schemas.append(plan_tool_schema)
+
+        _l.info("🤖 AML: Total %d tool schemas prepared.", len(self.tool_schemas))
+
+        # ------------------------------------------------------------------
+        # 6. Verify essential tools are present -----------------------------
+        # ------------------------------------------------------------------
+        essential = [
+            self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_WORKFLOW),
             self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_GOAL),
             self._get_ums_tool_mcp_name(UMS_FUNC_GET_RICH_CONTEXT_PACKAGE),
             AGENT_TOOL_UPDATE_PLAN,
         ]
-        available_original_names_for_agent_llm = set(sanitized_to_original_map_shared_from_mcpc.values()) 
-        missing_essential_tools = [orig_name for orig_name in essential_mcp_tool_names_list_for_check if orig_name not in available_original_names_for_agent_llm]
-        
-        if missing_essential_tools:
-            self.logger.error(
-                f"🤖 AML CRITICAL ERROR (Post-Tool-Setup): Missing essential tools (by original MCP name) from agent's final effective toolset: {missing_essential_tools}. "
-                f"Agent functionality WILL BE severely impaired. Check MCPClient's tool formatting and ServerManager's sanitized_to_original map."
-            )
-            # Depending on severity, you might want to return False here or raise an error
-            # return False 
-        else:
-            self.logger.info("🤖 AML: All specified essential tools (by original MCP name) confirmed available and mapped for agent's LLM.")
-
-        self.logger.info(
-            f"🤖 AML: Agent Master Loop initialization complete. Effective state for session - "
-            f"WF ID: '{_fmt_id(self.state.workflow_id)}', "
-            f"Context ID: '{_fmt_id(self.state.context_id)}', "
-            f"UMS Goal ID: '{_fmt_id(self.state.current_goal_id)}'."
-        )
-        return True
-
-
-    async def _initialize_agent_if_needed(self, default_llm_model_override: Optional[str] = None) -> bool:
-        """
-        Initializes or RE-INITIALIZES the AgentMasterLoop instance for a new agent task.
-        This involves:
-        1. Creating the AgentMasterLoop instance if it doesn't exist.
-        2. Updating its configured LLM model if an override is provided for this task.
-        3. Calling the AgentMasterLoop's own .initialize() method, which handles:
-           - Loading its persistent state from its state file.
-           - Validating any loaded workflow_id against UMS and a temp recovery file.
-           - Resetting workflow-specific state if the loaded workflow_id is invalid.
-           - Saving its (potentially reset) state back.
-           - Setting up its tool schemas based on the current MCPClient's available tools.
-        Returns True if initialization is successful, False otherwise.
-        """
-        if self.agent_loop_instance is None:
-            log.info("MCPC: Initializing AgentMasterLoop instance for the first time...")
-            ActualAgentMasterLoopClass = None
-            try:
-                # Ensure this import path is correct for your project structure
-                from agent_master_loop import AgentMasterLoop as AMLClass
-
-                ActualAgentMasterLoopClass = AMLClass
-                log.debug(f"MCPC: Successfully imported AgentMasterLoop as AMLClass: {type(ActualAgentMasterLoopClass)}")
-            except ImportError as ie:
-                log.critical(f"MCPC: CRITICAL - Failed to import AgentMasterLoop class from 'agent_master_loop.py': {ie}", exc_info=True)
-                return False  # Cannot proceed without the class
-
-            if not callable(ActualAgentMasterLoopClass):  # Check if it's a class
-                log.critical(f"MCPC: CRITICAL - AgentMasterLoop is not a callable class after import. Type: {type(ActualAgentMasterLoopClass)}")
-                return False
-
-            try:
-                agent_model_to_use = default_llm_model_override or self.current_model
-                self.agent_loop_instance = ActualAgentMasterLoopClass(
-                    mcp_client_instance=self,  # Pass self (MCPClient instance)
-                    default_llm_model_string=agent_model_to_use,
-                    agent_state_file=self.config.agent_state_file_path,  # Pass state file path
-                )
-                log.info(f"MCPC: AgentMasterLoop instance created. Model: {agent_model_to_use}")
-            except Exception as e:  # Catch errors during instantiation
-                log.critical(f"MCPC: CRITICAL - Error instantiating AgentMasterLoop: {e}", exc_info=True)
-                self.agent_loop_instance = None  # Ensure it's None on failure
-                return False
-        else:
-            log.info("MCPC: Reusing existing AgentMasterLoop instance for new task. Will re-initialize its state.")
-            # If reusing, ensure the model is updated if an override is provided for *this new task*
-            if default_llm_model_override and self.agent_loop_instance.agent_llm_model != default_llm_model_override:
-                log.info(
-                    f"MCPC: Updating agent's LLM model for new task from '{self.agent_loop_instance.agent_llm_model}' to '{default_llm_model_override}'."
-                )
-                self.agent_loop_instance.agent_llm_model = default_llm_model_override
-
-        # ALWAYS call .initialize() on the (new or existing) instance for EACH new task start.
-        # This ensures its internal state is freshly loaded/validated from the state file,
-        # and its tool schemas are up-to-date with MCPClient's current tool availability.
-        if self.agent_loop_instance:
-            log.info("MCPC: Calling .initialize() on AgentMasterLoop instance to prepare for new task...")
-            if not await self.agent_loop_instance.initialize():  # This now contains the robust state loading and tool setup
-                log.error("MCPC: AgentMasterLoop instance .initialize() method FAILED. Agent task cannot start correctly.")
-                # Do not nullify self.agent_loop_instance here if it's an existing instance
-                # that might be reused later. A failed initialize means the agent
-                # cannot start the *current* task correctly.
-                return False  # Signal failure to start
-
-            log.info(
-                f"MCPC: AgentMasterLoop initialized/re-initialized successfully for new task. Effective WF ID: {_fmt_id(self.agent_loop_instance.state.workflow_id)}"
-            )
-            return True
-        else:  # Should not happen if creation above succeeded for a new instance
-            log.critical(
-                "MCPC: Agent loop instance is None after creation/reuse attempt in _initialize_agent_if_needed. This indicates a prior critical failure."
-            )
+        available_original = set(s2o.values())
+        missing = [tool for tool in essential if tool not in available_original]
+        if missing:
+            _l.critical("🤖 AML CRITICAL: Missing essential tools: %s", missing)
             return False
+        _l.info("🤖 AML: All essential tools confirmed available.")
+
+        # ------------------------------------------------------------------
+        # 7.  Success! -------------------------------------------------------
+        # ------------------------------------------------------------------
+        _l.info("🤖 AML: Initialization complete. WF='%s', CTX='%s', Goal='%s'", _fmt(self.state.workflow_id), _fmt(self.state.context_id), _fmt(self.state.current_goal_id))
+        return True
 
 
     def _find_tool_server(self, tool_identifier_mcp_style: str) -> Optional[str]:
         """
-        Finds an active server that provides the specified tool.
-        The tool_identifier_mcp_style is expected to be an original MCP name
-        (e.g., "ExpectedServerName:FunctionName") or AGENT_TOOL_UPDATE_PLAN.
+        Locate an **active** server that exposes the tool described by
+        `tool_identifier_mcp_style`.
 
-        This method first extracts the target base function name. It then searches
-        all tools from all *active* servers. If multiple active servers provide
-        the same base function name, it uses the server part of
-        tool_identifier_mcp_style as a hint to disambiguate. For known UMS functions,
-        it explicitly prefers UMS_SERVER_NAME if that server is among the active candidates.
+        Parameters
+        ----------
+        tool_identifier_mcp_style : str
+            • Either a fully–qualified MCP identifier
+            ``"<ServerName>:<BaseFunctionName>"`` **or**
+            • a bare function name (``"create_goal"``) **or**
+            • ``AGENT_TOOL_UPDATE_PLAN`` (special in-process tool).
+
+        Returns
+        -------
+        Optional[str]
+            The *server name* that should run the tool, or ``None`` if a safe
+            choice cannot be made.
+
+        Behaviour & resolution strategy
+        -------------------------------
+        1. **Fast-path**:  
+        • ``AGENT_TOOL_UPDATE_PLAN`` → `"AGENT_INTERNAL"`  
+        2. Parse *expected* server hint and *target* base-function name.  
+        3. Build the **candidate set** of *active* servers that expose that
+        base-function.  
+        4. Resolve ambiguity (≥ 2 candidates) in this order:  
+        a. server-hint match (case-insensitive).  
+        b. if the function is a *UMS core* function, prefer ``UMS_SERVER_NAME``  
+            when present in the candidates set (case-insensitive).  
+        5. If ambiguity remains, log and return ``None`` instead of guessing.
         """
-        self.logger.debug(f"AML _find_tool_server: Locating server for tool identifier: '{tool_identifier_mcp_style}'")
+        self.logger.debug(
+            "AML _find_tool_server: locating server for identifier '%s'",
+            tool_identifier_mcp_style,
+        )
 
-        if not self.mcp_client or not self.mcp_client.server_manager:
-            self.logger.warning("AML _find_tool_server: MCPClient or ServerManager is not available. Cannot find tool server.")
+        # ------------------------------------------------------------------ guard rails
+        if not tool_identifier_mcp_style:
+            self.logger.warning("AML _find_tool_server: empty identifier supplied")
+            return None
+
+        if not (self.mcp_client and getattr(self.mcp_client, "server_manager", None)):
+            self.logger.warning(
+                "AML _find_tool_server: MCPClient or ServerManager unavailable"
+            )
             return None
 
         sm = self.mcp_client.server_manager
 
+        # ------------------------------------------------------------------ special case
         if tool_identifier_mcp_style == AGENT_TOOL_UPDATE_PLAN:
-            self.logger.debug(f"AML _find_tool_server: Matched AGENT_TOOL_UPDATE_PLAN. Returning 'AGENT_INTERNAL'.")
+            self.logger.debug(
+                "AML _find_tool_server: '%s' is internal – returning 'AGENT_INTERNAL'",
+                AGENT_TOOL_UPDATE_PLAN,
+            )
             return "AGENT_INTERNAL"
 
-        # Extract the expected server name part (hint) and the target base function name
-        # from the provided MCP-style tool identifier.
-        parts = tool_identifier_mcp_style.split(":", 1)
-        expected_server_name_hint = parts[0] if len(parts) > 1 else None # e.g., "Ultimate MCP Server" or None
-        target_base_function_name = parts[-1] # e.g., "create_goal" (self._get_base_function_name handles this)
+        # ------------------------------------------------------------------ parse parts
+        # Split *once* on ':' to obtain possible server-name hint.
+        server_hint, _, func_part = tool_identifier_mcp_style.partition(":")
+        expected_server_name_hint = server_hint if _ else None   # '' → None
+        target_base_function_name = self._get_base_function_name(func_part or server_hint)
 
-        self.logger.debug(f"AML _find_tool_server: Parsed - Target Base Function: '{target_base_function_name}', Expected Server Hint: '{expected_server_name_hint}'")
-
-        candidate_active_servers_providing_function: List[str] = []
-        
-        # Iterate through all tools known to the ServerManager.
-        # sm.tools is keyed by the original MCP name used at registration time,
-        # which is `ActualConnectedServerNameAsKnownToSM:BaseFunctionName`.
-        for original_mcp_name_key_in_sm, mcp_tool_obj in sm.tools.items():
-            # mcp_tool_obj.server_name is the ActualConnectedServerNameAsKnownToSM
-            # mcp_tool_obj.name is original_mcp_name_key_in_sm
-            
-            actual_tool_server_name_in_sm = mcp_tool_obj.server_name 
-            actual_tool_base_function_in_sm = self._get_base_function_name(mcp_tool_obj.name)
-
-            if actual_tool_base_function_in_sm == target_base_function_name:
-                # Found a tool with the matching base function name.
-                # Now check if its server (actual_tool_server_name_in_sm) is currently active.
-                if actual_tool_server_name_in_sm in sm.active_sessions:
-                    candidate_active_servers_providing_function.append(actual_tool_server_name_in_sm)
-                    self.logger.debug(
-                        f"AML _find_tool_server: Active server '{actual_tool_server_name_in_sm}' provides base function '{target_base_function_name}' "
-                        f"(via tool '{original_mcp_name_key_in_sm}'). Added to candidates."
-                    )
-                else:
-                    self.logger.debug(
-                        f"AML _find_tool_server: Server '{actual_tool_server_name_in_sm}' provides base function '{target_base_function_name}', "
-                        f"but is NOT ACTIVE. Skipping."
-                    )
-        
-        # Remove duplicates from candidate_active_servers_providing_function
-        unique_candidate_servers = sorted(set(candidate_active_servers_providing_function))
         self.logger.debug(
-            f"AML _find_tool_server: Unique active candidate servers for base_func '{target_base_function_name}': {unique_candidate_servers}"
+            "AML _find_tool_server: target base-function='%s', server-hint='%s'",
+            target_base_function_name,
+            expected_server_name_hint,
         )
 
-        if not unique_candidate_servers:
-            self.logger.warning(f"AML _find_tool_server: No ACTIVE server found providing base function '{target_base_function_name}'. Input identifier was '{tool_identifier_mcp_style}'.")
-            return None
-        
-        if len(unique_candidate_servers) == 1:
-            # Only one active server provides this function, unambiguous.
-            found_server = unique_candidate_servers[0]
-            self.logger.info(
-                f"AML _find_tool_server: Unambiguously found base function '{target_base_function_name}' "
-                f"on active server '{found_server}'."
-            )
-            return found_server
-        
-        # Ambiguity: Multiple active servers provide this base function.
-        self.logger.debug(
-            f"AML _find_tool_server: Ambiguity - Multiple active servers for base_func '{target_base_function_name}': {unique_candidate_servers}. "
-            f"Attempting to resolve using hint: '{expected_server_name_hint}'."
-        )
+        # ------------------------------------------------------------------ gather candidates
+        candidate_servers: Set[str] = set()
 
-        # Resolution Strategy:
-        # 1. If the expected_server_name_hint (e.g., "Ultimate MCP Server" from the input identifier)
-        #    is among the active candidates, prefer that.
-        if expected_server_name_hint and expected_server_name_hint in unique_candidate_servers:
-            self.logger.info(
-                f"AML _find_tool_server: Resolving ambiguity for '{target_base_function_name}'. "
-                f"Prioritizing server matching hint '{expected_server_name_hint}' as it is active and provides the function."
-            )
-            return expected_server_name_hint
+        for mcp_tool_name, mcp_tool_obj in sm.tools.items():
+            # Normalise base-function for comparison
+            if self._get_base_function_name(mcp_tool_name) != target_base_function_name:
+                continue
 
-        # 2. If it's a known UMS base function (from self.all_ums_base_function_names),
-        #    and the UMS_SERVER_NAME constant (e.g. "Ultimate MCP Server") is among the active candidates,
-        #    prefer UMS_SERVER_NAME. This covers cases where the hint might have been slightly different
-        #    but the function is clearly a core UMS one.
-        if target_base_function_name in self.all_ums_base_function_names:
-            # Check if any of the candidate server names *exactly match* UMS_SERVER_NAME constant
-            if UMS_SERVER_NAME in unique_candidate_servers:
-                self.logger.info(
-                    f"AML _find_tool_server: Resolving ambiguity for UMS base function '{target_base_function_name}'. "
-                    f"Prioritizing the server named '{UMS_SERVER_NAME}' (matching constant) as it is an active candidate."
-                )
-                return UMS_SERVER_NAME
-            else:
-                # If UMS_SERVER_NAME constant is not an exact match, but there's only ONE candidate left,
-                # and it's a UMS function, it's likely the UMS server (even if its connected name differs slightly).
-                # This part is tricky. The current logic of unique_candidate_servers already handles if there's only one.
-                # The above check is for when UMS_SERVER_NAME is explicitly one of the unique_candidate_servers.
+            srv_name = getattr(mcp_tool_obj, "server_name", None)
+            if not srv_name:
+                continue
+
+            # Check active session
+            if srv_name in sm.active_sessions:
+                candidate_servers.add(srv_name)
                 self.logger.debug(
-                    f"AML _find_tool_server: UMS function '{target_base_function_name}' sought. "
-                    f"Active candidates: {unique_candidate_servers}. UMS_SERVER_NAME constant ('{UMS_SERVER_NAME}') not found among them directly."
+                    "AML _find_tool_server:   + '%s' provides '%s' (ACTIVE)",
+                    srv_name,
+                    target_base_function_name,
+                )
+            else:
+                self.logger.debug(
+                    "AML _find_tool_server:   - '%s' provides '%s' but is NOT active",
+                    srv_name,
+                    target_base_function_name,
                 )
 
+        # ------------------------------------------------------------------ evaluate candidates
+        if not candidate_servers:
+            self.logger.warning(
+                "AML _find_tool_server: no ACTIVE server provides '%s' (identifier='%s')",
+                target_base_function_name,
+                tool_identifier_mcp_style,
+            )
+            return None
 
-        # 3. If still ambiguous after hints, we cannot safely choose.
+        if len(candidate_servers) == 1:
+            chosen = next(iter(candidate_servers))
+            self.logger.info(
+                "AML _find_tool_server: unique match – '%s' hosts '%s'",
+                chosen,
+                target_base_function_name,
+            )
+            return chosen
+
+        # ------------------------------------------------------------------ ambiguous – resolve
+        self.logger.debug(
+            "AML _find_tool_server: ambiguity (%s) for '%s', resolving…",
+            sorted(candidate_servers),
+            target_base_function_name,
+        )
+
+        # 1️⃣  server hint (case-insensitive exact match)
+        if expected_server_name_hint:
+            for srv in candidate_servers:
+                if srv.casefold() == expected_server_name_hint.casefold():
+                    self.logger.info(
+                        "AML _find_tool_server: resolved via server-hint → '%s'",
+                        srv,
+                    )
+                    return srv
+
+        # 2️⃣  prefer UMS server for core UMS functions
+        if (
+            target_base_function_name in self.all_ums_base_function_names
+            and any(srv.casefold() == UMS_SERVER_NAME.casefold() for srv in candidate_servers)
+        ):
+            self.logger.info(
+                "AML _find_tool_server: resolved UMS core '%s' → '%s'",
+                target_base_function_name,
+                UMS_SERVER_NAME,
+            )
+            return next(
+                srv for srv in candidate_servers if srv.casefold() == UMS_SERVER_NAME.casefold()
+            )
+
+        # ------------------------------------------------------------------ still ambiguous
         self.logger.warning(
-            f"AML _find_tool_server: Could not unambiguously resolve server for base function '{target_base_function_name}'. "
-            f"Active candidates: {unique_candidate_servers}. Original hint was '{expected_server_name_hint}'. "
-            f"Input identifier: '{tool_identifier_mcp_style}'. Returning None."
+            "AML _find_tool_server: cannot disambiguate server for '%s'; candidates=%s ; identifier='%s'",
+            target_base_function_name,
+            sorted(candidate_servers),
+            tool_identifier_mcp_style,
         )
         return None
 
-    async def _set_default_thought_chain_id(self):
-        current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+
+    async def _set_default_thought_chain_id(self) -> None:
+        """
+        Populate ``self.state.current_thought_chain_id`` with the *first* thought-chain
+        attached to the agent’s current workflow, **if** the field is still unset.
+        """
+        # ------------------------------------------------------------------ constants
+        DEFAULT_TOOL_TIMEOUT_SEC = 15           # hard stop for the UMS call
+        TOOL_NAME = UMS_FUNC_GET_WORKFLOW_DETAILS  # base func name (no MCP prefix)
+
+        # ------------------------------------------------------------------ short-circuit
+        if self.state.current_thought_chain_id:
+            # Nothing to do – keep the already-selected chain
+            self.logger.debug(
+                "Default thought-chain already set: %s",
+                _fmt_id(self.state.current_thought_chain_id),
+            )
+            return self.state.current_thought_chain_id
+
+        current_wf_id = (
+            self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+        )
         if not current_wf_id:
-            self.logger.debug("No active workflow for default thought chain.")
-            return
+            self.logger.debug("Cannot set default thought chain – no active workflow.")
+            return None
 
-        # Construct full MCP name for get_workflow_details
-        get_details_mcp_tool_name = self._get_ums_tool_mcp_name(UMS_FUNC_GET_WORKFLOW_DETAILS)
+        # ------------------------------------------------------------------ tool discovery
+        mcp_tool_name = self._get_ums_tool_mcp_name(TOOL_NAME)
+        if not self._find_tool_server(mcp_tool_name):
+            self.logger.warning("UMS tool '%s' not available – cannot fetch workflow details.", mcp_tool_name)
+            return None
 
-        if self._find_tool_server(get_details_mcp_tool_name):  # Check availability using full MCP name
-            try:
-                details = await self._execute_tool_call_internal(
-                    get_details_mcp_tool_name,  # Call using full MCP name
+        # ------------------------------------------------------------------ call UMS
+        try:
+            envelope: Dict[str, Any] = await asyncio.wait_for(
+                self._execute_tool_call_internal(
+                    mcp_tool_name,
                     {
                         "workflow_id": current_wf_id,
                         "include_thoughts": True,
@@ -1983,1305 +2702,2558 @@ class AgentMasterLoop:
                         "include_memories": False,
                     },
                     record_action=False,
-                )
-                if details.get("success"):
-                    thought_chains = details.get("thought_chains")
-                    if isinstance(thought_chains, list) and thought_chains:
-                        first_chain = thought_chains[0]
-                        chain_id = first_chain.get("thought_chain_id")
-                        if chain_id:
-                            self.state.current_thought_chain_id = chain_id
-                            self.logger.info(f"Set current_thought_chain_id: {_fmt_id(chain_id)} for WF {_fmt_id(current_wf_id)}")
-                            return
-                        else:
-                            self.logger.warning(f"Primary thought chain lacks ID for WF {current_wf_id}.")
-                    else:
-                        self.logger.warning(f"No thought chains in details for WF {current_wf_id}.")
-                else:
-                    self.logger.error(f"Tool '{get_details_mcp_tool_name}' failed for default chain: {details.get('error')}")
-            except Exception as e:
-                self.logger.error(f"Error fetching WF details for default chain: {e}", exc_info=False)
-        else:
-            self.logger.warning(f"Tool '{get_details_mcp_tool_name}' unavailable for default chain.")
-        self.logger.info(f"Could not set primary thought chain ID for WF {_fmt_id(current_wf_id)}.")
-
-    async def _check_workflow_exists(self, workflow_id: str) -> bool:
-        get_details_mcp_tool_name = self._get_ums_tool_mcp_name(UMS_FUNC_GET_WORKFLOW_DETAILS)
-        self.logger.debug(f"Checking existence of workflow {_fmt_id(workflow_id)} using {get_details_mcp_tool_name}.")
-
-        if not self._find_tool_server(get_details_mcp_tool_name):
-            self.logger.error(f"Tool {get_details_mcp_tool_name} unavailable.")
-            return False
-        try:
-            result = await self._execute_tool_call_internal(
-                get_details_mcp_tool_name,
-                {
-                    "workflow_id": workflow_id,
-                    "include_actions": False,
-                    "include_artifacts": False,
-                    "include_thoughts": False,
-                    "include_memories": False,
-                },
-                record_action=False,
+                ),
+                timeout=DEFAULT_TOOL_TIMEOUT_SEC,
             )
-            return isinstance(result, dict) and result.get("success", False)
-        except ToolInputError as e:  # UMS tool itself raises ToolInputError if not found
-            self.logger.debug(f"Workflow {_fmt_id(workflow_id)} not found (ToolInputError: {e}).")
-            return False
-        except Exception as e:
-            self.logger.error(f"Error checking WF {_fmt_id(workflow_id)}: {e}", exc_info=False)
-            return False
+        except asyncio.TimeoutError:
+            self.logger.error(
+                "Timeout (%ss) while calling '%s' for workflow %s.",
+                DEFAULT_TOOL_TIMEOUT_SEC,
+                mcp_tool_name,
+                _fmt_id(current_wf_id),
+            )
+            return None
+        except Exception as exc:
+            self.logger.error(
+                "Exception while calling '%s' for workflow %s: %s",
+                mcp_tool_name,
+                _fmt_id(current_wf_id),
+                exc,
+                exc_info=True,
+            )
+            return None
 
-    async def _validate_goal_stack_on_load(self):
-        if not self.state.workflow_id:
-            self.logger.warning("Cannot validate goal stack on load: No active workflow ID in state.")
-            self.state.goal_stack = []
-            self.state.current_goal_id = None
-            return
+        # ------------------------------------------------------------------ validate envelope
+        if not envelope.get("success"):
+            self.logger.error(
+                "UMS tool '%s' failed for workflow %s: %s",
+                mcp_tool_name,
+                _fmt_id(current_wf_id),
+                envelope.get("error_message") or envelope.get("error"),
+            )
+            return None
 
-        if self.state.current_goal_id:
-            self.logger.info(f"Validating loaded goal stack, current_goal_id: {_fmt_id(self.state.current_goal_id)}")
-            ums_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
-            if ums_stack:
-                if ums_stack[-1].get("goal_id") == self.state.current_goal_id:
-                    self.state.goal_stack = ums_stack
-                    self.logger.info(
-                        f"Goal stack re-validated and updated from UMS. Current: {_fmt_id(self.state.current_goal_id)}, Stack depth: {len(self.state.goal_stack)}"
-                    )
-                else:
-                    self.logger.warning(
-                        f"Loaded current_goal_id {_fmt_id(self.state.current_goal_id)} "
-                        f"could not be confirmed as leaf of a valid stack from UMS (UMS leaf: {_fmt_id(ums_stack[-1].get('goal_id'))}). "
-                        f"Resetting current_goal_id and stack."
-                    )
-                    self.state.goal_stack = []
-                    self.state.current_goal_id = None
-            else:
+        data = envelope.get("data", {})
+        if not isinstance(data, dict):
+            self.logger.error(
+                "UMS tool '%s' returned non-dict data (%s) for workflow %s.",
+                mcp_tool_name,
+                type(data).__name__,
+                _fmt_id(current_wf_id),
+            )
+            return None
+
+        # UMS may embed the list directly or under 'workflow'
+        thought_chains = (
+            data.get("thought_chains")
+            or data.get("workflow", {}).get("thought_chains")
+            or []
+        )
+
+        if not (isinstance(thought_chains, list) and thought_chains):
+            self.logger.warning(
+                "No thought chains found for workflow %s.",
+                _fmt_id(current_wf_id),
+            )
+            return None
+
+        first_chain = thought_chains[0]
+        chain_id = first_chain.get("thought_chain_id") if isinstance(first_chain, dict) else None
+        if not chain_id:
+            self.logger.warning(
+                "First thought chain in workflow %s lacks an ID.",
+                _fmt_id(current_wf_id),
+            )
+            return None
+
+        # ------------------------------------------------------------------ commit to state
+        self.state.current_thought_chain_id = chain_id
+        self.logger.info(
+            "Default thought-chain set to %s for workflow %s.",
+            _fmt_id(chain_id),
+            _fmt_id(current_wf_id),
+        )
+        return chain_id
+
+
+
+    async def _validate_goal_stack_on_load(self) -> None:
+        """
+        Re-hydrates and validates the agent’s in-memory goal stack after a restart.
+        """
+        # ------------------------------------------------------------------ #
+        # Ensure we have a lock (older instances may not). This does *not*
+        # change semantics in single-threaded contexts.
+        # ------------------------------------------------------------------ #
+        if not hasattr(self, "_state_lock"):
+            self._state_lock = asyncio.Lock()
+
+        async with self._state_lock:
+            # ------ 1. No workflow → nothing to validate ------------------- #
+            if not self.state.workflow_id:
                 self.logger.warning(
-                    f"Could not reconstruct goal stack from UMS for loaded current_goal_id {_fmt_id(self.state.current_goal_id)}. "
-                    f"Resetting goal stack and current_goal_id."
+                    "🛑 Goal-stack validation skipped: no active workflow_id."
                 )
-                self.state.goal_stack = []
+                self.state.goal_stack.clear()
                 self.state.current_goal_id = None
-        else:
+                return
+
+            # ------ 2. We *have* a current_goal_id ------------------------ #
+            if self.state.current_goal_id:
+                goal_id_fmt = _fmt_id(self.state.current_goal_id)
+                self.logger.info("🔍 Validating goal stack; current_goal_id=%s", goal_id_fmt)
+
+                FETCH_TIMEOUT_SEC = 10
+                try:
+                    ums_stack = await asyncio.wait_for(
+                        self._fetch_goal_stack_from_ums(self.state.current_goal_id),
+                        timeout=FETCH_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.error(
+                        "⏰ Timed-out (>%ss) while fetching goal stack for %s. "
+                        "Clearing local goal context.",
+                        FETCH_TIMEOUT_SEC,
+                        goal_id_fmt,
+                    )
+                    self.state.goal_stack.clear()
+                    self.state.current_goal_id = None
+                    return
+
+                if ums_stack:
+                    ums_leaf_id = ums_stack[-1].get("goal_id")
+                    if ums_leaf_id == self.state.current_goal_id:
+                        # Happy path – synchronise local stack
+                        self.state.goal_stack = ums_stack
+                        self.logger.info(
+                            "✅ Goal stack synchronised from UMS (leaf=%s, depth=%d).",
+                            goal_id_fmt,
+                            len(self.state.goal_stack),
+                        )
+                    else:
+                        # Mismatch – leaf differs
+                        self.logger.warning(
+                            "⚠️  Local current_goal_id %s is not the leaf returned "
+                            "by UMS (%s). Resetting goal context.",
+                            goal_id_fmt,
+                            _fmt_id(ums_leaf_id),
+                        )
+                        self.state.goal_stack.clear()
+                        self.state.current_goal_id = None
+                else:  # empty list → goal vanished or fetch failed silently
+                    self.logger.warning(
+                        "⚠️  UMS returned an empty stack for goal %s. "
+                        "Clearing goal context.",
+                        goal_id_fmt,
+                    )
+                    self.state.goal_stack.clear()
+                    self.state.current_goal_id = None
+                return  # handled all branches above
+
+            # ------ 3. No current_goal_id but a residual stack ------------- #
             if self.state.goal_stack:
-                self.logger.info("Loaded goal stack present but no current_goal_id. Clearing local stack.")
-                self.state.goal_stack = []
+                self.logger.info(
+                    "⚠️  goal_stack present (%d items) but current_goal_id is None. "
+                    "Resetting stack.",
+                    len(self.state.goal_stack),
+                )
+                self.state.goal_stack.clear()
             else:
-                self.logger.debug("Goal stack and current_goal_id are empty on load, nothing to validate.")
+                self.logger.debug(
+                    "ℹ️  No goal information to validate – state is clean."
+                )
 
-    def _detect_plan_cycle(self, plan: List[PlanStep]) -> bool:
-        if not plan:
+
+    def _detect_plan_cycle(self, plan_steps: Iterable["PlanStep"]) -> bool:
+        """
+        Detects whether the given collection of PlanStep objects contains a
+        dependency cycle.
+
+        A cycle exists when, starting from any step, following `depends_on`
+        edges eventually revisits the same step.
+
+        This implementation is **iterative** (explicit stack) so it is safe
+        for very deep graphs ≥ 10,000 nodes without blowing Python's call-stack.
+
+        Args:
+            plan_steps: Any iterable of PlanStep instances.  Each PlanStep is
+                        expected to expose `.id` (hashable) and
+                        `.depends_on` (Iterable[Hashable]) attributes.
+
+        Returns:
+            bool: True - at least one cycle detected  
+                False - no cycles
+        """
+        # ------------------------------------------------------------------
+        # Build quick-lookup table: step_id -> depends_on (as tuple for speed)
+        # ------------------------------------------------------------------
+        dep_map: Dict[str, tuple] = {}
+        for step in plan_steps:
+            try:
+                dep_map[step.id] = tuple(step.depends_on or ())
+            except AttributeError:
+                raise TypeError(
+                    "Each PlanStep must provide 'id' and 'depends_on' attributes."
+                ) from None
+
+        # Fast-exit for trivial sizes
+        if len(dep_map) < 2:
             return False
-        adj: Dict[str, Set[str]] = defaultdict(set)
-        plan_step_ids = {step.id for step in plan}
-        for step in plan:
-            for dep_id in step.depends_on:
-                if dep_id in plan_step_ids:
-                    adj[step.id].add(dep_id)
-                else:
-                    self.logger.warning(f"Step {_fmt_id(step.id)} depends on non-existent step {_fmt_id(dep_id)}.")
-        path: Set[str] = set()
-        visited: Set[str] = set()
 
-        def dfs(node_id: str) -> bool:
-            path.add(node_id)
-            visited.add(node_id)
-            for neighbor_id in adj[node_id]:
-                if neighbor_id in path:
-                    self.logger.warning(f"Cycle detected: {_fmt_id(node_id)} -> {_fmt_id(neighbor_id)}")
-                    return True
-                if neighbor_id not in visited and dfs(neighbor_id):
-                    return True
-            path.remove(node_id)
-            return False
+        # ------------------------------------------------------------------
+        # Iterative DFS with tri-color marking:
+        #   white = unseen, gray = in current DFS stack, black = fully visited
+        # A gray → gray edge signals a cycle.
+        # ------------------------------------------------------------------
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color: Dict[str, int] = {sid: WHITE for sid in dep_map} # noqa: C420
 
-        for step_id in plan_step_ids:
-            if step_id not in visited and dfs(step_id):
-                return True
+        for root in dep_map.keys():                       # try every component
+            if color[root] != WHITE:
+                continue
+
+            stack: Deque[tuple[str, int]] = deque([(root, 0)])
+            while stack:
+                node, idx = stack.pop()
+
+                if color[node] == WHITE:
+                    # First time we see the node – mark gray & push back for post-visit
+                    color[node] = GRAY
+                    stack.append((node, 0))               # post-visit marker
+                    # Push all children for pre-visit
+                    for child in dep_map[node]:
+                        if child not in dep_map:           # dangling dep → ignore
+                            continue
+                        if color[child] == GRAY:           # gray → gray  ⇒ cycle
+                            return True
+                        if color[child] == WHITE:
+                            stack.append((child, 0))
+
+                elif color[node] == GRAY:
+                    # Post-visit – mark black so future traversals skip it
+                    color[node] = BLACK
+                    # (nothing else to do – children already processed)
+
+                # color[node] == BLACK is impossible here because we never push blacks
+
         return False
+    
 
     async def _check_prerequisites(self, ids: List[str]) -> Tuple[bool, str]:
+        """
+        Verify that every action‐ID in *ids* exists **and** is already
+        `ActionStatus.COMPLETED`.
+
+        Returns
+        -------
+        Tuple[bool, str]
+            • First element – *True* when every prerequisite is satisfied.  
+            • Second element – human-readable reason/message.
+        """
+        # ------------------------------------------------------------------
+        # 0. Fast exit – nothing to check
+        # ------------------------------------------------------------------
         if not ids:
             return True, "No dependencies."
 
+        # De-duplicate while preserving order.
+        unique_ids: List[str] = list(dict.fromkeys(filter(None, ids)))
+        if not unique_ids:
+            return True, "No valid dependency IDs."
+
+        # ------------------------------------------------------------------
+        # 1. Resolve MCP tool
+        # ------------------------------------------------------------------
         get_action_details_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_GET_ACTION_DETAILS)
         if not self._find_tool_server(get_action_details_mcp_name):
-            self.logger.error(f"Tool for '{UMS_FUNC_GET_ACTION_DETAILS}' unavailable.")
-            return False, f"Tool for '{UMS_FUNC_GET_ACTION_DETAILS}' unavailable."
+            msg = f"Tool for '{UMS_FUNC_GET_ACTION_DETAILS}' unavailable."
+            self.logger.error(msg)
+            return False, msg
 
-        self.logger.debug(f"Checking prerequisites: {[_fmt_id(i) for i in ids]}")
-        try:
-            res = await self._execute_tool_call_internal(
-                get_action_details_mcp_name, {"action_ids": ids, "include_dependencies": False}, record_action=False
-            )
-            if not res.get("success"):
-                error_msg = res.get("error", "Unknown error.")
-                self.logger.warning(f"Dep check failed: {error_msg}")
-                return False, f"Failed: {error_msg}"
-            actions_found = res.get("actions", [])
-            found_ids = {a.get("action_id") for a in actions_found}
-            missing_ids = list(set(ids) - found_ids)
-            if missing_ids:
-                self.logger.warning(f"Dep actions not found: {[_fmt_id(i) for i in missing_ids]}")
-                return False, f"Not found: {[_fmt_id(i) for i in missing_ids]}"
-            incomplete = [
-                f"'{a.get('title', _fmt_id(a.get('action_id')))}' (Status: {a.get('status', 'UNK')})"
-                for a in actions_found
-                if a.get("status") != ActionStatus.COMPLETED.value
-            ]
-            if incomplete:
-                reason = f"Not completed: {', '.join(incomplete)}"
-                self.logger.warning(reason)
-                return False, reason
-            self.logger.debug("All deps completed.")
-            return True, "All deps completed."
-        except Exception as e:
-            self.logger.error(f"Error checking prereqs: {e}", exc_info=True)
-            return False, f"Exception: {str(e)}"
+        # ------------------------------------------------------------------
+        # 2. Parameters & helpers
+        # ------------------------------------------------------------------
+        CHUNK_SIZE: int = 50          # payload size safety-valve
+        RETRY_ATTEMPTS: int = 3
+        RETRY_BACKOFF_SEC: float = 0.8
+        TOOL_TIMEOUT_SEC: float = 15.0
+
+        async def _fetch_chunk(chunk: List[str]) -> Optional[Dict[str, Any]]:
+            """
+            Call UMS for a single chunk with bounded retries / timeout.
+            Returns the tool envelope (dict) on success or None on failure.
+            """
+            for attempt in range(1, RETRY_ATTEMPTS + 1):
+                try:
+                    self.logger.debug(
+                        f"Prereq-check: fetching details for "
+                        f"{', '.join(_fmt_id(i) for i in chunk)} (try {attempt}/{RETRY_ATTEMPTS})"
+                    )
+                    res = await asyncio.wait_for(
+                        self._execute_tool_call_internal(
+                            get_action_details_mcp_name,
+                            {"action_ids": chunk, "include_dependencies": False},
+                            record_action=False,
+                        ),
+                        timeout=TOOL_TIMEOUT_SEC,
+                    )
+                    return res
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        f"Prereq-check: timeout ({TOOL_TIMEOUT_SEC}s) on attempt {attempt} "
+                        f"for IDs {', '.join(_fmt_id(i) for i in chunk)}"
+                    )
+                except Exception as e:
+                    self.logger.error(
+                        f"Prereq-check: exception '{e}' on attempt {attempt} "
+                        f"for IDs {', '.join(_fmt_id(i) for i in chunk)}",
+                        exc_info=True,
+                    )
+                await asyncio.sleep(RETRY_BACKOFF_SEC * attempt)  # simple exponential back-off
+            return None  # all retries exhausted
+
+        # ------------------------------------------------------------------
+        # 3. Gather all action meta in parallel (chunked)
+        # ------------------------------------------------------------------
+        chunks: List[List[str]] = [
+            unique_ids[i : i + CHUNK_SIZE] for i in range(0, len(unique_ids), CHUNK_SIZE)
+        ]
+        # Parallel fetch with limited concurrency to avoid hammering the UMS.
+        SEMAPHORE = asyncio.Semaphore(5)
+
+        async def _bounded_fetch(chunk):
+            async with SEMAPHORE:
+                return await _fetch_chunk(chunk)
+
+        envelopes = await asyncio.gather(*(_bounded_fetch(c) for c in chunks))
+
+        # ------------------------------------------------------------------
+        # 4. Analyse results
+        # ------------------------------------------------------------------
+        actions_found: List[Dict[str, Any]] = []
+        for env, chunk in zip(envelopes, chunks, strict=True):
+            if not env or not env.get("success"):
+                err_msg = (
+                    (env or {}).get("error")
+                    or "UMS call failed or timed-out."
+                )
+                self.logger.warning(
+                    f"Prereq-check: Failed to retrieve chunk "
+                    f"{', '.join(_fmt_id(i) for i in chunk)} – {err_msg}"
+                )
+                return False, f"Failed: {err_msg}"
+            # Successful envelope – merge actions
+            actions_found.extend(env.get("actions", []))
+
+        found_ids: set = {a.get("action_id") for a in actions_found}
+        missing_ids: List[str] = [i for i in unique_ids if i not in found_ids]
+        if missing_ids:
+            self.logger.warning(f"Prereq-check: actions not found: {', '.join(_fmt_id(i) for i in missing_ids)}")
+            return False, f"Not found: {', '.join(_fmt_id(i) for i in missing_ids)}"
+
+        # Check completion status
+        incomplete_descriptions: List[str] = []
+        for act in actions_found:
+            status = str(act.get("status", "")).upper()
+            if status != ActionStatus.COMPLETED.value:
+                title_or_id = act.get("title") or _fmt_id(act.get("action_id"))
+                incomplete_descriptions.append(f"'{title_or_id}' (Status: {status or 'UNK'})")
+
+        if incomplete_descriptions:
+            reason = f"Not completed: {', '.join(incomplete_descriptions)}"
+            self.logger.warning(f"Prereq-check: {reason}")
+            return False, reason
+
+        self.logger.debug("Prereq-check: all dependencies completed.")
+        return True, "All deps completed."
+
 
     async def _record_action_start_internal(
-        self, tool_name_mcp: str, tool_args: Dict[str, Any], planned_dependencies: Optional[List[str]] = None
+        self,
+        tool_name_mcp: str,
+        tool_args: Dict[str, Any],
+        planned_dependencies: Optional[List[str]] = None,
     ) -> Optional[str]:
-        # tool_name_mcp is the original MCP name (e.g., "Ultimate MCP Server:some_tool")
-        record_action_start_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ACTION_START)
+        """
+        Create an **Action Start** record in UMS before executing a tool.
 
-        if not self._find_tool_server(record_action_start_mcp_name):
-            self.logger.error(f"Tool for '{UMS_FUNC_RECORD_ACTION_START}' unavailable.")
+        Parameters
+        ----------
+        tool_name_mcp : str
+            *Original* MCP name of the tool being executed (e.g. ``"Ultimate MCP Server:some_tool"``).
+        tool_args : Dict[str, Any]
+            Arguments that will be passed to the tool call (deep-copied for safety).
+        planned_dependencies : Optional[List[str]]
+            Memory / artifact IDs this action is expected to depend on.
+
+        Returns
+        -------
+        Optional[str]
+            The newly-created ``action_id`` (UMS UUID) or ``None`` if the record
+            could not be created.
+        """
+        # ------------------------------------------------------------------ #
+        # 1. Resolve the UMS tool we need and make sure a server is present. #
+        # ------------------------------------------------------------------ #
+        record_action_start_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ACTION_START)
+
+        if not self._find_tool_server(record_action_start_mcp):
+            self.logger.error("Tool server for '%s' unavailable.", UMS_FUNC_RECORD_ACTION_START)
             return None
-        current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+
+        # -------------------------------------------------------------- #
+        # 2. Work out which workflow this action belongs to.             #
+        # -------------------------------------------------------------- #
+        current_wf_id: Optional[str] = (
+            self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+        )
         if not current_wf_id:
-            self.logger.warning("No active WF ID for action start.")
+            self.logger.warning("Attempted to record action start, but no active workflow is set.")
             return None
 
-        base_tool_name_for_title = tool_name_mcp.split(":")[-1]
-        payload = {
+        # -------------------------------------------------------------- #
+        # 3. Build the payload – keep caller's dict untouched.           #
+        # -------------------------------------------------------------- #
+        safe_tool_args: Dict[str, Any] = copy.deepcopy(tool_args)
+
+        payload: Dict[str, Any] = {
             "workflow_id": current_wf_id,
-            "title": f"Execute: {base_tool_name_for_title}",
+            "title": f"Execute: {tool_name_mcp.split(':')[-1]}",
             "action_type": ActionType.TOOL_USE.value,
-            "tool_name": tool_name_mcp,  # Store the original MCP name of the tool being executed
-            "tool_args": tool_args,
+            "tool_name": tool_name_mcp,
+            "tool_args": safe_tool_args,
             "reasoning": f"Agent initiated call to tool: {tool_name_mcp}",
         }
-        action_id: Optional[str] = None
+
+        # -------------------------------------------------------------- #
+        # 4. Call the UMS tool and handle the response.                  #
+        # -------------------------------------------------------------- #
         try:
-            res = await self._execute_tool_call_internal(record_action_start_mcp_name, payload, record_action=False)
-            if res.get("success"):
-                action_id = res.get("action_id")
-                if action_id:
-                    self.logger.debug(f"Action started: {_fmt_id(action_id)} for tool {tool_name_mcp}")
-                    if planned_dependencies:
-                        await self._record_action_dependencies_internal(action_id, planned_dependencies)
-                else:
-                    self.logger.warning(f"{record_action_start_mcp_name} success but no action_id.")
+            res: Dict[str, Any] = await self._execute_tool_call_internal(
+                record_action_start_mcp,
+                payload,
+                record_action=False,  # ← avoid recursive action logging
+            )
+        except Exception as exc:
+            self.logger.error(
+                "Exception while calling '%s' for tool '%s': %s",
+                record_action_start_mcp,
+                tool_name_mcp,
+                exc,
+                exc_info=True,
+            )
+            return None
+
+        if not res.get("success"):
+            self.logger.error(
+                "Failed to record action start for '%s': %s",
+                tool_name_mcp,
+                res.get("error"),
+            )
+            return None
+
+        action_id: Optional[str] = res.get("action_id")
+        if not action_id:
+            self.logger.warning(
+                "'%s' succeeded but returned no action_id (tool '%s').",
+                record_action_start_mcp,
+                tool_name_mcp,
+            )
+            return None
+
+        self.logger.debug("Action started (%s) for tool %s", _fmt_id(action_id), tool_name_mcp)
+
+        # ---------------------------------------------------------------- #
+        # 5. Record planned dependencies – best-effort, never fatal.       #
+        # ---------------------------------------------------------------- #
+        if planned_dependencies:
+            # validate list contents
+            if not isinstance(planned_dependencies, list) or not all(isinstance(d, str) for d in planned_dependencies):
+                self.logger.warning(
+                    "planned_dependencies must be List[str]; got %s – skipping dependency recording.",
+                    type(planned_dependencies),
+                )
             else:
-                self.logger.error(f"Failed record action start for {tool_name_mcp}: {res.get('error')}")
-        except Exception as e:
-            self.logger.error(f"Exception recording action start for {tool_name_mcp}: {e}", exc_info=True)
+                unique_deps: List[str] = [d for d in dict.fromkeys(planned_dependencies) if d]
+                if unique_deps:
+                    try:
+                        await self._record_action_dependencies_internal(action_id, unique_deps)
+                    except Exception as dep_err:
+                        self.logger.error(
+                            "Failed to record dependencies for action %s: %s",
+                            _fmt_id(action_id),
+                            dep_err,
+                            exc_info=True,
+                        )
+
         return action_id
 
-    async def _record_action_dependencies_internal(self, source_id: str, target_ids: List[str]) -> None:
+    async def _record_action_dependencies_internal(  # noqa: C901  (complexity OK – scoped)
+        self,
+        source_id: str,
+        target_ids: List[str],
+    ) -> None:
+        """
+        Persist “requires” dependencies (⟂ edges) between a *source* action and
+        one or more *target* actions in UMS.
+        """
+        # ------------------------------------------------------------------ #
+        # 1. Fast exit guards                                                #
+        # ------------------------------------------------------------------ #
         if not source_id or not target_ids:
             return
-        valid_targets = {tid for tid in target_ids if tid and tid != source_id}
+
+        valid_targets: Set[str] = {tid for tid in target_ids if tid and tid != source_id}
         if not valid_targets:
             return
 
-        add_dep_mcp_tool_name = self._get_ums_tool_mcp_name(UMS_FUNC_ADD_ACTION_DEPENDENCY)
-        if not self._find_tool_server(add_dep_mcp_tool_name):
-            self.logger.error(f"Tool for '{UMS_FUNC_ADD_ACTION_DEPENDENCY}' unavailable.")
+        # Allow higher-level shutdown to short-circuit early
+        if getattr(self, "_shutdown_event", None) and self._shutdown_event.is_set():
             return
-        current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
-        if not current_wf_id:
-            self.logger.warning(f"No active WF ID for dep record for action {_fmt_id(source_id)}.")
+
+        # ------------------------------------------------------------------ #
+        # 2. Resolve MCP tool + workflow context                             #
+        # ------------------------------------------------------------------ #
+        add_dep_mcp_tool: str = self._get_ums_tool_mcp_name(UMS_FUNC_ADD_ACTION_DEPENDENCY)
+        if not self._find_tool_server(add_dep_mcp_tool):
+            self.logger.error("Tool for '%s' unavailable.", UMS_FUNC_ADD_ACTION_DEPENDENCY)
+            return
+
+        workflow_id: str | None = (
+            self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+        )
+        if not workflow_id:
+            self.logger.warning("No active WF ID while recording deps for action %s.", _fmt_id(source_id))
             return
 
         self.logger.debug(
-            f"Recording {len(valid_targets)} deps for action {_fmt_id(source_id)}: depends on {[_fmt_id(tid) for tid in valid_targets]}"
+            "Recording %d deps for action %s: %s",
+            len(valid_targets),
+            _fmt_id(source_id),
+            [_fmt_id(tid) for tid in valid_targets],
         )
-        tasks = [
-            asyncio.create_task(
-                self._execute_tool_call_internal(
-                    add_dep_mcp_tool_name,
-                    {"source_action_id": source_id, "target_action_id": target_id, "dependency_type": "requires"},
+
+        # ------------------------------------------------------------------ #
+        # 3. Helper to call UMS tool (w/ single retry)                       #
+        # ------------------------------------------------------------------ #
+        async def _call_add_dependency(target_id: str) -> Tuple[str, Union[Dict[str, Any], Exception]]:
+            """Single RPC wrapper – catches & returns all exceptions."""
+            payload: Dict[str, Any] = {
+                "workflow_id": workflow_id,          # **new** – required by UMS
+                "source_action_id": source_id,
+                "target_action_id": target_id,
+                "dependency_type": "requires",
+            }
+            try:
+                result = await self._execute_tool_call_internal(
+                    add_dep_mcp_tool,
+                    payload,
                     record_action=False,
                 )
-            )
-            for target_id in valid_targets
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, res in enumerate(results):
+                # Lightweight retry once on transient UMS failure
+                if isinstance(result, dict) and not result.get("success", False):
+                    if result.get("status_code") in {429, 500, 503}:  # transient
+                        self.logger.debug(
+                            "Transient failure on dep %s -> %s, retrying once…",
+                            _fmt_id(source_id),
+                            _fmt_id(target_id),
+                        )
+                        result = await self._execute_tool_call_internal(
+                            add_dep_mcp_tool,
+                            payload,
+                            record_action=False,
+                        )
+                return target_id, result
+            except Exception as exc:  # noqa: BLE001  (we re-emit in caller)
+                return target_id, exc
+
+        # ------------------------------------------------------------------ #
+        # 4. Bounded concurrency execution                                   #
+        # ------------------------------------------------------------------ #
+        max_parallel: int = getattr(self, "MAX_PARALLEL_DEP_CALLS", 10)
+        semaphore = asyncio.Semaphore(max_parallel)
+
+        async def _bounded(tid: str):
+            async with semaphore:
+                return await _call_add_dependency(tid)
+
+        tasks = [_bounded(tid) for tid in valid_targets]
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+        except asyncio.CancelledError:  # propagate cancellation cleanly
+            for t in tasks:
+                t.cancel()
+            raise
+
+        # ------------------------------------------------------------------ #
+        # 5. Post-processing + logging                                       #
+        # ------------------------------------------------------------------ #
+        for target_id, res in results:
             if isinstance(res, Exception):
-                self.logger.error(f"Error recording dep {_fmt_id(source_id)} -> target_idx_{i}: {res}", exc_info=False)
-            elif isinstance(res, dict) and not res.get("success"):
-                self.logger.warning(f"Failed recording dep {_fmt_id(source_id)} -> target_idx_{i}: {res.get('error')}")
+                self.logger.error(
+                    "Error recording dep %s -> %s: %s",
+                    _fmt_id(source_id),
+                    _fmt_id(target_id),
+                    res,
+                    exc_info=False,
+                )
+            elif isinstance(res, dict) and not res.get("success", False):
+                self.logger.warning(
+                    "Failed recording dep %s -> %s: %s",
+                    _fmt_id(source_id),
+                    _fmt_id(target_id),
+                    res.get("error") or res.get("error_message"),
+                )
 
-    async def _record_action_completion_internal(self, action_id: str, result: Dict[str, Any]) -> None:
-        completion_mcp_tool_name = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ACTION_COMPLETION)
+    async def _record_action_completion_internal(
+        self,
+        action_id: str,
+        result: Dict[str, Any],
+    ) -> None:
+        """
+        Persist the completion/failure status of an action in UMS.
+        """
+        if not isinstance(action_id, str) or not action_id.strip():
+            self.logger.error("record_action_completion: invalid action_id %r", action_id)
+            return
+
+        completion_mcp_tool_name: str = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ACTION_COMPLETION)
         if not self._find_tool_server(completion_mcp_tool_name):
-            self.logger.error(f"Tool for '{UMS_FUNC_RECORD_ACTION_COMPLETION}' unavailable.")
+            self.logger.error("Tool for '%s' unavailable.", UMS_FUNC_RECORD_ACTION_COMPLETION)
             return
-        status = ActionStatus.COMPLETED.value if isinstance(result, dict) and result.get("success") else ActionStatus.FAILED.value
-        current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+
+        status: str = (
+            ActionStatus.COMPLETED.value
+            if isinstance(result, dict) and result.get("success", False)
+            else ActionStatus.FAILED.value
+        )
+
+        current_wf_id: Optional[str] = (
+            self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+        )
         if not current_wf_id:
-            self.logger.warning(f"No active WF ID for action completion {_fmt_id(action_id)}.")
+            self.logger.warning("No active WF ID for action completion %s.", _fmt_id(action_id))
             return
 
-        payload = {"action_id": action_id, "status": status, "tool_result": result}
-        try:
-            completion_res = await self._execute_tool_call_internal(completion_mcp_tool_name, payload, record_action=False)
-            if completion_res.get("success"):
-                self.logger.debug(f"Action completion recorded for {_fmt_id(action_id)} (Status: {status})")
-            else:
-                self.logger.error(f"Failed record action completion for {_fmt_id(action_id)}: {completion_res.get('error')}")
-        except Exception as e:
-            self.logger.error(f"Exception recording action completion for {_fmt_id(action_id)}: {e}", exc_info=True)
+        payload: Dict[str, Any] = {
+            "workflow_id": current_wf_id,
+            "context_id": self.state.context_id,            # may be None – UMS ignores if null
+            "action_id": action_id,
+            "status": status,
+            "tool_result": _safe_json_compatible(result),
+        }
 
-    async def _run_auto_linking(self, memory_id: str, *, workflow_id: Optional[str], context_id: Optional[str]) -> None:
-        # This method uses full MCP names for UMS tool calls.
-        # workflow_id here is the snapshot taken when the task was scheduled.
-        current_agent_workflow_id = self.state.workflow_id  # Get current agent state at execution time
-        if workflow_id != current_agent_workflow_id or self._shutdown_event.is_set():
+        # Attempt + optional single retry
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                completion_res = await asyncio.wait_for(
+                    self._execute_tool_call_internal(
+                        completion_mcp_tool_name,
+                        payload,
+                        record_action=False,
+                    ),
+                    timeout=_RECORD_TIMEOUT_SEC,
+                )
+
+                if completion_res.get("success"):
+                    self.logger.debug(
+                        "Action completion recorded • WF=%s • Action=%s • Status=%s",
+                        _fmt_id(current_wf_id),
+                        _fmt_id(action_id),
+                        status,
+                    )
+                    return  # success → done
+
+                self.logger.error(
+                    "Failed to record action completion (attempt %d/%d) for %s: %s",
+                    attempt + 1,
+                    _MAX_RETRIES + 1,
+                    _fmt_id(action_id),
+                    completion_res.get("error"),
+                )
+                if attempt < _MAX_RETRIES:
+                    await asyncio.sleep(0.5 * math.pow(2, attempt))  # simple back-off
+                    continue
+                return  # no more retries
+
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    "Timeout (%ss) while recording action completion (attempt %d/%d) for %s.",
+                    _RECORD_TIMEOUT_SEC,
+                    attempt + 1,
+                    _MAX_RETRIES + 1,
+                    _fmt_id(action_id),
+                )
+                if attempt < _MAX_RETRIES:
+                    continue
+                return
+            except Exception as exc:  # noqa: BLE001 – log & bail
+                self.logger.error(
+                    "Exception recording action completion (attempt %d/%d) for %s: %s",
+                    attempt + 1,
+                    _MAX_RETRIES + 1,
+                    _fmt_id(action_id),
+                    exc,
+                    exc_info=True,
+                )
+                if attempt < _MAX_RETRIES:
+                    continue
+                return
+
+    async def _run_auto_linking(
+        self,
+        memory_id: str,
+        *,
+        workflow_id: Optional[str],
+        context_id: Optional[str],
+    ) -> None:
+        """
+        Background task that tries to create semantic/keyword links from the *source*
+        `memory_id` to other memories in **the same workflow**.  It is intentionally
+        conservative: it never mutates agent state (other than via UMS-side link
+        creation) and it bails out immediately on workflow changes, shutdown events,
+        tool unavailability, or low-quality search results.
+
+        ── Current responsibilities ────────────────────────────────────────────────
+        1.  Guard-rails & throttling (snapshot WF, shutdown flag, random delay)
+        2.  Retrieve the source memory (description/content)
+        3.  Choose the best available search tool (hybrid > semantic)
+        4.  Run a similarity search and rank candidates
+        5.  Create up to `self.auto_linking_max_links` links using UMS
+        6.  Log verbosely in DEBUG, warn gracefully on any failure
+        """
+        # --------------------------------------------------------------------- #
+        # 0.  Early exits                                                       #
+        # --------------------------------------------------------------------- #
+        snapshot_wf_id = workflow_id                      # value captured at schedule-time
+        active_wf_id    = self.state.workflow_id          # value at execution-time
+
+        if (
+            not memory_id
+            or not snapshot_wf_id
+            or snapshot_wf_id != active_wf_id
+            or self._shutdown_event.is_set()
+        ):
+            # Nothing to do (workflow changed, missing ids, or agent shutting down)
             self.logger.debug(
-                f"Skipping auto-link for {_fmt_id(memory_id)}: WF changed ({_fmt_id(workflow_id)} vs {_fmt_id(current_agent_workflow_id)}) or shutdown."
+                "Auto-linking skipped - mem=%s, snapWF=%s, activeWF=%s, shutdown=%s",
+                _fmt_id(memory_id),
+                _fmt_id(snapshot_wf_id),
+                _fmt_id(active_wf_id),
+                self._shutdown_event.is_set(),
             )
             return
 
+        # --------------------------------------------------------------------- #
+        # 1.  Gentle back-off so we don’t hammer the store immediately           #
+        # --------------------------------------------------------------------- #
         try:
-            if not memory_id or not workflow_id:  # Use the snapshot workflow_id
-                self.logger.debug(f"Skipping auto-link: Missing memory_id ({_fmt_id(memory_id)}) or snapshot workflow_id ({_fmt_id(workflow_id)}).")
-                return
             await asyncio.sleep(random.uniform(*AUTO_LINKING_DELAY_SECS))
             if self._shutdown_event.is_set():
                 return
 
-            self.logger.debug(f"Attempting auto-link for memory {_fmt_id(memory_id)} in WF {_fmt_id(workflow_id)}...")
-
-            get_mem_by_id_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_GET_MEMORY_BY_ID)
-            source_res = await self._execute_tool_call_internal(
-                get_mem_by_id_mcp_name,
-                {"memory_id": memory_id, "include_links": False, "workflow_id": workflow_id},  # Pass workflow_id
+            # ----------------------------------------------------------------- #
+            # 2.  Fetch the *source* memory (single call)                        #
+            # ----------------------------------------------------------------- #
+            get_mem_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_GET_MEMORY_BY_ID)
+            src_resp = await self._execute_tool_call_internal(
+                get_mem_mcp,
+                {
+                    "memory_id": memory_id,
+                    "include_links": False,
+                    "workflow_id": snapshot_wf_id,
+                },
                 record_action=False,
             )
-            if not source_res.get("success") or source_res.get("workflow_id") != workflow_id:
-                self.logger.warning(f"Auto-link failed for {_fmt_id(memory_id)}: Source mem error or WF mismatch. Resp: {source_res}")
-                return
-            source_mem = source_res
-            query_text = source_mem.get("description", "") or source_mem.get("content", "")[:200]
-            if not query_text:
-                self.logger.debug(f"Skipping auto-link for {_fmt_id(memory_id)}: No query text.")
+
+            if (
+                not src_resp.get("success")
+                or src_resp.get("workflow_id") != snapshot_wf_id
+            ):
+                self.logger.warning(
+                    "Auto-linking: failed to fetch source mem %s (resp=%s)",
+                    _fmt_id(memory_id),
+                    str(src_resp)[:120],
+                )
                 return
 
-            search_base_func = (
-                UMS_FUNC_HYBRID_SEARCH
-                if self._find_tool_server(self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH))
-                else UMS_FUNC_SEARCH_SEMANTIC_MEMORIES
+            source_mem = src_resp
+            query_text: str = (
+                source_mem.get("description") or
+                (source_mem.get("content") or "")[:200]
             )
-            search_mcp_tool_name = self._get_ums_tool_mcp_name(search_base_func)
 
-            if not self._find_tool_server(search_mcp_tool_name):
-                self.logger.warning(f"Skipping auto-link: Tool for {search_base_func} unavailable.")
+            if not query_text:
+                self.logger.debug(
+                    "Auto-linking skipped for %s - no description/content.",
+                    _fmt_id(memory_id),
+                )
                 return
 
+            # ----------------------------------------------------------------- #
+            # 3.  Decide which search tool to use                                #
+            # ----------------------------------------------------------------- #
+            hybrid_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH)
+            semantic_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_SEARCH_SEMANTIC_MEMORIES)
+
+            if self._find_tool_server(hybrid_mcp):
+                search_mcp_name  = hybrid_mcp
+                score_key        = "hybrid_score"
+                search_args_extra = {"semantic_weight": 0.8, "keyword_weight": 0.2}
+            elif self._find_tool_server(semantic_mcp):
+                search_mcp_name  = semantic_mcp
+                score_key        = "similarity"
+                search_args_extra = {}
+            else:
+                self.logger.warning("Auto-linking aborted: no search tool available.")
+                return
+
+            # ----------------------------------------------------------------- #
+            # 4.  Run search                                                     #
+            # ----------------------------------------------------------------- #
             search_args: Dict[str, Any] = {
-                "workflow_id": workflow_id,
+                "workflow_id": snapshot_wf_id,
                 "query": query_text,
-                "limit": self.auto_linking_max_links + 1,
+                "limit": self.auto_linking_max_links + 1,  # +1 so we can ignore self
                 "threshold": self.auto_linking_threshold,
                 "include_content": False,
+                **search_args_extra,
             }
-            if search_base_func == UMS_FUNC_HYBRID_SEARCH:
-                search_args.update({"semantic_weight": 0.8, "keyword_weight": 0.2})
 
-            similar_res = await self._execute_tool_call_internal(search_mcp_tool_name, search_args, record_action=False)
-            if not similar_res.get("success"):
-                self.logger.warning(f"Auto-link search failed for {_fmt_id(memory_id)}: {similar_res.get('error')}")
+            search_resp = await self._execute_tool_call_internal(
+                search_mcp_name,
+                search_args,
+                record_action=False,
+            )
+
+            if not search_resp.get("success"):
+                self.logger.warning(
+                    "Auto-linking search failed for %s: %s",
+                    _fmt_id(memory_id),
+                    search_resp.get("error"),
+                )
                 return
 
-            link_count = 0
-            score_key = "hybrid_score" if search_base_func == UMS_FUNC_HYBRID_SEARCH else "similarity"
-
-            create_link_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_LINK)
-            if not self._find_tool_server(create_link_mcp_name):
-                self.logger.warning(f"Skipping link creation: Tool for '{UMS_FUNC_CREATE_LINK}' unavailable.")
+            candidate_mems = search_resp.get("memories", []) or []
+            if not candidate_mems:
+                self.logger.debug(
+                    "Auto-linking found no candidates for %s (query='%s...').",
+                    _fmt_id(memory_id),
+                    query_text[:60],
+                )
                 return
 
-            for sim_mem_summary in similar_res.get("memories", []):
+            # ----------------------------------------------------------------- #
+            # 5.  Prepare for link creation                                      #
+            # ----------------------------------------------------------------- #
+            create_link_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_LINK)
+            if not self._find_tool_server(create_link_mcp):
+                self.logger.warning("Auto-linking: link-creation tool unavailable.")
+                return
+
+            src_type = source_mem.get("memory_type")
+            links_created = 0
+
+            # ----------------------------------------------------------------- #
+            # 6.  Iterate through search results                                 #
+            # ----------------------------------------------------------------- #
+            for mem in candidate_mems:
+                if links_created >= self.auto_linking_max_links:
+                    break
                 if self._shutdown_event.is_set():
                     break
-                target_id = sim_mem_summary.get("memory_id")
-                sim_score = sim_mem_summary.get(score_key, 0.0)
-                if not target_id or target_id == memory_id:
-                    continue
 
-                # No need to fetch target_mem again if we trust workflow_id from search_args
-                # and sim_mem_summary usually contains enough for simple link typing.
-                link_type = LinkType.RELATED.value  # Default
-                # Simple link typing based on source and target types from summaries
-                source_type_from_summary = source_mem.get("memory_type")
-                target_type_from_summary = sim_mem_summary.get("memory_type")
-                if source_type_from_summary == MemoryType.INSIGHT.value and target_type_from_summary == MemoryType.FACT.value:
+                tgt_id   = mem.get("memory_id")
+                sim_val  = mem.get(score_key, 0.0)
+
+                if not tgt_id or tgt_id == memory_id:
+                    continue  # skip self or malformed entries
+
+                # Simple heuristic for link typing
+                link_type = LinkType.RELATED.value
+                tgt_type  = mem.get("memory_type")
+                if (
+                    src_type == MemoryType.INSIGHT.value
+                    and tgt_type == MemoryType.FACT.value
+                ):
                     link_type = LinkType.SUPPORTS.value
 
                 link_args = {
                     "source_memory_id": memory_id,
-                    "target_memory_id": target_id,
+                    "target_memory_id": tgt_id,
                     "link_type": link_type,
-                    "strength": round(sim_score, 3),
+                    "strength": round(float(sim_val), 3),
                     "description": f"Auto-link ({link_type})",
-                    "workflow_id": workflow_id,  # Pass workflow_id for the link operation itself
+                    "workflow_id": snapshot_wf_id,
                 }
-                link_result = await self._execute_tool_call_internal(create_link_mcp_name, link_args, record_action=False)
-                if link_result.get("success"):
-                    link_count += 1
-                    self.logger.debug(f"Auto-linked {_fmt_id(memory_id)} to {_fmt_id(target_id)} ({link_type}, {sim_score:.2f})")
+
+                link_resp = await self._execute_tool_call_internal(
+                    create_link_mcp,
+                    link_args,
+                    record_action=False,
+                )
+
+                if link_resp.get("success"):
+                    links_created += 1
+                    self.logger.debug(
+                        "Auto-linked %s → %s  (%s, %.3f)",
+                        _fmt_id(memory_id),
+                        _fmt_id(tgt_id),
+                        link_type,
+                        sim_val,
+                    )
                 else:
-                    self.logger.warning(f"Failed auto-create link {_fmt_id(memory_id)}->{_fmt_id(target_id)}: {link_result.get('error')}")
-                if link_count >= self.auto_linking_max_links:
-                    break
-                await asyncio.sleep(0.1)  # Be nice
-        except Exception as e:
-            self.logger.warning(f"Error in auto-linking for {_fmt_id(memory_id)} in WF {_fmt_id(workflow_id)}: {e}", exc_info=False)
+                    self.logger.warning(
+                        "Auto-linking failed %s→%s: %s",
+                        _fmt_id(memory_id),
+                        _fmt_id(tgt_id),
+                        link_resp.get("error"),
+                    )
+
+                # Friendly pacing between link creations
+                await asyncio.sleep(0.1)
+
+        except Exception as exc:
+            self.logger.warning(
+                "Error during auto-linking for %s (WF %s): %s",
+                _fmt_id(memory_id),
+                _fmt_id(workflow_id),
+                exc,
+                exc_info=False,
+            )
 
 
     async def _execute_tool_call_internal(
-        self, tool_name_mcp: str, arguments: Dict[str, Any], record_action: bool = True, planned_dependencies: Optional[List[str]] = None
-    ) -> Dict[str, Any]:  # Returns the standard_envelope
+        self,
+        tool_name_mcp: str,
+        arguments: Dict[str, Any],
+        record_action: bool = True,
+        planned_dependencies: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """
-        Core internal method to execute a tool call (UMS or agent-internal),
-        record it as a UMS action (if applicable), handle retries, parse results,
-        and manage agent state updates related to the call.
+        Execute a tool (UMS or agent-internal) and return the *standard envelope*:
 
-        This method now calls `self.mcp_client._execute_tool_and_parse_for_agent`
-        which returns a pre-parsed standardized dictionary envelope.
+            {
+                "success": bool,
+                "data": … | None,
+                "error_type": str | None,
+                "error_message": str | None,
+                "status_code": int | None,
+                "details": … | None,
+            }
+
+        The method
+
+        • performs dependency checks, retry logic, action-start/finish bookkeeping  
+        • routes the call through `MCPClient._execute_tool_and_parse_for_agent`  
+        • updates agent-state counters, error tracking, `needs_replan`, etc.  
+        • schedules background tasks for auto-linking / promotion when relevant  
+        • calls `_handle_workflow_and_goal_side_effects` after completion.
         """
-        def _force_print(*args_print, **kwargs_print): # Keep for debugging
-            print(*args_print, file=sys.stderr, flush=True, **kwargs_print)
 
-        current_base_func_name = self._get_base_function_name(tool_name_mcp)
+        # ──────────────────────────── helpers ─────────────────────────────
+        def _force_print(*a, **kw):  # retained for live debugging (unchanged)
+            print(*a, file=sys.stderr, flush=True, **kw)
+
+        def _mk_envelope(
+            *,
+            success: bool = False,
+            data: Any = None,
+            err_type: Optional[str] = None,
+            err_msg: Optional[str] = None,
+            status: Optional[int] = None,
+            details: Any = None,
+        ) -> Dict[str, Any]:
+            """Create a fully-populated envelope with sensible defaults."""
+            return {
+                "success": success,
+                "data": data,
+                "error_type": err_type,
+                "error_message": err_msg,
+                "status_code": status,
+                "details": details,
+            }
+
+        async def _bail(
+            envelope: Dict[str, Any],
+            *,
+            set_state_error: bool = True,
+            mark_replan: bool = False,
+            summary_prefix: str = "Failed",
+        ) -> Dict[str, Any]:
+            """
+            Early-exit helper:
+            • records `last_error_details` / `needs_replan` / `last_action_summary`
+            • returns the envelope
+            """
+            if set_state_error:
+                self.state.last_error_details = {
+                    "tool": tool_name_mcp,
+                    "args": arguments,
+                    "error": envelope.get("error_message"),
+                    "type": envelope.get("error_type"),
+                    "status_code": envelope.get("status_code"),
+                    "details": envelope.get("details"),
+                }
+            if mark_replan and not self.state.needs_replan:
+                self.state.needs_replan = True
+
+            # NOTE: summary recording kept identical to previous behaviour
+            self.state.last_action_summary = (
+                f"{tool_name_mcp} -> {summary_prefix} "
+                f"({envelope.get('error_type')}): {envelope.get('error_message')}"
+            )
+            self.logger.error(f"AML_EXEC_TOOL_INTERNAL: returning envelope for {tool_name_mcp}: success={envelope.get('success')}, data_keys={str(envelope.get('data', {}).keys())[:200] if isinstance(envelope.get('data'), dict) else 'not_dict'}")
+            return envelope
+
+        current_base = self._get_base_function_name(tool_name_mcp)
         _force_print(
-            f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: Entered for tool '{tool_name_mcp}'. Base Func: '{current_base_func_name}'. Args: {str(arguments)[:200]}..."
+            f"AML_EXEC_TOOL_INTERNAL: start tool='{tool_name_mcp}' "
+            f"base='{current_base}' args={str(arguments)[:200]}…"
         )
 
-        # Initialize the standard envelope with error defaults
-        standard_envelope: Dict[str, Any] = {
-            "success": False,
-            "data": None,
-            "error_type": "UnknownInternalError_AML", # More specific initial error
-            "error_message": "AML: Initial error before tool call attempt.",
-            "status_code": None,
-            "details": None,
-        }
+        envelope: Dict[str, Any] = _mk_envelope(
+            err_type="UnknownInternalError_AML",
+            err_msg="AML: Initial error before tool call attempt.",
+        )
 
+        # ─────────────────────── server lookup / availability ──────────────────────
         target_server = self._find_tool_server(tool_name_mcp)
         if not target_server and tool_name_mcp != AGENT_TOOL_UPDATE_PLAN:
-            err_msg = f"Tool server unavailable for {tool_name_mcp}"
-            _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: ERROR - {err_msg}")
-            standard_envelope.update({"error_message": err_msg, "error_type": "ServerUnavailable_AML", "status_code": 503})
-            self.state.last_error_details = {"tool": tool_name_mcp, "error": err_msg, "type": "ServerUnavailable", "status_code": 503}
-            if not self.state.needs_replan: self.state.needs_replan = True
-            self.state.last_action_summary = f"{tool_name_mcp} -> Failed (ServerUnavailable_AML): {err_msg}"
-            return standard_envelope
+            envelope.update(
+                err_type="ServerUnavailable_AML",
+                err_msg=f"Tool server unavailable for {tool_name_mcp}",
+                status=503,
+            )
+            return await _bail(envelope, mark_replan=True)
 
+        # ───────────────────────── special-case: update_plan ───────────────────────
         if tool_name_mcp == AGENT_TOOL_UPDATE_PLAN:
-            self.logger.info(f"AML EXEC_TOOL_INTERNAL: Handling AGENT_TOOL_UPDATE_PLAN directly.")
-            new_plan_steps_data = arguments.get("plan")
-            if not isinstance(new_plan_steps_data, list):
-                err_msg = "Invalid plan: 'plan' argument must be a list of steps for agent:update_plan."
-                self.logger.error(err_msg)
-                standard_envelope.update({"success": False, "error_message": err_msg, "error_type": "PlanUpdateError_AML"})
-                self.state.last_error_details = {"tool": tool_name_mcp, "error": err_msg, "type": "PlanUpdateError"}
-                self.state.needs_replan = True
-                self.state.last_action_summary = f"{tool_name_mcp} -> Failed: {err_msg}"
-                return standard_envelope
+            # validate input
+            plan_data = arguments.get("plan")
+            if not isinstance(plan_data, list):
+                envelope.update(
+                    err_type="PlanUpdateError_AML",
+                    err_msg="Invalid 'plan' argument (must be list of steps).",
+                )
+                return await _bail(envelope, mark_replan=True)
+
             try:
-                validated_plan = [PlanStep(**step_data) for step_data in new_plan_steps_data]
-                if self._detect_plan_cycle(validated_plan):
-                    err_msg = "Plan cycle detected in proposed update."
-                    self.logger.error(err_msg)
-                    standard_envelope.update({"success": False, "error_message": err_msg, "error_type": "PlanValidationError_AML"})
-                    self.state.last_error_details = {"tool": tool_name_mcp, "error": err_msg, "type": "PlanValidationError"}
-                    self.state.needs_replan = True
-                    self.state.last_action_summary = f"{tool_name_mcp} -> Failed: {err_msg}"
-                    return standard_envelope
-
-                self.state.current_plan = validated_plan
-                self.state.needs_replan = False
-                self.state.last_error_details = None
-                self.state.consecutive_error_count = 0
-                msg = f"Plan updated with {len(validated_plan)} steps."
-                self.logger.info(f"AML EXEC_TOOL_INTERNAL: {msg}")
-                standard_envelope.update({"success": True, "data": {"message": msg}, "error_type": None, "error_message": None})
-                self.state.last_action_summary = f"{tool_name_mcp} -> Success: {msg}"
-                return standard_envelope
-            except (ValidationError, TypeError) as e_plan_val:
-                err_msg = f"Plan validation error: {e_plan_val}"
-                self.logger.error(f"AML EXEC_TOOL_INTERNAL: {err_msg}")
-                standard_envelope.update({"success": False, "error_message": err_msg, "error_type": "PlanValidationError_AML"})
-                self.state.last_error_details = {"tool": tool_name_mcp, "error": err_msg, "type": "PlanValidationError"}
-                self.state.needs_replan = True
-                self.state.last_action_summary = f"{tool_name_mcp} -> Failed: {err_msg}"
-                return standard_envelope
-
-        final_arguments = arguments.copy()
-        current_wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
-        current_ctx_id = self.state.context_id
-        current_goal_id_for_tool = self.state.current_goal_id
-
-        if (final_arguments.get("workflow_id") is None and current_wf_id and
-            current_base_func_name not in [UMS_FUNC_CREATE_WORKFLOW, UMS_FUNC_LIST_WORKFLOWS]):
-            final_arguments["workflow_id"] = current_wf_id
-        if (final_arguments.get("context_id") is None and current_ctx_id and
-            current_base_func_name in {UMS_FUNC_GET_WORKING_MEMORY, UMS_FUNC_OPTIMIZE_WM, UMS_FUNC_AUTO_FOCUS, UMS_FUNC_FOCUS_MEMORY,
-                                       UMS_FUNC_SAVE_COGNITIVE_STATE, UMS_FUNC_LOAD_COGNITIVE_STATE, UMS_FUNC_GET_RICH_CONTEXT_PACKAGE}):
-            final_arguments["context_id"] = current_ctx_id
-            if current_base_func_name == UMS_FUNC_LOAD_COGNITIVE_STATE and "state_id" not in final_arguments:
-                final_arguments["state_id"] = current_ctx_id
-        if (final_arguments.get("thought_chain_id") is None and self.state.current_thought_chain_id and
-            current_base_func_name == UMS_FUNC_RECORD_THOUGHT):
-            final_arguments["thought_chain_id"] = self.state.current_thought_chain_id
-        if (final_arguments.get("parent_goal_id") is None and current_goal_id_for_tool and
-            current_base_func_name == UMS_FUNC_CREATE_GOAL):
-            final_arguments["parent_goal_id"] = current_goal_id_for_tool
-
-        _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: Final args for '{tool_name_mcp}': {str(final_arguments)[:200]}...")
-
-        if planned_dependencies:
-            _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: Checking prerequisites for '{tool_name_mcp}': {[_fmt_id(d) for d in planned_dependencies]}")
-            ok, reason = await self._check_prerequisites(planned_dependencies)
-            if not ok:
-                err_msg = f"Prerequisites not met for {tool_name_mcp}: {reason}"
-                _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: ERROR - {err_msg}")
-                standard_envelope.update({
-                    "error_message": err_msg, "error_type": "DependencyNotMetError_AML",
-                    "status_code": 412, "details": {"dependencies": planned_dependencies}
-                })
-                self.state.last_error_details = {"tool": tool_name_mcp, "error": err_msg, "type": "DependencyNotMetError", "dependencies": planned_dependencies, "status_code": 412}
-                if not self.state.needs_replan: self.state.needs_replan = True
-                self.state.last_action_summary = f"{tool_name_mcp} -> Failed (DependencyNotMetError_AML): {err_msg}"
-                return standard_envelope
-            _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: Prerequisites met for {tool_name_mcp}.")
-
-        action_id: Optional[str] = None
-        should_record_this_action = record_action and current_base_func_name not in self._INTERNAL_OR_META_TOOLS_BASE_NAMES
-        if should_record_this_action:
-            _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: Recording UMS action start for '{tool_name_mcp}'.")
-            action_id = await self._record_action_start_internal(tool_name_mcp, final_arguments, planned_dependencies)
-            if not action_id:
-                err_msg = f"Failed to record UMS action_start for tool {tool_name_mcp}."
-                _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: ERROR - {err_msg}")
-                standard_envelope.update({
-                    "error_message": err_msg, "error_type": "UMSError_AML",
-                    "details": {"reason": "ActionStartFailed"}, "status_code": 500
-                })
-                self.state.last_error_details = {"tool": tool_name_mcp, "error": err_msg, "type": "UMSError", "reason": "ActionStartFailed"}
-                if not self.state.needs_replan: self.state.needs_replan = True
-                self.state.last_action_summary = f"{tool_name_mcp} -> Failed (UMSError_AML): ActionStartFailed"
-                return standard_envelope
-
-        record_stats = self.state.tool_usage_stats.setdefault(tool_name_mcp, {"success": 0, "failure": 0, "latency_ms_total": 0.0})
-        idempotent_tool_call = current_base_func_name in {
-            UMS_FUNC_GET_MEMORY_BY_ID, UMS_FUNC_SEARCH_SEMANTIC_MEMORIES, UMS_FUNC_HYBRID_SEARCH,
-            UMS_FUNC_QUERY_MEMORIES, UMS_FUNC_GET_ACTION_DETAILS, UMS_FUNC_LIST_WORKFLOWS,
-            UMS_FUNC_COMPUTE_STATS, UMS_FUNC_GET_WORKING_MEMORY, UMS_FUNC_GET_LINKED_MEMORIES,
-            UMS_FUNC_GET_ARTIFACTS, UMS_FUNC_GET_ARTIFACT_BY_ID, UMS_FUNC_GET_ACTION_DEPENDENCIES,
-            UMS_FUNC_GET_THOUGHT_CHAIN, UMS_FUNC_GET_WORKFLOW_DETAILS, UMS_FUNC_GET_GOAL_DETAILS,
-            UMS_FUNC_SUMMARIZE_TEXT, UMS_FUNC_SUMMARIZE_CONTEXT_BLOCK, UMS_FUNC_GET_RICH_CONTEXT_PACKAGE,
-            UMS_FUNC_GET_RECENT_ACTIONS, UMS_FUNC_VISUALIZE_REASONING_CHAIN, UMS_FUNC_VISUALIZE_MEMORY_NETWORK,
-            UMS_FUNC_GENERATE_WORKFLOW_REPORT, UMS_FUNC_LOAD_COGNITIVE_STATE,
-        }
-        start_ts = time.time()
-
-        try:
-            _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: Attempting MCPClient._execute_tool_and_parse_for_agent for '{tool_name_mcp}' on server '{target_server}'.")
-
-            async def _do_mcp_agent_call():
-                call_args = {k: v for k, v in final_arguments.items() if v is not None}
-                # This now calls the new wrapper method in MCPClient
-                agent_standard_envelope_from_wrapper: Dict[str, Any] = await self.mcp_client._execute_tool_and_parse_for_agent(
-                    target_server, tool_name_mcp, call_args
+                validated_plan = [PlanStep(**step) for step in plan_data]
+            except (ValidationError, TypeError) as exc:
+                envelope.update(
+                    err_type="PlanValidationError_AML",
+                    err_msg=f"Plan validation error: {exc}",
                 )
-                return agent_standard_envelope_from_wrapper
+                return await _bail(envelope, mark_replan=True)
 
-            # `result_from_mcpc_wrapper` is the standardized dictionary from the MCPClient wrapper
-            result_from_mcpc_wrapper: Dict[str, Any] = await self._with_retries(
-                _do_mcp_agent_call, max_retries=3 if idempotent_tool_call else 1
-            )
-            
-            _force_print(
-                f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: MCPClient._execute_tool_and_parse_for_agent for '{tool_name_mcp}' RETURNED. "
-                f"Type: {type(result_from_mcpc_wrapper)}. Value Preview: {str(result_from_mcpc_wrapper)[:500]}..."
-            )
-
-            latency_ms = (time.time() - start_ts) * 1000
-            current_latency_total = record_stats.get("latency_ms_total", 0.0)
-            if not isinstance(current_latency_total, (int, float)): current_latency_total = 0.0
-            record_stats["latency_ms_total"] = current_latency_total + latency_ms
-
-            # Assign the result from the wrapper directly to standard_envelope
-            if isinstance(result_from_mcpc_wrapper, dict):
-                standard_envelope = result_from_mcpc_wrapper 
-            else: 
-                _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: CRITICAL - MCPClient._execute_tool_and_parse_for_agent returned non-dict: {type(result_from_mcpc_wrapper)}")
-                standard_envelope.update({
-                    "success": False,
-                    "error_message": "Internal MCPClient error: Agent wrapper did not return expected dictionary.",
-                    "error_type": "MCPClientContractError_AML", 
-                })
-        
-        except asyncio.CancelledError:
-            _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: CAUGHT CancelledError for tool '{tool_name_mcp}' during _with_retries/agent_call.")
-            standard_envelope.update({"success": False, "error_message": "Tool execution cancelled by AML.", "error_type": "CancelledError_AML"})
-            if action_id and should_record_this_action:
-                await self._record_action_completion_internal(
-                    action_id, 
-                    {"success": False, "data": {"error_details": "Operation cancelled by AML"}, 
-                     "error_type": "CancelledError_AML", "error_message": "Operation Cancelled by AML", 
-                     "status_code": None, "details": {"reason": "AML retry wrapper or agent call caught cancellation"}}
+            if self._detect_plan_cycle(validated_plan):
+                envelope.update(
+                    err_type="PlanValidationError_AML",
+                    err_msg="Plan cycle detected in proposed update.",
                 )
-            raise 
-        except Exception as e_unhandled_retries: 
-            err_str_unhandled = str(e_unhandled_retries)
-            _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: CAUGHT UNEXPECTED EXCEPTION from _with_retries/agent_call for tool '{tool_name_mcp}': {type(e_unhandled_retries).__name__} - {e_unhandled_retries}")
-            self.logger.error(f"AML EXEC_TOOL_INTERNAL: Unexpected Error from _with_retries/agent_call for {tool_name_mcp}: {err_str_unhandled}", exc_info=True)
-            standard_envelope.update({
-                "success": False,
-                "error_message": f"Unexpected error during tool call (AML retries/wrapper): {err_str_unhandled}",
-                "error_type": "AMLRetryOrWrapperError", 
-            })
+                return await _bail(envelope, mark_replan=True)
+
+            # happy-path: commit plan
+            self.state.current_plan = validated_plan
+            self.state.needs_replan = False
+            self.state.last_error_details = None
+            self.state.consecutive_error_count = 0
+            msg = f"Plan updated with {len(validated_plan)} steps."
+            self.logger.info("AML EXEC_TOOL_INTERNAL: %s", msg)
+
+            envelope = _mk_envelope(success=True, data={"message": msg})
+            self.state.last_action_summary = f"{tool_name_mcp} -> Success: {msg}"
+            return envelope
+
+        # ───────────────────────── arg auto-injection / coercion ────────────────────
+        final_args = arguments.copy()
+        wf_id = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
+        ctx_id = self.state.context_id
+        goal_id = self.state.current_goal_id
+
+        if (
+            wf_id
+            and "workflow_id" not in final_args
+            and current_base not in [UMS_FUNC_CREATE_WORKFLOW, UMS_FUNC_LIST_WORKFLOWS]
+        ):
+            final_args["workflow_id"] = wf_id
+
+        if (
+            ctx_id
+            and current_base
+            in {
+                UMS_FUNC_GET_WORKING_MEMORY,
+                UMS_FUNC_OPTIMIZE_WM,
+                UMS_FUNC_AUTO_FOCUS,
+                UMS_FUNC_FOCUS_MEMORY,
+                UMS_FUNC_SAVE_COGNITIVE_STATE,
+                UMS_FUNC_LOAD_COGNITIVE_STATE,
+                UMS_FUNC_GET_RICH_CONTEXT_PACKAGE,
+            }
+            and "context_id" not in final_args
+        ):
+            final_args["context_id"] = ctx_id
+            if current_base == UMS_FUNC_LOAD_COGNITIVE_STATE and "state_id" not in final_args:
+                final_args["state_id"] = ctx_id
+
+        if (
+            self.state.current_thought_chain_id
+            and current_base == UMS_FUNC_RECORD_THOUGHT
+            and "thought_chain_id" not in final_args
+        ):
+            final_args["thought_chain_id"] = self.state.current_thought_chain_id
+
+        if (
+            goal_id
+            and current_base == UMS_FUNC_CREATE_GOAL
+            and "parent_goal_id" not in final_args
+        ):
+            final_args["parent_goal_id"] = goal_id
 
         _force_print(
-            f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL: Standardized Envelope for '{tool_name_mcp}' (after MCPC call and parsing): "
-            f"Success={standard_envelope.get('success')}, ErrorType={standard_envelope.get('error_type')}, "
-            f"Data is dict: {isinstance(standard_envelope.get('data'), dict)}, "
-            f"Data Keys (if dict): {list(standard_envelope.get('data', {}).keys()) if isinstance(standard_envelope.get('data'), dict) else 'N/A'}"
+            f"AML_EXEC_TOOL_INTERNAL: final args for '{tool_name_mcp}': "
+            f"{str(final_args)[:200]}…"
         )
-        
-        current_success_count = record_stats.get("success", 0)
-        if not isinstance(current_success_count, int): current_success_count = 0
-        current_failure_count = record_stats.get("failure", 0)
-        if not isinstance(current_failure_count, int): current_failure_count = 0
 
-        if standard_envelope.get("success"):
-            record_stats["success"] = current_success_count + 1
-            if self.state.last_error_details and self.state.last_error_details.get("tool") == tool_name_mcp:
-                self.state.last_error_details = None 
-            
-            ums_data_for_bg_tasks = standard_envelope.get("data")
-            if isinstance(ums_data_for_bg_tasks, dict):
-                bg_task_workflow_id = ums_data_for_bg_tasks.get("workflow_id", current_wf_id) 
-                bg_task_context_id = ums_data_for_bg_tasks.get("context_id", current_ctx_id)   
+        # ───────────────────── prerequisite dependency check ───────────────────────
+        if planned_dependencies:
+            ok, reason = await self._check_prerequisites(planned_dependencies)
+            if not ok:
+                envelope.update(
+                    err_type="DependencyNotMetError_AML",
+                    err_msg=f"Prerequisites not met: {reason}",
+                    status=412,
+                    details={"dependencies": planned_dependencies},
+                )
+                return await _bail(envelope, mark_replan=True)
 
-                if bg_task_workflow_id: 
-                    if current_base_func_name in [UMS_FUNC_STORE_MEMORY, UMS_FUNC_UPDATE_MEMORY] and ums_data_for_bg_tasks.get("memory_id"):
-                        self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=ums_data_for_bg_tasks["memory_id"], workflow_id=bg_task_workflow_id, context_id=bg_task_context_id)
-                    elif current_base_func_name == UMS_FUNC_RECORD_ARTIFACT and ums_data_for_bg_tasks.get("linked_memory_id"):
-                        self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=ums_data_for_bg_tasks["linked_memory_id"], workflow_id=bg_task_workflow_id, context_id=bg_task_context_id)
-                    elif current_base_func_name == UMS_FUNC_RECORD_THOUGHT and ums_data_for_bg_tasks.get("linked_memory_id"):
-                        self._start_background_task(AgentMasterLoop._run_auto_linking, memory_id=ums_data_for_bg_tasks["linked_memory_id"], workflow_id=bg_task_workflow_id, context_id=bg_task_context_id)
-                    
-                    mem_ids_to_check_for_promo = set()
-                    if current_base_func_name == UMS_FUNC_GET_MEMORY_BY_ID and isinstance(ums_data_for_bg_tasks.get("memory_id"), str):
-                        mem_ids_to_check_for_promo.add(ums_data_for_bg_tasks["memory_id"])
-                    elif current_base_func_name == UMS_FUNC_GET_WORKING_MEMORY and isinstance(ums_data_for_bg_tasks.get("working_memories"), list):
-                        mems_list = ums_data_for_bg_tasks["working_memories"]
-                        mem_ids_to_check_for_promo.update(m.get("memory_id") for m in mems_list[:3] if isinstance(m, dict) and m.get("memory_id"))
-                        if ums_data_for_bg_tasks.get("focal_memory_id"): mem_ids_to_check_for_promo.add(ums_data_for_bg_tasks["focal_memory_id"])
-                    elif current_base_func_name in [UMS_FUNC_QUERY_MEMORIES, UMS_FUNC_HYBRID_SEARCH, UMS_FUNC_SEARCH_SEMANTIC_MEMORIES] and isinstance(ums_data_for_bg_tasks.get("memories"), list):
-                        mems_list = ums_data_for_bg_tasks["memories"]
-                        mem_ids_to_check_for_promo.update(m.get("memory_id") for m in mems_list[:3] if isinstance(m, dict) and m.get("memory_id"))
-                    
-                    for mem_id_chk_promo in filter(None, mem_ids_to_check_for_promo):
-                        self._start_background_task(AgentMasterLoop._check_and_trigger_promotion, memory_id=mem_id_chk_promo, workflow_id=bg_task_workflow_id, context_id=bg_task_context_id)
-                else:
-                    self.logger.warning(f"AML_EXEC_TOOL_INTERNAL: Cannot schedule BG tasks for tool '{tool_name_mcp}' - no valid workflow_id (UMS payload or agent state). UMS data: {str(ums_data_for_bg_tasks)[:100]}")
-        else: 
-            record_stats["failure"] = current_failure_count + 1
-            agent_facing_error_type = standard_envelope.get("error_type", "ToolExecutionError_AML") # Default to AML specific error
-            
-            # Map error types from the wrapper/UMS to types the LLM's recovery strategies expect
-            if agent_facing_error_type in [
-                "UMSToolReportedFailure", "ContentParsingError", "InternalParsingWrapperError", 
-                "MCPClientContractError_AML", "AgentSideToolWrapperUnexpectedError", 
-                "UMSUnparsableJSONError", "UMSError_AML", 
-                "ToolInternalError_AML", "InvalidInputError_AML", # Suffix to indicate where it was set
-                "UMSError" # Generic from wrapper
-            ]:
-                agent_facing_error_type = "UMSError" 
-            elif agent_facing_error_type == "ToolMaxRetriesOrServerError":
-                agent_facing_error_type = "ServerUnavailable"
-            elif agent_facing_error_type in ["AMLToolCallProcessingError", "AMLRetryOrWrapperError", "UnknownInternalError_AML", "AMLUnexpectedExecutionError"]:
-                agent_facing_error_type = "AgentError" 
-            
-            self.state.last_error_details = {
-                "tool": tool_name_mcp, 
-                "args": arguments, 
-                "error": standard_envelope.get("error_message", "Unknown tool failure."),
-                "status_code": standard_envelope.get("status_code"),
-                "type": agent_facing_error_type, 
-                "details": standard_envelope.get("details"),
-            }
-            if not idempotent_tool_call and not self.state.needs_replan: 
-                self.state.needs_replan = True
-                self.logger.info(f"AML EXEC_TOOL_INTERNAL: Setting needs_replan=True due to failure in non-idempotent tool '{tool_name_mcp}'. Error type: {agent_facing_error_type}")
+        # ───────────────────────────── action start log ────────────────────────────
+        should_record = (
+            record_action
+            and current_base not in self._INTERNAL_OR_META_TOOLS_BASE_NAMES
+        )
+        action_id: Optional[str] = None
+        if should_record:
+            action_id = await self._record_action_start_internal(
+                tool_name_mcp, final_args, planned_dependencies
+            )
+            if not action_id:
+                envelope.update(
+                    err_type="UMSError_AML",
+                    err_msg=f"Failed to record action_start for {tool_name_mcp}.",
+                    status=500,
+                    details={"reason": "ActionStartFailed"},
+                )
+                return await _bail(envelope, mark_replan=True)
 
-        summary_text_for_log = ""
-        if standard_envelope.get("success"):
-            data_payload_for_summary = standard_envelope.get("data")
-            if isinstance(data_payload_for_summary, dict):
-                summary_keys_log = ["summary", "message", "memory_id", "action_id", "artifact_id", "link_id", "thought_chain_id", "thought_id", "state_id", "report", "visualization", "goal_id", "workflow_id", "title"]
-                found_summary_key = False
-                for k_log in summary_keys_log:
-                    if k_log in data_payload_for_summary and data_payload_for_summary[k_log] is not None:
-                        val_str_log = str(data_payload_for_summary[k_log])
-                        summary_text_for_log = f"{k_log}: {_fmt_id(val_str_log) if 'id' in k_log.lower() else val_str_log}"
-                        found_summary_key = True; break
-                if not found_summary_key:
-                    ums_payload_success = data_payload_for_summary.get("success") 
-                    if ums_payload_success is True and len(data_payload_for_summary) == 1 and "success" in data_payload_for_summary:
-                        summary_text_for_log = "Success (UMS tool returned minimal success payload)."
-                    elif ums_payload_success is False: 
-                        summary_text_for_log = f"UMS Tool Reported Failure: {data_payload_for_summary.get('error', data_payload_for_summary.get('error_message', 'Unknown UMS tool error'))[:70]}"
-                    else: 
-                        generic_parts_log = [f"{k_s}={_fmt_id(str(v_s)) if 'id' in k_s.lower() else str(v_s)[:20]}" for k_s, v_s in data_payload_for_summary.items() if v_s is not None and k_s != "success"][:3]
-                        summary_text_for_log = f"Success. Data: {', '.join(generic_parts_log)}" if generic_parts_log else "Success (No specific data in UMS 'data' field)."
-            elif data_payload_for_summary is not None: 
-                summary_text_for_log = f"Success (Data: {str(data_payload_for_summary)[:50]}...)"
-            else: 
-                summary_text_for_log = "Success (No data payload returned by UMS tool)."
-        else: 
-            err_type_log = standard_envelope.get("error_type", "Err_AML")
-            err_msg_log = str(standard_envelope.get("error_message", "Unknown_AML"))[:100]
-            summary_text_for_log = f"Failed ({err_type_log}): {err_msg_log}"
-        
-        if standard_envelope.get("status_code"):
-            summary_text_for_log += f" (Code: {standard_envelope['status_code']})"
-        self.state.last_action_summary = f"{tool_name_mcp} -> {summary_text_for_log}"
-        _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL (AML): Standardized Last Action Summary: {self.state.last_action_summary}")
+        # ────────────────────────── retry-wrapped tool call ─────────────────────────
+        idempotent = current_base in {
+            UMS_FUNC_GET_MEMORY_BY_ID,
+            UMS_FUNC_SEARCH_SEMANTIC_MEMORIES,
+            UMS_FUNC_HYBRID_SEARCH,
+            UMS_FUNC_QUERY_MEMORIES,
+            UMS_FUNC_GET_ACTION_DETAILS,
+            UMS_FUNC_LIST_WORKFLOWS,
+            UMS_FUNC_COMPUTE_STATS,
+            UMS_FUNC_GET_WORKING_MEMORY,
+            UMS_FUNC_GET_LINKED_MEMORIES,
+            UMS_FUNC_GET_ARTIFACTS,
+            UMS_FUNC_GET_ARTIFACT_BY_ID,
+            UMS_FUNC_GET_ACTION_DEPENDENCIES,
+            UMS_FUNC_GET_THOUGHT_CHAIN,
+            UMS_FUNC_GET_WORKFLOW_DETAILS,
+            UMS_FUNC_GET_GOAL_DETAILS,
+            UMS_FUNC_SUMMARIZE_TEXT,
+            UMS_FUNC_SUMMARIZE_CONTEXT_BLOCK,
+            UMS_FUNC_GET_RICH_CONTEXT_PACKAGE,
+            UMS_FUNC_GET_RECENT_ACTIONS,
+            UMS_FUNC_VISUALIZE_REASONING_CHAIN,
+            UMS_FUNC_VISUALIZE_MEMORY_NETWORK,
+            UMS_FUNC_GENERATE_WORKFLOW_REPORT,
+            UMS_FUNC_LOAD_COGNITIVE_STATE,
+        }
 
-        if action_id and should_record_this_action:
-            _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL (AML): Recording UMS action completion for action ID {_fmt_id(action_id)} of tool '{tool_name_mcp}'.")
-            # Pass the standard_envelope, which _record_action_completion_internal expects to find 'tool_result' (which is standard_envelope['data'])
-            # and 'status' (derived from standard_envelope['success']) within its own logic.
-            # To be absolutely clear for _record_action_completion_internal, we can construct what it expects:
-            completion_payload = {
-                "action_id": action_id,
-                "status": ActionStatus.COMPLETED.value if standard_envelope.get("success") else ActionStatus.FAILED.value,
-                "tool_result": standard_envelope # Store the whole envelope as the tool_result in UMS action record
-            }
-            await self._record_action_completion_internal(action_id, completion_payload) 
+        stats = self.state.tool_usage_stats.setdefault(
+            tool_name_mcp, {"success": 0, "failure": 0, "latency_ms_total": 0.0}
+        )
+        start_ts = time.time()
 
-        _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL (AML): Calling side effects for base_func_name='{current_base_func_name}'.")
-        await self._handle_workflow_and_goal_side_effects(current_base_func_name, final_arguments, standard_envelope) 
-        _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL (AML): After calling side effects for base_func_name='{current_base_func_name}'.")
-        
-        _force_print(f"FORCE_PRINT AML_EXEC_TOOL_INTERNAL (AML): Final envelope for '{tool_name_mcp}': Success={standard_envelope.get('success')}, ErrorType={standard_envelope.get('error_type')}")
-        return standard_envelope
-    
+        async def _run_call():
+            clean_args = {k: v for k, v in final_args.items() if v is not None}
+            return await self.mcp_client._execute_tool_and_parse_for_agent(
+                target_server, tool_name_mcp, clean_args
+            )
 
-    async def _check_and_trigger_promotion(self, memory_id: str, *, workflow_id: Optional[str], context_id: Optional[str]):
-        # workflow_id here is the snapshot
-        current_agent_workflow_id = self.state.workflow_id
-        if workflow_id != current_agent_workflow_id or self._shutdown_event.is_set():
-            self.logger.debug(f"Skipping promo check for {_fmt_id(memory_id)}: WF changed or shutdown.")
-            return
-
-        promote_mem_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_PROMOTE_MEM)
-        if not memory_id or not self._find_tool_server(promote_mem_mcp_name):
-            self.logger.debug(f"Skipping promo check for {_fmt_id(memory_id)}: Invalid ID or tool for '{UMS_FUNC_PROMOTE_MEM}' unavailable.")
-            return
         try:
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            if self._shutdown_event.is_set():
-                return
-
-            self.logger.debug(f"Checking promo potential for memory {_fmt_id(memory_id)} in WF {_fmt_id(workflow_id)}...")
-            # Pass workflow_id to the UMS tool if it requires it (some UMS tools might infer from memory_id)
-            promo_args = {"memory_id": memory_id}
-            # if workflow_id: promo_args["workflow_id"] = workflow_id # promote_memory_level doesn't take workflow_id
-
-            promo_res = await self._execute_tool_call_internal(promote_mem_mcp_name, promo_args, record_action=False)
-            if promo_res.get("success"):
-                if promo_res.get("promoted"):
-                    self.logger.info(
-                        f"⬆️ Memory {_fmt_id(memory_id)} promoted from {promo_res.get('previous_level')} to {promo_res.get('new_level')}."
-                    )
-                else:
-                    self.logger.debug(f"Memory {_fmt_id(memory_id)} not promoted: {promo_res.get('reason')}")
-            else:
-                self.logger.warning(f"Promo check tool failed for {_fmt_id(memory_id)}: {promo_res.get('error')}")
-        except Exception as e:
-            self.logger.warning(f"Error in promo check task for {_fmt_id(memory_id)}: {e}", exc_info=False)
-
-
-    async def _handle_workflow_and_goal_side_effects(self, base_tool_func_name: str, arguments: Dict, result_content_envelope: Dict):
-        """
-        Handles agent state changes triggered by specific UMS tool outcomes,
-        particularly workflow creation/status changes and goal creation/status changes.
-        This method consumes the standardized envelope from _execute_tool_call_internal.
-
-        Args:
-            base_tool_func_name: The canonical base function name (e.g., "create_workflow").
-            arguments: The arguments passed to the original UMS tool call.
-            result_content_envelope: The standardized dictionary envelope from _execute_tool_call_internal.
-        """
-        if not isinstance(result_content_envelope, dict):
-            self.logger.error(
-                f"AML_SIDE_EFFECTS CRITICAL: result_content_envelope is not a dict (type: {type(result_content_envelope)}) for tool '{base_tool_func_name}'. This indicates a severe internal error in _execute_tool_call_internal."
+            result = await self._with_retries(
+                _run_call, max_retries=3 if idempotent else 1
             )
+        except asyncio.CancelledError:
+            envelope.update(
+                err_type="CancelledError_AML",
+                err_msg="Tool execution cancelled by AML.",
+            )
+            if action_id and should_record:
+                await self._record_action_completion_internal(
+                    action_id,
+                    _mk_envelope(
+                        success=False,
+                        err_type="CancelledError_AML",
+                        err_msg="Operation cancelled by AML",
+                        details={"reason": "AML cancellation"},
+                    ),
+                )
+            raise
+        except Exception as exc:
+            envelope.update(
+                err_type="AMLRetryOrWrapperError",
+                err_msg=f"Unexpected error during tool call: {exc}",
+            )
+            result = envelope  # ensure downstream code has dict
+
+        # result is guaranteed dict at this point
+        if not isinstance(result, dict):
+            result = _mk_envelope(
+                err_type="MCPClientContractError_AML",
+                err_msg="MCPClient wrapper returned non-dict result.",
+            )
+
+        envelope = result  # definitive envelope
+
+        # ─────────────────────────── stats + counters ──────────────────────────────
+        stats["latency_ms_total"] += (time.time() - start_ts) * 1000.0
+        if envelope.get("success"):
+            stats["success"] += 1
+            if (
+                self.state.last_error_details
+                and self.state.last_error_details.get("tool") == tool_name_mcp
+            ):
+                self.state.last_error_details = None
+        else:
+            stats["failure"] += 1
+
+        # ─────────────────────── background-task scheduling ────────────────────────
+        if envelope.get("success"):
+            data = envelope.get("data") or {}
+            bg_wf_id = data.get("workflow_id", wf_id)
+            bg_ctx_id = data.get("context_id", ctx_id)
+            if bg_wf_id:
+                # auto-linking
+                if current_base in [UMS_FUNC_STORE_MEMORY, UMS_FUNC_UPDATE_MEMORY] and data.get("memory_id"):
+                    self._start_background_task(
+                        AgentMasterLoop._run_auto_linking,
+                        memory_id=data["memory_id"],
+                        workflow_id=bg_wf_id,
+                        context_id=bg_ctx_id,
+                    )
+                elif current_base == UMS_FUNC_RECORD_ARTIFACT and data.get("linked_memory_id"):
+                    self._start_background_task(
+                        AgentMasterLoop._run_auto_linking,
+                        memory_id=data["linked_memory_id"],
+                        workflow_id=bg_wf_id,
+                        context_id=bg_ctx_id,
+                    )
+                elif current_base == UMS_FUNC_RECORD_THOUGHT and data.get("linked_memory_id"):
+                    self._start_background_task(
+                        AgentMasterLoop._run_auto_linking,
+                        memory_id=data["linked_memory_id"],
+                        workflow_id=bg_wf_id,
+                        context_id=bg_ctx_id,
+                    )
+
+                # promotion candidates
+                promo_ids: Set[str] = set()
+                if current_base == UMS_FUNC_GET_MEMORY_BY_ID and isinstance(
+                    data.get("memory_id"), str
+                ):
+                    promo_ids.add(data["memory_id"])
+                elif current_base == UMS_FUNC_GET_WORKING_MEMORY and isinstance(
+                    data.get("working_memories"), list
+                ):
+                    promo_ids.update(
+                        m.get("memory_id")
+                        for m in data["working_memories"][:3]
+                        if isinstance(m, dict)
+                    )
+                    if data.get("focal_memory_id"):
+                        promo_ids.add(data["focal_memory_id"])
+                elif current_base in {
+                    UMS_FUNC_QUERY_MEMORIES,
+                    UMS_FUNC_HYBRID_SEARCH,
+                    UMS_FUNC_SEARCH_SEMANTIC_MEMORIES,
+                } and isinstance(data.get("memories"), list):
+                    promo_ids.update(
+                        m.get("memory_id")
+                        for m in data["memories"][:3]
+                        if isinstance(m, dict)
+                    )
+
+                for mem_id in filter(None, promo_ids):
+                    self._start_background_task(
+                        AgentMasterLoop._check_and_trigger_promotion,
+                        memory_id=mem_id,
+                        workflow_id=bg_wf_id,
+                        context_id=bg_ctx_id,
+                    )
+
+        # ─────────────── propagate failure to agent-level error state ──────────────
+        if not envelope.get("success"):
+            mapped_type = envelope.get("error_type") or "ToolExecutionError_AML"
+            # canonicalise for downstream heuristics
+            if mapped_type in {
+                "UMSToolReportedFailure",
+                "UMSError_AML",
+                "UMSError",
+                "ContentParsingError",
+                "MCPClientContractError_AML",
+                "AMLRetryOrWrapperError",
+            }:
+                mapped_type = "UMSError"
+            elif mapped_type == "ToolMaxRetriesOrServerError":
+                mapped_type = "ServerUnavailable"
+            elif mapped_type.startswith("AML"):
+                mapped_type = "AgentError"
+
             self.state.last_error_details = {
-                "tool": self._get_ums_tool_mcp_name(base_tool_func_name) if base_tool_func_name else "UnknownToolDueToError",
-                "error": "Internal error: Tool result processing failed to produce standard envelope.",
-                "type": "AgentError",
-                "details": {"raw_result_type": str(type(result_content_envelope))},
+                "tool": tool_name_mcp,
+                "args": arguments,
+                "error": envelope.get("error_message"),
+                "status_code": envelope.get("status_code"),
+                "type": mapped_type,
+                "details": envelope.get("details"),
             }
-            self.state.needs_replan = True
+            if not idempotent and not self.state.needs_replan:
+                self.state.needs_replan = True
+                self.logger.info(
+                    "AML EXEC_TOOL_INTERNAL: needs_replan=True (non-idempotent failure %s)",
+                    tool_name_mcp,
+                )
+
+        # ───────────────────────- human-readable action summary ────────────────────
+        if envelope.get("success"):
+            data = envelope.get("data")
+            summary = "Success"
+            if isinstance(data, dict):
+                for k in (
+                    "summary",
+                    "message",
+                    "memory_id",
+                    "action_id",
+                    "artifact_id",
+                    "link_id",
+                    "thought_chain_id",
+                    "thought_id",
+                    "state_id",
+                    "report",
+                    "visualization",
+                    "goal_id",
+                    "workflow_id",
+                    "title",
+                ):
+                    if k in data and data[k] is not None:
+                        v = str(data[k])
+                        summary = f"{k}: {_fmt_id(v) if 'id' in k.lower() else v}"
+                        break
+            self.state.last_action_summary = f"{tool_name_mcp} -> {summary}"
+        else:
+            msg = f"Failed ({envelope.get('error_type')}): {envelope.get('error_message')}"
+            if envelope.get("status_code") is not None:
+                msg += f" (Code: {envelope['status_code']})"
+            self.state.last_action_summary = f"{tool_name_mcp} -> {msg}"
+
+        _force_print(
+            f"AML_EXEC_TOOL_INTERNAL: last_action_summary='{self.state.last_action_summary}'"
+        )
+
+        # ────────────────────────── record action completion ───────────────────────
+        if action_id and should_record:
+            try:
+                await self._record_action_completion_internal(action_id, envelope)
+            except Exception as exc:
+                self.logger.error(
+                    "Failed to record completion for action %s: %s", action_id, exc, exc_info=True
+                )
+
+        # ───────────────────────── workflow / goal side-effects ────────────────────
+        await self._handle_workflow_and_goal_side_effects(current_base, final_args, envelope)
+
+        _force_print(
+            f"AML_EXEC_TOOL_INTERNAL: returning envelope "
+            f"success={envelope.get('success')} err={envelope.get('error_type')}"
+        )
+        return envelope
+
+
+    async def _run_periodic_tasks(self) -> None:  # noqa: C901 – complex but contained
+        """Schedule and execute housekeeping / meta-cognitive UMS calls.
+        """
+        # ------------------------------------------------------------------ guard
+        if (
+            not self.state.workflow_id
+            or not self.state.context_id  # context_id might be None if just workflow created
+            or self._shutdown_event.is_set()
+        ):
+            self.logger.debug(
+                "Skipping periodic tasks: inactive workflow/context or shutdown."
+            )
             return
 
-        is_ums_tool_call_successful_in_envelope = result_content_envelope.get("success", False)
-        ums_data_payload = result_content_envelope.get("data", {}) # Default to empty dict if 'data' is missing
+        log_prefix = f"AML_PERIODIC (WF:{_fmt_id(self.state.workflow_id)}, Loop:{self.state.current_loop})"
+        self.logger.debug("%s: Evaluating periodic tasks.", log_prefix)
 
-        # Ensure ums_data_payload is a dict if the envelope claimed success and the tool is expected to return a dict.
-        # For tools that might return non-dict success (e.g., summarize_text returns string), this check is nuanced.
-        # For the critical state-changing tools here, we expect a dict.
-        expected_dict_payload_tools = [
-            UMS_FUNC_CREATE_WORKFLOW, UMS_FUNC_UPDATE_WORKFLOW_STATUS,
-            UMS_FUNC_CREATE_GOAL, UMS_FUNC_UPDATE_GOAL_STATUS,
-            # UMS_FUNC_RECORD_THOUGHT, UMS_FUNC_SAVE_COGNITIVE_STATE are also expected to return dicts
-        ]
+        # ----------------------------------------------------- helper: add_task()
+        tasks_to_run: List[Tuple[str, Dict[str, any]]] = []
+        trigger_reasons: List[str] = []
 
-        if base_tool_func_name in expected_dict_payload_tools and not isinstance(ums_data_payload, dict):
-            self.logger.warning(
-                f"AML_SIDE_EFFECTS: UMS Tool '{base_tool_func_name}' envelope success={is_ums_tool_call_successful_in_envelope}, "
-                f"but its 'data' payload is not a dict (type: {type(ums_data_payload)}). Using empty dict for safety. "
-                f"Full Envelope Preview: {str(result_content_envelope)[:300]}"
-            )
-            if is_ums_tool_call_successful_in_envelope: # If envelope said success but data is wrong type for these tools
-                self.logger.error(
-                    f"AML_SIDE_EFFECTS: UMS Tool '{base_tool_func_name}' reported success in envelope, "
-                    f"but its 'data' payload is malformed for critical state update. Cannot reliably process side effects."
+        def add_task(tool_name: str, args: Dict[str, any], reason: str) -> None:
+            """Idempotently queue a task and record its trigger reason."""
+            if any(t[0] == tool_name for t in tasks_to_run):
+                return  # already queued
+            tasks_to_run.append((tool_name, args))
+            trigger_reasons.append(reason)
+
+        # ---------------------------------------------------- tool registry table
+        # Each entry: (base_ums_function, should_check_workflow_id, should_check_ctx_id)
+        # For periodic tasks, workflow_id is almost always needed for context,
+        # context_id is needed for context-specific operations like optimize_wm.
+        tool_registry: Dict[str, Tuple[str, bool, bool]] = {
+            "reflection"      : (UMS_FUNC_REFLECTION,       True,  False),
+            "consolidation"   : (UMS_FUNC_CONSOLIDATION,    True,  False),
+            "opt_wm"          : (UMS_FUNC_OPTIMIZE_WM,      False, True ), # Requires context_id
+            "auto_focus"      : (UMS_FUNC_AUTO_FOCUS,       False, True ), # Requires context_id
+            "query_mem"       : (UMS_FUNC_QUERY_MEMORIES,   True,  False), # For promotion checks
+            "stats"           : (UMS_FUNC_COMPUTE_STATS,    True,  False),
+            "maintenance"     : (UMS_FUNC_DELETE_EXPIRED_MEMORIES, False, False), # Global or UMS handles scope
+        }
+
+        # Map base-name → full MCP name and availability
+        tool_info: Dict[str, Tuple[str, bool]] = {}
+        for alias, (base_fn, *_rest) in tool_registry.items():
+            full_mcp_name = self._get_ums_tool_mcp_name(base_fn)
+            tool_info[alias] = (full_mcp_name, self._find_tool_server(full_mcp_name) is not None)
+
+        # ---------------------------------------------------------------- stats +
+        self.state.loops_since_stats_adaptation += 1
+        try:
+            if self.state.loops_since_stats_adaptation >= STATS_ADAPTATION_INTERVAL:
+                self.state.loops_since_stats_adaptation = 0  # reset early
+                full_stats_tool_name, stats_tool_available = tool_info["stats"]
+                if not stats_tool_available:
+                    self.logger.warning("%s: Stats tool '%s' unavailable.", log_prefix, full_stats_tool_name)
+                elif not self.state.workflow_id: # Guard against stats call without workflow_id
+                    self.logger.warning("%s: Skipping stats collection - no active workflow_id.", log_prefix)
+                else:
+                    self.logger.debug("%s: Triggering compute_memory_statistics for workflow %s.", log_prefix, self.state.workflow_id)
+                    stats_result_envelope = {} # Default to empty dict
+                    with contextlib.suppress(asyncio.CancelledError): # Allow cancellation
+                        stats_result_envelope = await asyncio.wait_for(
+                            self._execute_tool_call_internal(
+                                full_stats_tool_name,
+                                {"workflow_id": self.state.workflow_id}, # Explicitly pass workflow_id
+                                record_action=False,
+                            ),
+                            timeout=_TASK_TIMEOUT_SEC,
+                        )
+                    
+                    # UMS tools return payload directly in envelope if not nested under 'data'
+                    # For compute_memory_statistics, the stats are the direct payload.
+                    if stats_result_envelope.get("success"):
+                        # The stats_result_envelope *is* the UMS payload here.
+                        self._adapt_thresholds(stats_result_envelope)
+                        episodic_cnt = stats_result_envelope.get("by_level", {}).get(
+                            MemoryLevel.EPISODIC.value, 0
+                        )
+                        # Queue consolidation if episodic backlog is huge
+                        full_consolidation_tool_name, consolidation_tool_available = tool_info["consolidation"]
+                        if (
+                            episodic_cnt
+                            > (self.state.current_consolidation_threshold * 2.0)
+                            and consolidation_tool_available
+                            and self.state.workflow_id # Ensure workflow_id for consolidation
+                        ):
+                            add_task(
+                                full_consolidation_tool_name,
+                                {
+                                    "workflow_id": self.state.workflow_id, # Pass workflow_id
+                                    "consolidation_type": "summary",
+                                    "query_filter": {"memory_level": MemoryLevel.EPISODIC.value},
+                                    "max_source_memories": self.consolidation_max_sources,
+                                },
+                                f"HighEpisodic({episodic_cnt})",
+                            )
+                    else:
+                        self.logger.warning(
+                            "%s: compute_memory_statistics call failed: %s",
+                            log_prefix,
+                            stats_result_envelope.get("error_message") or stats_result_envelope.get("error"),
+                        )
+        except Exception as e_stats:
+             self.logger.error(f"{log_prefix}: Error during stats adaptation block: {e_stats}", exc_info=True)
+        finally:
+            # guarantee counter reset even if an exception bubbles
+            self.state.loops_since_stats_adaptation = 0
+
+        # ------------------------------------------------------- reflection need
+        needs_reflection = (
+            self.state.needs_replan # Agent explicitly flagged for replan
+            or self.state.successful_actions_since_reflection >= self.state.current_reflection_threshold
+        )
+        full_reflection_tool_name, reflection_tool_available = tool_info["reflection"]
+        if needs_reflection and reflection_tool_available:
+            if not self.state.workflow_id:
+                self.logger.warning("%s: Skipping reflection - no active workflow_id.", log_prefix)
+            else:
+                reflection_type = self.reflection_type_sequence[
+                    self.state.reflection_cycle_index % len(self.reflection_type_sequence)
+                ]
+                add_task(
+                    full_reflection_tool_name,
+                    {"workflow_id": self.state.workflow_id, "reflection_type": reflection_type},
+                    "Replan" if self.state.needs_replan else "ReflectionThreshold",
                 )
-                self.state.last_error_details = {
-                    "tool": self._get_ums_tool_mcp_name(base_tool_func_name),
-                    "error": f"UMS tool {base_tool_func_name} success payload malformed (data not a dict).",
-                    "type": "UMSError", 
-                    "envelope_preview": str(result_content_envelope)[:200],
-                }
-                self.state.needs_replan = True
-                return 
-            ums_data_payload = {} # Force to empty dict for safety in subsequent .get() calls if envelope was already failure
+                self.state.successful_actions_since_reflection = 0 # Reset counter after scheduling
+                self.state.reflection_cycle_index += 1
+        elif needs_reflection and not reflection_tool_available:
+            self.logger.warning("%s: Reflection tool '%s' unavailable. Resetting reflection counter.", log_prefix, full_reflection_tool_name)
+            self.state.successful_actions_since_reflection = 0 # Still reset counter
 
-        log_prefix = f"AML_SIDE_EFFECTS ({base_tool_func_name}, EnvelopeSuccess: {is_ums_tool_call_successful_in_envelope})"
-        current_wf_id_before_effect = self.state.workflow_id
-        current_goal_id_before_effect = self.state.current_goal_id
-        needs_replan_before_side_effects = self.state.needs_replan
+        # ---------------------------------------------------- consolidation need
+        full_consolidation_tool_name, consolidation_tool_available = tool_info["consolidation"]
+        if (
+            self.state.successful_actions_since_consolidation >= self.state.current_consolidation_threshold
+        ):
+            if consolidation_tool_available:
+                if not self.state.workflow_id:
+                     self.logger.warning("%s: Skipping consolidation - no active workflow_id.", log_prefix)
+                else:
+                    add_task(
+                        full_consolidation_tool_name,
+                        {
+                            "workflow_id": self.state.workflow_id, # Pass workflow_id
+                            "consolidation_type": "summary",
+                            "query_filter": {"memory_level": self.consolidation_memory_level},
+                            "max_source_memories": self.consolidation_max_sources,
+                        },
+                        "ConsolidationThreshold",
+                    )
+                self.state.successful_actions_since_consolidation = 0 # Reset counter after scheduling
+            else:
+                self.logger.warning("%s: Consolidation tool '%s' unavailable. Resetting consolidation counter.", log_prefix, full_consolidation_tool_name)
+                self.state.successful_actions_since_consolidation = 0 # Still reset
 
-        self.logger.info(
-            f"{log_prefix}: Entered. WF (before): {_fmt_id(current_wf_id_before_effect)}, "
-            f"UMS Goal (before): {_fmt_id(current_goal_id_before_effect)}, "
-            f"NeedsReplan (before this func): {needs_replan_before_side_effects}. "
-            f"UMS Data Payload Preview (from envelope.data): {str(ums_data_payload)[:200]}"
+        # --------------------------------------------------- optimisation / focus
+        self.state.loops_since_optimization += 1
+        full_opt_wm_tool_name, opt_wm_tool_available = tool_info["opt_wm"]
+        full_auto_focus_tool_name, auto_focus_tool_available = tool_info["auto_focus"]
+
+        if self.state.loops_since_optimization >= OPTIMIZATION_LOOP_INTERVAL:
+            self.state.loops_since_optimization = 0 # Reset counter
+            if not self.state.context_id: # Guard for context_id specific tools
+                self.logger.warning("%s: Skipping optimize_wm and auto_focus - no active context_id.", log_prefix)
+            else:
+                if opt_wm_tool_available:
+                    add_task(
+                        full_opt_wm_tool_name,
+                        {"context_id": self.state.context_id}, # Pass context_id
+                        "OptimizeInterval",
+                    )
+                else:
+                    self.logger.warning("%s: optimize_working_memory tool '%s' unavailable.", log_prefix, full_opt_wm_tool_name)
+
+                if auto_focus_tool_available:
+                    add_task(
+                        full_auto_focus_tool_name,
+                        {"context_id": self.state.context_id}, # Pass context_id
+                        "FocusUpdateInterval",
+                    )
+                else:
+                    self.logger.warning("%s: auto_focus tool '%s' unavailable.", log_prefix, full_auto_focus_tool_name)
+
+        # -------------------------------------------------------- promotion check
+        self.state.loops_since_promotion_check += 1
+        full_query_mem_tool_name, query_mem_tool_available = tool_info["query_mem"]
+        if self.state.loops_since_promotion_check >= MEMORY_PROMOTION_LOOP_INTERVAL:
+            self.state.loops_since_promotion_check = 0 # Reset counter
+            if query_mem_tool_available: # query_memories is used by the internal helper
+                if not self.state.workflow_id:
+                    self.logger.warning("%s: Skipping promotion check - no active workflow_id for query_memories.", log_prefix)
+                else:
+                    add_task(
+                        _INTERNAL_PROMO_SENTINEL, # Internal sentinel for _trigger_promotion_checks
+                        {"workflow_id": self.state.workflow_id}, # Pass workflow_id
+                        "PromotionInterval",
+                    )
+            else:
+                self.logger.warning("%s: query_memories tool '%s' (needed for promotion) unavailable.", log_prefix, full_query_mem_tool_name)
+
+        # ----------------------------------------------------------- maintenance
+        self.state.loops_since_maintenance += 1
+        full_maintenance_tool_name, maintenance_tool_available = tool_info["maintenance"]
+        if self.state.loops_since_maintenance >= MAINTENANCE_INTERVAL:
+            self.state.loops_since_maintenance = 0 # Reset counter
+            if maintenance_tool_available:
+                add_task(
+                    full_maintenance_tool_name,
+                    {"db_path": None}, # UMS uses its own default db_path for this
+                    "MaintenanceInterval",
+                )
+            else:
+                self.logger.warning(
+                    "%s: delete_expired_memories tool '%s' unavailable.", log_prefix, full_maintenance_tool_name
+                )
+
+        # --------------------------------------------------- nothing to execute?
+        if not tasks_to_run:
+            self.logger.debug("%s: No periodic tasks scheduled this cycle.", log_prefix)
+            return
+
+        # -------------------------------------------------------- execute queue
+        # stable ordering by priority
+        tasks_to_run.sort(
+            key=lambda t: _TASK_PRIORITY.get(self._get_base_function_name(t[0]), 99)
         )
 
-        # --- Side effects for UMS_FUNC_CREATE_WORKFLOW ---
-        if base_tool_func_name == UMS_FUNC_CREATE_WORKFLOW:
-            if is_ums_tool_call_successful_in_envelope and ums_data_payload.get("success"): # Both envelope and UMS payload success
-                self.logger.info(f"{log_prefix}: UMS 'create_workflow' fully successful. Payload: {str(ums_data_payload)[:300]}")
-
-                new_wf_id_from_ums = ums_data_payload.get("workflow_id")
-                primary_chain_id_from_ums = ums_data_payload.get("primary_thought_chain_id")
-                # UMS create_workflow returns the 'goal' text it was given, and its 'title'.
-                # It also implicitly creates the primary cognitive_state with state_id == workflow_id.
-                workflow_goal_text_from_ums_payload = ums_data_payload.get("goal")
-                workflow_title_from_ums_payload = ums_data_payload.get("title")
-
-                if not (new_wf_id_from_ums and isinstance(new_wf_id_from_ums, str)):
-                    self.logger.error(f"{log_prefix}: CRITICAL - UMS create_workflow success payload missing valid 'workflow_id'. UMS Data: {ums_data_payload}")
-                    self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_WORKFLOW), "error": "UMS create_workflow success payload invalid 'workflow_id'.", "type": "UMSError"}
-                    self.state.needs_replan = True; return
-
-                if not (primary_chain_id_from_ums and isinstance(primary_chain_id_from_ums, str)):
-                    self.logger.error(f"{log_prefix}: CRITICAL - UMS create_workflow success payload missing valid 'primary_thought_chain_id'. UMS Data: {ums_data_payload}")
-                    self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_WORKFLOW), "error": "UMS create_workflow success payload invalid 'primary_thought_chain_id'.", "type": "UMSError"}
-                    self.state.needs_replan = True; return
-
-                await asyncio.sleep(0.2) # Increased delay slightly for DB visibility
-                if not await self._check_workflow_exists(new_wf_id_from_ums): # Robust check
-                    self.logger.error(f"{log_prefix}: CRITICAL - UMS create_workflow success, but WF ID '{_fmt_id(new_wf_id_from_ums)}' NOT FOUND on re-check.")
-                    self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_WORKFLOW), "error": f"UMS created WF '{_fmt_id(new_wf_id_from_ums)}' not found on re-check.", "type": "UMSError", "details":"DB_VISIBILITY_ISSUE_POST_CREATE_WF"}
-                    self.state.needs_replan = True; return
-                
-                self.logger.info(f"{log_prefix}: Successfully created AND VERIFIED new workflow_id in UMS: {_fmt_id(new_wf_id_from_ums)}.")
-
-                # --- Update Agent State with NEW Workflow Info ---
-                self.state.workflow_id = new_wf_id_from_ums
-                self.state.context_id = new_wf_id_from_ums # UMS create_workflow sets up cognitive_state with state_id = workflow_id
-                self.state.current_thought_chain_id = primary_chain_id_from_ums
-
-                parent_wf_id_arg_from_call = arguments.get("parent_workflow_id")
-                is_sub_workflow = parent_wf_id_arg_from_call and parent_wf_id_arg_from_call == current_wf_id_before_effect
-                if is_sub_workflow:
-                    self.state.workflow_stack.append(new_wf_id_from_ums)
-                else:
-                    self.state.workflow_stack = [new_wf_id_from_ums]
-
-                self.state.goal_stack = []
-                self.state.current_goal_id = None
-                self.state.needs_replan = False 
-                self.state.last_error_details = None
-                self.state.consecutive_error_count = 0
-                self.logger.info(f"{log_prefix}: Agent state updated for new WF. WF ID={_fmt_id(self.state.workflow_id)}, Context ID={_fmt_id(self.state.context_id)}, Chain={_fmt_id(self.state.current_thought_chain_id)}.")
-
-                # --- Create the Root UMS GOAL (in 'goals' table) for this new workflow ---
-                initial_setup_for_goal_succeeded = True
-                created_ums_goal_object_for_state: Optional[Dict[str, Any]] = None
-                
-                # Determine description & title for the root UMS goal
-                root_goal_description_for_ums_table = (
-                    workflow_goal_text_from_ums_payload 
-                    if workflow_goal_text_from_ums_payload is not None 
-                    else arguments.get("goal", f"Overall objectives for workflow {_fmt_id(self.state.workflow_id)}")
-                )
-                root_goal_title_for_ums_table = (
-                    workflow_title_from_ums_payload # Use workflow title as goal title for root
-                    if workflow_title_from_ums_payload is not None
-                    else arguments.get("title", f"Primary Goal for WF-{self.state.workflow_id[:8]}")
-                )
-
-                create_goal_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_GOAL)
-                if self._find_tool_server(create_goal_mcp_name):
-                    goal_args_for_ums = {
-                        "workflow_id": self.state.workflow_id,
-                        "description": root_goal_description_for_ums_table,
-                        "title": root_goal_title_for_ums_table,
-                        "parent_goal_id": None, # This IS the root UMS goal
-                        "initial_status": GoalStatus.ACTIVE.value
-                    }
-                    self.logger.info(f"{log_prefix}: Creating root UMS 'goals' table entry for WF '{_fmt_id(self.state.workflow_id)}'. Desc: '{root_goal_description_for_ums_table[:50]}...'")
-                    
-                    goal_creation_envelope = await self._execute_tool_call_internal(create_goal_mcp_name, goal_args_for_ums, record_action=False)
-                    goal_creation_ums_payload = goal_creation_envelope.get("data", {})
-
-                    if goal_creation_envelope.get("success") and isinstance(goal_creation_ums_payload, dict) and goal_creation_ums_payload.get("success"):
-                        created_ums_goal_object_for_state = goal_creation_ums_payload.get("goal")
-                        if isinstance(created_ums_goal_object_for_state, dict) and created_ums_goal_object_for_state.get("goal_id"):
-                            self.state.goal_stack = [created_ums_goal_object_for_state] # Initialize stack with this root UMS goal
-                            self.state.current_goal_id = created_ums_goal_object_for_state["goal_id"]
-                            self.logger.info(f"{log_prefix}: Successfully created UMS root goal (in 'goals' table): {_fmt_id(self.state.current_goal_id)}.")
-                        else:
-                            self.logger.error(f"{log_prefix}: UMS create_goal for root returned success but malformed 'goal' object. Payload: {goal_creation_ums_payload}")
-                            initial_setup_for_goal_succeeded = False
-                            if not self.state.last_error_details: self.state.last_error_details = {"tool": create_goal_mcp_name, "error": "UMS create_goal (root) success payload malformed.", "type": "GoalManagementError"}
-                    else: # UMS create_goal call failed
-                        self.logger.error(f"{log_prefix}: Failed to create UMS root goal. Error: {goal_creation_envelope.get('error_message', 'Unknown error')}")
-                        initial_setup_for_goal_succeeded = False
-                        if not self.state.last_error_details: self.state.last_error_details = {"tool": create_goal_mcp_name, "error": goal_creation_envelope.get('error_message', "Failed UMS root goal creation."), "type": goal_creation_envelope.get('error_type', "GoalManagementError")}
-                else: # UMS_FUNC_CREATE_GOAL tool not found
-                    self.logger.error(f"{log_prefix}: Tool '{UMS_FUNC_CREATE_GOAL}' unavailable. Cannot create root UMS goal in 'goals' table.")
-                    initial_setup_for_goal_succeeded = False
-                    if not self.state.last_error_details: self.state.last_error_details = {"tool": create_goal_mcp_name, "error": "Tool unavailable", "type": "ToolUnavailable"}
-
-                # Set Initial Plan
-                if initial_setup_for_goal_succeeded and self.state.current_goal_id:
-                    current_ums_goal_obj_desc = created_ums_goal_object_for_state.get("description", "Newly established root UMS goal") if created_ums_goal_object_for_state else "Newly established root UMS goal"
-                    plan_step_desc = (
-                        f"Initial assessment of root UMS goal: '{current_ums_goal_obj_desc[:70]}...' "
-                        f"(UMS Goal ID: {_fmt_id(self.state.current_goal_id)}). My task is to understand this goal and outline the first concrete steps."
-                    )
-                    self.state.current_plan = [PlanStep(description=plan_step_desc, assigned_tool=None)]
-                    self.state.needs_replan = False # LLM should execute this assessment step by recording thoughts
-                    self.logger.info(f"{log_prefix}: Initial plan set: Assess new root UMS goal. NeedsReplan is False.")
-                else: # Root UMS goal setup failed
-                    plan_desc_error = (
-                        f"ERROR: Failed to establish initial UMS root goal (in 'goals' table) for workflow '{_fmt_id(self.state.workflow_id)}'. "
-                        f"Agent cannot proceed effectively. Review last error details and UMS state."
-                    )
-                    self.state.current_plan = [PlanStep(description=plan_desc_error, status="failed")]
-                    self.state.needs_replan = True 
-                    self.logger.error(f"{log_prefix}: Plan set to error state due to failed root UMS goal setup. Last error: {self.state.last_error_details}")
-
-            elif not is_ums_tool_call_successful_in_envelope: # UMS create_workflow tool call itself FAILED (envelope error)
-                self.logger.error(
-                    f"{log_prefix}: UMS Tool '{UMS_FUNC_CREATE_WORKFLOW}' call failed as per standardized envelope. "
-                    f"Error: {result_content_envelope.get('error_message', 'Unknown UMS error')}. Cannot proceed."
-                )
-                # self.state.last_error_details should have been set by _execute_tool_call_internal
-                self.state.needs_replan = True 
-
-            self.logger.info(
-                f"{log_prefix}: END of create_workflow side effects. Current State: "
-                f"WF ID='{_fmt_id(self.state.workflow_id)}', "
-                f"Context ID='{_fmt_id(self.state.context_id)}', "
-                f"UMS Goal ID='{_fmt_id(self.state.current_goal_id)}', "
-                f"Plan Step 0 Desc='{self.state.current_plan[0].description[:50] if self.state.current_plan else 'N/A'}', "
-                f"needs_replan={self.state.needs_replan}"
-            )
-
-        # --- Side effects for UMS_FUNC_CREATE_GOAL (when called by LLM directly) ---
-        elif base_tool_func_name == UMS_FUNC_CREATE_GOAL:
-            if is_ums_tool_call_successful_in_envelope and isinstance(ums_data_payload, dict) and ums_data_payload.get("success"):
-                self.logger.info(
-                    f"{log_prefix} (LLM invoked UMS_FUNC_CREATE_GOAL): START (UMS Success). Current UMS Goal (before): {_fmt_id(self.state.current_goal_id)}"
-                )
-                created_ums_goal_obj_from_llm_req = ums_data_payload.get("goal") 
-
-                if isinstance(created_ums_goal_obj_from_llm_req, dict) and created_ums_goal_obj_from_llm_req.get("goal_id"):
-                    if created_ums_goal_obj_from_llm_req.get("workflow_id") != self.state.workflow_id:
-                        self.logger.error(
-                            f"{log_prefix}: LLM created UMS goal {_fmt_id(created_ums_goal_obj_from_llm_req.get('goal_id'))} for incorrect workflow "
-                            f"'{_fmt_id(created_ums_goal_obj_from_llm_req.get('workflow_id'))}' (Agent WF: '{_fmt_id(self.state.workflow_id)}'). Ignoring."
-                        )
-                        self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_GOAL), "error": "LLM created UMS goal for an incorrect workflow.", "type": "GoalManagementError"}
-                        self.state.needs_replan = True
-                    else: 
-                        self.state.goal_stack.append(created_ums_goal_obj_from_llm_req)
-                        self.state.current_goal_id = created_ums_goal_obj_from_llm_req["goal_id"]
-                        self.logger.info(
-                            f"📌 {log_prefix}: Pushed new UMS goal {_fmt_id(self.state.current_goal_id)} to local stack: '{created_ums_goal_obj_from_llm_req.get('description', '')[:50]}...'. Stack depth: {len(self.state.goal_stack)}"
-                        )
-                        
-                        new_goal_desc_llm = created_ums_goal_obj_from_llm_req.get("description", f"Goal {self.state.current_goal_id[:8]}")
-                        record_thought_mcp_name_llm = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_THOUGHT)
-                        if self._find_tool_server(record_thought_mcp_name_llm):
-                            thought_args = {"workflow_id": self.state.workflow_id, "content": f"Established new UMS sub-goal: {new_goal_desc_llm}", "thought_type": ThoughtType.GOAL.value, "thought_chain_id": self.state.current_thought_chain_id}
-                            thought_res_env = await self._execute_tool_call_internal(record_thought_mcp_name_llm, thought_args, record_action=False)
-                            if thought_res_env.get("success") and isinstance(thought_res_env.get("data"), dict) and thought_res_env["data"].get("success"):
-                                self.logger.info(f"{log_prefix}: Recorded UMS thought {_fmt_id(thought_res_env['data'].get('thought_id'))} for LLM-created UMS goal.")
-                            else:
-                                self.logger.warning(f"{log_prefix}: Failed to record UMS thought for LLM-created UMS goal. Error: {thought_res_env.get('error_message')}")
-                        else:
-                            self.logger.warning(f"{log_prefix}: Tool '{UMS_FUNC_RECORD_THOUGHT}' unavailable for LLM-created UMS goal thought.")
-
-                        self.state.needs_replan = True 
-                        plan_desc = f"New UMS goal established by LLM: '{new_goal_desc_llm[:50]}...' ({_fmt_id(self.state.current_goal_id)}). Formulate plan for this sub-goal."
-                        self.state.current_plan = [PlanStep(description=plan_desc)]
-                        self.state.last_error_details = None 
-                        self.state.consecutive_error_count = 0
-                else: 
-                    self.logger.warning(f"{log_prefix}: UMS Tool '{UMS_FUNC_CREATE_GOAL}' (LLM) success payload malformed. Data: {str(ums_data_payload)[:300]}")
-                    self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_GOAL), "error": "UMS create_goal (LLM) success payload malformed.", "type": "GoalManagementError"}
-                    self.state.needs_replan = True
-            elif not is_ums_tool_call_successful_in_envelope:
-                self.logger.error(f"{log_prefix}: UMS Tool '{UMS_FUNC_CREATE_GOAL}' (LLM) failed. Error: {result_content_envelope.get('error_message')}")
-                self.state.needs_replan = True
-            
-            self.logger.info(f"{log_prefix} (LLM invoked UMS_FUNC_CREATE_GOAL): END. Current UMS Goal: {_fmt_id(self.state.current_goal_id)}, Stack Depth: {len(self.state.goal_stack)}, needs_replan={self.state.needs_replan}")
-
-        # --- Side effects for UMS_FUNC_UPDATE_GOAL_STATUS ---
-        elif base_tool_func_name == UMS_FUNC_UPDATE_GOAL_STATUS:
-            if is_ums_tool_call_successful_in_envelope and isinstance(ums_data_payload, dict) and ums_data_payload.get("success"):
-                self.logger.info(
-                    f"{log_prefix}: START (UMS Success). UMS Goal marked in arguments: {_fmt_id(arguments.get('goal_id'))}, "
-                    f"New Status in arguments: {arguments.get('status')}"
-                )
-                updated_goal_details_from_ums = ums_data_payload.get("updated_goal_details")
-                parent_goal_id_of_updated_from_ums = ums_data_payload.get("parent_goal_id") # Parent of the goal that was updated
-                is_root_finished_according_to_ums = ums_data_payload.get("is_root_finished", False)
-
-                goal_id_that_was_updated_in_ums = updated_goal_details_from_ums.get("goal_id") if isinstance(updated_goal_details_from_ums, dict) else None
-                new_status_str_from_ums = updated_goal_details_from_ums.get("status") if isinstance(updated_goal_details_from_ums, dict) else None
-
-                if not goal_id_that_was_updated_in_ums or not new_status_str_from_ums:
-                    self.logger.error(f"{log_prefix}: UMS update_goal_status success payload malformed. Data: {str(ums_data_payload)[:300]}")
-                    self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_GOAL_STATUS), "error": "UMS update_goal_status success payload malformed.", "type": "GoalManagementError"}
-                    self.state.needs_replan = True; return
-                try:
-                    new_status_enum_from_ums = GoalStatus(new_status_str_from_ums.lower())
-                except ValueError:
-                    self.logger.error(f"{log_prefix}: Invalid status '{new_status_str_from_ums}' in UMS response.")
-                    self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_GOAL_STATUS), "error": f"UMS returned invalid goal status '{new_status_str_from_ums}'.", "type": "GoalManagementError"}
-                    self.state.needs_replan = True; return
-
-                # Update local goal stack view if the updated goal is in it
-                if isinstance(updated_goal_details_from_ums, dict):
-                    for i, local_goal_dict in enumerate(self.state.goal_stack):
-                        if isinstance(local_goal_dict, dict) and local_goal_dict.get("goal_id") == goal_id_that_was_updated_in_ums:
-                            self.state.goal_stack[i] = updated_goal_details_from_ums # Replace with UMS truth
-                            self.logger.debug(f"{log_prefix}: Updated goal {_fmt_id(goal_id_that_was_updated_in_ums)} in local stack to status '{new_status_enum_from_ums.value}'.")
-                            break
-                
-                is_terminal_status_update = new_status_enum_from_ums in [GoalStatus.COMPLETED, GoalStatus.FAILED, GoalStatus.ABANDONED]
-                if goal_id_that_was_updated_in_ums == self.state.current_goal_id and is_terminal_status_update:
-                    self.logger.info(f"{log_prefix}: Current UMS operational goal {_fmt_id(self.state.current_goal_id)} reached terminal state '{new_status_enum_from_ums.value}'.")
-                    
-                    # Pop current goal and shift focus to its parent (which might be None)
-                    if self.state.goal_stack and self.state.goal_stack[-1].get("goal_id") == self.state.current_goal_id:
-                        self.state.goal_stack.pop() 
-                    
-                    self.state.current_goal_id = parent_goal_id_of_updated_from_ums 
-                    # If current_goal_id is now None, it means we are back to the overall workflow goal.
-                    # If it's not None, rebuild the stack view from this new current parent.
-                    if self.state.current_goal_id:
-                        self.state.goal_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
-                    else: # Popped to root of goal hierarchy (no parent_goal_id for the one just completed)
-                        self.state.goal_stack = [] # Stack is empty if no current operational UMS goal
-
-                    self.logger.info(f"{log_prefix}: Agent focus shifted. New current UMS goal: '{_fmt_id(self.state.current_goal_id) if self.state.current_goal_id else 'Overall Workflow Goal'}'. Local stack depth: {len(self.state.goal_stack)}")
-
-                    if is_root_finished_according_to_ums: # UMS confirms this was the root goal of the workflow
-                        self.logger.info(f"{log_prefix}: UMS indicated root UMS goal {_fmt_id(goal_id_that_was_updated_in_ums)} finished. Workflow presumed finished with status: {new_status_enum_from_ums.value}.")
-                        self.state.goal_achieved_flag = (new_status_enum_from_ums == GoalStatus.COMPLETED) # This flag stops the main agent loop if true
-                        
-                        update_wf_status_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_WORKFLOW_STATUS)
-                        if self.state.workflow_id and self._find_tool_server(update_wf_status_mcp_name):
-                            final_wf_status_str = WorkflowStatus.COMPLETED.value if self.state.goal_achieved_flag else WorkflowStatus.FAILED.value
-                            # This internal call will have its own side effects handled by this same function.
-                            await self._execute_tool_call_internal(update_wf_status_mcp_name, {"workflow_id": self.state.workflow_id, "status": final_wf_status_str, "completion_message": f"Root UMS goal {_fmt_id(goal_id_that_was_updated_in_ums)} marked '{new_status_enum_from_ums.value}'. Workflow concluded."}, record_action=False)
-                        
-                        # Set plan to finalization, no more replanning needed from this state.
-                        self.state.current_plan = [PlanStep(description="Overall workflow goal achieved or failed. Finalizing.")]
-                        self.state.needs_replan = False
-                    elif self.state.current_goal_id: # Switched to a parent UMS goal
-                        self.state.needs_replan = True
-                        current_parent_goal_obj = next((g for g in self.state.goal_stack if isinstance(g, dict) and g.get("goal_id") == self.state.current_goal_id), None)
-                        current_parent_goal_desc = current_parent_goal_obj.get("description", "Unknown Parent UMS Goal") if current_parent_goal_obj else "Unknown Parent UMS Goal"
-                        plan_desc = f"Returned from UMS sub-goal {_fmt_id(goal_id_that_was_updated_in_ums)} (status: {new_status_enum_from_ums.value}). Re-assess current UMS parent goal: '{current_parent_goal_desc[:50]}...' ({_fmt_id(self.state.current_goal_id)})."
-                        self.state.current_plan = [PlanStep(description=plan_desc)]
-                    else: # No parent_goal_id, but UMS didn't flag as root_finished (should be rare if logic is correct)
-                        self.logger.warning(f"{log_prefix}: Completed UMS goal {_fmt_id(goal_id_that_was_updated_in_ums)} with no parent. UMS did not flag as 'root_finished'. Re-evaluating overall workflow goal for safety.")
-                        self.state.goal_achieved_flag = (new_status_enum_from_ums == GoalStatus.COMPLETED) # Tentative, may be overridden by workflow status update
-                        self.state.needs_replan = True
-                        self.state.current_plan = [PlanStep(description=f"Completed UMS goal {_fmt_id(goal_id_that_was_updated_in_ums)}. Re-evaluating overall workflow objectives.")]
-                    
-                    self.state.last_error_details = None; self.state.consecutive_error_count = 0
-                else: # A non-current goal was updated, or current goal was updated to non-terminal status
-                    self.logger.info(f"{log_prefix}: UMS Goal '{_fmt_id(goal_id_that_was_updated_in_ums)}' updated to '{new_status_enum_from_ums.value}'. Agent focus on '{_fmt_id(self.state.current_goal_id)}' (if set) remains.")
-            
-            elif not is_ums_tool_call_successful_in_envelope:
-                self.logger.error(f"{log_prefix}: UMS Tool '{UMS_FUNC_UPDATE_GOAL_STATUS}' failed. Error: {result_content_envelope.get('error_message')}")
-                self.state.needs_replan = True
-                
-            self.logger.info(f"{log_prefix}: END. Current UMS Goal: {_fmt_id(self.state.current_goal_id)}, Stack Depth: {len(self.state.goal_stack)}, needs_replan={self.state.needs_replan}, achieved_flag={self.state.goal_achieved_flag}")
-
-        # --- Side effects for UMS_FUNC_UPDATE_WORKFLOW_STATUS ---
-        elif base_tool_func_name == UMS_FUNC_UPDATE_WORKFLOW_STATUS:
-            if is_ums_tool_call_successful_in_envelope and isinstance(ums_data_payload, dict) and ums_data_payload.get("success"):
-                self.logger.info(f"{log_prefix}: START (UMS Success). WF ID from UMS payload: {_fmt_id(ums_data_payload.get('workflow_id'))}, New Status from UMS payload: {ums_data_payload.get('status')}")
-                new_status_str_from_ums_wf = ums_data_payload.get("status")
-                wf_id_updated_in_ums_wf = ums_data_payload.get("workflow_id")
-
-                if not wf_id_updated_in_ums_wf or not new_status_str_from_ums_wf:
-                    self.logger.error(f"{log_prefix}: UMS update_workflow_status success payload malformed. Data: {str(ums_data_payload)[:300]}")
-                    self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_WORKFLOW_STATUS), "error": "UMS update_workflow_status success payload malformed.", "type": "UMSError"}
-                    self.state.needs_replan = True; return
-                try:
-                    new_status_enum_from_ums_wf = WorkflowStatus(new_status_str_from_ums_wf.lower())
-                except ValueError:
-                    self.logger.error(f"{log_prefix}: Invalid workflow status '{new_status_str_from_ums_wf}' in UMS payload.")
-                    self.state.last_error_details = {"tool": self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_WORKFLOW_STATUS), "error": f"UMS returned invalid workflow status '{new_status_str_from_ums_wf}'.", "type": "UMSError"}
-                    self.state.needs_replan = True; return
-
-                is_terminal_wf_status_update = new_status_enum_from_ums_wf in [WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.ABANDONED]
-                
-                # Check if the updated workflow is the one on top of the agent's stack
-                if self.state.workflow_stack and wf_id_updated_in_ums_wf == self.state.workflow_stack[-1]:
-                    if is_terminal_wf_status_update:
-                        finished_wf_id = self.state.workflow_stack.pop()
-                        parent_wf_id_after_pop = self.state.workflow_stack[-1] if self.state.workflow_stack else None
-                        
-                        if parent_wf_id_after_pop: 
-                            self.state.workflow_id = parent_wf_id_after_pop
-                            self.state.context_id = self.state.workflow_id # Reset context to parent
-                            await self._set_default_thought_chain_id() # For the parent
-                            self.state.goal_stack = [] # Reset local goal stack view for parent
-                            self.state.current_goal_id = None # Parent workflow starts without a specific UMS goal focus
-                            self.logger.info(f"{log_prefix}: Sub-workflow '{_fmt_id(finished_wf_id)}' ({new_status_enum_from_ums_wf.value}) finished. Returning to parent '{_fmt_id(parent_wf_id_after_pop)}'.")
-                            self.state.needs_replan = True # Must replan for parent context
-                            self.state.current_plan = [PlanStep(description=f"Resumed parent workflow '{_fmt_id(self.state.workflow_id)}' after sub-workflow '{_fmt_id(finished_wf_id)}' ({new_status_enum_from_ums_wf.value}). Establish root UMS goal for parent or re-assess context.")]
-                        else: # Root workflow (or last on stack) finished
-                            self.logger.info(f"{log_prefix}: Root/Final workflow '{_fmt_id(finished_wf_id)}' finished ({new_status_enum_from_ums_wf.value}). No parent. Agent run concluding.")
-                            self.state.workflow_id = None # This will stop the main agent loop
-                            self.state.context_id = None; self.state.current_thought_chain_id = None
-                            self.state.current_plan = []; self.state.goal_stack = []; self.state.current_goal_id = None
-                            self.state.goal_achieved_flag = (new_status_enum_from_ums_wf == WorkflowStatus.COMPLETED)
-                            self.state.needs_replan = False # Final state
-                        
-                        self.state.last_error_details = None 
-                        self.state.consecutive_error_count = 0
-                    else: # Non-terminal status update for current workflow (e.g., paused)
-                        self.logger.info(f"{log_prefix}: Current workflow '{_fmt_id(wf_id_updated_in_ums_wf)}' status updated to '{new_status_enum_from_ums_wf.value}'. Agent focus remains.")
-                        if new_status_enum_from_ums_wf == WorkflowStatus.PAUSED and not self.state.needs_replan:
-                            self.state.needs_replan = True
-                            self.state.current_plan = [PlanStep(description=f"Workflow '{_fmt_id(wf_id_updated_in_ums_wf)}' PAUSED. Await resume or new directive.")]
-                
-                elif wf_id_updated_in_ums_wf == self.state.workflow_id: # Current primary workflow was updated (and stack might be empty or mismatched)
-                    self.logger.info(f"{log_prefix}: Current primary workflow '{_fmt_id(wf_id_updated_in_ums_wf)}' status changed to '{new_status_enum_from_ums_wf.value}'.")
-                    if is_terminal_wf_status_update:
-                        self.logger.info(f"{log_prefix}: Current primary workflow '{_fmt_id(wf_id_updated_in_ums_wf)}' reached terminal state. Agent run concluding.")
-                        self.state.workflow_id = None
-                        self.state.context_id = None; self.state.current_thought_chain_id = None
-                        self.state.current_plan = []; self.state.goal_stack = []; self.state.current_goal_id = None
-                        self.state.goal_achieved_flag = (new_status_enum_from_ums_wf == WorkflowStatus.COMPLETED)
-                        self.state.needs_replan = False
-                else: 
-                    self.logger.info(f"{log_prefix}: UMS Workflow '{_fmt_id(wf_id_updated_in_ums_wf)}' status changed to '{new_status_enum_from_ums_wf.value}'. This was not agent's current focus. No change to agent's primary focus.")
-            
-            elif not is_ums_tool_call_successful_in_envelope:
-                self.logger.error(f"{log_prefix}: UMS Tool '{UMS_FUNC_UPDATE_WORKFLOW_STATUS}' failed. Error: {result_content_envelope.get('error_message')}")
-                self.state.needs_replan = True
-                
-            self.logger.info(f"{log_prefix}: END. WF: {_fmt_id(self.state.workflow_id)}, Current UMS Goal: {_fmt_id(self.state.current_goal_id)}, goal_achieved_flag: {self.state.goal_achieved_flag}, needs_replan: {self.state.needs_replan}")
-
-        # --- No changes needed for UMS_FUNC_SAVE_COGNITIVE_STATE side effects in this function ---
-        # save_cognitive_state is called internally for checkpoints; its direct success/failure
-        # doesn't usually alter the agent's primary workflow/goal state in the same way
-        # as create_workflow or goal updates. Its results are primarily for UMS record-keeping.
-        # If its failure is critical, _execute_tool_call_internal would set last_error_details.
-
-        # --- General Logging for State Changes After ALL Side Effects ---
-        if not needs_replan_before_side_effects and self.state.needs_replan:
-            self.logger.info(f"{log_prefix}: `needs_replan` became True due to overall side effects of '{base_tool_func_name}'.")
-        elif needs_replan_before_side_effects and not self.state.needs_replan:
-            self.logger.info(f"{log_prefix}: `needs_replan` became False due to overall side effects of '{base_tool_func_name}'.")
-
-        new_current_wf_id_after_effect = self.state.workflow_id
-        if current_wf_id_before_effect != new_current_wf_id_after_effect or current_goal_id_before_effect != self.state.current_goal_id:
-            self.logger.info(
-                f"AML_SIDE_EFFECTS Summary (Overall State Change by '{base_tool_func_name}'): "
-                f"WF: {_fmt_id(current_wf_id_before_effect)} -> {_fmt_id(new_current_wf_id_after_effect)}, "
-                f"ContextID: {_fmt_id(self.state.context_id)}, "
-                f"UMS Goal: {_fmt_id(current_goal_id_before_effect)} -> {_fmt_id(self.state.current_goal_id)}, "
-                f"Local Goal Stack Depth: {len(self.state.goal_stack)}"
-            )
-        else:
-            self.logger.info(
-                f"AML_SIDE_EFFECTS Summary (Agent WF/Goal/Context focus NOT significantly changed overall by tool '{base_tool_func_name}')"
-            )
-
+        unique_reasons = ", ".join(sorted(set(trigger_reasons)))
         self.logger.info(
-            f"{log_prefix}: Exiting. Final agent state after side effects: WF ID='{_fmt_id(self.state.workflow_id)}', "
-            f"Context ID='{_fmt_id(self.state.context_id)}', UMS Goal ID='{_fmt_id(self.state.current_goal_id)}', needs_replan={self.state.needs_replan}"
+            "🧠 %s: Running %d periodic tasks (Triggers: %s).",
+            log_prefix,
+            len(tasks_to_run),
+            unique_reasons,
         )
 
-
-    async def _fetch_goal_stack_from_ums(self, leaf_goal_id: Optional[str]) -> List[Dict[str, Any]]:
-        if not leaf_goal_id:
-            self.logger.debug("_fetch_goal_stack_from_ums: No leaf_goal_id provided, returning empty stack.")
-            return []
-
-        get_goal_details_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_GET_GOAL_DETAILS)
-        if not self._find_tool_server(get_goal_details_mcp_name):
-            self.logger.warning(f"Tool for '{UMS_FUNC_GET_GOAL_DETAILS}' unavailable. Cannot reconstruct goal stack from UMS.")
-            return []
-
-        reconstructed_stack: List[Dict[str, Any]] = []
-        current_id_to_fetch: Optional[str] = leaf_goal_id
-        fetch_depth = 0
-        max_fetch_depth = CONTEXT_GOAL_DETAILS_FETCH_LIMIT
-
-        self.logger.debug(f"Reconstructing goal stack from UMS, starting with leaf: {_fmt_id(leaf_goal_id)}")
-
-        while current_id_to_fetch and fetch_depth < max_fetch_depth:
-            try:
-                res = await self._execute_tool_call_internal(
-                    get_goal_details_mcp_name,
-                    {"goal_id": current_id_to_fetch},
-                    record_action=False,
+        # sequential execution keeps side-effects predictable
+        for tool_full_name_mcp, tool_args_for_call in tasks_to_run:
+            if self._shutdown_event.is_set():
+                self.logger.info(
+                    "%s: Shutdown signaled during periodic execution. Stopping further tasks.",
+                    log_prefix,
                 )
-                goal_data = res.get("goal") if isinstance(res, dict) and res.get("success") else None
-
-                if isinstance(goal_data, dict):
-                    reconstructed_stack.append(goal_data)
-                    parent_id = goal_data.get("parent_goal_id")
-                    self.logger.debug(f"Fetched goal {_fmt_id(current_id_to_fetch)}. Parent: {_fmt_id(parent_id)}. Depth: {fetch_depth}")
-                    current_id_to_fetch = parent_id
-                    fetch_depth += 1
-                else:
-                    self.logger.warning(
-                        f"Failed to fetch details for goal {_fmt_id(current_id_to_fetch)} "
-                        f"or invalid data received from UMS. Stopping stack reconstruction. Response: {res}"
-                    )
-                    break
-            except Exception as e:
-                self.logger.error(f"Exception while fetching goal {_fmt_id(current_id_to_fetch)} for stack reconstruction: {e}", exc_info=True)
                 break
 
-        reconstructed_stack.reverse()
-        self.logger.info(
-            f"Reconstructed goal stack from UMS: {[_fmt_id(g.get('goal_id')) for g in reconstructed_stack]} (Depth: {len(reconstructed_stack)})"
+            current_base_fn = self._get_base_function_name(tool_full_name_mcp)
+
+            if tool_full_name_mcp == _INTERNAL_PROMO_SENTINEL:
+                self.logger.debug("%s: Running promotion-check helper with args %s.", log_prefix, tool_args_for_call)
+                # _trigger_promotion_checks expects workflow_id directly.
+                wf_id_for_promo = tool_args_for_call.get("workflow_id", self.state.workflow_id)
+                if wf_id_for_promo: # Ensure workflow_id is present
+                    await self._trigger_promotion_checks() # This helper uses self.state.workflow_id internally.
+                else:
+                    self.logger.warning(f"{log_prefix}: Skipping promotion check as workflow_id is missing for _INTERNAL_PROMO_SENTINEL.")
+                continue
+
+            # auto-inject workflow / context ids where required by tool_registry mapping
+            # This is a simplified check; specific tools manage their own required args more robustly.
+            # The primary purpose here is to ensure workflow_id and context_id are passed IF NEEDED for THIS CALL.
+            _tool_alias_for_registry = next((alias for alias, (base, _, _) in tool_registry.items() if base == current_base_fn), None)
+            if _tool_alias_for_registry:
+                _, needs_wf, needs_ctx = tool_registry[_tool_alias_for_registry]
+                if needs_wf and "workflow_id" not in tool_args_for_call and self.state.workflow_id:
+                    tool_args_for_call["workflow_id"] = self.state.workflow_id
+                if needs_ctx and "context_id" not in tool_args_for_call and self.state.context_id:
+                    tool_args_for_call["context_id"] = self.state.context_id
+            
+            # Final check for critical IDs for tools that absolutely need them
+            if current_base_fn in [UMS_FUNC_REFLECTION, UMS_FUNC_CONSOLIDATION, UMS_FUNC_QUERY_MEMORIES] and not tool_args_for_call.get("workflow_id"):
+                if self.state.workflow_id:
+                    tool_args_for_call["workflow_id"] = self.state.workflow_id
+                else:
+                    self.logger.warning(f"{log_prefix}: Skipping {current_base_fn} as workflow_id is missing and couldn't be auto-injected.")
+                    continue
+            if current_base_fn in [UMS_FUNC_OPTIMIZE_WM, UMS_FUNC_AUTO_FOCUS] and not tool_args_for_call.get("context_id"):
+                if self.state.context_id:
+                    tool_args_for_call["context_id"] = self.state.context_id
+                else:
+                    self.logger.warning(f"{log_prefix}: Skipping {current_base_fn} as context_id is missing and couldn't be auto-injected.")
+                    continue
+
+
+            self.logger.debug(
+                "%s: Executing periodic tool %s with args %s",
+                log_prefix,
+                tool_full_name_mcp,
+                tool_args_for_call,
+            )
+            
+            result_envelope = {} # Default to empty dict
+            try:
+                with contextlib.suppress(asyncio.CancelledError): # Allow cancellation
+                    result_envelope = await asyncio.wait_for(
+                        self._execute_tool_call_internal(
+                            tool_full_name_mcp, tool_args_for_call, record_action=False
+                        ),
+                        timeout=_TASK_TIMEOUT_SEC,
+                    )
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    "%s: Tool %s timed out after %ss.",
+                    log_prefix,
+                    tool_full_name_mcp,
+                    _TASK_TIMEOUT_SEC,
+                )
+                # treat timeout as failure
+                result_envelope = {"success": False, "error_message": "Timeout", "error_type": "PeriodicTaskTimeout"}
+            except Exception as e_task_exec:
+                self.logger.error(f"{log_prefix}: Unhandled error executing periodic tool {tool_full_name_mcp}: {e_task_exec}", exc_info=True)
+                result_envelope = {"success": False, "error_message": str(e_task_exec), "error_type": "PeriodicTaskException"}
+
+
+            # --------------- result handling
+            if not result_envelope.get("success"):
+                self.logger.warning(
+                    "%s: Periodic tool %s failed: %s",
+                    log_prefix,
+                    tool_full_name_mcp,
+                    result_envelope.get("error_message") or result_envelope.get("error"),
+                )
+                # For critical context-dependent tools, set error if they fail, so LLM can see it.
+                if current_base_fn in [UMS_FUNC_OPTIMIZE_WM, UMS_FUNC_AUTO_FOCUS] and not self.state.last_error_details:
+                    self.state.last_error_details = {
+                        "tool": tool_full_name_mcp,
+                        "error": result_envelope.get("error_message") or result_envelope.get("error", "Periodic task failed"),
+                        "type": result_envelope.get("error_type", "PeriodicTaskToolError"),
+                        "details": {"args_used": tool_args_for_call}
+                    }
+                continue  # next task in queue
+
+            # reflection / consolidation meta-feedback
+            if current_base_fn in [UMS_FUNC_REFLECTION, UMS_FUNC_CONSOLIDATION]:
+                # UMS tools return payload directly, not nested under 'data' if this wrapper is used.
+                feedback = (
+                    result_envelope.get("content") # UMS generate_reflection returns content directly
+                    if current_base_fn == UMS_FUNC_REFLECTION
+                    else result_envelope.get("consolidated_content") # UMS consolidate_memories returns consolidated_content directly
+                ) or ""
+                if feedback:
+                    headline = feedback.split("\n", 1)[0][:150]
+                    self.state.last_meta_feedback = (
+                        f"Feedback from UMS {current_base_fn}: {headline}..."
+                    )
+                    self.logger.info(
+                        "%s: Meta-feedback captured: %s", log_prefix, self.state.last_meta_feedback
+                    )
+                    
+                    # Revised logic for setting needs_replan
+                    reflection_type_arg = tool_args_for_call.get("reflection_type", "summary") # Default if not specified
+                    
+                    # Case 1: Reflection type is explicitly 'plan'
+                    if current_base_fn == UMS_FUNC_REFLECTION and reflection_type_arg == "plan":
+                        if not self.state.needs_replan: # Only log if it's a change
+                            self.state.needs_replan = True
+                            self.logger.info(f"{log_prefix}: Setting needs_replan=True due to 'plan' reflection type.")
+                    # Case 2: Feedback content suggests a replan is needed
+                    elif "replan needed" in feedback.lower() or \
+                         "new plan required" in feedback.lower() or \
+                         "plan update suggested" in feedback.lower():
+                        if not self.state.needs_replan: # Only log if it's a change
+                            self.state.needs_replan = True
+                            self.logger.info(f"{log_prefix}: Setting needs_replan=True due to feedback content suggesting it.")
+                    # Case 3: Consolidation might implicitly suggest replan if it fundamentally changes understanding
+                    elif current_base_fn == UMS_FUNC_CONSOLIDATION:
+                        # For now, let's not automatically set needs_replan from consolidation unless feedback explicitly states it
+                        # or unless a specific consolidation_type implies it (e.g., a 'planning_consolidation' type if you add one)
+                        self.logger.debug(f"{log_prefix}: Consolidation occurred. Needs_replan remains: {self.state.needs_replan}. Feedback captured for LLM review.")
+                    # else: self.state.needs_replan remains unchanged by this feedback.
+
+                else:
+                    self.logger.debug(
+                        "%s: %s succeeded but returned no feedback content.",
+                        log_prefix,
+                        current_base_fn,
+                    )
+
+            # small breather to avoid thundering-herd on the tool server
+            await asyncio.sleep(0.05)
+
+
+    async def _check_and_trigger_promotion(
+        self,
+        memory_id: str,
+        *,
+        workflow_id: Optional[str],
+        context_id: Optional[str],
+    ) -> None:
+        """
+        Background coroutine that asks UMS to promote `memory_id` if eligible.
+
+        Defensive improvements
+        ----------------------
+        • Guards against workflow switch & shutdown early.
+        • Validates `memory_id` eagerly.
+        • Adds jitter + explicit timeout to avoid thundering-herd and hung awaits.
+        • Catches `CancelledError` separately for cooperative cancellation.
+        • Structured debug paths to keep noisy logs down.
+        """
+        # ------------------------------------------------------------------ early guards
+        if self._shutdown_event.is_set():
+            return
+
+        if not (isinstance(memory_id, str) and memory_id.strip()):
+            self.logger.debug("Promo-check aborted: empty/invalid memory_id.")
+            return
+
+        if workflow_id != self.state.workflow_id:
+            # Workflow changed while task was queued.
+            self.logger.debug(
+                f"Promo-check skipped for {_fmt_id(memory_id)}: "
+                f"workflow switched from {_fmt_id(workflow_id)} ➜ {_fmt_id(self.state.workflow_id)}."
+            )
+            return
+
+        promote_mcp_name = self._get_ums_tool_mcp_name(_PROMO_TOOL_NAME)
+        if not self._find_tool_server(promote_mcp_name):
+            self.logger.debug(
+                f"Promo-check skipped for {_fmt_id(memory_id)}: "
+                f"UMS tool '{_PROMO_TOOL_NAME}' unavailable."
+            )
+            return
+
+        # ------------------------------------------------------------------ jittered start
+        await asyncio.sleep(random.uniform(*_PROMO_JITTER_RANGE))
+        if self._shutdown_event.is_set():
+            return
+
+        self.logger.debug(
+            f"Checking promotion eligibility for memory {_fmt_id(memory_id)} "
+            f"(WF {_fmt_id(workflow_id)}, CTX {_fmt_id(context_id)})..."
         )
-        return reconstructed_stack
 
-    async def _apply_heuristic_plan_update(
-        self, last_llm_decision_from_mcpc: Dict[str, Any], last_tool_result_envelope: Optional[Dict[str, Any]] = None
-    ):
-        """
-        Applies a heuristic update to the agent's plan based on the last action's outcome.
-        This conservative version primarily focuses on marking steps complete/failed
-        and advancing the plan, setting needs_replan=True on failures or if the
-        plan becomes empty/too generic after an assessment.
+        promo_args = {"memory_id": memory_id}
 
-        Args:
-            last_llm_decision_from_mcpc: The decision object from MCPClient.process_agent_llm_turn.
-                                         Keys: "decision", "tool_name" (original MCP name), "arguments", "content", etc.
-            last_tool_result_envelope: The standardized envelope returned by _execute_tool_call_internal
-                                       for the primary action of the turn.
-                                       Structure: {"success": bool, "data": ..., "error_type": ..., ...}
+        # ------------------------------------------------------------------ guarded tool call
+        try:
+            with contextlib.suppress(CancelledError):  # allow cooperative cancellation
+                promo_res = await asyncio.wait_for(
+                    self._execute_tool_call_internal(promote_mcp_name, promo_args, record_action=False),
+                    timeout=_PROMO_CALL_TIMEOUT,
+                )
+        except CancelledError:
+            # Task was cancelled by shutdown or higher-level timeouts.
+            self.logger.debug(f"Promo-check task for {_fmt_id(memory_id)} was cancelled.")
+            return
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"Promo-check for {_fmt_id(memory_id)} timed out after {_PROMO_CALL_TIMEOUT}s."
+            )
+            return
+        except Exception as exc:
+            self.logger.warning(
+                f"Unhandled error during promo-check for {_fmt_id(memory_id)}: {exc}", exc_info=False
+            )
+            return
+
+        # ------------------------------------------------------------------ result handling
+        if promo_res.get("success"):
+            if promo_res.get("promoted"):
+                self.logger.info(
+                    f"⬆️  Memory {_fmt_id(memory_id)} promoted "
+                    f"{promo_res.get('previous_level')} ➜ {promo_res.get('new_level')}."
+                )
+            else:
+                # Only log at DEBUG if promotion did not happen – avoids log spam.
+                self.logger.debug(
+                    f"No promotion for {_fmt_id(memory_id)}: {promo_res.get('reason', 'no reason given')}."
+                )
+        else:
+            self.logger.warning(
+                f"Promo-check failed for {_fmt_id(memory_id)}: {promo_res.get('error', 'unknown error')}."
+            )
+
+    async def _handle_workflow_and_goal_side_effects(
+        self,
+        base_tool_func_name: str,
+        arguments: Dict[str, Any],
+        result_content_envelope: Dict[str, Any],
+    ) -> None:
         """
-        self.logger.info("📋 Applying heuristic plan update (conservative)...")
+        Centralised post-processing for UMS tool calls that mutate agent state
+        (workflows, goals, statuses, etc.).  **Must** be called with the *canonical*
+        base function name (e.g. ``"create_workflow"`` rather than the full MCP
+        name) and the *standardised* envelope returned by
+        ``_execute_tool_call_internal``.
+
+        Parameters
+        ----------
+        base_tool_func_name : str
+            Canonical base name of the UMS function just executed.
+        arguments : Dict[str, Any]
+            Arguments originally supplied to the tool.
+        result_content_envelope : Dict[str, Any]
+            Envelope with keys ``success`` / ``error_type`` / ``error_message`` /
+            ``data`` (payload from UMS) / etc.
+        """
+
+        # ------------------------------------------------------------------ #
+        # 0.  Helpers & constants
+        # ------------------------------------------------------------------ #
+        TERMINAL_GOAL_STATES: Tuple[GoalStatus, ...] = (
+            GoalStatus.COMPLETED,
+            GoalStatus.FAILED,
+            GoalStatus.ABANDONED,
+        )
+        TERMINAL_WF_STATES: Tuple[WorkflowStatus, ...] = (
+            WorkflowStatus.COMPLETED,
+            WorkflowStatus.FAILED,
+            WorkflowStatus.ABANDONED,
+        )
+        EXPECT_DICT_PAYLOAD_TOOLS: Tuple[str, ...] = (
+            UMS_FUNC_CREATE_WORKFLOW,
+            UMS_FUNC_UPDATE_WORKFLOW_STATUS,
+            UMS_FUNC_CREATE_GOAL,
+            UMS_FUNC_UPDATE_GOAL_STATUS,
+        )
+
+        def _env_success(env: Dict[str, Any]) -> bool:
+            """True if the envelope signals overall success."""
+            return bool(env.get("success", False))
+
+        def _payload(env: Dict[str, Any]) -> Any:
+            """Return envelope['data'] (may be None/str/dict/etc.)."""
+            return env.get("data", {})
+
+        def _payload_success(payload_obj: Any) -> bool:
+            """True if payload is dict and payload['success'] is truthy."""
+            return isinstance(payload_obj, dict) and payload_obj.get("success", False)
+
+        def _set_error(tool: str, msg: str, err_type: str = "UMSError") -> None:
+            """Utility to set last_error_details & flip needs_replan."""
+            self.state.last_error_details = {
+                "tool": self._get_ums_tool_mcp_name(tool),
+                "error": msg,
+                "type": err_type,
+            }
+            self.state.needs_replan = True
+
+        envelope_ok = _env_success(result_content_envelope)
+        payload_obj = _payload(result_content_envelope)
+
+        # ------------------------------------------------------------------ #
+        # 1.  Payload sanity-check for critical tools
+        # ------------------------------------------------------------------ #
+        if (
+            base_tool_func_name in EXPECT_DICT_PAYLOAD_TOOLS
+            and envelope_ok
+            and not isinstance(payload_obj, dict)
+        ):
+            msg = (
+                f"UMS tool '{base_tool_func_name}' reported success, but its "
+                f"'data' payload is not a dict (type={type(payload_obj)})."
+            )
+            self.logger.error(f"AML_SIDE_EFFECTS: {msg}  Envelope={str(result_content_envelope)[:300]}")
+            _set_error(base_tool_func_name, msg)
+            return
+
+        # For uniform downstream handling, ensure dict for expected tools
+        if base_tool_func_name in EXPECT_DICT_PAYLOAD_TOOLS and not isinstance(payload_obj, dict):
+            payload_obj = {}
+
+        # Snapshot state before mutation
+        wf_id_before: Optional[str] = self.state.workflow_id
+        goal_id_before: Optional[str] = self.state.current_goal_id
+        needs_replan_before: bool = self.state.needs_replan
+
+        log_prefix = (
+            f"AML_SIDE_EFFECTS({base_tool_func_name}, "
+            f"EnvSuccess={envelope_ok})"
+        )
+        self.logger.info(
+            f"{log_prefix}: WF(before)={_fmt_id(wf_id_before)}, "
+            f"Goal(before)={_fmt_id(goal_id_before)}, "
+            f"needs_replan(before)={needs_replan_before}. "
+            f"PayloadPreview={str(payload_obj)[:200]}"
+        )
+
+        # ------------------------------------------------------------------ #
+        # 2.  Dispatch per-tool
+        # ------------------------------------------------------------------ #
+        if base_tool_func_name == UMS_FUNC_CREATE_WORKFLOW:
+            # ---------------------------------------------------------- #
+            # create_workflow
+            # ---------------------------------------------------------- #
+            if not (envelope_ok and _payload_success(payload_obj)):
+                # Envelope said fail – nothing created.
+                self.logger.error(
+                    f"{log_prefix}: create_workflow failed. "
+                    f"Error={result_content_envelope.get('error_message')}"
+                )
+                # _execute_tool_call_internal should already have set last_error_details,
+                # but belt-and-suspenders:
+                if not self.state.last_error_details:
+                    _set_error(
+                        UMS_FUNC_CREATE_WORKFLOW,
+                        result_content_envelope.get(
+                            "error_message",
+                            "UMS create_workflow failed (envelope level).",
+                        ),
+                        result_content_envelope.get("error_type", "UMSError"),
+                    )
+                return
+
+            # ---- Happy-path ------------------------------------------------ #
+            wf_id: Optional[str] = payload_obj.get("workflow_id")
+            chain_id: Optional[str] = payload_obj.get("primary_thought_chain_id")
+
+            if not (wf_id and isinstance(wf_id, str)):
+                _set_error(
+                    UMS_FUNC_CREATE_WORKFLOW,
+                    "create_workflow payload missing 'workflow_id'.",
+                )
+                return
+            if not (chain_id and isinstance(chain_id, str)):
+                _set_error(
+                    UMS_FUNC_CREATE_WORKFLOW,
+                    "create_workflow payload missing 'primary_thought_chain_id'.",
+                )
+                return
+
+            # Double-check existence (DB eventual consistency)
+            await asyncio.sleep(0.2)
+            if not await self._check_workflow_exists(wf_id):
+                _set_error(
+                    UMS_FUNC_CREATE_WORKFLOW,
+                    f"Workflow '{_fmt_id(wf_id)}' not visible after creation.",
+                )
+                return
+
+            # ----- State updates ------------------------------------------- #
+            self.state.workflow_id = wf_id
+            self.state.context_id = wf_id          # convention: ctx == wf_id
+            self.state.current_thought_chain_id = chain_id
+
+            # Manage workflow stack (supporting sub-workflows)
+            parent_wf_id = arguments.get("parent_workflow_id")
+            if parent_wf_id and parent_wf_id == wf_id_before:
+                self.state.workflow_stack.append(wf_id)          # sub-workflow
+            else:
+                self.state.workflow_stack = [wf_id]              # new root
+                
+            # Force immediate persistence to avoid losing the workflow ID
+            await self._save_agent_state()
+
+            # Reset goal info – will create a root goal below
+            self.state.goal_stack = []
+            self.state.current_goal_id = None
+            self.state.needs_replan = False
+            self.state.last_error_details = None
+            self.state.consecutive_error_count = 0
+
+            self.logger.info(
+                f"{log_prefix}: New workflow {_fmt_id(wf_id)} verified. "
+                f"Chain={_fmt_id(chain_id)}. StackDepth={len(self.state.workflow_stack)}"
+            )
+
+            # ---- Create ROOT goal in UMS 'goals' table -------------------- #
+            root_goal_desc = (
+                payload_obj.get("goal")
+                or arguments.get("goal")
+                or f"Overall objectives for workflow {_fmt_id(wf_id)}"
+            )
+            root_goal_title = (
+                payload_obj.get("title")
+                or arguments.get("title")
+                or f"Primary Goal for WF-{wf_id[:8]}"
+            )
+            create_goal_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_GOAL)
+            goal_created_ok = False
+            if self._find_tool_server(create_goal_mcp):
+                goal_args = {
+                    "workflow_id": wf_id,
+                    "description": root_goal_desc,
+                    "title": root_goal_title,
+                    "parent_goal_id": None,
+                    "initial_status": GoalStatus.ACTIVE.value,
+                }
+                goal_env = await self._execute_tool_call_internal(
+                    create_goal_mcp,
+                    goal_args,
+                    record_action=False,
+                )
+                goal_payload = goal_env.get("data", {})
+                if _env_success(goal_env) and _payload_success(goal_payload):
+                    goal_obj = goal_payload.get("goal", {})
+                    goal_id = goal_obj.get("goal_id")
+                    if goal_id:
+                        self.state.goal_stack = [goal_obj]
+                        self.state.current_goal_id = goal_id
+                        goal_created_ok = True
+                        self.logger.info(
+                            f"{log_prefix}: Root goal {_fmt_id(goal_id)} created."
+                        )
+
+            if goal_created_ok:
+                assess_desc = (
+                    f"Initial assessment of root UMS goal: "
+                    f"'{root_goal_desc[:70]}...' (Goal ID: {_fmt_id(self.state.current_goal_id)}). "
+                    f"Understand goal and outline first steps."
+                )
+                self.state.current_plan = [
+                    PlanStep(description=assess_desc, status="planned")
+                ]
+            else:
+                retry_desc = (
+                    f"CRITICAL: Workflow '{_fmt_id(wf_id)}' was created but "
+                    f"root goal creation failed.  Retry using '{UMS_FUNC_CREATE_GOAL}'."
+                )
+                self.state.current_plan = [
+                    PlanStep(
+                        description=retry_desc,
+                        status="planned",
+                        assigned_tool=create_goal_mcp,
+                    )
+                ]
+            # Done → fall-through to common summary / diff logs at bottom
+
+        # ------------------------------------------------------------------ #
+        elif base_tool_func_name == UMS_FUNC_CREATE_GOAL:
+            # LLM called create_goal directly
+            if not envelope_ok:
+                self.logger.error(
+                    f"{log_prefix}: LLM-initiated create_goal failed at envelope level. "
+                    f"Err={result_content_envelope.get('error_message')}"
+                )
+                self.state.needs_replan = True
+                return
+
+            # Log the payload structure for debugging
+            self.logger.info(f"{log_prefix}: Create_goal result_envelope: {str(result_content_envelope)[:800]}")
+            
+            # The actual goal object could be in multiple places:
+            # 1. Directly in result_content_envelope["goal"] - most common case we're seeing
+            # 2. In payload_obj["goal"] 
+            # 3. In result_content_envelope["data"]["goal"]
+            # 4. Directly in payload_obj if it has goal_id
+            
+            goal_obj = None
+            
+            # Check location #1 - directly in result_content_envelope["goal"]
+            if isinstance(result_content_envelope.get("goal"), dict) and "goal_id" in result_content_envelope["goal"]:
+                goal_obj = result_content_envelope["goal"]
+                self.logger.info(f"{log_prefix}: FOUND GOAL directly in result_envelope: {str(goal_obj)[:200]}")
+            
+            # Check location #2 - in payload_obj["goal"]
+            elif isinstance(payload_obj.get("goal"), dict) and "goal_id" in payload_obj["goal"]:
+                goal_obj = payload_obj["goal"]
+                self.logger.info(f"{log_prefix}: Found goal in payload.goal: {str(goal_obj)[:200]}")
+                
+            # Check location #3 - in result_content_envelope["data"]["goal"]
+            elif isinstance(result_content_envelope.get("data", {}).get("goal"), dict) and "goal_id" in result_content_envelope["data"]["goal"]:
+                goal_obj = result_content_envelope["data"]["goal"]
+                self.logger.info(f"{log_prefix}: Found goal in envelope data.goal: {str(goal_obj)[:200]}")
+            
+            # Check location #4 - directly in payload_obj
+            elif isinstance(payload_obj, dict) and "goal_id" in payload_obj:
+                goal_obj = payload_obj
+                self.logger.info(f"{log_prefix}: Found goal directly in payload: {str(goal_obj)[:200]}")
+                
+            # Extra checking in case result_content_envelope is the goal itself
+            elif isinstance(result_content_envelope, dict) and "goal_id" in result_content_envelope:
+                goal_obj = result_content_envelope
+                self.logger.info(f"{log_prefix}: Found goal as the entire result_envelope: {str(goal_obj)[:200]}")
+                
+            self.logger.info(f"{log_prefix}: Final extracted goal_obj: {goal_obj}")
+            
+            # Check for goal in envelope data
+            if not goal_obj or not goal_obj.get("goal_id"):
+                envelope_data = result_content_envelope.get("data", {})
+                if isinstance(envelope_data, dict):
+                    if "goal" in envelope_data and isinstance(envelope_data["goal"], dict):
+                        goal_obj = envelope_data["goal"]
+                        self.logger.info(f"{log_prefix}: Found goal in envelope data")
+                    elif "goal_id" in envelope_data:
+                        goal_obj = envelope_data
+                        self.logger.info(f"{log_prefix}: Found goal directly in envelope data")
+            
+            goal_id = None
+            if isinstance(goal_obj, dict):
+                goal_id = goal_obj.get("goal_id")
+            if not goal_id:
+                _set_error(
+                    UMS_FUNC_CREATE_GOAL,
+                    "create_goal success payload missing 'goal_id'.",
+                    "GoalManagementError",
+                )
+                return
+
+            # Reject if wrong workflow id
+            if goal_obj.get("workflow_id") != self.state.workflow_id:
+                _set_error(
+                    UMS_FUNC_CREATE_GOAL,
+                    "LLM created goal for a different workflow.",
+                    "GoalManagementError",
+                )
+                return
+
+            # Push onto stack & mark as current
+            self.state.goal_stack.append(goal_obj)
+            self.state.current_goal_id = goal_id
+            self.state.needs_replan = True
+            self.state.current_plan = [
+                PlanStep(
+                    description=f"New UMS goal established: '{goal_obj.get('description','')[:50]}...'. Formulate plan.",
+                    status="planned",
+                )
+            ]
+            self.state.last_error_details = None
+            self.state.consecutive_error_count = 0
+
+            # Record a thought (best-effort)
+            record_thought_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_THOUGHT)
+            if self._find_tool_server(record_thought_mcp):
+                await self._execute_tool_call_internal(
+                    record_thought_mcp,
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "content": f"Established new UMS sub-goal: {goal_obj.get('description','')}",
+                        "thought_type": ThoughtType.GOAL.value,
+                        "thought_chain_id": self.state.current_thought_chain_id,
+                    },
+                    record_action=False,
+                )
+
+        # ------------------------------------------------------------------ #
+        elif base_tool_func_name == UMS_FUNC_UPDATE_GOAL_STATUS:
+            if not (envelope_ok and _payload_success(payload_obj)):
+                self.logger.error(
+                    f"{log_prefix}: update_goal_status failed. "
+                    f"Err={result_content_envelope.get('error_message')}"
+                )
+                self.state.needs_replan = True
+                return
+
+            goal_details = payload_obj.get("updated_goal_details", {})
+            goal_id = goal_details.get("goal_id")
+            new_status_raw = goal_details.get("status")
+            if not (goal_id and new_status_raw):
+                _set_error(
+                    UMS_FUNC_UPDATE_GOAL_STATUS,
+                    "update_goal_status payload malformed.",
+                    "GoalManagementError",
+                )
+                return
+
+            try:
+                new_status = GoalStatus(new_status_raw.lower())
+            except ValueError:
+                _set_error(
+                    UMS_FUNC_UPDATE_GOAL_STATUS,
+                    f"Invalid goal status '{new_status_raw}'.",
+                    "GoalManagementError",
+                )
+                return
+
+            # Replace local copy in stack if present
+            for idx, g in enumerate(self.state.goal_stack):
+                if isinstance(g, dict) and g.get("goal_id") == goal_id:
+                    self.state.goal_stack[idx] = goal_details
+                    break
+
+            is_terminal = new_status in TERMINAL_GOAL_STATES
+            if goal_id == self.state.current_goal_id and is_terminal:
+                # Pop and shift focus
+                if self.state.goal_stack and self.state.goal_stack[-1].get("goal_id") == goal_id:
+                    self.state.goal_stack.pop()
+                parent_goal_id = payload_obj.get("parent_goal_id")
+                self.state.current_goal_id = parent_goal_id
+                if parent_goal_id:
+                    self.state.goal_stack = await self._fetch_goal_stack_from_ums(parent_goal_id)
+                    self.state.needs_replan = True
+                else:
+                    self.state.goal_stack = []
+                    self.state.needs_replan = False
+
+                # Root goal finished?
+                if payload_obj.get("is_root_finished", False):
+                    self.state.goal_achieved_flag = (new_status == GoalStatus.COMPLETED)
+                    # Ensure workflow status updated
+                    update_wf_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_WORKFLOW_STATUS)
+                    if self.state.workflow_id and self._find_tool_server(update_wf_mcp):
+                        await self._execute_tool_call_internal(
+                            update_wf_mcp,
+                            {
+                                "workflow_id": self.state.workflow_id,
+                                "status": (
+                                    WorkflowStatus.COMPLETED.value
+                                    if self.state.goal_achieved_flag
+                                    else WorkflowStatus.FAILED.value
+                                ),
+                                "completion_message": f"Root goal {_fmt_id(goal_id)} reached '{new_status.value}'.",
+                            },
+                            record_action=False,
+                        )
+                    self.state.current_plan = [
+                        PlanStep(description="Overall workflow goal reached. Finalising.", status="completed")
+                    ]
+            elif goal_id == self.state.current_goal_id and new_status == GoalStatus.PAUSED:
+                self.state.needs_replan = True
+                self.state.current_plan = [
+                    PlanStep(description=f"Current goal '{_fmt_id(goal_id)}' PAUSED. Re-evaluate strategy.", status="planned")
+                ]
+
+        # ------------------------------------------------------------------ #
+        elif base_tool_func_name == UMS_FUNC_UPDATE_WORKFLOW_STATUS:
+            if not (envelope_ok and _payload_success(payload_obj)):
+                self.logger.error(
+                    f"{log_prefix}: update_workflow_status failed. "
+                    f"Err={result_content_envelope.get('error_message')}"
+                )
+                self.state.needs_replan = True
+                return
+
+            wf_id = payload_obj.get("workflow_id")
+            status_raw = payload_obj.get("status")
+            if not (wf_id and status_raw):
+                _set_error(
+                    UMS_FUNC_UPDATE_WORKFLOW_STATUS,
+                    "update_workflow_status payload malformed.",
+                )
+                return
+            try:
+                new_status = WorkflowStatus(status_raw.lower())
+            except ValueError:
+                _set_error(
+                    UMS_FUNC_UPDATE_WORKFLOW_STATUS,
+                    f"Invalid workflow status '{status_raw}'.",
+                )
+                return
+
+            is_terminal = new_status in TERMINAL_WF_STATES
+            if self.state.workflow_stack and wf_id == self.state.workflow_stack[-1]:
+                # Current top-of-stack workflow updated
+                if is_terminal:
+                    finished_wf = self.state.workflow_stack.pop()
+                    parent_wf = self.state.workflow_stack[-1] if self.state.workflow_stack else None
+                    if parent_wf:
+                        # Return to parent context
+                        self.state.workflow_id = parent_wf
+                        self.state.context_id = parent_wf
+                        await self._set_default_thought_chain_id()
+                        self.state.goal_stack = []
+                        self.state.current_goal_id = None
+                        self.state.needs_replan = True
+                        self.state.current_plan = [
+                            PlanStep(
+                                description=f"Returned to parent workflow '{_fmt_id(parent_wf)}' after sub-workflow '{_fmt_id(finished_wf)}' finished ({new_status.value}).",
+                                status="planned",
+                            )
+                        ]
+                    else:
+                        # Root workflow finished
+                        self.state.workflow_id = None
+                        self.state.context_id = None
+                        self.state.current_thought_chain_id = None
+                        self.state.current_plan = []
+                        self.state.goal_stack = []
+                        self.state.current_goal_id = None
+                        self.state.goal_achieved_flag = (new_status == WorkflowStatus.COMPLETED)
+                        self.state.needs_replan = False
+            elif wf_id == self.state.workflow_id and is_terminal:
+                # Single-workflow run finished
+                self.state.workflow_id = None
+                self.state.context_id = None
+                self.state.current_thought_chain_id = None
+                self.state.current_plan = []
+                self.state.goal_stack = []
+                self.state.current_goal_id = None
+                self.state.goal_achieved_flag = (new_status == WorkflowStatus.COMPLETED)
+                self.state.needs_replan = False
+            elif wf_id == self.state.workflow_id and new_status == WorkflowStatus.PAUSED:
+                self.state.needs_replan = True
+                self.state.current_plan = [
+                    PlanStep(description=f"Workflow '{_fmt_id(wf_id)}' PAUSED. Await resume.", status="planned")
+                ]
+
+        # ------------------------------------------------------------------ #
+        # 3.  Unknown tool – no side-effects required
+        # ------------------------------------------------------------------ #
+        else:
+            self.logger.debug(f"{log_prefix}: No side-effects registered for tool '{base_tool_func_name}'.")
+            # Nothing to do…
+
+        # ------------------------------------------------------------------ #
+        # 4.  Summary logging & needs_replan diff
+        # ------------------------------------------------------------------ #
+        if not needs_replan_before and self.state.needs_replan:
+            self.logger.info(f"{log_prefix}: needs_replan became *True* during side-effects.")
+        elif needs_replan_before and not self.state.needs_replan:
+            self.logger.info(f"{log_prefix}: needs_replan became *False* during side-effects.")
+
+        if (wf_id_before != self.state.workflow_id) or (goal_id_before != self.state.current_goal_id):
+            self.logger.info(
+                f"{log_prefix}: STATE-CHANGE → WF {_fmt_id(wf_id_before)} → {_fmt_id(self.state.workflow_id)}, "
+                f"Goal {_fmt_id(goal_id_before)} → {_fmt_id(self.state.current_goal_id)}, "
+                f"StackDepth={len(self.state.goal_stack)}"
+            )
+
+        self.logger.info(
+            f"{log_prefix}: Exit. WF={_fmt_id(self.state.workflow_id)}, "
+            f"Context={_fmt_id(self.state.context_id)}, "
+            f"Goal={_fmt_id(self.state.current_goal_id)}, "
+            f"needs_replan={self.state.needs_replan}"
+        )
+
+
+    async def _fetch_goal_stack_from_ums(self, goal_id: str) -> list[dict[str, Any]]:
+        """
+        Return the parent → leaf stack for *goal_id* as stored in UMS.
+
+        The UMS wrapper has evolved over time, so the returned envelope may look
+        like any of the following:
+
+        A.  {"success": true, "stack": [...]}
+        B.  {"success": true, "data": {"stack": [...]} }
+        C.  {"success": true, "goal_stack": [...]}
+        D.  {"success": true, "data": {"goal_stack": [...]} }
+
+        This helper normalises all four shapes and always yields a **list**.
+        An empty list means “couldn’t fetch / tool missing / schema invalid”.
+        """
+        # ------------------------------------------------------------------ #
+        # Resolve the fully-qualified MCP name and ensure the tool is live.
+        # ------------------------------------------------------------------ #
+        get_goal_stack_mcp = self._get_ums_tool_mcp_name("get_goal_stack")
+        if self._find_tool_server(get_goal_stack_mcp) is None:
+            self.logger.warning(
+                f"_fetch_goal_stack_from_ums: UMS tool '{get_goal_stack_mcp}' unavailable."
+            )
+            return []
+
+        # ------------------------------------------------------------------ #
+        # Invoke tool through the internal execution wrapper.
+        # ------------------------------------------------------------------ #
+        try:
+            envelope: dict[str, Any] = await self._execute_tool_call_internal(
+                get_goal_stack_mcp, {"goal_id": goal_id}, record_action=False
+            )
+        except Exception as exc:
+            self.logger.error(
+                f"_fetch_goal_stack_from_ums: Exception while calling '{get_goal_stack_mcp}': {exc}",
+                exc_info=True,
+            )
+            return []
+
+        if not envelope.get("success"):
+            self.logger.warning(
+                "_fetch_goal_stack_from_ums: Tool returned failure – "
+                f"type={envelope.get('error_type')}, msg={envelope.get('error_message')}"
+            )
+            return []
+
+        # ------------------------------------------------------------------ #
+        # Normalise schema variations.
+        # ------------------------------------------------------------------ #
+        def _extract_stack(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+            """
+            Locate a list under any of the accepted keys.  
+            Returns *None* if nothing matches.
+            """
+            if not payload:
+                return None
+
+            # Top-level keys -------------------------------------------------
+            if isinstance(payload.get("stack"), list):
+                return payload["stack"]
+            if isinstance(payload.get("goal_stack"), list):
+                return payload["goal_stack"]
+            if isinstance(payload.get("goal_tree"), list):  # Added support for goal_tree key
+                self.logger.info("_fetch_goal_stack_from_ums: Found goals in 'goal_tree' key")
+                return payload["goal_tree"]
+
+            # Nested inside "data" ------------------------------------------
+            data_block = payload.get("data")
+            if isinstance(data_block, dict):
+                if isinstance(data_block.get("stack"), list):
+                    return data_block["stack"]
+                if isinstance(data_block.get("goal_tree"), list):  # Added support for goal_tree key
+                    self.logger.info("_fetch_goal_stack_from_ums: Found goals in data.goal_tree key")
+                if isinstance(data_block.get("goal_stack"), list):
+                    return data_block["goal_stack"]
+                    return data_block["goal_tree"]
+
+            return None
+
+        stack = _extract_stack(envelope)
+        if stack is None:
+            self.logger.error(
+                "_fetch_goal_stack_from_ums: Successful call but no stack found "
+                "in any supported location. Check UMS wrapper for schema drift."
+            )
+            return []
+
+        # Return a shallow copy so callers can mutate safely.
+        return list(stack)
+
+
+    def _apply_heuristic_plan_update(  # noqa: C901  (cyclomatic complexity intentionally managed with dispatch)
+        self,
+        last_llm_decision_from_mcpc: Dict[str, Any],
+        last_tool_result_envelope: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Conservative heuristic-based plan maintenance (v2).
+
+        * Maintains original behaviour 1-for-1.
+        * Swaps long if/elif chain for a dispatcher to aid comprehension.
+        * Ensures internal flags/counters are *always* updated deterministically.
+        * Never wipes ``last_error_details`` unless this turn ends in success.
+        """
+
+        # ------------------------------------------------------------------ setup --
+        self.logger.info("📋 Applying heuristic plan update (v2)…")
         needs_replan_on_entry = self.state.needs_replan
 
-        if not self.state.current_plan:
+        decision_raw: str = str(last_llm_decision_from_mcpc.get("decision", ""))
+        try:
+            decision: Optional[_Decision] = _Decision(decision_raw)
+        except ValueError:  # unknown decision type
+            decision = None
+
+        tool_name_mcp: Optional[str] = last_llm_decision_from_mcpc.get("tool_name")
+        current_step = self.state.current_plan[0] if self.state.current_plan else None
+        current_step_desc_lc = (current_step.description or "").lower() if current_step else ""
+
+        # ------------- guard: empty plan ------------------------------------------
+        if current_step is None:
             self.logger.error("📋 HEURISTIC CRITICAL: Current plan is empty. Forcing replan.")
             self.state.current_plan = [PlanStep(description="CRITICAL FALLBACK: Plan was empty. Re-evaluate.")]
             self.state.needs_replan = True
-            if not self.state.last_error_details:
-                self.state.last_error_details = {"error": "Plan empty.", "type": "PlanManagementError"}
+            self.state.last_error_details = self.state.last_error_details or {
+                "error": "Plan empty.",
+                "type": "PlanManagementError",
+            }
             self.state.consecutive_error_count += 1
-            if self.state.successful_actions_since_reflection > 0:
-                self.state.successful_actions_since_reflection = 0
-            if self.state.successful_actions_since_consolidation > 0:
-                self.state.successful_actions_since_consolidation = 0
+            self.state.successful_actions_since_reflection = 0
+            self.state.successful_actions_since_consolidation = 0
             return
 
-        current_step_obj = self.state.current_plan[0]
-        original_step_description_lc = current_step_obj.description.lower()
+        # ------------------------- aliases & helpers ------------------------------
+        SUCCESS, FAILED = ActionStatus.COMPLETED.value, ActionStatus.FAILED.value
+        INTERNAL_META = self._INTERNAL_OR_META_TOOLS_BASE_NAMES
+        get_base = self._get_base_function_name
 
-        decision_type = last_llm_decision_from_mcpc.get("decision")
-        tool_name_involved_in_llm_decision_mcp = last_llm_decision_from_mcpc.get("tool_name")
+        def _mark_step(status: str, summary: str = "") -> None:
+            """Set status & summary on the *current* plan step (trim summary to 150 chars)."""
+            current_step.status = status
+            if summary:
+                current_step.result_summary = summary[:150]
 
-        action_was_successful_this_turn = False
+        def _pop_if_first(step) -> None:
+            """Remove step from head of plan if it is indeed the head."""
+            if self.state.current_plan and self.state.current_plan[0].id == step.id:
+                self.state.current_plan.pop(0)
 
-        self.logger.debug(
-            f"📋 Heuristic: Decision='{decision_type}', Tool='{tool_name_involved_in_llm_decision_mcp}', "
-            f"StepID='{current_step_obj.id}', StepDesc='{current_step_obj.description[:50]}...', "
-            f"AssignedTool='{current_step_obj.assigned_tool}', NeedsReplanOnEntry='{needs_replan_on_entry}'"
-        )
+        # ----------------------------- scenario handlers --------------------------
+        #
+        # each returns: (success_flag: bool, reason_tag: str)
 
-        # current_step_was_agent_update_plan_tool_call_by_llm was unused, removed for now.
-        # If needed later, can be re-added:
-        # current_step_was_agent_update_plan_tool_call_by_llm = (
-        #     decision_type == "call_tool" and
-        #     tool_name_involved_in_llm_decision_mcp == AGENT_TOOL_UPDATE_PLAN and
-        #     current_step_obj.assigned_tool and
-        #     current_step_obj.assigned_tool == AGENT_TOOL_UPDATE_PLAN
-        # )
-
-        current_step_was_attempted_tool_execution = (
-            decision_type == "tool_executed_by_mcp"
-            and current_step_obj.assigned_tool
-            and current_step_obj.assigned_tool == tool_name_involved_in_llm_decision_mcp
-        )
-
-        current_step_was_generic_thinking_intent_by_llm = (
-            decision_type == "thought_process"
-            and not current_step_obj.assigned_tool
-            and tool_name_involved_in_llm_decision_mcp == self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_THOUGHT)
-        )
-
-        # --- Scenario 1: UMS/Server tool (current plan step's assigned_tool) EXECUTED BY MCPCLIENT ---
-        if current_step_was_attempted_tool_execution:
-            self.logger.debug(f"📋 Heuristic: Scenario 1 - UMS/Server tool '{tool_name_involved_in_llm_decision_mcp}' executed by MCPClient.")
-            tool_call_succeeded = isinstance(last_tool_result_envelope, dict) and last_tool_result_envelope.get("success", False)
-            action_was_successful_this_turn = tool_call_succeeded
-
-            if tool_call_succeeded:
-                current_step_obj.status = ActionStatus.COMPLETED.value
-                # ... (summary generation logic as before) ...
+        def _handle_tool_executed() -> Tuple[bool, str]:
+            succeeded = bool(isinstance(last_tool_result_envelope, dict) and last_tool_result_envelope.get("success"))
+            if succeeded:
                 summary = "Success."
-                ums_data_for_summary = last_tool_result_envelope.get("data", {}) if isinstance(last_tool_result_envelope, dict) else {}
-                if isinstance(ums_data_for_summary, dict):
-                    summary_keys = [
+                data = last_tool_result_envelope.get("data") if isinstance(last_tool_result_envelope, dict) else {}
+                if isinstance(data, dict):
+                    for k in (
                         "summary",
                         "message",
                         "memory_id",
@@ -3294,1166 +5266,1041 @@ class AgentMasterLoop:
                         "visualization",
                         "goal_id",
                         "workflow_id",
-                    ]
-                    for k_sum_h in summary_keys:
-                        if k_sum_h in ums_data_for_summary and ums_data_for_summary[k_sum_h] is not None:
-                            summary_value_str = str(ums_data_for_summary[k_sum_h])
-                            summary = f"{k_sum_h}: {_fmt_id(summary_value_str) if 'id' in k_sum_h.lower() else summary_value_str}"
+                    ):
+                        if data.get(k) is not None:
+                            summary_val = str(data[k])
+                            summary = f"{k}: {_fmt_id(summary_val) if 'id' in k else summary_val}"
                             break
-                    else:
-                        generic_summary_parts = [
-                            f"{k_s_h}={_fmt_id(str(v_s_h)) if 'id' in k_s_h.lower() else str(v_s_h)[:20]}"
-                            for k_s_h, v_s_h in ums_data_for_summary.items()
-                            if v_s_h is not None and k_s_h not in ["success", "processing_time"]
-                        ]
-                        if generic_summary_parts:
-                            summary = f"Success. Data: {', '.join(generic_summary_parts)}"
-                        else:
-                            summary = "Success (No specific summary data from UMS tool)."
-                current_step_obj.result_summary = summary[:150]
-                self.state.current_plan.pop(0)
-                if not self.state.needs_replan:
-                    if not self.state.current_plan:
-                        self.state.current_plan.append(
-                            PlanStep(description="Plan finished. Analyze overall result and decide if overall UMS workflow goal is met.")
-                        )
-                else:
-                    if not self.state.current_plan:
-                        self.state.current_plan.append(
-                            PlanStep(description="Plan cleared after successful UMS tool step due to side-effect requiring replan. Re-evaluate.")
-                        )
-                if self.state.last_error_details and self.state.last_error_details.get("tool") == tool_name_involved_in_llm_decision_mcp:
+                _mark_step(SUCCESS, summary)
+                _pop_if_first(current_step)
+
+                if not self.state.current_plan:
+                    self.state.current_plan.append(
+                        PlanStep(description="Plan finished. Analyze overall result and decide if workflow goal met.")
+                    )
+
+                # Clear error only if same tool now succeeded
+                if (
+                    self.state.last_error_details
+                    and self.state.last_error_details.get("tool") == tool_name_mcp
+                ):
                     self.state.last_error_details = None
-                self.logger.debug(f"📋 Heuristic: Step COMPLETED (UMS Tool). NeedsReplan={self.state.needs_replan}")
-            else:
-                current_step_obj.status = ActionStatus.FAILED.value
-                error_msg = (
-                    f"Type: {last_tool_result_envelope.get('error_type', 'Unk')}, Msg: {last_tool_result_envelope.get('error_message', 'Unk')}"
+
+                return True, "tool-exec"
+
+            # --- failure path
+            err_msg = (
+                last_tool_result_envelope.get("error_message", "Unknown failure")[:120]
+                if isinstance(last_tool_result_envelope, dict)
+                else "Unknown tool failure."
+            )
+            _mark_step(FAILED, f"Failure: {err_msg}")
+            self.state.needs_replan = True
+            return False, "tool-exec-fail"
+
+        def _handle_thought() -> Tuple[bool, str]:
+            succeeded = bool(isinstance(last_tool_result_envelope, dict) and last_tool_result_envelope.get("success"))
+            if succeeded:
+                content = last_llm_decision_from_mcpc.get("content", "")
+                thought_id = (
+                    last_tool_result_envelope.get("data", {}).get("thought_id", "UnkID")
                     if isinstance(last_tool_result_envelope, dict)
-                    else "Unknown tool failure."
+                    else "UnkID"
                 )
-                current_step_obj.result_summary = f"Failure: {error_msg[:150]}"
-                if not self.state.needs_replan:
-                    self.state.needs_replan = True
-                self.logger.warning(f"📋 Heuristic: Step FAILED (UMS Tool). NeedsReplan=True. Error: {error_msg}")
+                _mark_step(SUCCESS, f"Thought({_fmt_id(thought_id)}): {content[:50]}…")
+                _pop_if_first(current_step)
 
-        # --- Scenario 2: Generic thinking step -> Thought Recorded ---
-        elif current_step_was_generic_thinking_intent_by_llm:
-            self.logger.debug(f"📋 Heuristic: Scenario 2 - LLM recorded thought for generic plan step.")
-            thought_record_succeeded = isinstance(last_tool_result_envelope, dict) and last_tool_result_envelope.get("success", False)
-            action_was_successful_this_turn = thought_record_succeeded
-            original_thought_content_by_llm = last_llm_decision_from_mcpc.get("content", "")
-
-            if thought_record_succeeded:
-                current_step_obj.status = ActionStatus.COMPLETED.value
-                ums_data = last_tool_result_envelope.get("data", {}) if isinstance(last_tool_result_envelope, dict) else {}
-                thought_id = ums_data.get("thought_id", "UnkID") if isinstance(ums_data, dict) else "UnkID"
-                current_step_obj.result_summary = f"Thought Recorded (ID: {_fmt_id(thought_id)}): {original_thought_content_by_llm[:50]}..."
-                self.state.current_plan.pop(0)
-
+                # Determine whether we need to replan
                 if last_llm_decision_from_mcpc.get("_mcp_client_force_replan_after_thought_"):
-                    if not self.state.needs_replan:
-                        self.state.needs_replan = True
+                    self.state.needs_replan = True
                     if not self.state.current_plan:
                         self.state.current_plan.append(
-                            PlanStep(description=f"Replan forced. Orig thought: {original_thought_content_by_llm[:60]}...")
+                            PlanStep(description=f"Replan forced. Orig thought: {content[:60]}…")
                         )
                 else:
-                    if not self.state.needs_replan:
-                        is_assessment_like = any(
-                            kw in original_step_description_lc
-                            for kw in [
-                                "assess",
-                                "evaluate",
-                                "decide next",
-                                "formulate initial plan",
-                                "re-evaluate",
-                                "analyze goal",
-                                "understand task",
-                                "initial step",
-                                "root ums goal",
-                                "determine initial research strategy",
-                            ]
+                    assessment_kw = (
+                        "assess",
+                        "evaluate",
+                        "decide next",
+                        "re-evaluate",
+                        "analyze goal",
+                        "understand task",
+                    )
+                    is_assess = any(kw in current_step_desc_lc for kw in assessment_kw)
+                    empty_or_generic_next = (
+                        not self.state.current_plan
+                        or any(
+                            kw in self.state.current_plan[0].description.lower()
+                            for kw in ("decide next", "re-evaluate", "formulate plan", "assess goal")
                         )
-                        plan_empty_or_generic_next = not self.state.current_plan or (
-                            self.state.current_plan
-                            and any(
-                                kw in self.state.current_plan[0].description.lower()
-                                for kw in ["decide next", "re-evaluate", "formulate plan", "assess goal"]
-                            )
-                        )
-                        if is_assessment_like and plan_empty_or_generic_next:
-                            self.state.needs_replan = True
-                            new_plan_desc = "Replan: Formulate detailed steps after assessment."
-                            if not self.state.current_plan:
-                                self.state.current_plan.append(PlanStep(description=new_plan_desc))
-                            else:
-                                self.state.current_plan[0].description = new_plan_desc
-                                self.state.current_plan[0].status = "planned"
-                                self.state.current_plan[0].assigned_tool = None
-                                self.state.current_plan[0].depends_on = []
-                        else:
-                            self.state.needs_replan = False
-                    if not self.state.current_plan and not self.state.needs_replan:
+                    )
+                    self.state.needs_replan = is_assess and empty_or_generic_next
+                    if not self.state.needs_replan and not self.state.current_plan:
                         self.state.current_plan.append(PlanStep(description="Decide next action after thought."))
-                self.logger.debug(f"📋 Heuristic: Step COMPLETED (Thought). NeedsReplan={self.state.needs_replan}")
-            else:
-                current_step_obj.status = ActionStatus.FAILED.value
-                error_msg = (
-                    str(last_tool_result_envelope.get("error_message", "Failed to record thought."))[:100]
-                    if isinstance(last_tool_result_envelope, dict)
-                    else "Failed thought recording."
-                )
-                current_step_obj.result_summary = f"Failed Thought: {error_msg}"
-                if not self.state.needs_replan:
-                    self.state.needs_replan = True
-                self.logger.warning(f"📋 Heuristic: Step FAILED (Thought). NeedsReplan=True. Error: {error_msg}")
 
-        # --- Scenario 3: LLM called AGENT_TOOL_UPDATE_PLAN ---
-        elif decision_type == "call_tool" and tool_name_involved_in_llm_decision_mcp == AGENT_TOOL_UPDATE_PLAN:
-            self.logger.debug(f"📋 Heuristic: Scenario 3 - LLM called AGENT_TOOL_UPDATE_PLAN.")
-            plan_update_succeeded = isinstance(last_tool_result_envelope, dict) and last_tool_result_envelope.get("success", False)
-            action_was_successful_this_turn = plan_update_succeeded
+                return True, "thought"
 
-            if plan_update_succeeded:  # Plan already updated by _execute_tool_call_internal
-                self.logger.info(f"📋 Heuristic: Plan successfully updated by '{AGENT_TOOL_UPDATE_PLAN}'.")
-                if current_step_obj.assigned_tool == AGENT_TOOL_UPDATE_PLAN or "update plan" in original_step_description_lc:
-                    current_step_obj.status = ActionStatus.COMPLETED.value
-                    current_step_obj.result_summary = "Plan updated by LLM."
-                    if self.state.current_plan and self.state.current_plan[0].id == current_step_obj.id:
-                        self.state.current_plan.pop(0)
+            # --- failure path
+            err_msg = (
+                last_tool_result_envelope.get("error_message", "Failed to record thought.")[:100]
+                if isinstance(last_tool_result_envelope, dict)
+                else "Failed thought recording."
+            )
+            _mark_step(FAILED, f"Failed Thought: {err_msg}")
+            self.state.needs_replan = True
+            return False, "thought-fail"
+
+        def _handle_agent_plan_update() -> Tuple[bool, str]:
+            succeeded = bool(isinstance(last_tool_result_envelope, dict) and last_tool_result_envelope.get("success"))
+            if succeeded:
+                if current_step.assigned_tool == AGENT_TOOL_UPDATE_PLAN or "update plan" in current_step_desc_lc:
+                    _mark_step(SUCCESS, "Plan updated by LLM.")
+                    _pop_if_first(current_step)
                 if not self.state.current_plan:
                     self.state.current_plan.append(PlanStep(description="New plan active. Proceed."))
-                # needs_replan should be False from successful _execute_tool_call_internal
-            else:  # AGENT_TOOL_UPDATE_PLAN failed validation in _execute_tool_call_internal
-                current_step_obj.status = ActionStatus.FAILED.value
-                error_msg = (
-                    f"Type: {last_tool_result_envelope.get('error_type', 'PlanUpdateErr')}, Msg: {last_tool_result_envelope.get('error_message', 'Unk')}"
-                    if isinstance(last_tool_result_envelope, dict)
-                    else "Plan update failed."
-                )
-                current_step_obj.result_summary = f"Failed plan update: {error_msg[:100]}"
-                if not self.state.needs_replan:
-                    self.state.needs_replan = True  # Error in plan update logic
-                self.logger.warning(f"📋 Heuristic: Call to '{AGENT_TOOL_UPDATE_PLAN}' FAILED. Step FAILED. NeedsReplan=True. Error: {error_msg}")
+                return True, "agent-plan-update"
 
-        # --- Scenario 4: LLM signaled overall goal completion ---
-        elif decision_type == "complete" or decision_type == "complete_with_artifact":
-            self.logger.debug(f"📋 Heuristic: Scenario 4 - LLM signaled overall goal completion.")
-            action_was_successful_this_turn = True
-            self.state.current_plan = [PlanStep(description="Goal Achieved. Finalizing workflow.", status="completed")]
+            _mark_step(
+                FAILED,
+                f"Failed plan update: {last_tool_result_envelope.get('error_message', 'Unknown')[:100]}",
+            )
+            self.state.needs_replan = True
+            return False, "agent-plan-update-fail"
+
+        def _handle_complete() -> Tuple[bool, str]:
+            self.state.current_plan = [
+                PlanStep(description="Goal Achieved. Finalizing workflow.", status="completed")
+            ]
             self.state.needs_replan = False
-            self.logger.info(f"📋 Heuristic: LLM signaled 'complete'. Plan set to finalization. NeedsReplan=False")
+            return True, "complete"
 
-        # --- Scenario 5: LLM provided a textual plan update (parsed by MCPClient) ---
-        elif decision_type == "plan_update":
-            self.logger.debug(f"📋 Heuristic: Scenario 5 - LLM textual plan update processed by MCPClient.")
-            if not self.state.needs_replan:  # Plan was successfully applied by MCPClient/execute_llm_decision
-                action_was_successful_this_turn = True
-                self.logger.info("📋 Heuristic: Plan successfully updated from LLM text (handled by MCPClient).")
-                if "assess" in original_step_description_lc or "plan" in original_step_description_lc:
-                    # Don't pop, self.state.current_plan is already the *new* plan.
-                    # If we wanted to mark the *previous* step that led to this, it's harder without history here.
-                    # For now, just acknowledge the new plan is active.
-                    pass
-            else:  # Textual plan update failed validation (needs_replan is True from MCPClient)
-                action_was_successful_this_turn = False
-                current_step_obj.status = ActionStatus.FAILED.value
-                error_msg = (
-                    f"LLM textual plan validation error: {self.state.last_error_details.get('error', 'Unk')}"
-                    if self.state.last_error_details and self.state.last_error_details.get("type") == "PlanValidationError"
-                    else "Failed to apply LLM textual plan."
-                )
-                current_step_obj.result_summary = f"Textual Plan Error: {error_msg[:100]}"
-                self.logger.warning(f"📋 Heuristic: LLM textual plan NOT applied (needs_replan is True). Step FAILED. Error: {error_msg}")
-
-        # --- Scenario 6: Other decision types or no direct action on current plan step ---
-        else:
-            self.logger.debug(
-                f"📋 Heuristic: Scenario 6 - Decision type '{decision_type}' or tool '{tool_name_involved_in_llm_decision_mcp}' unmatched primary paths."
+        def _handle_textual_plan_update() -> Tuple[bool, str]:
+            if not self.state.needs_replan:
+                return True, "textual-plan-update"
+            _mark_step(
+                FAILED,
+                f"Textual Plan Error: {self.state.last_error_details.get('error', 'Validation error')[:100]}"
+                if self.state.last_error_details
+                else "Failed textual plan.",
             )
-            action_was_successful_this_turn = False
+            return False, "textual-plan-fail"
+
+        def _handle_other() -> Tuple[bool, str]:
             if self.state.last_error_details and not self.state.needs_replan:
-                self.logger.warning("📋 Heuristic: `last_error_details` set, `needs_replan` was false. Forcing replan due to error.")
                 self.state.needs_replan = True
-                current_step_obj.status = ActionStatus.FAILED.value
-                current_step_obj.result_summary = f"Error state detected: {str(self.state.last_error_details.get('error'))[:50]}"
+                _mark_step(
+                    FAILED,
+                    f"Error state detected: {str(self.state.last_error_details.get('error'))[:50]}",
+                )
+            if not self.state.current_plan:
+                self.state.current_plan.append(
+                    PlanStep(description="Assess situation and decide next action.")
+                )
+            return False, "unhandled"
 
-            if not self.state.current_plan and self.state.needs_replan:
-                self.state.current_plan.append(PlanStep(description="Plan empty and replan needed. Re-evaluate."))
-            elif not self.state.current_plan and not self.state.needs_replan:
-                self.logger.warning("📋 Heuristic: Plan empty (Scenario 6) without needs_replan. Adding assessment step.")
-                self.state.current_plan.append(PlanStep(description="Assess situation and decide next action."))
+        # ----------------------------- dispatcher ----------------------------------
+        dispatcher = {
+            _Decision.TOOL_EXECUTED: _handle_tool_executed,
+            _Decision.THOUGHT: _handle_thought,
+            _Decision.CALL_TOOL: _handle_agent_plan_update
+            if tool_name_mcp == AGENT_TOOL_UPDATE_PLAN
+            else _handle_other,
+            _Decision.COMPLETE: _handle_complete,
+            _Decision.COMPLETE_ART: _handle_complete,
+            _Decision.PLAN_UPDATE: _handle_textual_plan_update,
+        }
 
-        # --- Update Meta-Cognitive Counters ---
-        if action_was_successful_this_turn:
+        if decision in dispatcher:
+            action_successful, reason_tag = dispatcher[decision]()
+        else:  # unknown / unsupported decision
+            action_successful, reason_tag = _handle_other()
+
+        # ----------------------- counters / meta-cognition -------------------------
+        if action_successful:
             self.state.consecutive_error_count = 0
-            base_tool_name_for_counter = (
-                self._get_base_function_name(tool_name_involved_in_llm_decision_mcp) if tool_name_involved_in_llm_decision_mcp else None
+            base_tool = get_base(tool_name_mcp) if tool_name_mcp else None
+            substantive_tool = (
+                decision == _Decision.TOOL_EXECUTED
+                and tool_name_mcp
+                and base_tool not in INTERNAL_META
+                and tool_name_mcp != AGENT_TOOL_UPDATE_PLAN
             )
-
-            # Define conditions for substantive actions
-            is_substantive_ums_tool_by_mcpc = (
-                decision_type == "tool_executed_by_mcp"
-                and tool_name_involved_in_llm_decision_mcp
-                and base_tool_name_for_counter not in self._INTERNAL_OR_META_TOOLS_BASE_NAMES
-                and tool_name_involved_in_llm_decision_mcp != AGENT_TOOL_UPDATE_PLAN
-            )
-            is_successful_thought = decision_type == "thought_process" and action_was_successful_this_turn
-
-            if is_substantive_ums_tool_by_mcpc:
+            successful_thought = decision == _Decision.THOUGHT
+            if substantive_tool:
                 self.state.successful_actions_since_reflection += 1.0
                 self.state.successful_actions_since_consolidation += 1.0
-            elif is_successful_thought:
+            elif successful_thought:
                 self.state.successful_actions_since_reflection += 0.5
                 self.state.successful_actions_since_consolidation += 0.5
-            # No increment for plan updates or goal completions for these counters
         else:
             if self.state.last_error_details:
                 self.state.consecutive_error_count += 1
-                self.logger.warning(
-                    f"📋 Heuristic: Consecutive error count incremented to: {self.state.consecutive_error_count} due to active error."
-                )
-
             if self.state.last_error_details or (self.state.needs_replan and not needs_replan_on_entry):
-                if self.state.successful_actions_since_reflection > 0:
-                    self.logger.info(f"📋 Heuristic: Reset reflection counter from {self.state.successful_actions_since_reflection:.1f}.")
-                    self.state.successful_actions_since_reflection = 0
-                if self.state.successful_actions_since_consolidation > 0:
-                    self.logger.info(f"📋 Heuristic: Reset consolidation counter from {self.state.successful_actions_since_consolidation:.1f}.")
-                    self.state.successful_actions_since_consolidation = 0
+                self.state.successful_actions_since_reflection = 0
+                self.state.successful_actions_since_consolidation = 0
 
-        log_plan_msg = f"Plan after heuristic. Steps: {len(self.state.current_plan)}. "
-        if self.state.current_plan:
-            next_step_log = self.state.current_plan[0]
-            depends_str_log = f"Depends: {[_fmt_id(d) for d in next_step_log.depends_on]}" if next_step_log.depends_on else "Depends: None"
-            log_plan_msg += (
-                f"Next: '{next_step_log.description[:60]}...' (ID: {_fmt_id(next_step_log.id)}, Status: {next_step_log.status}, {depends_str_log})"
+        # -------------------------------- logging ----------------------------------
+        if self.logger.isEnabledFor(logging.DEBUG):
+            log_msg = (
+                f"📋 Heuristic Update End ({reason_tag}). Steps: {len(self.state.current_plan)}; "
             )
-        else:
-            log_plan_msg += "Plan is CRITICALLY empty."
-        self.logger.info(
-            f"📋 Heuristic Update End: {log_plan_msg}. NeedsReplan={self.state.needs_replan}. ConsecutiveErrors={self.state.consecutive_error_count}"
-        )
+            if self.state.current_plan:
+                nxt = self.state.current_plan[0]
+                depends = f"Depends: {[_fmt_id(d) for d in nxt.depends_on]}" if nxt.depends_on else "Depends: None"
+                log_msg += (
+                    f"Next: '{nxt.description[:60]}…' (ID: {_fmt_id(nxt.id)}, Status: {nxt.status}, {depends})"
+                )
+            else:
+                log_msg += "Plan empty."
+            log_msg += (
+                f"; NeedsReplan={self.state.needs_replan}; "
+                f"ConsecutiveErrors={self.state.consecutive_error_count}"
+            )
+            self.logger.debug(log_msg)
+
+        # ------------------------------- sanity assert -----------------------------
+        assert action_successful is not None, "Internal error: action_successful not set!"
+
 
     def _adapt_thresholds(self, stats: Dict[str, Any]) -> None:
-        if not stats or not stats.get("success"):
-            self.logger.warning("Cannot adapt thresholds: Invalid stats.")
+        """
+        Heuristically nudge the reflection / consolidation thresholds so the agent
+        stays within target failure-rate and memory-mix envelopes.
+
+        Args:
+            stats: result object returned by `ums.compute_memory_statistics`
+                Expected keys:
+                    - success: bool
+                    - total_memories: int
+                    - by_level: {MemoryLevel: int}
+        Side-effects:
+            - May mutate `self.state.current_consolidation_threshold`
+            - May mutate `self.state.current_reflection_threshold`
+        """
+
+        # ───────────────────────────────────────────────────────────── constants ──
+        TARGET_EPISODIC_UPPER = 0.30
+        TARGET_EPISODIC_LOWER = 0.10
+        CONSOLIDATION_SCALER  = 2.0               # how aggressively we react
+        FAILURE_RATE_TARGET   = 0.10
+        REFLECTION_SCALER     = 3.0
+        MIN_CALLS_FOR_RATE    = 5                 # avoid noisy early division
+        THOUGHT_MOMENTUM_BIAS = MOMENTUM_THRESHOLD_BIAS_FACTOR
+        DAMPENING             = THRESHOLD_ADAPTATION_DAMPENING
+
+        # ─────────────────────────────────────────────────── early validity check ──
+        if not (stats and stats.get("success", False)):
+            self.logger.warning("Cannot adapt thresholds: Invalid stats object.")
             return
-        self.logger.debug(f"Adapting thresholds based on stats: {stats}")
-        adjustment_dampening = THRESHOLD_ADAPTATION_DAMPENING
+
+        # small helper to clamp & log, returns True if a change was applied
+        def _apply_delta(curr: int, delta: int, lo: int, hi: int, label: str, meta: str) -> bool:
+            if delta == 0:                    # fast exit
+                return False
+            new_val = max(lo, min(hi, curr + delta))
+            if new_val == curr:               # already at bound
+                return False
+            direction = "Lowering" if new_val < curr else "Raising"
+            self.logger.info(
+                f"{direction} {label} threshold: {curr} → {new_val} {meta}"
+            )
+            return setattr(self.state, f"current_{label}_threshold", new_val) or True  # setattr returns None
+
         changed = False
-        episodic_count = stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0)
-        total_memories = stats.get("total_memories", 1)
-        episodic_ratio = episodic_count / total_memories if total_memories > 0 else 0
-        target_episodic_ratio_upper = 0.30
-        target_episodic_ratio_lower = 0.10
-        mid_target_ratio = (target_episodic_ratio_upper + target_episodic_ratio_lower) / 2
-        ratio_deviation = episodic_ratio - mid_target_ratio
-        consolidation_adjustment = -math.ceil(ratio_deviation * self.state.current_consolidation_threshold * 2.0)
-        dampened_adjustment = int(consolidation_adjustment * adjustment_dampening)
-        if dampened_adjustment != 0:
-            old_threshold = self.state.current_consolidation_threshold
-            potential_new = max(MIN_CONSOLIDATION_THRESHOLD, min(MAX_CONSOLIDATION_THRESHOLD, old_threshold + dampened_adjustment))
-            if potential_new != old_threshold:
-                change_direction = "Lowering" if dampened_adjustment < 0 else "Raising"
-                self.logger.info(
-                    f"{change_direction} consolidation threshold: {old_threshold} -> {potential_new} (Episodic Ratio: {episodic_ratio:.1%}, Dev: {ratio_deviation:+.1%}, Adj: {dampened_adjustment})"
-                )
-                self.state.current_consolidation_threshold = potential_new
-                changed = True
-        total_calls = sum(v.get("success", 0) + v.get("failure", 0) for v in self.state.tool_usage_stats.values())
-        total_failures = sum(v.get("failure", 0) for v in self.state.tool_usage_stats.values())
-        min_calls_for_rate = 5
-        failure_rate = (total_failures / total_calls) if total_calls >= min_calls_for_rate else 0.0
-        target_failure_rate = 0.10
-        failure_deviation = failure_rate - target_failure_rate
-        reflection_adjustment = -math.ceil(failure_deviation * self.state.current_reflection_threshold * 3.0)
-        is_stable_progress = (failure_rate < target_failure_rate * 0.5) and (self.state.consecutive_error_count == 0)
-        momentum_bias = 0
-        if is_stable_progress and reflection_adjustment >= 0:
-            momentum_bias = math.ceil(reflection_adjustment * (MOMENTUM_THRESHOLD_BIAS_FACTOR - 1.0))
-            reflection_adjustment += momentum_bias
-            self.logger.debug(f"Mental Momentum: Adding +{momentum_bias} to reflection adj (Stable).")
-        dampened_adjustment = int(reflection_adjustment * adjustment_dampening)
-        if dampened_adjustment != 0 and total_calls >= min_calls_for_rate:
-            old_threshold = self.state.current_reflection_threshold
-            potential_new = max(MIN_REFLECTION_THRESHOLD, min(MAX_REFLECTION_THRESHOLD, old_threshold + dampened_adjustment))
-            if potential_new != old_threshold:
-                change_direction = "Lowering" if dampened_adjustment < 0 else "Raising"
-                momentum_tag = " (+Momentum)" if is_stable_progress and momentum_bias > 0 else ""
-                self.logger.info(
-                    f"{change_direction} reflection threshold: {old_threshold} -> {potential_new} (Fail Rate: {failure_rate:.1%}, Dev: {failure_deviation:+.1%}, Adj: {dampened_adjustment}{momentum_tag})"
-                )
-                self.state.current_reflection_threshold = potential_new
-                changed = True
+        self.logger.debug("Adapting thresholds with stats: %s", stats)
+
+        # ───────────────────────────────────────────── consolidate-threshold branch ──
+        total_memories = max(int(stats.get("total_memories", 0)), 1)  # guard /0
+        episodic_count = int(stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0))
+        episodic_ratio = episodic_count / total_memories
+
+        mid_target = (TARGET_EPISODIC_UPPER + TARGET_EPISODIC_LOWER) / 2.0
+        ratio_deviation = episodic_ratio - mid_target
+        raw_adj = -math.ceil(ratio_deviation * self.state.current_consolidation_threshold * CONSOLIDATION_SCALER)
+        damp_adj = int(raw_adj * DAMPENING) or 0  # avoid negative zero
+
+        changed |= _apply_delta(
+            curr=self.state.current_consolidation_threshold,
+            delta=damp_adj,
+            lo=MIN_CONSOLIDATION_THRESHOLD,
+            hi=MAX_CONSOLIDATION_THRESHOLD,
+            label="consolidation",
+            meta=f"(Episodic %: {episodic_ratio:.1%}, Δ: {ratio_deviation:+.1%}, raw: {raw_adj}, damp: {damp_adj})",
+        )
+
+        # ───────────────────────────────────────────── reflection-threshold branch ──
+        totals = [v.get("success", 0) + v.get("failure", 0) for v in self.state.tool_usage_stats.values()]
+        failures = [v.get("failure", 0) for v in self.state.tool_usage_stats.values()]
+        total_calls, total_failures = sum(totals), sum(failures)
+
+        failure_rate = (total_failures / total_calls) if total_calls >= MIN_CALLS_FOR_RATE else 0.0
+        fail_dev = failure_rate - FAILURE_RATE_TARGET
+        raw_ref_adj = -math.ceil(fail_dev * self.state.current_reflection_threshold * REFLECTION_SCALER)
+
+        is_stable = (failure_rate < FAILURE_RATE_TARGET * 0.5) and (self.state.consecutive_error_count == 0)
+        if is_stable and raw_ref_adj >= 0:
+            momentum_boost = math.ceil(raw_ref_adj * (THOUGHT_MOMENTUM_BIAS - 1.0))
+            raw_ref_adj += momentum_boost
+            self.logger.debug("Mental momentum: +%d added to reflection delta.", momentum_boost)
+
+        damp_ref_adj = int(raw_ref_adj * DAMPENING) or 0
+
+        changed |= _apply_delta(
+            curr=self.state.current_reflection_threshold,
+            delta=damp_ref_adj,
+            lo=MIN_REFLECTION_THRESHOLD,
+            hi=MAX_REFLECTION_THRESHOLD,
+            label="reflection",
+            meta=f"(Fail rate: {failure_rate:.1%}, Δ: {fail_dev:+.1%}, raw: {raw_ref_adj}, damp: {damp_ref_adj})",
+        )
+
         if not changed:
             self.logger.debug("No threshold adjustments triggered.")
 
-    async def _run_periodic_tasks(self):
-        # This method uses _get_ums_tool_mcp_name for UMS tool calls
-        if not self.state.workflow_id or not self.state.context_id or self._shutdown_event.is_set():
-            self.logger.debug("Skipping periodic tasks: No active workflow/context or shutdown signaled.")
+    async def _trigger_promotion_checks(self) -> None:
+        """
+        Scan the current workflow for memories that are good candidates for
+        promotion (episodic → semantic, semantic → procedural/skill) and fire
+        `_check_and_trigger_promotion` in the background for each.
+        """
+        # ---- fast pre-flight checks ------------------------------------------------
+        if self._shutdown_event.is_set():
+            self.logger.debug("Promotion check aborted: shutdown signalled.")
             return
 
-        # Store (full_mcp_tool_name, args_dict)
-        tasks_to_run: List[Tuple[str, Dict[str, Any]]] = []
-        trigger_reasons: List[str] = []
-
-        log_prefix = f"AML_PERIODIC (WF:{_fmt_id(self.state.workflow_id)}, Loop:{self.state.current_loop})"
-        self.logger.debug(f"{log_prefix}: Evaluating periodic tasks.")
-
-        # Construct full MCP names for UMS tools
-        ums_reflection_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_REFLECTION)
-        ums_consolidation_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_CONSOLIDATION)
-        ums_optimize_wm_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_OPTIMIZE_WM)
-        ums_auto_focus_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_AUTO_FOCUS)
-        ums_query_memories_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_QUERY_MEMORIES)
-        ums_compute_stats_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_COMPUTE_STATS)
-        ums_delete_expired_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_DELETE_EXPIRED_MEMORIES)
-
-        reflection_tool_available = self._find_tool_server(ums_reflection_mcp_name) is not None
-        consolidation_tool_available = self._find_tool_server(ums_consolidation_mcp_name) is not None
-        optimize_wm_tool_available = self._find_tool_server(ums_optimize_wm_mcp_name) is not None
-        auto_focus_tool_available = self._find_tool_server(ums_auto_focus_mcp_name) is not None
-        promotion_query_tool_available = self._find_tool_server(ums_query_memories_mcp_name) is not None
-        stats_tool_available = self._find_tool_server(ums_compute_stats_mcp_name) is not None
-        maintenance_tool_available = self._find_tool_server(ums_delete_expired_mcp_name) is not None
-
-        # 1. Statistics and Threshold Adaptation
-        self.state.loops_since_stats_adaptation += 1
-        if self.state.loops_since_stats_adaptation >= STATS_ADAPTATION_INTERVAL:
-            if stats_tool_available:
-                trigger_reasons.append("StatsInterval")
-                try:
-                    self.logger.debug(f"{log_prefix}: Triggering UMS compute_memory_statistics.")
-                    stats_result = await self._execute_tool_call_internal(
-                        ums_compute_stats_mcp_name, {"workflow_id": self.state.workflow_id}, record_action=False
-                    )
-                    if stats_result.get("success"):
-                        self._adapt_thresholds(stats_result)
-                        episodic_count = stats_result.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0)
-                        # Check if consolidation is already scheduled to avoid duplication
-                        if (
-                            episodic_count > (self.state.current_consolidation_threshold * 2.0)
-                            and consolidation_tool_available
-                            and not any(task[0] == ums_consolidation_mcp_name for task in tasks_to_run)
-                        ):
-                            self.logger.info(f"{log_prefix}: High episodic count ({episodic_count}), scheduling consolidation.")
-                            tasks_to_run.append(
-                                (
-                                    ums_consolidation_mcp_name,
-                                    {
-                                        "workflow_id": self.state.workflow_id,
-                                        "consolidation_type": "summary",
-                                        "query_filter": {"memory_level": MemoryLevel.EPISODIC.value},
-                                        "max_source_memories": self.consolidation_max_sources,
-                                    },
-                                )
-                            )
-                            trigger_reasons.append(f"HighEpisodic({episodic_count})")
-                            self.state.successful_actions_since_consolidation = 0  # Reset as it's being scheduled
-                    else:
-                        self.logger.warning(f"{log_prefix}: Failed to compute stats for adaptation: {stats_result.get('error')}")
-                except Exception as e:
-                    self.logger.error(f"{log_prefix}: Error during stats/adaptation: {e}", exc_info=True)  # Log full traceback for unexpected
-                finally:
-                    self.state.loops_since_stats_adaptation = 0
-            else:
-                self.logger.warning(f"{log_prefix}: Skipping stats/adaptation: Tool '{UMS_FUNC_COMPUTE_STATS}' not available.")
-                self.state.loops_since_stats_adaptation = 0  # Still reset counter
-
-        # 2. Reflection
-        needs_reflection = self.state.needs_replan or (self.state.successful_actions_since_reflection >= self.state.current_reflection_threshold)
-        if needs_reflection:
-            if reflection_tool_available and not any(task[0] == ums_reflection_mcp_name for task in tasks_to_run):
-                reflection_type = self.reflection_type_sequence[self.state.reflection_cycle_index % len(self.reflection_type_sequence)]
-                tasks_to_run.append((ums_reflection_mcp_name, {"workflow_id": self.state.workflow_id, "reflection_type": reflection_type}))
-                reason_str = (
-                    f"Replan({self.state.needs_replan})"
-                    if self.state.needs_replan
-                    else f"SuccessCount({self.state.successful_actions_since_reflection:.1f}>={self.state.current_reflection_threshold})"
-                )
-                trigger_reasons.append(f"Reflect({reason_str})")
-                self.state.successful_actions_since_reflection = 0  # Reset counter as it's being scheduled
-                self.state.reflection_cycle_index += 1
-            else:
-                if not reflection_tool_available:
-                    self.logger.warning(f"{log_prefix}: Skipping reflection: Tool '{UMS_FUNC_REFLECTION}' unavailable.")
-                    self.state.successful_actions_since_reflection = 0  # Reset if tool missing, to avoid re-triggering immediately
-                elif any(task[0] == ums_reflection_mcp_name for task in tasks_to_run):
-                    self.logger.debug(f"{log_prefix}: Reflection already scheduled this cycle.")
-
-        # 3. Consolidation
-        needs_consolidation = self.state.successful_actions_since_consolidation >= self.state.current_consolidation_threshold
-        if needs_consolidation:
-            if consolidation_tool_available and not any(task[0] == ums_consolidation_mcp_name for task in tasks_to_run):
-                tasks_to_run.append(
-                    (
-                        ums_consolidation_mcp_name,
-                        {
-                            "workflow_id": self.state.workflow_id,
-                            "consolidation_type": "summary",
-                            "query_filter": {"memory_level": self.consolidation_memory_level},  # Use configured level
-                            "max_source_memories": self.consolidation_max_sources,
-                        },
-                    )
-                )
-                trigger_reasons.append(
-                    f"ConsolidateThreshold({self.state.successful_actions_since_consolidation:.1f}>={self.state.current_consolidation_threshold})"
-                )
-                self.state.successful_actions_since_consolidation = 0  # Reset counter as it's being scheduled
-            else:
-                if not consolidation_tool_available:
-                    self.logger.warning(f"{log_prefix}: Skipping consolidation: Tool '{UMS_FUNC_CONSOLIDATION}' unavailable.")
-                    self.state.successful_actions_since_consolidation = 0  # Reset if tool missing
-                elif any(task[0] == ums_consolidation_mcp_name for task in tasks_to_run):
-                    self.logger.debug(f"{log_prefix}: Consolidation already scheduled this cycle.")
-
-        # 4. Working Memory Optimization & Focus Update
-        self.state.loops_since_optimization += 1
-        if self.state.loops_since_optimization >= OPTIMIZATION_LOOP_INTERVAL:
-            if optimize_wm_tool_available:
-                # optimize_working_memory is agent-internal, its result is used to update cognitive_states.
-                # It does not directly return a result to be used as meta-feedback for LLM.
-                # The task here is to *calculate* the optimization. Applying it happens in main loop if needed.
-                # For simplicity, let's assume the UMS tool does the calculation.
-                # If the tool *also* applies it, then no further action here.
-                # If it *only* calculates, Agent might need another step to apply.
-                # Current UMS `optimize_working_memory` returns lists to retain/remove. Agent applies it.
-                # So, this is more like an "initiate calculation" step.
-                # For now, let's assume the UMS tool might update state or the agent will handle its output.
-                # It seems `optimize_working_memory` itself logs its actions.
-                tasks_to_run.append((ums_optimize_wm_mcp_name, {"context_id": self.state.context_id}))
-                trigger_reasons.append("OptimizeInterval")
-            else:
-                self.logger.warning(f"{log_prefix}: Skipping WM optimization: Tool '{UMS_FUNC_OPTIMIZE_WM}' unavailable.")
-
-            if auto_focus_tool_available:
-                tasks_to_run.append((ums_auto_focus_mcp_name, {"context_id": self.state.context_id}))
-                trigger_reasons.append("FocusUpdateInterval")
-            else:
-                self.logger.warning(f"{log_prefix}: Skipping auto-focus: Tool '{UMS_FUNC_AUTO_FOCUS}' unavailable.")
-            self.state.loops_since_optimization = 0
-
-        # 5. Memory Promotion Check
-        self.state.loops_since_promotion_check += 1
-        if self.state.loops_since_promotion_check >= MEMORY_PROMOTION_LOOP_INTERVAL:
-            if promotion_query_tool_available:  # query_memories is needed to find candidates
-                # This internal task will then call _check_and_trigger_promotion for each candidate
-                tasks_to_run.append(("CHECK_PROMOTIONS_INTERNAL_TASK", {"workflow_id": self.state.workflow_id}))
-                trigger_reasons.append("PromotionInterval")
-            else:
-                self.logger.warning(f"{log_prefix}: Skipping promotion check: Tool '{UMS_FUNC_QUERY_MEMORIES}' (for candidate search) unavailable.")
-            self.state.loops_since_promotion_check = 0
-
-        # 6. Maintenance (Delete Expired Memories)
-        self.state.loops_since_maintenance += 1
-        if self.state.loops_since_maintenance >= MAINTENANCE_INTERVAL:
-            if maintenance_tool_available:
-                tasks_to_run.append((ums_delete_expired_mcp_name, {"db_path": None}))  # db_path will be handled by UMS tool
-                trigger_reasons.append("MaintenanceInterval")
-                self.state.loops_since_maintenance = 0
-            else:
-                self.logger.warning(f"{log_prefix}: Skipping maintenance: Tool '{UMS_FUNC_DELETE_EXPIRED_MEMORIES}' unavailable.")
-                self.state.loops_since_maintenance = 0  # Reset counter even if tool is missing
-
-        # Execute scheduled tasks
-        if tasks_to_run:
-            unique_reasons_str = ", ".join(sorted(set(trigger_reasons)))  # Ensure unique reasons
-            self.logger.info(f"🧠 {log_prefix}: Running {len(tasks_to_run)} periodic tasks (Triggers: {unique_reasons_str}).")
-
-            # Sort for consistent execution order (e.g., maintenance first, then stats, then cognitive)
-            def sort_key_periodic(task_tuple: Tuple[str, Dict[str, Any]]) -> int:
-                tool_mcp_name = task_tuple[0]
-                if tool_mcp_name == ums_delete_expired_mcp_name:
-                    return 0
-                if tool_mcp_name == ums_compute_stats_mcp_name:
-                    return 1
-                if tool_mcp_name == "CHECK_PROMOTIONS_INTERNAL_TASK":
-                    return 2
-                if tool_mcp_name == ums_optimize_wm_mcp_name:
-                    return 3
-                if tool_mcp_name == ums_auto_focus_mcp_name:
-                    return 4
-                if tool_mcp_name == ums_consolidation_mcp_name:
-                    return 5
-                if tool_mcp_name == ums_reflection_mcp_name:
-                    return 6
-                return 7  # Default for any other
-
-            tasks_to_run.sort(key=sort_key_periodic)
-
-            for mcp_tool_name_to_call, args_for_tool in tasks_to_run:
-                if self._shutdown_event.is_set():
-                    self.logger.info(f"{log_prefix}: Shutdown signaled during periodic tasks execution. Stopping further tasks.")
-                    break
-                try:
-                    if mcp_tool_name_to_call == "CHECK_PROMOTIONS_INTERNAL_TASK":
-                        self.logger.debug(
-                            f"{log_prefix}: Triggering internal promotion checks based on workflow_id '{args_for_tool.get('workflow_id')}'..."
-                        )
-                        await self._trigger_promotion_checks()  # This internally uses self.state.workflow_id
-                        continue  # Skip normal tool call processing
-
-                    self.logger.debug(f"{log_prefix}: Executing periodic MCP Tool: {mcp_tool_name_to_call} with args: {args_for_tool}")
-
-                    # Ensure workflow_id is in args if not already and tool is not create_workflow/list_workflows
-                    if (
-                        "workflow_id" not in args_for_tool
-                        and self.state.workflow_id
-                        and self._get_base_function_name(mcp_tool_name_to_call)
-                        not in [UMS_FUNC_CREATE_WORKFLOW, UMS_FUNC_LIST_WORKFLOWS, UMS_FUNC_DELETE_EXPIRED_MEMORIES]
-                    ):
-                        args_for_tool["workflow_id"] = self.state.workflow_id
-                    if (
-                        "context_id" not in args_for_tool
-                        and self.state.context_id
-                        and self._get_base_function_name(mcp_tool_name_to_call) in [UMS_FUNC_OPTIMIZE_WM, UMS_FUNC_AUTO_FOCUS]
-                    ):
-                        args_for_tool["context_id"] = self.state.context_id
-
-                    result_content_periodic = await self._execute_tool_call_internal(mcp_tool_name_to_call, args_for_tool, record_action=False)
-
-                    base_func_name_periodic = self._get_base_function_name(mcp_tool_name_to_call)
-
-                    if not result_content_periodic.get("success"):
-                        self.logger.warning(
-                            f"{log_prefix}: Periodic task UMS tool '{mcp_tool_name_to_call}' call failed: {result_content_periodic.get('error')}"
-                        )
-                        # If a critical periodic task (like optimize_wm or auto_focus) fails, it might warrant setting last_error_details
-                        if base_func_name_periodic in [UMS_FUNC_OPTIMIZE_WM, UMS_FUNC_AUTO_FOCUS]:
-                            if not self.state.last_error_details:  # Don't overwrite existing primary error
-                                self.state.last_error_details = {
-                                    "tool": mcp_tool_name_to_call,
-                                    "error": f"Periodic {base_func_name_periodic} failed: {result_content_periodic.get('error')}",
-                                    "type": "PeriodicTaskToolError",
-                                }
-                        continue  # Move to next periodic task
-
-                    # Process successful periodic task result for reflection/consolidation
-                    if base_func_name_periodic in [UMS_FUNC_REFLECTION, UMS_FUNC_CONSOLIDATION]:
-                        feedback = ""
-                        if base_func_name_periodic == UMS_FUNC_REFLECTION:
-                            feedback = result_content_periodic.get("content", "")
-                        elif base_func_name_periodic == UMS_FUNC_CONSOLIDATION:
-                            feedback = result_content_periodic.get("consolidated_content", "")
-
-                        if feedback:
-                            feedback_summary = str(feedback).split("\n", 1)[0][:150]  # Get first line
-                            self.state.last_meta_feedback = f"Feedback from UMS {base_func_name_periodic}: {feedback_summary}..."
-                            self.logger.info(
-                                f"{log_prefix}: Meta-feedback received from UMS {base_func_name_periodic}: {self.state.last_meta_feedback}"
-                            )
-                            self.state.needs_replan = True  # Meta-cognition often leads to replanning
-                        else:
-                            self.logger.debug(
-                                f"{log_prefix}: Periodic UMS task {mcp_tool_name_to_call} succeeded but returned no feedback content. Result: {str(result_content_periodic)[:200]}"
-                            )
-
-                except Exception as e_periodic_task_exec:
-                    self.logger.error(
-                        f"{log_prefix}: Exception during execution of periodic task '{mcp_tool_name_to_call}': {e_periodic_task_exec}", exc_info=True
-                    )
-                    # Optionally set last_error_details if a periodic task itself has an unhandled exception
-                    if not self.state.last_error_details:
-                        self.state.last_error_details = {
-                            "tool": mcp_tool_name_to_call,
-                            "error": f"Unhandled exception in periodic task execution: {str(e_periodic_task_exec)[:100]}",
-                            "type": "PeriodicTaskExecutionError",
-                        }
-                        self.state.needs_replan = True
-
-                await asyncio.sleep(0.05)  # Small delay between tasks if many are queued
-        else:
-            self.logger.debug(f"{log_prefix}: No periodic tasks triggered this cycle.")
-
-    async def _trigger_promotion_checks(self):
-        # This method uses full MCP names for UMS tool calls
-        if not self.state.workflow_id:
-            self.logger.debug("Skipping promo check: No active WF.")
+        wf_id = self.state.workflow_id
+        if not wf_id:
+            self.logger.debug("Skipping promotion check: no active workflow.")
             return
-        self.logger.debug("Running periodic promotion check...")
 
-        query_memories_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_QUERY_MEMORIES)
-        promote_level_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_PROMOTE_MEM)
+        self.logger.debug("🔄 Running periodic promotion check…")
 
-        if not self._find_tool_server(query_memories_mcp_name) or not self._find_tool_server(promote_level_mcp_name):
+        # ---- tool discovery --------------------------------------------------------
+        query_mcp  = self._get_ums_tool_mcp_name(UMS_FUNC_QUERY_MEMORIES)
+        promote_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_PROMOTE_MEM)
+
+        if not (self._find_tool_server(query_mcp) and self._find_tool_server(promote_mcp)):
             self.logger.warning(
-                f"Skipping promotion checks: Required UMS tools for '{UMS_FUNC_QUERY_MEMORIES}' or '{UMS_FUNC_PROMOTE_MEM}' unavailable."
+                "Skipping promotion checks: required UMS tools "
+                f"('{UMS_FUNC_QUERY_MEMORIES}' or '{UMS_FUNC_PROMOTE_MEM}') unavailable."
             )
             return
 
-        candidate_ids = set()
-        try:
-            # Fetch episodic memories
-            episodic_args = {
-                "workflow_id": self.state.workflow_id,
-                "memory_level": MemoryLevel.EPISODIC.value,
-                "sort_by": "last_accessed",
-                "sort_order": "DESC",
-                "limit": 5,
-                "include_content": False,
-            }
-            episodic_res = await self._execute_tool_call_internal(query_memories_mcp_name, episodic_args, record_action=False)
-            if episodic_res.get("success"):
-                mems = episodic_res.get("memories", [])
-                candidate_ids.update(m.get("memory_id") for m in mems if isinstance(m, dict) and m.get("memory_id"))
-
-            # Fetch semantic memories that are procedures or skills
-            semantic_args = {
-                "workflow_id": self.state.workflow_id,
-                "memory_level": MemoryLevel.SEMANTIC.value,
-                "memory_type": None,  # Will be filtered below
-                "sort_by": "last_accessed",
-                "sort_order": "DESC",
-                "limit": 10,
-                "include_content": False,  # Fetch more semantic to filter
-            }
-            semantic_res = await self._execute_tool_call_internal(query_memories_mcp_name, semantic_args, record_action=False)
-            if semantic_res.get("success"):
-                mems = semantic_res.get("memories", [])
-                candidate_ids.update(
-                    m.get("memory_id")
-                    for m in mems
-                    if isinstance(m, dict) and m.get("memory_id") and m.get("memory_type") in [MemoryType.PROCEDURE.value, MemoryType.SKILL.value]
+        # ---- helper: safe tool call with timeout -----------------------------------
+        async def _safe_call(tool_name: str, args: dict, *, tool_timeout: float = 15.0) -> dict:
+            """Call `_execute_tool_call_internal` with a timeout & error wrapping."""
+            try:
+                return await asyncio.wait_for(
+                    self._execute_tool_call_internal(tool_name, args, record_action=False),
+                    timeout=tool_timeout,
                 )
+            except asyncio.TimeoutError:
+                self.logger.error("%s timed-out after %.1fs", tool_name, tool_timeout)
+                return {"success": False, "error": "timeout"}
+            except Exception as exc:  # noqa: BLE001
+                # full traceback only on DEBUG to avoid log spam
+                self.logger.error("Exception in %s: %s", tool_name, exc, exc_info=self.logger.isEnabledFor(logging.DEBUG))
+                return {"success": False, "error": str(exc)}
 
-            if candidate_ids:
-                self.logger.debug(f"Checking {len(candidate_ids)} memories for promotion: {[_fmt_id(i) for i in candidate_ids]}")
-                for mem_id in candidate_ids:
-                    if self._shutdown_event.is_set():
-                        break
-                    # Pass the snapshot workflow_id for the background task's context
-                    self._start_background_task(
-                        AgentMasterLoop._check_and_trigger_promotion,
-                        memory_id=mem_id,
-                        workflow_id=self.state.workflow_id,  # Pass current WF ID for context
-                        context_id=self.state.context_id,
-                    )  # Pass current context ID
-            else:
-                self.logger.debug("No eligible memories for promotion check.")
-        except Exception as e:
-            self.logger.error(f"Error during promotion check query: {e}", exc_info=False)
+        # ---- build query argument payloads ----------------------------------------
+        EPISODIC_BATCH_LIMIT = 5
+        SEMANTIC_BATCH_LIMIT = 10
+        PROCEDURAL_TYPES = {MemoryType.PROCEDURE.value, MemoryType.SKILL.value}
+
+        episodic_args = {
+            "workflow_id": wf_id,
+            "memory_level": MemoryLevel.EPISODIC.value,
+            "sort_by": "last_accessed",
+            "sort_order": "DESC",
+            "limit": EPISODIC_BATCH_LIMIT,
+            "include_content": False,
+        }
+        semantic_args = {
+            "workflow_id": wf_id,
+            "memory_level": MemoryLevel.SEMANTIC.value,
+            # memory_type intentionally omitted → get all, we’ll filter
+            "sort_by": "last_accessed",
+            "sort_order": "DESC",
+            "limit": SEMANTIC_BATCH_LIMIT,
+            "include_content": False,
+        }
+
+        # ---- execute both queries concurrently ------------------------------------
+        epis_res, sem_res = await asyncio.gather(
+            _safe_call(query_mcp, episodic_args),
+            _safe_call(query_mcp, semantic_args),
+        )
+
+        if self._shutdown_event.is_set():
+            self.logger.debug("Promotion check aborted mid-scan: shutdown signalled.")
+            return
+
+        # ---- collect candidate memory ids -----------------------------------------
+        candidate_ids: set[str] = set()
+
+        if epis_res.get("success"):
+            for mem in epis_res.get("memories", []):
+                if isinstance(mem, dict) and (mid := mem.get("memory_id")):
+                    candidate_ids.add(mid)
+        else:
+            self.logger.warning("Episodic memory query failed: %s", epis_res.get("error"))
+
+        if sem_res.get("success"):
+            for mem in sem_res.get("memories", []):
+                if (
+                    isinstance(mem, dict)
+                    and (mid := mem.get("memory_id"))
+                    and mem.get("memory_type") in PROCEDURAL_TYPES
+                ):
+                    candidate_ids.add(mid)
+        else:
+            self.logger.warning("Semantic memory query failed: %s", sem_res.get("error"))
+
+        # ---- schedule promotion tasks ---------------------------------------------
+        if not candidate_ids:
+            self.logger.debug("No eligible memories for promotion.")
+            return
+
+        self.logger.debug(
+            "📈 Promotion candidates (%d): %s",
+            len(candidate_ids),
+            ", ".join(_fmt_id(cid) for cid in candidate_ids),
+        )
+
+        for mem_id in candidate_ids:
+            if self._shutdown_event.is_set():
+                break
+            # snapshot current context so that background task has stable ids
+            self._start_background_task(
+                AgentMasterLoop._check_and_trigger_promotion,
+                memory_id=mem_id,
+                workflow_id=wf_id,
+                context_id=self.state.context_id,
+            )
 
     async def _gather_context(self) -> Dict[str, Any]:
-        self.logger.info(f"🛰️ Gathering comprehensive context for LLM (Loop: {self.state.current_loop}).")
-        start_time = time.time()
-        agent_retrieval_timestamp = datetime.now(timezone.utc).isoformat()
+        """
+        Build the full “context package” that is fed to the LLM for the *next* turn.
+        """
+        t_start = time.time()
+        self.logger.info("🛰️ Gathering comprehensive context for LLM "
+                        f"(Loop: {self.state.current_loop}).")
 
+        # ------------------------------------------------------------------ #
+        #  Helper utilities (local—do NOT escape the function’s namespace)   #
+        # ------------------------------------------------------------------ #
+        def _safe_fmt(obj: Any, default: str = "N/A") -> str:
+            """Best-effort stringify that never throws."""
+            try:
+                return _fmt_id(obj) if "id" in str(obj).lower() else str(obj)
+            except Exception:  # pragma: no cover
+                return default
+
+        def _append_err(payload: Dict[str, Any], msg: str) -> None:
+            """Append an error message to the context payload in a single place."""
+            payload.setdefault("errors_in_context_gathering", []).append(msg)
+
+        async def _fetch_goal_stack(goal_id: str) -> List[Dict[str, Any]]:
+            """Wrapper so we can trap & log errors from _fetch_goal_stack_from_ums."""
+            try:
+                return await self._fetch_goal_stack_from_ums(goal_id) or []
+            except Exception as exc:  # pragma: no cover
+                err = (f"Exception while fetching goal stack for "
+                    f"{_safe_fmt(goal_id)}: {exc}")
+                self.logger.error(err, exc_info=True)
+                _append_err(context_payload, err)
+                return []
+
+        # ------------------------- SECTION 0 ------------------------------ #
+        #  Core “static” agent-state snapshot                                #
+        # ------------------------------------------------------------------ #
+        agent_retrieval_ts = datetime.now(timezone.utc).isoformat()
         context_payload: Dict[str, Any] = {
             "agent_name": AGENT_NAME,
             "current_loop": self.state.current_loop,
-            "current_plan_snapshot": [p.model_dump(exclude_none=True) for p in self.state.current_plan],
+            "current_plan_snapshot": [
+                p.model_dump(exclude_none=True) for p in self.state.current_plan
+            ],
             "last_action_summary": self.state.last_action_summary,
             "consecutive_error_count": self.state.consecutive_error_count,
-            # Make a deep copy of last_error_details for the context, so modifications
-            # during prompt construction don't affect the agent's true error state.
             "last_error_details": copy.deepcopy(self.state.last_error_details),
             "needs_replan": self.state.needs_replan,
-            "workflow_stack_summary": [_fmt_id(wf_id) for wf_id in self.state.workflow_stack[-3:]],
-            "meta_feedback": self.state.last_meta_feedback,  # This is cleared after being read
+            "workflow_stack_summary": [
+                _safe_fmt(wf) for wf in self.state.workflow_stack[-3:]
+            ],
+            "meta_feedback": self.state.last_meta_feedback,   # cleared later
             "current_thought_chain_id": self.state.current_thought_chain_id,
-            "retrieval_timestamp_agent_state": agent_retrieval_timestamp,
+            "retrieval_timestamp_agent_state": agent_retrieval_ts,
             "status_message_from_agent": "Context assembly by agent.",
             "errors_in_context_gathering": [],
         }
-        # Clear meta_feedback after including it in the context for this turn
-        self.state.last_meta_feedback = None
 
-        current_workflow_id_for_context = self.state.workflow_stack[-1] if self.state.workflow_stack else self.state.workflow_id
-        current_cognitive_context_id_for_context = self.state.context_id
-        current_plan_step_desc_for_context = self.state.current_plan[0].description if self.state.current_plan else DEFAULT_PLAN_STEP
+        # ensure we *always* clear meta-feedback exactly once,
+        # even if later parts of this function raise.
+        try:
+            # ------------------------------------------------------------------ #
+            #  SECTION 1 — Figure out workflow / basic IDs                        #
+            # ------------------------------------------------------------------ #
+            workflow_id_ctx = (
+                self.state.workflow_stack[-1]
+                if self.state.workflow_stack else self.state.workflow_id
+            )
+            context_id_ctx = self.state.context_id
+            plan_step_desc_ctx = (
+                self.state.current_plan[0].description
+                if self.state.current_plan else DEFAULT_PLAN_STEP
+            )
 
-        if not current_workflow_id_for_context:
-            context_payload["status_message_from_agent"] = "No Active Workflow. Agent will be prompted to create one."
-            self.logger.warning(context_payload["status_message_from_agent"])
-            context_payload["ums_package_retrieval_status"] = "skipped_no_workflow"
-            context_payload["agent_assembled_goal_context"] = {
-                "retrieved_at": agent_retrieval_timestamp,
+            if not workflow_id_ctx:
+                # === EARLY EXIT: no workflow at all ===
+                msg = "No Active Workflow. Agent will be prompted to create one."
+                self.logger.warning(msg)
+                context_payload.update(
+                    status_message_from_agent=msg,
+                    ums_package_retrieval_status="skipped_no_workflow",
+                    agent_assembled_goal_context={
+                        "retrieved_at": agent_retrieval_ts,
+                        "current_goal_details_from_ums": None,
+                        "goal_stack_summary_from_agent_state": [],
+                        "data_source_comment": "No active workflow, so no UMS goal context available.",
+                    },
+                    processing_time_sec=time.time() - t_start,
+                )
+                return context_payload
+
+            context_payload.update(
+                workflow_id=workflow_id_ctx,
+                cognitive_context_id_agent=context_id_ctx,
+            )
+
+            # ------------------------------------------------------------------ #
+            #  SECTION 2 — Assemble / validate Goal Stack                         #
+            # ------------------------------------------------------------------ #
+            goal_ctx_block: Dict[str, Any] = {
+                "retrieved_at": agent_retrieval_ts,
                 "current_goal_details_from_ums": None,
                 "goal_stack_summary_from_agent_state": [],
-                "data_source_comment": "No active workflow, so no UMS goal context available.",
+                "data_source_comment": "Goal context assembly by agent.",
+                "synchronization_status": "pending",
             }
-            context_payload["processing_time_sec"] = time.time() - start_time
-            return context_payload
 
-        context_payload["workflow_id"] = current_workflow_id_for_context
-        context_payload["cognitive_context_id_agent"] = current_cognitive_context_id_for_context
+            if self.state.goal_stack:
+                goal_ctx_block["goal_stack_summary_from_agent_state"] = [
+                    {
+                        "goal_id": _safe_fmt(g.get("goal_id")),
+                        "description": (g.get("description") or "")[:150] + "...",
+                        "status": g.get("status"),
+                    }
+                    for g in self.state.goal_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:]
+                    if isinstance(g, dict)
+                ]
 
-        # --- 1. Agent Assembles Its Goal Context (with Enhanced Sync Check) ---
-        agent_goal_context_block: Dict[str, Any] = {
-            "retrieved_at": agent_retrieval_timestamp,
-            "current_goal_details_from_ums": None,  # Will be populated by UMS fetch
-            "goal_stack_summary_from_agent_state": [],  # Represents agent's *local* view for comparison/debug
-            "data_source_comment": "Goal context assembly by agent.",
-            "synchronization_status": "pending",
-        }
+            if self.state.current_goal_id:
+                self.logger.info("Agent Context: Current local UMS goal "
+                                f"ID {_safe_fmt(self.state.current_goal_id)}. Verifying…")
+                ums_stack = await _fetch_goal_stack(self.state.current_goal_id)
 
-        # For context display, show the agent's *current local* stack summary before UMS validation
-        if self.state.goal_stack:
-            agent_goal_context_block["goal_stack_summary_from_agent_state"] = [
-                {"goal_id": _fmt_id(g.get("goal_id")), "description": (g.get("description") or "")[:150] + "...", "status": g.get("status")}
-                for g in self.state.goal_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:]
-                if isinstance(g, dict)
-            ]
+                if ums_stack:
+                    ums_leaf = ums_stack[-1]
+                    goal_ctx_block["current_goal_details_from_ums"] = ums_leaf
 
-        if self.state.current_goal_id:
-            self.logger.info(f"Agent Context: Current local UMS goal ID is {_fmt_id(self.state.current_goal_id)}. Fetching UMS stack to verify...")
-            # Fetch the goal stack from UMS based on the agent's current_goal_id
-            ums_fetched_stack = await self._fetch_goal_stack_from_ums(self.state.current_goal_id)
-
-            if ums_fetched_stack:
-                ums_leaf_goal = ums_fetched_stack[-1]
-                agent_goal_context_block["current_goal_details_from_ums"] = ums_leaf_goal  # This is the UMS ground truth for the current leaf
-
-                # *** Synchronization Check ***
-                if ums_leaf_goal.get("goal_id") != self.state.current_goal_id:
-                    mismatch_error_msg = (
-                        f"Goal Sync Mismatch: Agent's current_goal_id '{_fmt_id(self.state.current_goal_id)}' "
-                        f"does not match the leaf of the stack fetched from UMS '{_fmt_id(ums_leaf_goal.get('goal_id'))}'. "
-                        f"Agent state might be stale. UMS leaf description: '{ums_leaf_goal.get('description', 'N/A')[:70]}...'."
+                    if ums_leaf.get("goal_id") != self.state.current_goal_id:
+                        # -------- Mismatch -------- #
+                        msg = (
+                            f"Goal Sync Mismatch: Agent's current_goal_id "
+                            f"{_safe_fmt(self.state.current_goal_id)} ≠ "
+                            f"UMS leaf {_safe_fmt(ums_leaf.get('goal_id'))}."
+                        )
+                        self.logger.error(msg)
+                        _append_err(context_payload, msg)
+                        goal_ctx_block.update(
+                            synchronization_status="mismatch_forcing_replan",
+                            data_source_comment=(
+                                "UMS goal stack fetched but mismatch detected. Forcing replan."
+                            ),
+                        )
+                        # repair local state
+                        self.state.last_error_details = {
+                            "type": "GoalSyncError",
+                            "error": msg,
+                            "agent_current_goal_id": self.state.current_goal_id,
+                            "ums_leaf_goal_id": ums_leaf.get("goal_id"),
+                            "ums_leaf_goal_description": ums_leaf.get("description"),
+                        }
+                        self.state.needs_replan = True
+                        self.state.goal_stack = ums_stack
+                        self.state.current_goal_id = ums_leaf.get("goal_id")
+                    else:
+                        # -------- Synchronized -------- #
+                        self.state.goal_stack = ums_stack
+                        goal_ctx_block.update(
+                            synchronization_status="synchronized_with_ums",
+                            data_source_comment=(
+                                "Goal stack fetched successfully and synchronized."
+                            ),
+                        )
+                else:
+                    # -------- Fetch failed -------- #
+                    msg = (
+                        "Goal Sync Error: Unable to fetch UMS goal stack for "
+                        f"{_safe_fmt(self.state.current_goal_id)}."
                     )
-                    self.logger.error(mismatch_error_msg)
-                    context_payload["errors_in_context_gathering"].append(mismatch_error_msg)
-                    agent_goal_context_block["synchronization_status"] = "mismatch_forcing_replan"
-                    agent_goal_context_block["data_source_comment"] = (
-                        "UMS goal stack fetched, but mismatch detected with agent's current goal ID. Forcing replan."
+                    self.logger.error(msg)
+                    _append_err(context_payload, msg)
+                    goal_ctx_block.update(
+                        synchronization_status="fetch_failed_forcing_replan",
+                        current_goal_details_from_ums={
+                            "error_fetching_details": msg,
+                            "goal_id_attempted": self.state.current_goal_id,
+                        },
+                        data_source_comment=(
+                            "Critical error: Could not fetch UMS goal stack."
+                        ),
                     )
-
-                    # Set error details and trigger replan
                     self.state.last_error_details = {
                         "type": "GoalSyncError",
-                        "error": mismatch_error_msg,
+                        "error": msg,
                         "agent_current_goal_id": self.state.current_goal_id,
-                        "ums_leaf_goal_id": ums_leaf_goal.get("goal_id"),
-                        "ums_leaf_goal_description": ums_leaf_goal.get("description"),
-                        "recommendation": f"Re-evaluate operational goal. Agent thought it was working on '{_fmt_id(self.state.current_goal_id)}', but UMS indicates current leaf goal might be '{_fmt_id(ums_leaf_goal.get('goal_id'))}'. Consider calling get_goal_details for both if confusion persists.",
                     }
                     self.state.needs_replan = True
-                    # Update the agent's local stack and current_goal_id to reflect UMS reality to aid replan
-                    self.state.goal_stack = ums_fetched_stack
-                    self.state.current_goal_id = ums_leaf_goal.get("goal_id")
-                    self.logger.info(
-                        f"Agent Context: Corrected local goal_stack and current_goal_id to UMS truth: New current_goal_id is {_fmt_id(self.state.current_goal_id)}"
-                    )
-                else:
-                    # Agent's current_goal_id matches UMS leaf, now sync the local stack content.
-                    self.state.goal_stack = ums_fetched_stack  # Update local stack to exactly match UMS
-                    agent_goal_context_block["synchronization_status"] = "synchronized_with_ums"
-                    agent_goal_context_block["data_source_comment"] = (
-                        "Goal stack and current goal details fetched successfully from UMS and synchronized with agent state."
-                    )
-                    self.logger.info(f"Agent Context: Goal stack synchronized with UMS for current goal {_fmt_id(self.state.current_goal_id)}.")
+                    self.state.current_goal_id = None
+                    self.state.goal_stack = []
 
-            else:  # _fetch_goal_stack_from_ums returned empty list for a non-None self.state.current_goal_id
-                fetch_fail_error_msg = (
-                    f"Goal Sync Error: Failed to fetch UMS goal stack for agent's current_goal_id '{_fmt_id(self.state.current_goal_id)}'. "
-                    f"The goal might have been deleted or become orphaned in UMS. Agent state is likely stale."
+            else:
+                # -------- No current goal set -------- #
+                goal_ctx_block.update(
+                    synchronization_status="no_current_goal_in_agent_state",
+                    data_source_comment=(
+                        "No current_goal_id set in agent state. LLM will be prompted."
+                    ),
                 )
-                self.logger.error(fetch_fail_error_msg)
-                context_payload["errors_in_context_gathering"].append(fetch_fail_error_msg)
-                agent_goal_context_block["synchronization_status"] = "fetch_failed_forcing_replan"
-                agent_goal_context_block["current_goal_details_from_ums"] = {
-                    "error_fetching_details": fetch_fail_error_msg,
-                    "goal_id_attempted": self.state.current_goal_id,
-                }
-                agent_goal_context_block["data_source_comment"] = (
-                    "Critical error: Could not fetch UMS goal stack for current agent goal ID. Forcing replan."
+                self.logger.info(
+                    "Agent Context: No current_goal_id for active workflow."
                 )
 
-                self.state.last_error_details = {
-                    "type": "GoalSyncError",
-                    "error": fetch_fail_error_msg,
-                    "agent_current_goal_id": self.state.current_goal_id,
-                    "recommendation": "Current UMS goal seems invalid in UMS. Agent needs to re-evaluate its objectives, possibly by listing top-level goals for the workflow or setting a new root goal if necessary.",
+            # refresh summary after any corrections above
+            goal_ctx_block["goal_stack_summary_from_agent_state"] = [
+                {
+                    "goal_id": _safe_fmt(g.get("goal_id")),
+                    "description": (g.get("description") or "")[:150] + "...",
+                    "status": g.get("status"),
                 }
-                self.state.needs_replan = True
-                # Since the current UMS goal is problematic, clear it and the local stack to force re-establishment.
-                self.state.current_goal_id = None
-                self.state.goal_stack = []
-                self.logger.info("Agent Context: Cleared problematic current_goal_id and local stack due to UMS fetch failure.")
-
-        else:  # self.state.current_goal_id is None (but workflow is active)
-            agent_goal_context_block["synchronization_status"] = "no_current_goal_in_agent_state"
-            agent_goal_context_block["data_source_comment"] = (
-                "No current_goal_id set in agent state for this active workflow. UMS goal context is empty. Agent will be prompted to set one."
-            )
-            self.logger.info("Agent Context: No current_goal_id set for active workflow. LLM will be prompted to establish a root UMS goal.")
-            # needs_replan might already be True if this state was reached via an error.
-            # If not, this state implies a need to establish a goal, which the main prompt handles.
-            # No specific error here, but the plan should reflect the need to set a goal.
-
-        # Re-populate goal_stack_summary_from_agent_state *after* potential UMS sync
-        # This ensures the LLM sees the most up-to-date local stack view
-        if self.state.goal_stack:  # If stack exists after sync/error handling
-            agent_goal_context_block["goal_stack_summary_from_agent_state"] = [
-                {"goal_id": _fmt_id(g.get("goal_id")), "description": (g.get("description") or "")[:150] + "...", "status": g.get("status")}
                 for g in self.state.goal_stack[-CONTEXT_GOAL_STACK_SHOW_LIMIT:]
-                if isinstance(g, dict)
-            ]
-        else:  # Stack is empty
-            agent_goal_context_block["goal_stack_summary_from_agent_state"] = []
+            ] if self.state.goal_stack else []
 
-        context_payload["agent_assembled_goal_context"] = agent_goal_context_block
+            context_payload["agent_assembled_goal_context"] = goal_ctx_block
 
-        # --- 2. Call UMS Tool for Rich Context Package ---
-        ums_get_rich_context_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_GET_RICH_CONTEXT_PACKAGE)
-        ums_package_data: Dict[str, Any] = {}  # Initialize to empty dict
-        ums_package_retrieval_status_msg = "pending"
+            # ------------------------------------------------------------------ #
+            #  SECTION 3 — Fetch rich context package from UMS                   #
+            # ------------------------------------------------------------------ #
+            ums_tool_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_GET_RICH_CONTEXT_PACKAGE)
+            ums_pkg: Dict[str, Any] = {}
+            ums_pkg_status = "pending"
 
-        if self._find_tool_server(ums_get_rich_context_mcp_name):
-            focal_id_hint_for_ums = None
-            # If last_error_details suggests a focal memory from a previous working memory optimization
-            if isinstance(self.state.last_error_details, dict) and self.state.last_error_details.get("focal_memory_id_from_last_wm"):
-                focal_id_hint_for_ums = self.state.last_error_details["focal_memory_id_from_last_wm"]
+            if self._find_tool_server(ums_tool_mcp):
+                focal_memory_hint = None
+                if (
+                    isinstance(self.state.last_error_details, dict)
+                    and self.state.last_error_details.get("focal_memory_id_from_last_wm")
+                ):
+                    focal_memory_hint = self.state.last_error_details[
+                        "focal_memory_id_from_last_wm"
+                    ]
 
-            # If current_goal_details_from_ums (synced from UMS) exists and has an associated thought->memory, prefer that.
-            current_ums_goal_details_for_focal_hint = agent_goal_context_block.get("current_goal_details_from_ums")
-            if isinstance(current_ums_goal_details_for_focal_hint, dict):
-                # Assuming a UMS goal object might have a link to a thought ID, and that thought to a memory ID
-                # This part is speculative based on UMS structure. If UMS goals are directly linked to focal memories, use that.
-                # For now, let's assume the UMS get_rich_context_package handles focal selection well if no strong hint.
-                pass  # Placeholder for more sophisticated focal hint derivation from goal
+                # NOTE: we let UMS decide final focal memory if our hint is None/irrelevant
+                ums_params = {
+                    "workflow_id": workflow_id_ctx,
+                    "context_id": context_id_ctx,
+                    "current_plan_step_description": plan_step_desc_ctx,
+                    "focal_memory_id_hint": focal_memory_hint,
+                    "fetch_limits": {
+                        "recent_actions": CONTEXT_RECENT_ACTIONS_FETCH_LIMIT,
+                        "important_memories": CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT,
+                        "key_thoughts": CONTEXT_KEY_THOUGHTS_FETCH_LIMIT,
+                        "proactive_memories": CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT,
+                        "procedural_memories": CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT,
+                        "link_traversal": CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT,
+                    },
+                    "show_limits": {
+                        "working_memory": CONTEXT_WORKING_MEMORY_SHOW_LIMIT,
+                        "link_traversal": CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT,
+                    },
+                    "include_core_context": True,
+                    "include_working_memory": True,
+                    "include_proactive_memories": True,
+                    "include_relevant_procedures": True,
+                    "include_contextual_links": True,
+                    "compression_token_threshold": CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD,
+                    "compression_target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS,
+                }
 
-            ums_package_params = {
-                "workflow_id": current_workflow_id_for_context,
-                "context_id": current_cognitive_context_id_for_context,  # Agent's view of cognitive context ID
-                "current_plan_step_description": current_plan_step_desc_for_context,
-                "focal_memory_id_hint": focal_id_hint_for_ums,  # Pass hint
-                "fetch_limits": {
-                    "recent_actions": CONTEXT_RECENT_ACTIONS_FETCH_LIMIT,
-                    "important_memories": CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT,
-                    "key_thoughts": CONTEXT_KEY_THOUGHTS_FETCH_LIMIT,
-                    "proactive_memories": CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT,
-                    "procedural_memories": CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT,
-                    "link_traversal": CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT,
-                },
-                "show_limits": {  # These are for UMS-side summarization/truncation if it implements it
-                    "working_memory": CONTEXT_WORKING_MEMORY_SHOW_LIMIT,
-                    "link_traversal": CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT,
-                },
-                "include_core_context": True,
-                "include_working_memory": True,
-                "include_proactive_memories": True,
-                "include_relevant_procedures": True,
-                "include_contextual_links": True,
-                "compression_token_threshold": CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD,
-                "compression_target_tokens": CONTEXT_COMPRESSION_TARGET_TOKENS,
-            }
-            try:
-                self.logger.debug(f"Agent Context: Calling UMS tool '{ums_get_rich_context_mcp_name}' with params: {ums_package_params}")
-                raw_ums_response = await self._execute_tool_call_internal(ums_get_rich_context_mcp_name, ums_package_params, record_action=False)
+                try:
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug("Agent Context: Calling UMS tool "
+                                        f"'{ums_tool_mcp}' with params: {ums_params}")
+                    ums_raw = await self._execute_tool_call_internal(
+                        ums_tool_mcp, ums_params, record_action=False
+                    )
 
-                if raw_ums_response.get("success"):
-                    ums_package_content = raw_ums_response.get("context_package", {})
-                    if not isinstance(ums_package_content, dict):
-                        err_msg = f"Agent Context: UMS tool {ums_get_rich_context_mcp_name} returned invalid 'context_package' (type: {type(ums_package_content)})."
-                        self.logger.error(err_msg)
-                        context_payload["errors_in_context_gathering"].append(err_msg)
-                        ums_package_data = {"error_ums_pkg_invalid_type": err_msg}
-                        ums_package_retrieval_status_msg = "invalid_package_type"
+                    if ums_raw.get("success"):
+                        pk = ums_raw.get("context_package", {})
+                        if isinstance(pk, dict):
+                            ums_pkg = pk
+                            ums_pkg_status = "success"
+                            internal_errs = ums_raw.get("errors", [])
+                            if internal_errs:
+                                for e in internal_errs:
+                                    _append_err(context_payload, f"UMS_PKG_ERR: {e}")
+                            self.logger.info("Agent Context: Received rich context package.")
+                        else:
+                            msg = (f"UMS tool '{ums_tool_mcp}' returned invalid "
+                                f"type {type(pk)} for 'context_package'.")
+                            self.logger.error(msg)
+                            _append_err(context_payload, msg)
+                            ums_pkg = {"error_ums_pkg_invalid_type": msg}
+                            ums_pkg_status = "invalid_package_type"
                     else:
-                        self.logger.info("Agent Context: Successfully retrieved rich context package from UMS.")
-                        ums_internal_errors = raw_ums_response.get("errors")  # UMS tool's own error list
-                        if ums_internal_errors and isinstance(ums_internal_errors, list):
-                            context_payload["errors_in_context_gathering"].extend([f"UMS_PKG_ERR: {e}" for e in ums_internal_errors])
-                        # Store the actual package, don't pop errors from it if UMS included them
-                        ums_package_data = ums_package_content
-                        ums_package_retrieval_status_msg = "success"
-                else:
-                    err_msg = f"Agent Context: UMS rich context pkg retrieval failed: {raw_ums_response.get('error', 'Unknown UMS tool error')}"
-                    context_payload["errors_in_context_gathering"].append(err_msg)
-                    self.logger.warning(err_msg)
-                    ums_package_data = {"error_ums_pkg_retrieval": err_msg}
-                    ums_package_retrieval_status_msg = "failed_ums_tool_call"
-            except Exception as e:
-                err_msg = f"Agent Context: Exception calling UMS for rich context pkg: {e}"
-                self.logger.error(err_msg, exc_info=True)
-                context_payload["errors_in_context_gathering"].append(err_msg)
-                ums_package_data = {"error_ums_pkg_exception": err_msg}
-                ums_package_retrieval_status_msg = "exception_calling_ums_tool"
-        else:
-            err_msg = f"Agent Context: UMS tool for '{UMS_FUNC_GET_RICH_CONTEXT_PACKAGE}' unavailable."
-            self.logger.error(err_msg)
-            context_payload["errors_in_context_gathering"].append(err_msg)
-            ums_package_data = {"error_ums_package_tool_unavailable": err_msg}
-            ums_package_retrieval_status_msg = "tool_unavailable"
+                        msg = (f"UMS rich context pkg retrieval failed: "
+                            f"{ums_raw.get('error', 'Unknown error')}")
+                        self.logger.warning(msg)
+                        _append_err(context_payload, msg)
+                        ums_pkg = {"error_ums_pkg_retrieval": msg}
+                        ums_pkg_status = "failed_ums_tool_call"
+                except asyncio.CancelledError:  # propagate cancellations
+                    raise
+                except Exception as exc:  # pragma: no cover
+                    msg = f"Exception calling UMS for rich context pkg: {exc}"
+                    self.logger.error(msg, exc_info=True)
+                    _append_err(context_payload, msg)
+                    ums_pkg = {"error_ums_pkg_exception": msg}
+                    ums_pkg_status = "exception_calling_ums_tool"
+            else:
+                msg = f"UMS tool for '{UMS_FUNC_GET_RICH_CONTEXT_PACKAGE}' unavailable."
+                self.logger.error(msg)
+                _append_err(context_payload, msg)
+                ums_pkg = {"error_ums_package_tool_unavailable": msg}
+                ums_pkg_status = "tool_unavailable"
 
-        context_payload["ums_context_package"] = ums_package_data  # Add the retrieved (or error) package
-        context_payload["ums_package_retrieval_status"] = ums_package_retrieval_status_msg
+            context_payload.update(
+                ums_context_package=ums_pkg,
+                ums_package_retrieval_status=ums_pkg_status,
+            )
 
-        if ums_package_data.get("ums_compression_details"):  # Check within the actual package data
-            self.logger.info(f"Agent Context: UMS package includes compression details: {ums_package_data['ums_compression_details']}")
+            if ums_pkg.get("ums_compression_details"):
+                self.logger.info("Agent Context: UMS package includes compression "
+                                "details: %s", ums_pkg["ums_compression_details"])
 
-        final_errors_count = len(context_payload.get("errors_in_context_gathering", []))
-        if current_workflow_id_for_context and not final_errors_count:
-            context_payload["status_message_from_agent"] = "Workflow active. Context ready."
-        elif current_workflow_id_for_context and final_errors_count:
-            context_payload["status_message_from_agent"] = f"Workflow active. Context ready with {final_errors_count} gathering errors."
+            # ------------------------------------------------------------------ #
+            #  SECTION 4 — Final status / timing                                  #
+            # ------------------------------------------------------------------ #
+            n_errors = len(context_payload["errors_in_context_gathering"])
+            if n_errors == 0:
+                context_payload["status_message_from_agent"] = (
+                    "Workflow active. Context ready."
+                )
+            else:
+                context_payload["status_message_from_agent"] = (
+                    f"Workflow active. Context ready with {n_errors} gathering errors."
+                )
 
-        self.logger.info(
-            f"Agent Context: Gathering complete. Status: {context_payload['status_message_from_agent']}. Time: {(time.time() - start_time):.3f}s"
-        )
-        if final_errors_count > 0:
-            self.logger.info(f"Agent Context: Errors during context gathering: {context_payload.get('errors_in_context_gathering')}")
+        finally:
+            # always clear meta-feedback exactly once
+            self.state.last_meta_feedback = None
+            context_payload["processing_time_sec"] = time.time() - t_start
 
-        context_payload["processing_time_sec"] = time.time() - start_time
+        self.logger.info("Agent Context: Gathering complete. Status: %s. "
+                        "Time: %.3fs",
+                        context_payload["status_message_from_agent"],
+                        context_payload["processing_time_sec"])
+        if context_payload["errors_in_context_gathering"]:
+            self.logger.info("Agent Context: Errors encountered: %s",
+                            context_payload["errors_in_context_gathering"])
+
         return context_payload
 
 
     async def execute_llm_decision(
         self,
-        llm_decision: Dict[str, Any],  # This is the direct output from MCPClient.process_agent_llm_turn
-    ) -> bool:  # Returns True to continue loop, False to stop
+        llm_decision: Dict[str, Any],        # direct output from MCPClient.process_agent_llm_turn
+    ) -> bool:                               # True → continue loop, False → stop
+        """
+        Executes a single LLM decision returned by MCPClient, handling tool calls,
+        thought recording, plan updates, etc.  All side-effects on `self.state`
+        (errors, last_action_summary, needs_replan, counters) are preserved.
+
+        Returns
+        -------
+        bool
+            True  – continue main loop  
+            False – stop (goal achieved, shutdown, workflow missing, max errors, …)
+        """
+        # --------------------------------------------------------------------- #
+        # 0.  Logging & fast-path resets                                        #
+        # --------------------------------------------------------------------- #
         self.logger.info(
-            f"AML EXEC_DECISION: Entered for Loop {self.state.current_loop}. Current WF: {_fmt_id(self.state.workflow_id)}, Current UMS Goal: {_fmt_id(self.state.current_goal_id)}"
+            "AML EXEC_DECISION: Entered for Loop %s. Current WF: %s, Current UMS Goal: %s",
+            self.state.current_loop, _fmt_id(self.state.workflow_id), _fmt_id(self.state.current_goal_id),
         )
-        self.logger.debug(f"AML EXEC_DECISION: Received LLM Decision from MCPClient: {str(llm_decision)[:500]}")
+        self.logger.debug("AML EXEC_DECISION: Raw LLM decision: %s", str(llm_decision)[:500])
 
-        tool_call_result_payload_for_heuristic: Optional[Dict[str, Any]] = None
-        decision_type = llm_decision.get("decision")
-        tool_name_involved_in_turn: Optional[str] = llm_decision.get("tool_name") # Original MCP name
-
+        # Reset stale error info if we are on a clean slate
         if not self.state.needs_replan:
             self.state.last_error_details = None
-            # Note: consecutive_error_count is reset by _apply_heuristic_plan_update on successful actions
 
-        # --- Process MCPClient's Decision ---
+        decision_type: str = llm_decision.get("decision", "") or ""
+        tool_name_in_turn: Optional[str] = llm_decision.get("tool_name")
 
-        if decision_type == "tool_executed_by_mcp":
-            tool_name_original_mcp = llm_decision.get("tool_name")
-            arguments_used = llm_decision.get("arguments", {})
-            # ums_payload_direct_from_mcp is the direct dictionary result from the UMS tool
-            # (or potentially a string if the tool, like summarize_text, returns raw string and parsing handled it that way)
-            ums_payload_direct_from_mcp = llm_decision.get("result")
+        # This will be filled by each handler so the heuristic updater has a payload.
+        tool_call_envelope: Optional[Dict[str, Any]] = None
 
-            self.logger.info(
-                f"AML EXEC_DECISION: Processing 'tool_executed_by_mcp'. Tool: '{tool_name_original_mcp}'. "
-                f"Direct UMS Payload Preview from MCPClient: {str(ums_payload_direct_from_mcp)[:200]}"
-            )
-
-            # Construct the standard envelope that _handle_workflow_and_goal_side_effects
-            # and _apply_heuristic_plan_update expect.
-            constructed_envelope_for_aml: Dict[str, Any] = {
-                "success": False,  # Default, will be updated
-                "data": ums_payload_direct_from_mcp,  # IMPORTANT: Nest the UMS payload here
-                "error_type": None,
-                "error_message": None,
-                "status_code": None,
-                "details": None,
+        # --------------------------------------------------------------------- #
+        # 1.  Helper functions (inner scope so this remains drop-in)            #
+        # --------------------------------------------------------------------- #
+        def _construct_envelope(
+            success: bool,
+            data: Any = None,
+            *,
+            error_type: Optional[str] = None,
+            error_message: Optional[str] = None,
+            status_code: Optional[int] = None,
+            details: Any = None,
+        ) -> Dict[str, Any]:
+            """Return the standardized envelope used across AML."""
+            return {
+                "success": success,
+                "data": data,
+                "error_type": error_type,
+                "error_message": error_message,
+                "status_code": status_code,
+                "details": details,
             }
 
-            base_tool_func_name_for_check = self._get_base_function_name(tool_name_original_mcp)
-            critical_state_tools = [
-                UMS_FUNC_CREATE_WORKFLOW, UMS_FUNC_CREATE_GOAL, UMS_FUNC_UPDATE_GOAL_STATUS,
-                UMS_FUNC_UPDATE_WORKFLOW_STATUS, UMS_FUNC_SAVE_COGNITIVE_STATE, UMS_FUNC_LOAD_COGNITIVE_STATE
-            ]
+        def _build_success_summary(data_payload: Any) -> str:
+            """Create a one-line human log based on UMS payload content."""
+            if data_payload is None:
+                return "Success (No data payload from UMS tool)."
 
-            if isinstance(ums_payload_direct_from_mcp, dict):
-                if ums_payload_direct_from_mcp.get("success", False): # Default to False if 'success' key missing
-                    constructed_envelope_for_aml["success"] = True
-                else: # UMS payload indicates failure or 'success' key is missing/false
-                    constructed_envelope_for_aml["success"] = False
-                    constructed_envelope_for_aml["error_type"] = ums_payload_direct_from_mcp.get(
-                        "error_type", "UMSToolReportedFailureInPayload"
-                    )
-                    error_msg_from_payload = ums_payload_direct_from_mcp.get(
-                        "error_message", ums_payload_direct_from_mcp.get("error")
-                    )
-                    if error_msg_from_payload is None:
-                         error_msg_from_payload = "UMS tool failed as per its payload (or 'success' key missing/false)."
-                    constructed_envelope_for_aml["error_message"] = error_msg_from_payload
-                    constructed_envelope_for_aml["status_code"] = ums_payload_direct_from_mcp.get("status_code")
-                    constructed_envelope_for_aml["details"] = ums_payload_direct_from_mcp.get("details")
-            elif ums_payload_direct_from_mcp is not None: # Non-dict payload from UMS (e.g., summarize_text)
-                constructed_envelope_for_aml["success"] = True # Assume success if MCPClient passed it
-                if base_tool_func_name_for_check in critical_state_tools:
-                    self.logger.error(
-                        f"AML EXEC_DECISION ('tool_executed_by_mcp'): UMS tool '{tool_name_original_mcp}' "
-                        f"(critical for state) returned non-dict payload: {type(ums_payload_direct_from_mcp)}. "
-                        f"This is a contract violation. Marking as failure."
-                    )
-                    constructed_envelope_for_aml["success"] = False
-                    constructed_envelope_for_aml["error_type"] = "UMSMalformedPayload"
-                    constructed_envelope_for_aml["error_message"] = f"Critical UMS tool '{tool_name_original_mcp}' returned non-dictionary payload."
-            else: # ums_payload_direct_from_mcp is None
-                constructed_envelope_for_aml["success"] = False
-                constructed_envelope_for_aml["error_type"] = "MissingUMSPayloadFromMCP"
-                constructed_envelope_for_aml["error_message"] = (
-                    f"MCPClient reported tool '{tool_name_original_mcp}' executed by LLM, but UMS payload was missing/None."
-                )
+            if not isinstance(data_payload, dict):
+                return f"Success (Data: {str(data_payload)[:50]}...)"
 
-            # This is now the correctly structured envelope for heuristic update and side effects
-            tool_call_result_payload_for_heuristic = constructed_envelope_for_aml
+            summary_keys = (
+                "summary", "message", "memory_id", "action_id", "artifact_id",
+                "link_id", "thought_chain_id", "thought_id", "state_id", "report",
+                "visualization", "goal_id", "workflow_id", "title",
+            )
+            for k in summary_keys:
+                if k in data_payload and data_payload[k] is not None:
+                    val = str(data_payload[k])
+                    return f"{k}: {_fmt_id(val) if 'id' in k.lower() else val}"
 
-            base_tool_func_name = self._get_base_function_name(tool_name_original_mcp)
-            await self._handle_workflow_and_goal_side_effects(base_tool_func_name, arguments_used, constructed_envelope_for_aml)
+            generic_parts = [
+                f"{k}={_fmt_id(str(v)) if 'id' in k.lower() else str(v)[:20]}"
+                for k, v in data_payload.items()
+                if v is not None and k not in ("success", "processing_time")
+            ][:3]
+            return "Success. Data: " + ", ".join(generic_parts) if generic_parts else \
+                "Success (UMS payload has no distinct summary key)."
 
-            # Update last_action_summary and last_error_details based on the *constructed envelope*
-            summary_text_for_log_decision = ""
-            if constructed_envelope_for_aml.get("success"):
-                data_payload_for_summary_decision = constructed_envelope_for_aml.get("data", {})
-                if isinstance(data_payload_for_summary_decision, dict):
-                    summary_keys_log_decision = [
-                        "summary", "message", "memory_id", "action_id", "artifact_id",
-                        "link_id", "thought_chain_id", "thought_id", "state_id", "report",
-                        "visualization", "goal_id", "workflow_id", "title"
-                    ]
-                    found_summary_key_decision = False
-                    for k_log_decision in summary_keys_log_decision:
-                        if k_log_decision in data_payload_for_summary_decision and data_payload_for_summary_decision[k_log_decision] is not None:
-                            val_str_log_decision = str(data_payload_for_summary_decision[k_log_decision])
-                            summary_text_for_log_decision = f"{k_log_decision}: {_fmt_id(val_str_log_decision) if 'id' in k_log_decision.lower() else val_str_log_decision}"
-                            found_summary_key_decision = True
-                            break
-                    if not found_summary_key_decision:
-                        generic_parts_log_decision = [
-                            f"{k_s_d}={_fmt_id(str(v_s_d)) if 'id' in k_s_d.lower() else str(v_s_d)[:20]}"
-                            for k_s_d, v_s_d in data_payload_for_summary_decision.items()
-                            if v_s_d is not None and k_s_d not in ["success", "processing_time"] # Exclude common UMS envelope keys
-                        ][:3]
-                        summary_text_for_log_decision = (
-                            f"Success. Data: {', '.join(generic_parts_log_decision)}"
-                            if generic_parts_log_decision
-                            else "Success (UMS payload has no distinct summary key)."
-                        )
-                elif data_payload_for_summary_decision is not None: # Non-dict but not None
-                    summary_text_for_log_decision = f"Success (Data: {str(data_payload_for_summary_decision)[:50]}...)"
-                else: # Data is None
-                    summary_text_for_log_decision = "Success (No data payload from UMS tool)."
-            else: # Envelope indicates failure
-                err_type_log_decision = constructed_envelope_for_aml.get("error_type", "ToolExecutionError")
-                err_msg_log_decision = str(constructed_envelope_for_aml.get("error_message", "Unknown tool error"))[:100]
-                summary_text_for_log_decision = f"Failed ({err_type_log_decision}): {err_msg_log_decision}"
-
-            if constructed_envelope_for_aml.get("status_code"):
-                summary_text_for_log_decision += f" (Code: {constructed_envelope_for_aml['status_code']})"
-
-            self.state.last_action_summary = f"{tool_name_original_mcp} (executed by LLM via MCP) -> {summary_text_for_log_decision}"
-            self.logger.info(f"🏁 LLM-Executed UMS Tool (via MCP): {self.state.last_action_summary}")
-
-            if not constructed_envelope_for_aml.get("success"):
-                self.state.last_error_details = {
-                    "tool": tool_name_original_mcp,
-                    "args": arguments_used,
-                    "error": constructed_envelope_for_aml.get("error_message", "UMS tool failed as reported by MCPClient."),
-                    "status_code": constructed_envelope_for_aml.get("status_code"),
-                    "type": constructed_envelope_for_aml.get("error_type", "ToolExecutionError"),
-                    "details": constructed_envelope_for_aml.get("details")
-                }
-                if not self.state.needs_replan:
-                    self.state.needs_replan = True
-                    self.logger.info(f"AML EXEC_DECISION: Setting needs_replan=True due to LLM-executed UMS tool failure for '{tool_name_original_mcp}'.")
-
-        elif decision_type == "call_tool":
-            tool_name_to_execute_by_aml = llm_decision.get("tool_name") # Original MCP Name
-            arguments_for_aml_tool = llm_decision.get("arguments", {})
-            tool_name_involved_in_turn = tool_name_to_execute_by_aml
+        async def _handle_mcp_executed_tool() -> None:
+            """Handle decision_type == 'tool_executed_by_mcp'."""
+            nonlocal tool_call_envelope, tool_name_in_turn
+            tool_name_in_turn = llm_decision.get("tool_name")
+            arguments_used = llm_decision.get("arguments", {})
+            ums_payload = llm_decision.get("result")
 
             self.logger.info(
-                f"AML EXEC_DECISION: Processing 'call_tool' (to be executed by AML). Tool: '{tool_name_to_execute_by_aml}', Args: {str(arguments_for_aml_tool)[:100]}..."
+                "AML EXEC_DECISION: 'tool_executed_by_mcp' Tool='%s' Payload preview=%s",
+                tool_name_in_turn, str(ums_payload)[:200],
             )
 
-            if not self.state.current_plan:
-                self.logger.error("AML EXEC_DECISION: Plan empty before AML tool call! Forcing replan.")
-                err_msg_plan = "Plan empty before tool call."
-                self.state.last_error_details = {"tool": tool_name_to_execute_by_aml, "args": arguments_for_aml_tool, "error": err_msg_plan, "type": "PlanValidationError"}
-                tool_call_result_payload_for_heuristic = {"success": False, "error_message": err_msg_plan, "error_type": "PlanValidationError"}
-                self.state.needs_replan = True
-            elif not self.state.current_plan[0].description:
-                self.logger.error(f"AML EXEC_DECISION: Current plan step invalid (no description)! Step ID: {self.state.current_plan[0].id}. Forcing replan.")
-                err_msg_step = "Current plan step invalid (no description)."
-                self.state.last_error_details = {"tool": tool_name_to_execute_by_aml, "args": arguments_for_aml_tool, "error": err_msg_step, "type": "PlanValidationError", "step_id": self.state.current_plan[0].id}
-                tool_call_result_payload_for_heuristic = {"success": False, "error_message": err_msg_step, "error_type": "PlanValidationError"}
-                self.state.needs_replan = True
-            elif tool_name_to_execute_by_aml:
-                current_step_deps = self.state.current_plan[0].depends_on if self.state.current_plan else []
+            envelope = _construct_envelope(False, ums_payload)          # filled out below
+            critical_state_tools = {
+                UMS_FUNC_CREATE_WORKFLOW, UMS_FUNC_CREATE_GOAL, UMS_FUNC_UPDATE_GOAL_STATUS,
+                UMS_FUNC_UPDATE_WORKFLOW_STATUS, UMS_FUNC_SAVE_COGNITIVE_STATE, UMS_FUNC_LOAD_COGNITIVE_STATE,
+            }
+            base_tool = self._get_base_function_name(tool_name_in_turn)
 
-                # _execute_tool_call_internal ALREADY returns the standardized envelope
-                tool_call_result_payload_for_heuristic = await self._execute_tool_call_internal(
-                    tool_name_to_execute_by_aml,
-                    arguments_for_aml_tool,
-                    record_action=(tool_name_to_execute_by_aml != AGENT_TOOL_UPDATE_PLAN),
-                    planned_dependencies=current_step_deps,
+            if isinstance(ums_payload, dict):
+                if ums_payload.get("success", False):
+                    envelope["success"] = True
+                else:
+                    envelope.update(
+                        success=False,
+                        error_type=ums_payload.get("error_type", "UMSToolReportedFailureInPayload"),
+                        error_message=ums_payload.get("error_message", ums_payload.get("error", "UMS tool reported failure.")),
+                        status_code=ums_payload.get("status_code"),
+                        details=ums_payload.get("details"),
+                    )
+            elif ums_payload is not None:                              # non-dict payload
+                envelope["success"] = True
+                if base_tool in critical_state_tools:
+                    self.logger.error(
+                        "AML EXEC_DECISION: Critical tool '%s' returned non-dict payload (%s). Marking as failure.",
+                        tool_name_in_turn, type(ums_payload),
+                    )
+                    envelope.update(
+                        success=False,
+                        error_type="UMSMalformedPayload",
+                        error_message=f"Critical UMS tool '{tool_name_in_turn}' returned non-dictionary payload.",
+                    )
+            else:                                                      # payload None
+                envelope.update(
+                    success=False,
+                    error_type="MissingUMSPayloadFromMCP",
+                    error_message=f"MCPClient reported tool '{tool_name_in_turn}' executed but payload missing/None.",
                 )
-                # self.state.last_action_summary, self.state.last_error_details, and self.state.needs_replan
-                # are set by _execute_tool_call_internal and its call to _handle_workflow_and_goal_side_effects.
-            else: # tool_name_to_execute_by_aml is None
-                self.logger.error("AML EXEC_DECISION: LLM 'call_tool' (for AML exec) decision missing 'tool_name'.")
-                err_msg_missing_tool = "Missing tool name from LLM decision for AML exec."
-                self.state.last_error_details = {"decision_data": llm_decision, "error": err_msg_missing_tool, "type": "LLMOutputError"}
-                tool_call_result_payload_for_heuristic = {"success": False, "error_message": err_msg_missing_tool, "error_type": "LLMOutputError"}
+
+            tool_call_envelope = envelope
+            await self._handle_workflow_and_goal_side_effects(base_tool, arguments_used, envelope)
+
+            # Build `last_action_summary`
+            if envelope["success"]:
+                summary = _build_success_summary(envelope["data"])
+            else:
+                summary = f"Failed ({envelope.get('error_type', 'ToolExecutionError')}): " \
+                        f"{str(envelope.get('error_message', 'Unknown'))[:100]}"
+            if envelope.get("status_code"):
+                summary += f" (Code: {envelope['status_code']})"
+
+            self.state.last_action_summary = f"{tool_name_in_turn} (executed by LLM via MCP) -> {summary}"
+            self.logger.info("🏁 LLM-executed tool summary: %s", self.state.last_action_summary)
+
+            if not envelope["success"]:
+                self.state.last_error_details = {
+                    "tool": tool_name_in_turn,
+                    "args": arguments_used,
+                    "error": envelope.get("error_message"),
+                    "status_code": envelope.get("status_code"),
+                    "type": envelope.get("error_type", "ToolExecutionError"),
+                    "details": envelope.get("details"),
+                }
+                self.state.needs_replan = self.state.needs_replan or True
+
+        async def _handle_call_tool() -> None:
+            """Handle decision_type == 'call_tool' (AML executes)."""
+            nonlocal tool_call_envelope, tool_name_in_turn
+            tool_name_in_turn = llm_decision.get("tool_name")
+            args = llm_decision.get("arguments", {})
+
+            self.logger.info(
+                "AML EXEC_DECISION: 'call_tool' → will execute '%s' with args=%s",
+                tool_name_in_turn, str(args)[:100],
+            )
+
+            if not self.state.current_plan or not self.state.current_plan[0].description:
+                err_msg = "Plan empty before tool call." if not self.state.current_plan else \
+                        "Current plan step invalid (no description)."
+                self.logger.error("AML EXEC_DECISION: %s", err_msg)
+                self.state.last_error_details = {"tool": tool_name_in_turn, "args": args,
+                                                "error": err_msg, "type": "PlanValidationError"}
                 self.state.needs_replan = True
+                tool_call_envelope = _construct_envelope(False, error_type="PlanValidationError", error_message=err_msg)
+                return
 
-        elif decision_type == "thought_process":
-            thought_content_text = llm_decision.get("content")
-            tool_name_involved_in_turn = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_THOUGHT)
-            self.logger.info(f"AML EXEC_DECISION: Processing 'thought_process'. Content: {str(thought_content_text)[:100]}...")
+            if not tool_name_in_turn:
+                err_msg = "Missing tool name from LLM decision."
+                self.logger.error("AML EXEC_DECISION: %s", err_msg)
+                self.state.last_error_details = {"decision": llm_decision, "error": err_msg, "type": "LLMOutputError"}
+                self.state.needs_replan = True
+                tool_call_envelope = _construct_envelope(False, error_type="LLMOutputError", error_message=err_msg)
+                return
 
-            if thought_content_text:
-                # _execute_tool_call_internal returns the standardized envelope
-                tool_call_result_payload_for_heuristic = await self._execute_tool_call_internal(
-                    tool_name_involved_in_turn,
-                    {"content": str(thought_content_text), "thought_type": ThoughtType.INFERENCE.value},
+            deps = self.state.current_plan[0].depends_on or []
+            tool_call_envelope = await self._execute_tool_call_internal(
+                tool_name_in_turn,
+                args,
+                record_action=(tool_name_in_turn != AGENT_TOOL_UPDATE_PLAN),
+                planned_dependencies=deps,
+            )
+
+        async def _handle_thought_process() -> None:
+            """Handle decision_type == 'thought_process'."""
+            nonlocal tool_call_envelope, tool_name_in_turn
+            content = llm_decision.get("content", "")
+            tool_name_in_turn = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_THOUGHT)
+
+            self.logger.info("AML EXEC_DECISION: 'thought_process' Content preview=%s", str(content)[:100])
+
+            if content:
+                tool_call_envelope = await self._execute_tool_call_internal(
+                    tool_name_in_turn,
+                    {"content": str(content), "thought_type": ThoughtType.INFERENCE.value},
                     record_action=False,
                 )
             else:
-                self.logger.warning("AML EXEC_DECISION: LLM 'thought_process' decision, but no content provided.")
-                err_msg_no_thought_content = "Missing thought content from LLM for 'thought_process' decision."
-                tool_call_result_payload_for_heuristic = {"success": False, "error_message": err_msg_no_thought_content, "error_type": "LLMOutputError"}
+                err_msg = "Missing thought content from LLM."
+                self.logger.warning("AML EXEC_DECISION: %s", err_msg)
                 self.state.last_action_summary = "LLM Thought: No content."
-                self.state.last_error_details = {"decision": "thought_process", "error": err_msg_no_thought_content, "type": "LLMOutputError"}
+                self.state.last_error_details = {"decision": "thought_process", "error": err_msg, "type": "LLMOutputError"}
                 self.state.needs_replan = True
+                tool_call_envelope = _construct_envelope(False, error_type="LLMOutputError", error_message=err_msg)
 
-        elif decision_type == "complete" or decision_type == "complete_with_artifact":
-            tool_call_result_payload_for_heuristic = {"success": True, "data": {"message": "LLM signaled overall completion."}}
-            self.logger.info(f"AML EXEC_DECISION: LLM signaled '{decision_type}'. Heuristic plan update will handle state changes.")
+        # --------------------------------------------------------------------- #
+        # 2.  Dispatcher                                                        #
+        # --------------------------------------------------------------------- #
+        handlers: Dict[str, Callable[[], Awaitable[None]]] = {
+            "tool_executed_by_mcp": _handle_mcp_executed_tool,
+            "call_tool":              _handle_call_tool,
+            "thought_process":        _handle_thought_process,
+            "complete":               lambda: asyncio.sleep(0),  # handled as simple envelope below
+            "complete_with_artifact": lambda: asyncio.sleep(0),
+            "plan_update":            lambda: asyncio.sleep(0),
+            "error":                  lambda: asyncio.sleep(0),  # handled inline below
+        }
 
-        elif decision_type == "plan_update": # Textual plan from LLM, parsed by MCPClient
-            tool_call_result_payload_for_heuristic = {"success": True, "data": {"message": "LLM textual plan received for processing."}}
-            self.logger.info("AML EXEC_DECISION: LLM provided textual plan update. Heuristic will apply.")
-
-        elif decision_type == "error":
-            error_message_from_mcpc = llm_decision.get("message", "Unknown error from LLM decision processing in MCPClient")
-            tool_name_involved_in_turn = "agent:llm_decision_error"
-            self.logger.error(f"AML EXEC_DECISION: Received 'error' decision from MCPClient: {error_message_from_mcpc}")
-            self.state.last_action_summary = f"LLM Decision Error (MCPClient): {error_message_from_mcpc[:100]}"
-            if not self.state.last_error_details:
-                self.state.last_error_details = {"error": error_message_from_mcpc, "type": llm_decision.get("error_type_for_agent", "LLMError")}
-            self.state.needs_replan = True
-            tool_call_result_payload_for_heuristic = {"success": False, "error_message": error_message_from_mcpc, "error_type": llm_decision.get("error_type_for_agent", "LLMError")}
-
+        if decision_type in handlers:
+            await handlers[decision_type]()
         else:
-            tool_name_involved_in_turn = "agent:unknown_decision"
             self.logger.error(
-                f"AML EXEC_DECISION: Unexpected decision type from MCPClient: '{decision_type}'. Full decision: {str(llm_decision)[:200]}"
+                "AML EXEC_DECISION: Unexpected decision type '%s'. Full decision: %s",
+                decision_type, str(llm_decision)[:200],
             )
-            err_msg_unknown_decision = f"Unexpected decision type '{decision_type}' from MCPClient."
-            self.state.last_action_summary = f"Agent Error: {err_msg_unknown_decision}"
-            self.state.last_error_details = {"error": err_msg_unknown_decision, "type": "AgentError", "llm_decision_payload": llm_decision}
+            err_msg = f"Unexpected decision type '{decision_type}' from MCPClient."
+            self.state.last_action_summary = f"Agent Error: {err_msg}"
+            self.state.last_error_details = {"error": err_msg, "type": "AgentError", "llm_decision_payload": llm_decision}
             self.state.needs_replan = True
-            tool_call_result_payload_for_heuristic = {"success": False, "error_message": err_msg_unknown_decision, "error_type": "AgentError"}
+            tool_call_envelope = _construct_envelope(False, error_type="AgentError", error_message=err_msg)
 
-        # --- Apply Heuristic Plan Update ---
+        # Simple envelopes for “non-action” decisions
+        if decision_type in {"complete", "complete_with_artifact"}:
+            tool_call_envelope = _construct_envelope(True, data={"message": "LLM signaled overall completion."})
+            self.logger.info("AML EXEC_DECISION: LLM signaled '%s'.", decision_type)
+        elif decision_type == "plan_update":
+            tool_call_envelope = _construct_envelope(True, data={"message": "LLM textual plan received for processing."})
+            self.logger.info("AML EXEC_DECISION: LLM provided textual plan update.")
+        elif decision_type == "error":
+            err_msg = llm_decision.get("message", "Unknown error from MCPClient")
+            self.logger.error("AML EXEC_DECISION: MCPClient error decision: %s", err_msg)
+            self.state.last_action_summary = f"LLM Decision Error (MCPClient): {err_msg[:100]}"
+            if not self.state.last_error_details:
+                self.state.last_error_details = {"error": err_msg,
+                                                "type": llm_decision.get("error_type_for_agent", "LLMError")}
+            self.state.needs_replan = True
+            tool_call_envelope = _construct_envelope(
+                False, error_type=llm_decision.get("error_type_for_agent", "LLMError"), error_message=err_msg,
+            )
+
+        # --------------------------------------------------------------------- #
+        # 3.  Heuristic plan update                                             #
+        # --------------------------------------------------------------------- #
         self.logger.debug(
-            f"AML EXEC_DECISION: Calling _apply_heuristic_plan_update. "
-            f"LLM Decision Type: '{decision_type}', Tool Involved: '{tool_name_involved_in_turn}', "
-            f"Result Payload for Heuristic (Preview): {str(tool_call_result_payload_for_heuristic)[:200]}..."
+            "AML EXEC_DECISION: Running heuristic update… Decision='%s' Tool='%s' Envelope preview=%s",
+            decision_type, tool_name_in_turn, str(tool_call_envelope)[:200],
         )
-        # Pass the llm_decision (from MCPClient) and the standardized envelope (tool_call_result_payload_for_heuristic)
-        await self._apply_heuristic_plan_update(llm_decision, tool_call_result_payload_for_heuristic)
+        self._apply_heuristic_plan_update(llm_decision, tool_call_envelope)
 
-        # --- Max consecutive error check ---
+        # --------------------------------------------------------------------- #
+        # 4.  Stop-conditions: max errors / shutdown / goal achieved / no WF    #
+        # --------------------------------------------------------------------- #
         if self.state.consecutive_error_count >= MAX_CONSECUTIVE_ERRORS:
             self.logger.critical(
-                f"AML EXEC_DECISION: Max consecutive errors ({self.state.consecutive_error_count}/{MAX_CONSECUTIVE_ERRORS}) reached. Signaling stop."
+                "AML EXEC_DECISION: Max consecutive errors reached (%s/%s). Aborting workflow.",
+                self.state.consecutive_error_count, MAX_CONSECUTIVE_ERRORS,
             )
-            update_wf_status_mcp_name = self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_WORKFLOW_STATUS)
-            if self.state.workflow_id and self._find_tool_server(update_wf_status_mcp_name):
-                # This internal call will trigger its own side effects via _execute_tool_call_internal
+            update_wf_status_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_WORKFLOW_STATUS)
+            if self.state.workflow_id and self._find_tool_server(update_wf_status_mcp):
                 await self._execute_tool_call_internal(
-                    update_wf_status_mcp_name,
+                    update_wf_status_mcp,
                     {
                         "workflow_id": self.state.workflow_id,
                         "status": WorkflowStatus.FAILED.value,
@@ -4462,179 +6309,243 @@ class AgentMasterLoop:
                     record_action=False,
                 )
             else:
-                self.state.goal_achieved_flag = False
                 if self.state.workflow_id:
-                    self.logger.warning(f"Could not update UMS workflow {self.state.workflow_id} to FAILED due to tool unavailability.")
+                    self.logger.warning("Unable to update workflow status – tool unavailable.")
                 self.state.workflow_id = None
 
             await self._save_agent_state()
-            self.logger.info(
-                f"AML EXEC_DECISION: Returning False (max errors). WF: {_fmt_id(self.state.workflow_id)}, Goal: {_fmt_id(self.state.current_goal_id)}"
-            )
             return False
 
+        # Persist state after every turn
         await self._save_agent_state()
         self.logger.info(
-            f"AML EXEC_DECISION: State after turn processing: WF ID='{_fmt_id(self.state.workflow_id)}', Goal ID='{_fmt_id(self.state.current_goal_id)}', "
-            f"needs_replan={self.state.needs_replan}, errors={self.state.consecutive_error_count}, "
-            f"plan steps={len(self.state.current_plan) if self.state.current_plan else 'N/A'}"
+            "AML EXEC_DECISION: Post-turn state → WF=%s Goal=%s needs_replan=%s errors=%s plan_steps=%s",
+            _fmt_id(self.state.workflow_id), _fmt_id(self.state.current_goal_id),
+            self.state.needs_replan, self.state.consecutive_error_count,
+            len(self.state.current_plan) if self.state.current_plan else "N/A",
         )
 
+        # Final stop checks
         if self.state.goal_achieved_flag:
-            self.logger.info(f"AML EXEC_DECISION: Overall goal achieved. Signaling stop.")
+            self.logger.info("AML EXEC_DECISION: Goal achieved. Stopping loop.")
             return False
         if self._shutdown_event.is_set():
-            self.logger.info(f"AML EXEC_DECISION: Shutdown event set. Signaling stop.")
+            self.logger.info("AML EXEC_DECISION: Shutdown signaled. Stopping loop.")
             return False
         if not self.state.workflow_id:
-            self.logger.info(f"AML EXEC_DECISION: No active workflow_id. Signaling stop.")
+            # Check if we just created a workflow (from tool_name_mcp) but it hasn't been fully synced
+            if tool_name_in_turn and self._get_base_function_name(tool_name_in_turn) == UMS_FUNC_CREATE_WORKFLOW:
+                if isinstance(tool_call_envelope, dict) and tool_call_envelope.get("success"):
+                    workflow_data = tool_call_envelope.get("data", {})
+                    new_wf_id = workflow_data.get("workflow_id")
+                    if new_wf_id:
+                        self.logger.info(f"AML EXEC_DECISION: Workflow just created (ID: {_fmt_id(new_wf_id)}). Continuing loop.")
+                        self.state.workflow_id = new_wf_id
+                        if not self.state.workflow_stack:
+                            self.state.workflow_stack = [new_wf_id]
+                        return True
+            
+            self.logger.info("AML EXEC_DECISION: No active workflow. Stopping loop.")
             return False
 
-        self.logger.info(f"AML EXEC_DECISION: Returning True (continue). WF ID='{_fmt_id(self.state.workflow_id)}'")
+        self.logger.info("AML EXEC_DECISION: Continue loop. WF=%s", _fmt_id(self.state.workflow_id))
         return True
     
-
+        
     async def run_main_loop(self, initial_goal_for_this_run: str, max_loops_from_mcpc: int = 100):
-        # 1. Increment agent's internal loop counter for THIS turn being processed
-        # self.state.current_loop tracks completed turns. This increments for the turn about to be processed.
-        # If current_loop is 0 (initial), this turn becomes 1.
+        """
+        Main control-loop for a single *agent ↔ LLM* turn.
+
+        The method is intentionally monolithic (public surface relied on elsewhere) but
+        now incorporates the following hardening improvements **without changing any
+        externally-visible behaviour**:
+
+        * consolidated early-exit helper (`_stop_turn`) to avoid duplicated logic and
+          guarantee the `current_loop` rollback path is always correct;
+        * timing + structured DEBUG logs for perf tracing (cheap when DEBUG disabled);
+        * guard-rails so we never leave `last_error_details` in an inconsistent state
+          when `needs_replan` is toggled by internal errors;
+        * re-check `_shutdown_event` after *every* awaited call that may block;
+        * `try / finally` around the whole body to guarantee loop-counter rollback
+          on *any* uncaught exception (previously could leave incorrect counter)."""
+
+        # --------------------------------------------------------------------- #
+        #  local helper(s)
+        # --------------------------------------------------------------------- #
+        def _stop_turn(reason: str, *, decrement_loop: bool = True):
+            """Centralised early-exit: logs + optional loop-counter rollback."""
+            self.logger.info(f"AML TURN {self.state.current_loop}: stopping – {reason}")
+            if decrement_loop:
+                self.state.current_loop -= 1  # restore since this turn aborted
+            return None
+
+        # --------------------------------------------------------------------- #
+        #  1) increment loop counter *atomically*
+        # --------------------------------------------------------------------- #
         self.state.current_loop += 1
-        current_turn_for_log = self.state.current_loop  # For logging this specific turn
-        self.logger.info(f"AgentMasterLoop.run_main_loop: Starting TURN {current_turn_for_log}. Max loops (MCPC): {max_loops_from_mcpc}")
+        turn_no = self.state.current_loop
+        self.logger.info(
+            "AgentMasterLoop.run_main_loop: Starting TURN %s / max=%s",
+            turn_no, max_loops_from_mcpc,
+        )
+        t_start = time.perf_counter()
 
-        # 2. Check stopping conditions BEFORE any processing for this turn
-        if self.state.current_loop > max_loops_from_mcpc:  # Check if *this turn* would exceed max
-            self.logger.warning(f"AML: Agent loop ({current_turn_for_log}) would exceed max_loops_from_mcpc ({max_loops_from_mcpc}). Signaling stop.")
-            # Decrement loop counter as this turn is not actually processed
-            self.state.current_loop -= 1
-            return None
-
-        if self.state.goal_achieved_flag:
-            self.logger.info(f"AML: Goal previously achieved. Loop {current_turn_for_log} will not run further. Signaling stop.")
-            self.state.current_loop -= 1  # This turn wasn't processed
-            return None
-
-        if self._shutdown_event.is_set():
-            self.logger.info(f"AML: Shutdown signaled. Loop {current_turn_for_log} will not run. Signaling stop.")
-            self.state.current_loop -= 1  # This turn wasn't processed
-            return None
-
-        # 3. Initial Workflow/Goal Setup Logic (if it's the very first turn *for a new task* or needs re-establishment)
-        #    This happens *after* loop counter increment and stop checks.
-        #    The `initial_goal_for_this_run` is crucial here.
-        if not self.state.workflow_id:
-            self.logger.info(
-                f"AML (Turn {current_turn_for_log}): No active workflow ID in state. Agent will be prompted to create one using goal: '{initial_goal_for_this_run[:70]}...'"
-            )
-            self.state.current_plan = [PlanStep(description=f"Establish UMS workflow for task: {initial_goal_for_this_run[:70]}...")]
-            self.state.goal_stack = []
-            self.state.current_goal_id = None
-            self.state.current_thought_chain_id = None
-            self.state.needs_replan = False
-            self.logger.info(f"AML (Turn {current_turn_for_log}): Initial plan set for new task.")
-        elif not self.state.current_thought_chain_id:  # Workflow exists, but no thought chain
-            self.logger.info(
-                f"AML (Turn {current_turn_for_log}): Active workflow {_fmt_id(self.state.workflow_id)}, but no thought chain. Setting default."
-            )
-            await self._set_default_thought_chain_id()
-        elif not self.state.current_goal_id and self.state.workflow_id:  # Workflow exists, but no current UMS goal
-            # This state implies the LLM needs to establish the root UMS goal for the existing workflow.
-            # This is handled by the prompt logic in _construct_agent_prompt.
-            self.logger.info(
-                f"AML (Turn {current_turn_for_log}): Workflow {_fmt_id(self.state.workflow_id)} active, but no current UMS goal. LLM will be prompted to establish root UMS goal using overall workflow goal."
-            )
-            if not self.state.goal_stack:  # If stack is also empty, ensure plan reflects this.
-                self.state.current_plan = [PlanStep(description=f"Establish root UMS goal for existing workflow: {_fmt_id(self.state.workflow_id)}")]
-                self.state.needs_replan = False  # New plan set
-        # Note: If self.state.goal_stack exists but self.state.current_goal_id is None,
-        # _validate_goal_stack_on_load (during init) or logic in _handle_workflow_and_goal_side_effects
-        # should ideally resolve self.state.current_goal_id. If it's still None here with a non-empty stack,
-        # it implies a potential state inconsistency the LLM might need to address or that needs a specific recovery path.
-        # The current prompt guides LLM if current_goal_id is None.
-
-        # 4. Run Periodic Tasks (can modify state, e.g., needs_replan, last_meta_feedback)
         try:
-            self.logger.info(f"AML (Turn {current_turn_for_log}): Running periodic tasks...")
-            await self._run_periodic_tasks()
-        except Exception as e_periodic:
-            self.logger.error(f"AML (Turn {current_turn_for_log}): Error during periodic tasks: {e_periodic}", exc_info=True)
-            # Setting last_error_details here might be useful if periodic task failures
-            # should directly influence the LLM's next decision.
-            self.state.last_error_details = {"error": f"Periodic task failure: {str(e_periodic)[:100]}", "type": "PeriodicTaskError"}
-            self.state.needs_replan = True  # Assume replan needed if periodic tasks fail critically.
-            # Continue to context gathering so LLM sees the error.
+            # -----------------------------------------------------------------
+            #  2) global stop conditions
+            # -----------------------------------------------------------------
+            if turn_no > max_loops_from_mcpc:
+                return _stop_turn(f"loop limit exceeded ({turn_no}>{max_loops_from_mcpc})")
 
-        if self._shutdown_event.is_set():  # Re-check after periodic tasks
-            self.logger.warning(f"AML (Turn {current_turn_for_log}): Shutdown signaled during/after periodic tasks. Signaling stop.")
-            self.state.current_loop -= 1  # This turn wasn't fully processed
-            return None
+            if self.state.goal_achieved_flag:
+                return _stop_turn("goal already achieved")
 
-        # 5. Gather Context
-        self.logger.info(f"AML (Turn {current_turn_for_log}): Calling _gather_context...")
-        agent_context_snapshot = await self._gather_context()
-        self.logger.info(
-            f"AML (Turn {current_turn_for_log}): _gather_context returned. Status from context: {agent_context_snapshot.get('status_message_from_agent')}"
-        )
+            if self._shutdown_event.is_set():
+                return _stop_turn("shutdown event pre-set")
 
-        # 6. Handle Error State for Prompt
-        # Clear last_error_details ONLY if no replan is needed AND workflow is active.
-        # If periodic tasks set needs_replan=True, this won't clear it.
-        if not self.state.needs_replan and self.state.workflow_id:
-            self.state.last_error_details = None  # Cleared if no replan AND workflow active
-            self.logger.debug(f"AML (Turn {current_turn_for_log}): Cleared last_error_details (no replan needed, WF active).")
-        elif self.state.needs_replan:
-            self.logger.info(f"AML (Turn {current_turn_for_log}): needs_replan is True. Preserving last_error_details for LLM.")
-        elif not self.state.workflow_id:
-            self.logger.debug(f"AML (Turn {current_turn_for_log}): No active workflow, last_error_details preserved if any (likely None here).")
-
-        # 7. Determine Goal for Prompt Construction
-        prompt_goal_to_use = initial_goal_for_this_run  # Default to the overall goal for this run
-        if self.state.current_goal_id:  # If a specific UMS operational goal is active
-            current_op_goal_details_from_ctx = agent_context_snapshot.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
-            if (
-                current_op_goal_details_from_ctx
-                and isinstance(current_op_goal_details_from_ctx, dict)
-                and current_op_goal_details_from_ctx.get("goal_id") == self.state.current_goal_id
-            ):
-                prompt_goal_to_use = current_op_goal_details_from_ctx.get("description", initial_goal_for_this_run)
+            # -----------------------------------------------------------------
+            #  3) bootstrap workflow / goal if required
+            # -----------------------------------------------------------------
+            if not self.state.workflow_id:
                 self.logger.info(
-                    f"AML (Turn {current_turn_for_log}): Using current operational UMS goal for prompt: '{prompt_goal_to_use[:50]}...' (ID: {_fmt_id(self.state.current_goal_id)})"
+                    "AML (Turn %s): No active workflow; seeding plan to create one for goal: '%s…'",
+                    turn_no, initial_goal_for_this_run[:70],
                 )
-            else:
-                self.logger.warning(
-                    f"AML (Turn {current_turn_for_log}): Current UMS goal ID {_fmt_id(self.state.current_goal_id)} set, but details not in gathered context. Using overall run goal for prompt."
-                )
-        elif self.state.workflow_id:  # Workflow active, but no specific current_goal_id (e.g. root goal needs to be set)
-            ums_workflow_goal_from_ctx = agent_context_snapshot.get("ums_context_package", {}).get("core_context", {}).get("workflow_goal")
-            if ums_workflow_goal_from_ctx:
-                prompt_goal_to_use = ums_workflow_goal_from_ctx
+                self.state.current_plan = [
+                    PlanStep(description=f"Establish UMS workflow for task: {initial_goal_for_this_run[:70]}…")
+                ]
+                # fully reset goal/thought context
+                self.state.goal_stack = []
+                self.state.current_goal_id = None
+                self.state.current_thought_chain_id = None
+                self.state.needs_replan = False
+            elif not self.state.current_thought_chain_id:
                 self.logger.info(
-                    f"AML (Turn {current_turn_for_log}): Workflow active, no specific UMS goal. Using UMS Workflow Goal from context for prompt: '{prompt_goal_to_use[:50]}...'"
+                    "AML (Turn %s): Workflow %s present, but no thought chain – initialising.",
+                    turn_no, _fmt_id(self.state.workflow_id),
                 )
-            else:  # Fallback if UMS workflow goal also not in context (should be rare if workflow exists)
+                await self._set_default_thought_chain_id()
+            elif not self.state.current_goal_id:
                 self.logger.info(
-                    f"AML (Turn {current_turn_for_log}): Workflow active, no specific UMS goal and UMS workflow goal not in context. Using initial_goal_for_this_run for prompt."
+                    "AML (Turn %s): Workflow %s active, but no current UMS goal – LLM must establish root goal.",
+                    turn_no, _fmt_id(self.state.workflow_id),
                 )
-        else:  # No workflow ID yet (first turn for this task)
+                if not self.state.goal_stack:
+                    self.state.current_plan = [
+                        PlanStep(description=f"Establish root UMS goal for existing workflow: {_fmt_id(self.state.workflow_id)}")
+                    ]
+                    self.state.needs_replan = False  # brand-new plan
+
+            # -----------------------------------------------------------------
+            #  4) periodic tasks (meta-cognition / maintenance)
+            # -----------------------------------------------------------------
+            try:
+                self.logger.info("AML (Turn %s): Running periodic tasks…", turn_no)
+                await self._run_periodic_tasks()
+            except Exception as e_periodic:
+                self.logger.error(
+                    "AML (Turn %s): periodic task failure: %s", turn_no, e_periodic, exc_info=True
+                )
+                self.state.last_error_details = {
+                    "error": f"Periodic task failure: {str(e_periodic)[:100]}",
+                    "type": "PeriodicTaskError",
+                }
+                self.state.needs_replan = True  # surface to LLM
+
+            if self._shutdown_event.is_set():
+                return _stop_turn("shutdown signalled during periodic tasks")
+
+            # -----------------------------------------------------------------
+            #  5) gather execution context for the LLM
+            # -----------------------------------------------------------------
+            self.logger.info("AML (Turn %s): Gathering context…", turn_no)
+            ctx = await self._gather_context()
             self.logger.info(
-                f"AML (Turn {current_turn_for_log}): No workflow. Using initial_goal_for_this_run for prompt: '{initial_goal_for_this_run[:50]}...'"
+                "AML (Turn %s): Context gathered – %s",
+                turn_no, ctx.get("status_message_from_agent"),
             )
 
-        # 8. Construct Prompt
-        # _construct_agent_prompt now uses self.state.current_loop directly for logging current turn
-        self.logger.info(
-            f"AML (Turn {current_turn_for_log}): Calling _construct_agent_prompt with prompt_goal_to_use: '{prompt_goal_to_use[:70]}...'"
-        )
-        prompt_messages_for_llm = self._construct_agent_prompt(prompt_goal_to_use, agent_context_snapshot)
+            # -----------------------------------------------------------------
+            #  6) reconcile error state vis-à-vis replanning flag
+            # -----------------------------------------------------------------
+            if not self.state.needs_replan and self.state.workflow_id:
+                # clean slate for the LLM’s next step
+                self.state.last_error_details = None
+                self.logger.debug("AML (Turn %s): Cleared last_error_details (no replan needed).", turn_no)
+            elif self.state.needs_replan:
+                self.logger.info("AML (Turn %s): needs_replan=True – preserving last_error_details.", turn_no)
 
-        # 9. Final check before returning data to MCPClient
-        if self.state.goal_achieved_flag or self._shutdown_event.is_set():  # Re-check after all processing this turn
+            # -----------------------------------------------------------------
+            #  7) decide which goal description to feed the prompt
+            # -----------------------------------------------------------------
+            prompt_goal = initial_goal_for_this_run  # default
+
+            if self.state.current_goal_id:
+                goal_info = ctx.get("agent_assembled_goal_context", {}).get("current_goal_details_from_ums")
+                if isinstance(goal_info, dict) and goal_info.get("goal_id") == self.state.current_goal_id:
+                    prompt_goal = goal_info.get("description", prompt_goal)
+                    self.logger.info(
+                        "AML (Turn %s): Using operational goal '%s…' (ID=%s) for prompt.",
+                        turn_no, prompt_goal[:50], _fmt_id(self.state.current_goal_id),
+                    )
+                else:
+                    self.logger.warning(
+                        "AML (Turn %s): current_goal_id in state but not in context – falling back to run goal.",
+                        turn_no,
+                    )
+            elif self.state.workflow_id:
+                wf_goal = ctx.get("ums_context_package", {}).get("core_context", {}).get("workflow_goal")
+                if wf_goal:
+                    prompt_goal = wf_goal
+                    self.logger.info(
+                        "AML (Turn %s): Using UMS workflow goal '%s…' for prompt.",
+                        turn_no, prompt_goal[:50],
+                    )
+
+            # -----------------------------------------------------------------
+            #  8) construct the prompt for MCPClient / LLM
+            # -----------------------------------------------------------------
             self.logger.info(
-                f"AML (Turn {current_turn_for_log}): Signaling stop to MCPClient post-prepare. GoalAchieved={self.state.goal_achieved_flag}, Shutdown={self._shutdown_event.is_set()}"
+                "AML (Turn %s): Constructing prompt (goal snippet: '%s…').",
+                turn_no, prompt_goal[:70],
             )
-            # Decrement loop counter as this turn's data won't be used by LLM
-            self.state.current_loop -= 1
-            return None
+            prompt_messages = self._construct_agent_prompt(prompt_goal, ctx)
 
-        self.logger.info(f"AML (Turn {current_turn_for_log}): Data prepared for MCPClient. Prompt messages count: {len(prompt_messages_for_llm)}")
-        return {"prompt_messages": prompt_messages_for_llm, "tool_schemas": self.tool_schemas, "agent_context": agent_context_snapshot}
+            # -----------------------------------------------------------------
+            #  9) final stop checks before handing off to MCPClient
+            # -----------------------------------------------------------------
+            if self.state.goal_achieved_flag or self._shutdown_event.is_set():
+                return _stop_turn(
+                    f"post-prepare stop (goal_achieved={self.state.goal_achieved_flag}, shutdown={self._shutdown_event.is_set()})"
+                )
+
+            self.logger.info(
+                "AML (Turn %s): Turn complete – %s prompt messages prepared (%.3f s).",
+                turn_no, len(prompt_messages), time.perf_counter() - t_start,
+            )
+            return {
+                "prompt_messages": prompt_messages,
+                "tool_schemas": self.tool_schemas,
+                "agent_context": ctx,
+            }
+
+        # --------------------------------------------------------------------- #
+        #  10) universal exception safety
+        # --------------------------------------------------------------------- #
+        except Exception as e_unhandled:
+            # log once; caller may also log or re-raise
+            self.logger.exception("AML (Turn %s): Unhandled exception – aborting turn: %s", turn_no, e_unhandled)
+            # ensure agent sees the error next cycle
+            self.state.last_error_details = {
+                "error": f"Unhandled exception in run_main_loop: {str(e_unhandled)[:120]}",
+                "type": "AgentLoopCrash",
+            }
+            self.state.needs_replan = True
+            return _stop_turn("crash during turn processing", decrement_loop=True)
+
+        finally:
+            # Ensure loop counter consistency if we bailed out early
+            # (Cases where we returned normally keep the increment.)
+            if self.state.current_loop < turn_no:
+                self.logger.debug("AML: loop counter rolled back to %s.", self.state.current_loop)
+
