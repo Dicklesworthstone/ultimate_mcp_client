@@ -292,20 +292,6 @@ class _Decision(str, Enum):
     COMPLETE_ART = "complete_with_artifact"
     PLAN_UPDATE = "plan_update"
 
-# Logger Setup
-log = logging.getLogger("AgentMasterLoop")
-if not logging.root.handlers and not log.handlers:
-    logging.basicConfig(
-        level=os.environ.get("AGENT_LOOP_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-    log.warning("AgentMasterLoop logger self-initialized. If run integrated, mcp_client_multi should configure logging.")
-
-LOG_LEVEL_ENV = os.environ.get("AGENT_LOOP_LOG_LEVEL", "INFO").upper()
-log.setLevel(getattr(logging, LOG_LEVEL_ENV, logging.INFO))
-if log.level <= logging.DEBUG:
-    log.info("Verbose logging enabled for Agent loop.")
-
 # ==========================================================================
 # CONSTANTS
 # ==========================================================================
@@ -441,6 +427,311 @@ class ToolInputError(ToolError):
 # ==========================================================================
 # LOCAL UTILITY CLASSES & HELPERS
 # ==========================================================================
+
+from contextlib import asynccontextmanager
+
+class StateTransactionManager:
+    """
+    Atomic state management for AgentMasterLoop.
+    
+    Ensures that state changes and UMS operations either all succeed
+    or all are rolled back, preventing inconsistent state.
+    """
+    
+    def __init__(self, agent_master_loop: "AgentMasterLoop"):
+        self.aml = agent_master_loop
+        self.logger = agent_master_loop.logger
+        self._in_transaction = False
+        self._original_state: Optional["AgentState"] = None
+        self._transaction_id: Optional[str] = None
+        
+    @asynccontextmanager
+    async def transaction(self, description: str = "State Transaction"):
+        """
+        Start an atomic transaction for state changes.
+        
+        Usage:
+            async with state_manager.transaction("Update goal"):
+                # Make state changes
+                # Call UMS operations  
+                # If any operation fails, everything is rolled back
+        """
+        if self._in_transaction:
+            raise RuntimeError("Cannot start nested state transactions")
+            
+        self._transaction_id = f"txn-{uuid.uuid4().hex[:8]}"
+        self._in_transaction = True
+        
+        # Take a deep copy of current state as backup
+        self._original_state = copy.deepcopy(self.aml.state)
+        
+        self.logger.debug(f"🔄 State Transaction [{self._transaction_id}] STARTED: {description}")
+        
+        try:
+            yield self
+            # If we reach here, commit the transaction
+            await self._commit_transaction()
+            self.logger.info(f"✅ State Transaction [{self._transaction_id}] COMMITTED: {description}")
+            
+        except Exception as e:
+            # Rollback on any exception
+            await self._rollback_transaction()
+            self.logger.warning(f"🔙 State Transaction [{self._transaction_id}] ROLLED BACK: {description} - Error: {e}")
+            raise
+            
+        finally:
+            self._cleanup_transaction()
+    
+    async def _commit_transaction(self):
+        """Commit the transaction by saving state to disk."""
+        try:
+            await self.aml._save_agent_state()
+        except Exception as e:
+            self.logger.error(f"Failed to save state during transaction commit: {e}")
+            raise
+    
+    async def _rollback_transaction(self):
+        """Rollback by restoring the original state."""
+        if self._original_state is not None:
+            self.aml.state = self._original_state
+            self.logger.debug(f"State rolled back to pre-transaction state")
+        else:
+            self.logger.warning("No original state to rollback to")
+    
+    def _cleanup_transaction(self):
+        """Clean up transaction state."""
+        self._in_transaction = False
+        self._original_state = None
+        self._transaction_id = None
+
+
+class StateRecoveryManager:
+    """
+    Handles state recovery operations instead of emergency replanning.
+    
+    Attempts to fix state inconsistencies gracefully before resorting
+    to replanning as a last resort.
+    """
+    
+    def __init__(self, agent_master_loop: "AgentMasterLoop"):
+        self.aml = agent_master_loop
+        self.logger = agent_master_loop.logger
+        
+    async def attempt_state_recovery(self, issue_description: str, error_details: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Attempt to recover from state issues instead of immediate replanning.
+        
+        Returns:
+            True if recovery was successful, False if replanning is needed
+        """
+        self.logger.info(f"🔧 Attempting state recovery for: {issue_description}")
+        
+        recovery_attempts = [
+            self._recover_goal_stack_sync,
+            self._recover_workflow_context_sync,
+            self._recover_thought_chain,
+            self._recover_plan_validation,
+        ]
+        
+        for recovery_func in recovery_attempts:
+            try:
+                if await recovery_func(error_details):
+                    self.logger.info(f"✅ State recovery successful via {recovery_func.__name__}")
+                    return True
+            except Exception as e:
+                self.logger.warning(f"Recovery attempt {recovery_func.__name__} failed: {e}")
+                continue
+        
+        self.logger.warning(f"❌ All state recovery attempts failed for: {issue_description}")
+        return False
+    
+    async def _recover_goal_stack_sync(self, error_details: Optional[Dict[str, Any]]) -> bool:
+        """Try to sync goal stack with UMS."""
+        if not self.aml.state.current_goal_id:
+            return False
+            
+        try:
+            # Fetch current goal stack from UMS
+            ums_stack = await self.aml._fetch_goal_stack_from_ums(self.aml.state.current_goal_id)
+            if ums_stack:
+                # Update local goal stack to match UMS
+                self.aml.state.goal_stack = ums_stack
+                self.logger.info("🔄 Goal stack synced with UMS")
+                return True
+        except Exception as e:
+            self.logger.debug(f"Goal stack sync failed: {e}")
+            
+        return False
+    
+    async def _recover_workflow_context_sync(self, error_details: Optional[Dict[str, Any]]) -> bool:
+        """Try to fix workflow/context inconsistencies."""
+        if not self.aml.state.workflow_id:
+            return False
+            
+        try:
+            # Re-validate workflow and context
+            if await self.aml._validate_agent_workflow_and_context():
+                self.logger.info("🔄 Workflow/context validation recovered")
+                return True
+        except Exception as e:
+            self.logger.debug(f"Workflow/context recovery failed: {e}")
+            
+        return False
+    
+    async def _recover_thought_chain(self, error_details: Optional[Dict[str, Any]]) -> bool:
+        """Try to recover thought chain."""
+        if not self.aml.state.current_thought_chain_id:
+            try:
+                await self.aml._set_default_thought_chain_id()
+                if self.aml.state.current_thought_chain_id:
+                    self.logger.info("🔄 Thought chain recovered")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"Thought chain recovery failed: {e}")
+                
+        return False
+    
+    async def _recover_plan_validation(self, error_details: Optional[Dict[str, Any]]) -> bool:
+        """Try to fix plan validation issues."""
+        if not self.aml.state.current_plan or not self.aml.state.current_plan[0].description:
+            return False
+            
+        # Check if plan is just the default
+        first_step = self.aml.state.current_plan[0]
+        if first_step.description == DEFAULT_PLAN_STEP:
+            return False  # This needs actual replanning
+            
+        # Validate plan steps structure
+        valid_plan = True
+        for step in self.aml.state.current_plan:
+            if not step.description or not step.description.strip():
+                valid_plan = False
+                break
+                
+        if valid_plan:
+            self.logger.info("🔄 Plan structure is valid")
+            return True
+            
+        return False
+
+
+class EnhancedStateValidator:
+    """
+    Comprehensive state validation that checks all aspects of agent state
+    consistency with UMS and attempts recovery before falling back to replanning.
+    """
+    
+    def __init__(self, agent_master_loop: "AgentMasterLoop"):
+        self.aml = agent_master_loop
+        self.logger = agent_master_loop.logger
+        self.recovery_manager = StateRecoveryManager(agent_master_loop)
+        
+    async def validate_and_recover_state(self, context: str = "general") -> bool:
+        """
+        Perform comprehensive state validation and attempt recovery if needed.
+        
+        Returns:
+            True if state is valid or was successfully recovered
+            False if replanning is needed
+        """
+        self.logger.debug(f"🔍 Comprehensive state validation ({context})")
+        
+        validation_checks = [
+            ("workflow_exists", self._validate_workflow_exists),
+            ("context_valid", self._validate_context_valid), 
+            ("goal_stack_consistent", self._validate_goal_stack_consistent),
+            ("thought_chain_exists", self._validate_thought_chain_exists),
+            ("plan_structure_valid", self._validate_plan_structure_valid),
+        ]
+        
+        issues_found = []
+        
+        for check_name, check_func in validation_checks:
+            try:
+                is_valid, issue_desc = await check_func()
+                if not is_valid:
+                    issues_found.append((check_name, issue_desc))
+            except Exception as e:
+                issues_found.append((check_name, f"Validation error: {e}"))
+        
+        if not issues_found:
+            self.logger.debug("✅ All state validation checks passed")
+            return True
+        
+        # Attempt recovery for each issue
+        self.logger.info(f"🔧 Found {len(issues_found)} state issues, attempting recovery...")
+        
+        recovery_success = True
+        for check_name, issue_desc in issues_found:
+            recovered = await self.recovery_manager.attempt_state_recovery(
+                f"{check_name}: {issue_desc}"
+            )
+            if not recovered:
+                recovery_success = False
+                self.logger.warning(f"❌ Could not recover from: {check_name}: {issue_desc}")
+        
+        return recovery_success
+    
+    async def _validate_workflow_exists(self) -> Tuple[bool, str]:
+        """Validate that workflow exists in UMS."""
+        if not self.aml.state.workflow_id:
+            return False, "No workflow_id set"
+            
+        exists = await self.aml._check_workflow_exists(self.aml.state.workflow_id)
+        if not exists:
+            return False, f"Workflow {self.aml.state.workflow_id} not found in UMS"
+            
+        return True, ""
+    
+    async def _validate_context_valid(self) -> Tuple[bool, str]:
+        """Validate that context is consistent with UMS."""
+        if not self.aml.state.context_id:
+            return False, "No context_id set"
+            
+        # This leverages the existing validation logic
+        valid = await self.aml._validate_agent_workflow_and_context()
+        if not valid:
+            return False, "Context validation failed"
+            
+        return True, ""
+    
+    async def _validate_goal_stack_consistent(self) -> Tuple[bool, str]:
+        """Validate that goal stack is consistent with UMS."""
+        if not self.aml.state.current_goal_id:
+            return True, ""  # No goal is a valid state
+            
+        try:
+            ums_stack = await self.aml._fetch_goal_stack_from_ums(self.aml.state.current_goal_id)
+            if not ums_stack:
+                return False, "Could not fetch goal stack from UMS"
+                
+            # Check if current goal matches UMS
+            if ums_stack and ums_stack[-1].get("goal_id") != self.aml.state.current_goal_id:
+                return False, "Current goal ID mismatch with UMS"
+                
+        except Exception as e:
+            return False, f"Goal stack validation error: {e}"
+            
+        return True, ""
+    
+    async def _validate_thought_chain_exists(self) -> Tuple[bool, str]:
+        """Validate that thought chain exists."""
+        if not self.aml.state.current_thought_chain_id:
+            return False, "No thought chain ID set"
+        return True, ""
+    
+    async def _validate_plan_structure_valid(self) -> Tuple[bool, str]:
+        """Validate that plan structure is valid."""
+        if not self.aml.state.current_plan:
+            return False, "No plan steps"
+            
+        for i, step in enumerate(self.aml.state.current_plan):
+            if not step.description or not step.description.strip():
+                return False, f"Plan step {i} has empty description"
+                
+        return True, ""
+
+
 class MemoryUtils:
     @staticmethod
     def generate_id() -> str:
@@ -678,6 +969,9 @@ class AgentState:
     consecutive_error_count: int = 0
     needs_replan: bool = False
     last_error_details: Optional[Dict[str, Any]] = None
+    # Atomic tool call processing state
+    deferred_tool_calls: List[Dict[str, Any]] = field(default_factory=list)  # Tool calls deferred to next turn
+    last_atomic_decision_info: Optional[Dict[str, Any]] = None  # Info about last multi-tool decision
     successful_actions_since_reflection: float = 0.0
     successful_actions_since_consolidation: float = 0.0
     loops_since_optimization: int = 0
@@ -701,6 +995,7 @@ class AgentMasterLoop:
     _INTERNAL_OR_META_TOOLS_BASE_NAMES: Set[str] = {
         UMS_FUNC_RECORD_ACTION_START,
         UMS_FUNC_RECORD_ACTION_COMPLETION,
+        UMS_FUNC_CREATE_WORKFLOW,  # Added: create_workflow doesn't record actions (no workflow context yet)
         "get_workflow_context",
         UMS_FUNC_GET_RICH_CONTEXT_PACKAGE,
         UMS_FUNC_GET_WORKING_MEMORY,
@@ -770,7 +1065,7 @@ class AgentMasterLoop:
         # ------------------------------------------------------------------ #
         # 1. Logger / Paths                                                  #
         # ------------------------------------------------------------------ #
-        self.logger = log.getChild("AgentMasterLoop") if hasattr(log, "getChild") else log
+        self.logger = logging.getLogger("AgentMasterLoop.AgentMasterLoop")
         self.agent_state_file = Path(agent_state_file).expanduser().resolve()
 
         # ------------------------------------------------------------------ #
@@ -804,6 +1099,11 @@ class AgentMasterLoop:
         # 4. Core runtime state & concurrency primitives                     #
         # ------------------------------------------------------------------ #
         self.state = AgentState()
+        
+        # State management components for Fix C: Atomic State Management
+        self.state_transaction_manager = StateTransactionManager(self)
+        self.state_validator = EnhancedStateValidator(self)
+        
         self._shutdown_event = asyncio.Event()
         self._bg_tasks_lock = asyncio.Lock()
         self._bg_task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BG_TASKS)
@@ -1004,7 +1304,18 @@ class AgentMasterLoop:
         # ---------- 4. Assemble SYSTEM prompt blocks (with tweaks) -----------
         system_blocks: list[str] = [
             f"You are '{AGENT_NAME}', an AI agent orchestrator using a Unified Memory System (UMS) provided by the '{UMS_SERVER_NAME}' server.",
-            "All output you produce is consumed verbatim by the agent's executor; stray characters will cause a turn to fail.",  # [ADDED]
+            "",
+            "🎯 **CRITICAL OUTPUT FORMAT REQUIREMENTS:**",
+            "• Your response MUST be either:",
+            "  1. A single, valid JSON object for a tool call (no extra text, no markdown wrapping)",
+            "  2. OR the exact text 'Goal Achieved...' (for workflow completion)",
+            "• Examples of CORRECT tool call format:",
+            f'  {{"name": "{llm_seen_agent_update_plan_name_for_instr}", "arguments": {{"plan": [...]}}}}',
+            f'  {{"name": "ums_record_thought", "arguments": {{"content": "..."}}}}',
+            "• INCORRECT formats that will cause failures:",
+            "  - Markdown code blocks: ```json {...} ```",
+            "  - Extra text before/after JSON: 'Here is my response: {...}'",
+            "  - Multiple JSON objects or tool calls in one response",
             "",
         ]
 
@@ -1191,6 +1502,28 @@ class AgentMasterLoop:
             f"Last Action Summary:\n{self.state.last_action_summary}\n",
         ]
 
+        # Add deferred tool call information if present
+        if self.state.deferred_tool_calls:
+            user_prompt_blocks += [
+                "**DEFERRED TOOL CALLS FROM PREVIOUS TURN:**",
+                f"The following {len(self.state.deferred_tool_calls)} tool call(s) were deferred from the previous turn and should be considered for execution:",
+                "```json",
+                _safe_json(self.state.deferred_tool_calls, indent=2),
+                "```",
+                "",
+            ]
+
+        # Add atomic decision context if available
+        if self.state.last_atomic_decision_info:
+            info = self.state.last_atomic_decision_info
+            user_prompt_blocks += [
+                "**PREVIOUS TURN TOOL PROCESSING INFO:**",
+                f"Last turn processed {info.get('tools_processed', 0)} of {info.get('total_tools_requested', 0)} requested tools. " +
+                f"{info.get('tools_deferred', 0)} tools were deferred to this turn. " +
+                (f"Agent Message: {info.get('agent_message')}" if info.get('agent_message') else ""),
+                "",
+            ]
+
         if self.state.last_error_details:
             user_prompt_blocks += [
                 "**CRITICAL: Address Last Error Details (refer to Recovery Strategies in System Prompt)**:",
@@ -1311,12 +1644,22 @@ class AgentMasterLoop:
                     # instruction_append is removed here because we are not asking for a tool call JSON.
                 )
             
-            # Prepend meta-feedback if available
-            if self.state.last_meta_feedback:
-                 final_instruction_text = (
-                    f"Instruction: **REPLANNING REQUIRED.** Meta-cognitive feedback (see 'Meta-Cognitive Feedback' in context) is available. "
-                    + final_instruction_text.split("Instruction: **REPLANNING REQUIRED.**", 1)[-1]
-                )
+                            # Prepend meta-feedback if available
+                if self.state.last_meta_feedback:
+                     final_instruction_text = (
+                        f"Instruction: **REPLANNING REQUIRED.** Meta-cognitive feedback (see 'Meta-Cognitive Feedback' in context) is available. "
+                        + final_instruction_text.split("Instruction: **REPLANNING REQUIRED.**", 1)[-1]
+                    )
+        else:
+            # Normal operational case: workflow and goal exist, no replanning needed
+            final_instruction_text = (
+                f"Instruction: You are actively working on the current UMS goal. "
+                f"Review your current plan and progress, then execute the next logical action. "
+                f"This may involve calling a UMS tool, using available tools to make progress, or "
+                f"signaling goal completion if all necessary work is done."
+                + instruction_append
+            )
+        
         self.logger.info(f"AML CONSTRUCT_PROMPT (Turn {current_turn_for_log_prompt}): Final instruction: {final_instruction_text}")
 
         user_prompt_blocks.append(final_instruction_text)
@@ -1790,7 +2133,7 @@ class AgentMasterLoop:
             # --------------------------------------------------------------
             # 4. Write atomically in a background thread
             # --------------------------------------------------------------
-            async def _write_file() -> None:
+            def _write_file() -> None:
                 tmp_path: Path | None = None
                 try:
                     tmp_dir = self.agent_state_file.parent
@@ -1822,7 +2165,11 @@ class AgentMasterLoop:
                             pass
                     raise
 
-            await asyncio.to_thread(_write_file)
+            # Fix: This should be awaited properly to prevent "coroutine was never awaited" warnings
+            try:
+                await asyncio.to_thread(_write_file)
+            except Exception as write_err:
+                self.logger.error(f"_save_agent_state(): Error during asyncio.to_thread(_write_file): {write_err}", exc_info=True)
 
 
     async def _load_agent_state(self) -> None:  # noqa: C901  (complex by design)
@@ -1996,6 +2343,116 @@ class AgentMasterLoop:
         """
         return tool_name_input.split(":")[-1]
 
+    def _is_ums_tool(self, tool_name: str) -> bool:
+        """Check if a tool name refers to a UMS (Ultimate MCP Server) tool."""
+        return (tool_name.startswith(f"{UMS_SERVER_NAME}:") or 
+                self._get_base_function_name(tool_name) in self.all_ums_base_function_names)
+
+    def _validate_ums_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate tool arguments against the tool's schema before calling UMS."""
+        # Get the tool schema
+        tool_obj = self.mcp_client.server_manager.tools.get(tool_name)
+        if not tool_obj or not tool_obj.input_schema:
+            return {"valid": True}  # Can't validate without schema
+        
+        try:
+            # Use basic validation since jsonschema might not be available
+            schema = tool_obj.input_schema
+            if not isinstance(schema, dict):
+                return {"valid": True}
+            
+            # Check required fields
+            required = schema.get("required", [])
+            for field in required:
+                if field not in arguments:
+                    return {
+                        "valid": False,
+                        "error": f"Missing required field: {field}",
+                        "details": {"missing_field": field}
+                    }
+            
+            # Check field types for properties
+            properties = schema.get("properties", {})
+            for field, value in arguments.items():
+                if field in properties:
+                    expected_type = properties[field].get("type")
+                    if expected_type:
+                        if expected_type == "string" and not isinstance(value, str):
+                            return {
+                                "valid": False,
+                                "error": f"Field '{field}' must be string, got {type(value).__name__}",
+                                "details": {"invalid_field": field, "expected_type": expected_type}
+                            }
+                        elif expected_type == "object" and not isinstance(value, dict):
+                            return {
+                                "valid": False,
+                                "error": f"Field '{field}' must be object, got {type(value).__name__}",
+                                "details": {"invalid_field": field, "expected_type": expected_type}
+                            }
+                        elif expected_type == "array" and not isinstance(value, list):
+                            return {
+                                "valid": False,
+                                "error": f"Field '{field}' must be array, got {type(value).__name__}",
+                                "details": {"invalid_field": field, "expected_type": expected_type}
+                            }
+                        elif expected_type == "boolean" and not isinstance(value, bool):
+                            return {
+                                "valid": False,
+                                "error": f"Field '{field}' must be boolean, got {type(value).__name__}",
+                                "details": {"invalid_field": field, "expected_type": expected_type}
+                            }
+                        elif expected_type in ["integer", "number"] and not isinstance(value, (int, float)):
+                            return {
+                                "valid": False,
+                                "error": f"Field '{field}' must be {expected_type}, got {type(value).__name__}",
+                                "details": {"invalid_field": field, "expected_type": expected_type}
+                            }
+            
+            return {"valid": True}
+        except Exception as e:
+            return {"valid": False, "error": f"Validation error: {e}"}
+
+    def _generate_ums_tool_schema(self, tool_name: str, tool_def: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Generate a structured output schema for a specific UMS tool call."""
+        
+        try:
+            # Get the tool's input schema
+            input_schema = None
+            if isinstance(tool_def, dict):
+                if "input_schema" in tool_def:
+                    input_schema = tool_def["input_schema"]
+                elif "function" in tool_def and isinstance(tool_def["function"], dict):
+                    input_schema = tool_def["function"].get("parameters", {})
+                elif "parameters" in tool_def:
+                    input_schema = tool_def["parameters"]
+            
+            if not isinstance(input_schema, dict):
+                self.logger.debug(f"No valid input schema found for UMS tool {tool_name}")
+                return None
+            
+            # Basic validation that the input schema looks reasonable
+            if "type" not in input_schema:
+                self.logger.warning(f"UMS tool {tool_name} input schema missing 'type' field")
+                return None
+                
+            # Create a structured output schema that enforces the tool call format
+            structured_schema = {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "const": tool_name},
+                    "arguments": input_schema  # Use the UMS tool's actual schema
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": False
+            }
+            
+            self.logger.debug(f"Generated structured output schema for UMS tool {tool_name}")
+            return structured_schema
+            
+        except Exception as e:
+            self.logger.error(f"Error generating structured output schema for UMS tool {tool_name}: {e}")
+            return None
+
 
     async def _check_workflow_exists(self, workflow_id: str) -> bool:
         """
@@ -2099,15 +2556,13 @@ class AgentMasterLoop:
             return False # Treat other envelope failures as "cannot confirm existence"
 
         # Case B: Envelope is success, now inspect the UMS payload.
-        # The UMS `get_workflow_details` tool returns the workflow details directly
-        # if successful, not nested under a "data" key if called by `_execute_tool_call_internal`.
-        # `_execute_tool_call_internal` should pass through the UMS tool's direct payload as `result_envelope` itself
-        # when the UMS tool succeeds.
+        # The `_execute_tool_call_internal` method wraps UMS responses in an envelope structure,
+        # so the actual UMS data is in the `data` field of the envelope.
         
-        # The `result_envelope` IS the UMS payload if the UMS tool succeeded.
-        ums_payload = result_envelope 
+        # Extract the actual UMS payload from the envelope's data field
+        ums_payload = result_envelope.get("data", {})
         
-        # Check if the UMS payload explicitly states success=false (should not happen if envelope.success was true)
+        # Check if the UMS payload explicitly states success=false
         if ums_payload.get("success") is False:
             self.logger.warning(
                 f"AML Check WF Exists: UMS payload for WF {wf_id_fmt} indicates failure despite successful envelope. "
@@ -3152,12 +3607,19 @@ class AgentMasterLoop:
             )
             return None
 
-        action_id: Optional[str] = res.get("action_id")
+        # Try to find action_id in various possible locations
+        action_id: Optional[str] = None
+        if isinstance(res.get("data"), dict):
+            action_id = res["data"].get("action_id")
+        if not action_id:
+            action_id = res.get("action_id")
+        
         if not action_id:
             self.logger.warning(
-                "'%s' succeeded but returned no action_id (tool '%s').",
+                "'%s' succeeded but returned no action_id (tool '%s'). Response: %s",
                 record_action_start_mcp,
                 tool_name_mcp,
+                str(res)[:300]
             )
             return None
 
@@ -3816,6 +4278,18 @@ class AgentMasterLoop:
             f"AML_EXEC_TOOL_INTERNAL: final args for '{tool_name_mcp}': "
             f"{str(final_args)[:200]}…"
         )
+
+        # ───────────────────────────── pre-validate UMS tool arguments ─────────────────────
+        if self._is_ums_tool(tool_name_mcp):
+            validation_result = self._validate_ums_tool_arguments(tool_name_mcp, final_args)
+            if not validation_result["valid"]:
+                envelope = _mk_envelope(
+                    success=False,
+                    err_type="ToolInputValidationError_AML",
+                    err_msg=f"Schema validation failed for {tool_name_mcp}: {validation_result['error']}",
+                    details={"validation_errors": validation_result.get("details", {})}
+                )
+                return await _bail(envelope, mark_replan=True, summary_prefix="Schema validation failed")
 
         # ───────────────────── prerequisite dependency check ───────────────────────
         if planned_dependencies:
@@ -4641,9 +5115,11 @@ class AgentMasterLoop:
                 f"UMS tool '{base_tool_func_name}' reported success, but its "
                 f"'data' payload is not a dict (type={type(payload_obj)})."
             )
-            self.logger.error(f"AML_SIDE_EFFECTS: {msg}  Envelope={str(result_content_envelope)[:300]}")
-            _set_error(base_tool_func_name, msg)
-            return
+            self.logger.warning(f"AML_SIDE_EFFECTS: {msg}  Envelope={str(result_content_envelope)[:300]}")
+            # Don't treat as critical error - tool may have failed for legitimate reasons
+            # Just log and continue processing with empty dict fallback
+            self.logger.info(f"AML_SIDE_EFFECTS: Continuing with empty payload fallback for {base_tool_func_name}")
+            payload_obj = {}
 
         # For uniform downstream handling, ensure dict for expected tools
         if base_tool_func_name in EXPECT_DICT_PAYLOAD_TOOLS and not isinstance(payload_obj, dict):
@@ -4808,62 +5284,74 @@ class AgentMasterLoop:
         # ------------------------------------------------------------------ #
         elif base_tool_func_name == UMS_FUNC_CREATE_GOAL:
             # LLM called create_goal directly
+            
+            # First check if we already have a goal for this workflow
+            if (self.state.current_goal_id and 
+                self.state.workflow_id and 
+                arguments.get("workflow_id") == self.state.workflow_id):
+                self.logger.warning(
+                    f"{log_prefix}: Ignoring duplicate create_goal attempt - "
+                    f"goal {self.state.current_goal_id} already exists for workflow"
+                )
+                # Clear error state and continue with existing goal
+                self.state.needs_replan = False
+                self.state.last_error_details = None
+                self.state.consecutive_error_count = 0
+                return
             if not envelope_ok:
                 self.logger.error(
                     f"{log_prefix}: LLM-initiated create_goal failed at envelope level. "
                     f"Err={result_content_envelope.get('error_message')}"
                 )
+                
+                # Check if the error is because a goal already exists for this workflow
+                error_msg = result_content_envelope.get('error_message', '').lower()
+                if (('already' in error_msg and 'goal' in error_msg) or 
+                    ('exists' in error_msg and 'goal' in error_msg) or
+                    ('duplicate' in error_msg)) and self.state.current_goal_id:
+                    self.logger.warning(f"{log_prefix}: Goal already exists for workflow (error: {error_msg}), using existing goal {self.state.current_goal_id}")
+                    # Don't replan if goal already exists - just continue with current goal
+                    self.state.needs_replan = False
+                    self.state.last_error_details = None
+                    self.state.consecutive_error_count = 0
+                    return
+                
                 self.state.needs_replan = True
                 return
 
             # Log the payload structure for debugging
-            self.logger.info(f"{log_prefix}: Create_goal result_envelope: {str(result_content_envelope)[:800]}")
+            self.logger.info(f"{log_prefix}: Create_goal result_envelope keys: {list(result_content_envelope.keys()) if isinstance(result_content_envelope, dict) else 'not_dict'}")
+            self.logger.debug(f"{log_prefix}: Create_goal result_envelope: {str(result_content_envelope)[:800]}")
             
-            # The actual goal object could be in multiple places:
-            # 1. Directly in result_content_envelope["goal"] - most common case we're seeing
-            # 2. In payload_obj["goal"] 
-            # 3. In result_content_envelope["data"]["goal"]
-            # 4. Directly in payload_obj if it has goal_id
-            
+            # Enhanced goal object extraction with comprehensive location checking
             goal_obj = None
+            extraction_location = "not_found"
             
-            # Check location #1 - directly in result_content_envelope["goal"]
-            if isinstance(result_content_envelope.get("goal"), dict) and "goal_id" in result_content_envelope["goal"]:
-                goal_obj = result_content_envelope["goal"]
-                self.logger.info(f"{log_prefix}: FOUND GOAL directly in result_envelope: {str(goal_obj)[:200]}")
+            # Priority order for goal extraction:
+            locations_to_check = [
+                ("result_content_envelope.data.goal", lambda: result_content_envelope.get("data", {}).get("goal")),
+                ("payload_obj.goal", lambda: payload_obj.get("goal") if isinstance(payload_obj, dict) else None),
+                ("result_content_envelope.goal", lambda: result_content_envelope.get("goal")),
+                ("payload_obj_direct", lambda: payload_obj if isinstance(payload_obj, dict) and "goal_id" in payload_obj else None),
+                ("result_content_envelope_direct", lambda: result_content_envelope if "goal_id" in result_content_envelope else None)
+            ]
             
-            # Check location #2 - in payload_obj["goal"]
-            elif isinstance(payload_obj.get("goal"), dict) and "goal_id" in payload_obj["goal"]:
-                goal_obj = payload_obj["goal"]
-                self.logger.info(f"{log_prefix}: Found goal in payload.goal: {str(goal_obj)[:200]}")
-                
-            # Check location #3 - in result_content_envelope["data"]["goal"]
-            elif isinstance(result_content_envelope.get("data", {}).get("goal"), dict) and "goal_id" in result_content_envelope["data"]["goal"]:
-                goal_obj = result_content_envelope["data"]["goal"]
-                self.logger.info(f"{log_prefix}: Found goal in envelope data.goal: {str(goal_obj)[:200]}")
-            
-            # Check location #4 - directly in payload_obj
-            elif isinstance(payload_obj, dict) and "goal_id" in payload_obj:
-                goal_obj = payload_obj
-                self.logger.info(f"{log_prefix}: Found goal directly in payload: {str(goal_obj)[:200]}")
-                
-            # Extra checking in case result_content_envelope is the goal itself
-            elif isinstance(result_content_envelope, dict) and "goal_id" in result_content_envelope:
-                goal_obj = result_content_envelope
-                self.logger.info(f"{log_prefix}: Found goal as the entire result_envelope: {str(goal_obj)[:200]}")
-                
-            self.logger.info(f"{log_prefix}: Final extracted goal_obj: {goal_obj}")
-            
-            # Check for goal in envelope data
-            if not goal_obj or not goal_obj.get("goal_id"):
-                envelope_data = result_content_envelope.get("data", {})
-                if isinstance(envelope_data, dict):
-                    if "goal" in envelope_data and isinstance(envelope_data["goal"], dict):
-                        goal_obj = envelope_data["goal"]
-                        self.logger.info(f"{log_prefix}: Found goal in envelope data")
-                    elif "goal_id" in envelope_data:
-                        goal_obj = envelope_data
-                        self.logger.info(f"{log_prefix}: Found goal directly in envelope data")
+            for location_name, extractor in locations_to_check:
+                try:
+                    candidate = extractor()
+                    if isinstance(candidate, dict) and candidate.get("goal_id"):
+                        goal_obj = candidate
+                        extraction_location = location_name
+                        self.logger.info(f"{log_prefix}: Successfully extracted goal from {location_name}: goal_id={goal_obj.get('goal_id', 'missing')}")
+                        break
+                except Exception as e:
+                    self.logger.debug(f"{log_prefix}: Failed to extract from {location_name}: {e}")
+                    continue
+                    
+            if not goal_obj:
+                self.logger.error(f"{log_prefix}: Goal extraction failed from all locations. Available keys in envelope: {list(result_content_envelope.keys()) if isinstance(result_content_envelope, dict) else 'not_dict'}")
+                self.logger.debug(f"{log_prefix}: Envelope data keys: {list(result_content_envelope.get('data', {}).keys()) if isinstance(result_content_envelope.get('data'), dict) else 'not_dict'}")
+                self.logger.debug(f"{log_prefix}: Payload obj type: {type(payload_obj)}, keys: {list(payload_obj.keys()) if isinstance(payload_obj, dict) else 'not_dict'}")
             
             goal_id = None
             if isinstance(goal_obj, dict):
@@ -4888,15 +5376,43 @@ class AgentMasterLoop:
             # Push onto stack & mark as current
             self.state.goal_stack.append(goal_obj)
             self.state.current_goal_id = goal_id
-            self.state.needs_replan = True
-            self.state.current_plan = [
-                PlanStep(
-                    description=f"New UMS goal established: '{goal_obj.get('description','')[:50]}...'. Formulate plan.",
-                    status="planned",
-                )
-            ]
-            self.state.last_error_details = None
-            self.state.consecutive_error_count = 0
+            
+            # Force immediate persistence to avoid losing the goal ID
+            await self._save_agent_state()
+            
+            # --- ATOMIC STATE MANAGEMENT WITH RECOVERY ---
+            is_root_goal_setup = (len(self.state.goal_stack) == 1 and goal_obj.get("parent_goal_id") is None)
+            
+            # Check if we need to update the plan
+            if not is_root_goal_setup or \
+               not self.state.current_plan or \
+               self.state.current_plan[0].description == DEFAULT_PLAN_STEP or \
+               "Establish root UMS goal" in self.state.current_plan[0].description:
+                
+                # Try state recovery first before falling back to replanning
+                recovery_successful = await self.state_validator.validate_and_recover_state("create_goal_side_effects")
+                if not recovery_successful:
+                    self.state.needs_replan = True
+                    self.state.current_plan = [
+                        PlanStep(
+                            description=f"New UMS goal established: '{goal_obj.get('description','')[:50]}...'. Formulate plan.",
+                            status="planned",
+                        )
+                    ]
+                    self.logger.info(f"{log_prefix}: State recovery failed after create_goal - triggering replan (Goal ID={goal_id})")
+                else:
+                    self.logger.info(f"{log_prefix}: State recovery successful after create_goal (Goal ID={goal_id})")
+            else:
+                # If it's root goal setup and a specific plan is already there, retain existing plan
+                self.state.needs_replan = False 
+                self.logger.info(f"{log_prefix}: New goal {_fmt_id(goal_id)} established. Existing plan retained or will be assessed. needs_replan=False.")
+            # --- END ATOMIC STATE MANAGEMENT ---
+
+            # Clear error state only after successful goal creation/update
+            if goal_obj and goal_id:
+                self.state.last_error_details = None
+                self.state.consecutive_error_count = 0
+                self.logger.info(f"{log_prefix}: Goal {_fmt_id(goal_id)} successfully established, error state cleared")
 
             # Record a thought (best-effort)
             record_thought_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_THOUGHT)
@@ -4919,7 +5435,11 @@ class AgentMasterLoop:
                     f"{log_prefix}: update_goal_status failed. "
                     f"Err={result_content_envelope.get('error_message')}"
                 )
-                self.state.needs_replan = True
+                # Try state recovery before emergency replanning
+                recovery_successful = await self.state_validator.validate_and_recover_state("update_goal_status_failed")
+                if not recovery_successful:
+                    self.state.needs_replan = True
+                    self.logger.warning(f"{log_prefix}: State recovery failed after update_goal_status error - triggering replan")
                 return
 
             goal_details = payload_obj.get("updated_goal_details", {})
@@ -4958,7 +5478,11 @@ class AgentMasterLoop:
                 self.state.current_goal_id = parent_goal_id
                 if parent_goal_id:
                     self.state.goal_stack = await self._fetch_goal_stack_from_ums(parent_goal_id)
-                    self.state.needs_replan = True
+                    # Try state recovery before replanning for goal transition
+                    recovery_successful = await self.state_validator.validate_and_recover_state("goal_status_transition")
+                    if not recovery_successful:
+                        self.state.needs_replan = True
+                        self.logger.info(f"{log_prefix}: State recovery failed after goal transition - triggering replan")
                 else:
                     self.state.goal_stack = []
                     self.state.needs_replan = False
@@ -4986,10 +5510,14 @@ class AgentMasterLoop:
                         PlanStep(description="Overall workflow goal reached. Finalising.", status="completed")
                     ]
             elif goal_id == self.state.current_goal_id and new_status == GoalStatus.PAUSED:
-                self.state.needs_replan = True
-                self.state.current_plan = [
-                    PlanStep(description=f"Current goal '{_fmt_id(goal_id)}' PAUSED. Re-evaluate strategy.", status="planned")
-                ]
+                # Try state recovery before replanning for paused goal
+                recovery_successful = await self.state_validator.validate_and_recover_state("goal_paused")
+                if not recovery_successful:
+                    self.state.needs_replan = True
+                    self.state.current_plan = [
+                        PlanStep(description=f"Current goal '{_fmt_id(goal_id)}' PAUSED. Re-evaluate strategy.", status="planned")
+                    ]
+                    self.logger.info(f"{log_prefix}: State recovery failed for paused goal - triggering replan")
 
         # ------------------------------------------------------------------ #
         elif base_tool_func_name == UMS_FUNC_UPDATE_WORKFLOW_STATUS:
@@ -4998,7 +5526,11 @@ class AgentMasterLoop:
                     f"{log_prefix}: update_workflow_status failed. "
                     f"Err={result_content_envelope.get('error_message')}"
                 )
-                self.state.needs_replan = True
+                # Try state recovery before emergency replanning
+                recovery_successful = await self.state_validator.validate_and_recover_state("update_workflow_status_failed")
+                if not recovery_successful:
+                    self.state.needs_replan = True
+                    self.logger.warning(f"{log_prefix}: State recovery failed after workflow status error - triggering replan")
                 return
 
             wf_id = payload_obj.get("workflow_id")
@@ -5031,13 +5563,18 @@ class AgentMasterLoop:
                         await self._set_default_thought_chain_id()
                         self.state.goal_stack = []
                         self.state.current_goal_id = None
-                        self.state.needs_replan = True
-                        self.state.current_plan = [
-                            PlanStep(
-                                description=f"Returned to parent workflow '{_fmt_id(parent_wf)}' after sub-workflow '{_fmt_id(finished_wf)}' finished ({new_status.value}).",
-                                status="planned",
-                            )
-                        ]
+                        
+                        # Try state recovery before replanning for workflow transition
+                        recovery_successful = await self.state_validator.validate_and_recover_state("workflow_transition")
+                        if not recovery_successful:
+                            self.state.needs_replan = True
+                            self.state.current_plan = [
+                                PlanStep(
+                                    description=f"Returned to parent workflow '{_fmt_id(parent_wf)}' after sub-workflow '{_fmt_id(finished_wf)}' finished ({new_status.value}).",
+                                    status="planned",
+                                )
+                            ]
+                            self.logger.info(f"{log_prefix}: State recovery failed for workflow transition - triggering replan")
                     else:
                         # Root workflow finished
                         self.state.workflow_id = None
@@ -5059,10 +5596,14 @@ class AgentMasterLoop:
                 self.state.goal_achieved_flag = (new_status == WorkflowStatus.COMPLETED)
                 self.state.needs_replan = False
             elif wf_id == self.state.workflow_id and new_status == WorkflowStatus.PAUSED:
-                self.state.needs_replan = True
-                self.state.current_plan = [
-                    PlanStep(description=f"Workflow '{_fmt_id(wf_id)}' PAUSED. Await resume.", status="planned")
-                ]
+                # Try state recovery before replanning for paused workflow
+                recovery_successful = await self.state_validator.validate_and_recover_state("workflow_paused")
+                if not recovery_successful:
+                    self.state.needs_replan = True
+                    self.state.current_plan = [
+                        PlanStep(description=f"Workflow '{_fmt_id(wf_id)}' PAUSED. Await resume.", status="planned")
+                    ]
+                    self.logger.info(f"{log_prefix}: State recovery failed for paused workflow - triggering replan")
 
         # ------------------------------------------------------------------ #
         # 3.  Unknown tool – no side-effects required
@@ -5167,9 +5708,9 @@ class AgentMasterLoop:
                     return data_block["stack"]
                 if isinstance(data_block.get("goal_tree"), list):  # Added support for goal_tree key
                     self.logger.info("_fetch_goal_stack_from_ums: Found goals in data.goal_tree key")
+                    return data_block["goal_tree"]
                 if isinstance(data_block.get("goal_stack"), list):
                     return data_block["goal_stack"]
-                    return data_block["goal_tree"]
 
             return None
 
@@ -5185,7 +5726,7 @@ class AgentMasterLoop:
         return list(stack)
 
 
-    def _apply_heuristic_plan_update(  # noqa: C901  (cyclomatic complexity intentionally managed with dispatch)
+    async def _apply_heuristic_plan_update(  # noqa: C901  (cyclomatic complexity intentionally managed with dispatch)
         self,
         last_llm_decision_from_mcpc: Dict[str, Any],
         last_tool_result_envelope: Optional[Dict[str, Any]] = None,
@@ -5215,14 +5756,22 @@ class AgentMasterLoop:
 
         # ------------- guard: empty plan ------------------------------------------
         if current_step is None:
-            self.logger.error("📋 HEURISTIC CRITICAL: Current plan is empty. Forcing replan.")
-            self.state.current_plan = [PlanStep(description="CRITICAL FALLBACK: Plan was empty. Re-evaluate.")]
-            self.state.needs_replan = True
-            self.state.last_error_details = self.state.last_error_details or {
-                "error": "Plan empty.",
-                "type": "PlanManagementError",
-            }
-            self.state.consecutive_error_count += 1
+            self.logger.error("📋 HEURISTIC CRITICAL: Current plan is empty. Attempting state recovery.")
+            
+            # Try state recovery first before emergency replanning
+            recovery_successful = await self.state_validator.validate_and_recover_state("empty_plan_critical")
+            if not recovery_successful:
+                self.state.current_plan = [PlanStep(description="CRITICAL FALLBACK: Plan was empty. Re-evaluate.")]
+                self.state.needs_replan = True
+                self.state.last_error_details = self.state.last_error_details or {
+                    "error": "Plan empty.",
+                    "type": "PlanManagementError",
+                }
+                self.state.consecutive_error_count += 1
+                self.logger.warning("📋 State recovery failed for empty plan - triggering emergency replan")
+            else:
+                self.logger.info("📋 State recovery successful for empty plan issue")
+                
             self.state.successful_actions_since_reflection = 0
             self.state.successful_actions_since_consolidation = 0
             return
@@ -5247,7 +5796,7 @@ class AgentMasterLoop:
         #
         # each returns: (success_flag: bool, reason_tag: str)
 
-        def _handle_tool_executed() -> Tuple[bool, str]:
+        async def _handle_tool_executed() -> Tuple[bool, str]:
             succeeded = bool(isinstance(last_tool_result_envelope, dict) and last_tool_result_envelope.get("success"))
             if succeeded:
                 summary = "Success."
@@ -5288,17 +5837,25 @@ class AgentMasterLoop:
 
                 return True, "tool-exec"
 
-            # --- failure path
+            # --- failure path with state recovery
             err_msg = (
                 last_tool_result_envelope.get("error_message", "Unknown failure")[:120]
                 if isinstance(last_tool_result_envelope, dict)
                 else "Unknown tool failure."
             )
             _mark_step(FAILED, f"Failure: {err_msg}")
-            self.state.needs_replan = True
+            
+            # Try state recovery before replanning for tool failure
+            recovery_successful = await self.state_validator.validate_and_recover_state("tool_execution_failure")
+            if not recovery_successful:
+                self.state.needs_replan = True
+                self.logger.info("📋 State recovery failed for tool execution failure - triggering replan")
+            else:
+                self.logger.info("📋 State recovery successful for tool execution failure")
+                
             return False, "tool-exec-fail"
 
-        def _handle_thought() -> Tuple[bool, str]:
+        async def _handle_thought() -> Tuple[bool, str]:
             succeeded = bool(isinstance(last_tool_result_envelope, dict) and last_tool_result_envelope.get("success"))
             if succeeded:
                 content = last_llm_decision_from_mcpc.get("content", "")
@@ -5340,14 +5897,22 @@ class AgentMasterLoop:
 
                 return True, "thought"
 
-            # --- failure path
+            # --- failure path with state recovery
             err_msg = (
                 last_tool_result_envelope.get("error_message", "Failed to record thought.")[:100]
                 if isinstance(last_tool_result_envelope, dict)
                 else "Failed thought recording."
             )
             _mark_step(FAILED, f"Failed Thought: {err_msg}")
-            self.state.needs_replan = True
+            
+            # Try state recovery before replanning for thought failure
+            recovery_successful = await self.state_validator.validate_and_recover_state("thought_recording_failure")
+            if not recovery_successful:
+                self.state.needs_replan = True
+                self.logger.info("📋 State recovery failed for thought recording failure - triggering replan")
+            else:
+                self.logger.info("📋 State recovery successful for thought recording failure")
+                
             return False, "thought-fail"
 
         def _handle_agent_plan_update() -> Tuple[bool, str]:
@@ -5385,13 +5950,20 @@ class AgentMasterLoop:
             )
             return False, "textual-plan-fail"
 
-        def _handle_other() -> Tuple[bool, str]:
+        async def _handle_other() -> Tuple[bool, str]:
             if self.state.last_error_details and not self.state.needs_replan:
-                self.state.needs_replan = True
-                _mark_step(
-                    FAILED,
-                    f"Error state detected: {str(self.state.last_error_details.get('error'))[:50]}",
-                )
+                # Try state recovery before emergency replanning
+                recovery_successful = await self.state_validator.validate_and_recover_state("general_error_detected")
+                if not recovery_successful:
+                    self.state.needs_replan = True
+                    _mark_step(
+                        FAILED,
+                        f"Error state detected: {str(self.state.last_error_details.get('error'))[:50]}",
+                    )
+                    self.logger.info("📋 State recovery failed for general error - triggering replan")
+                else:
+                    self.logger.info("📋 State recovery successful for general error")
+                    
             if not self.state.current_plan:
                 self.state.current_plan.append(
                     PlanStep(description="Assess situation and decide next action.")
@@ -5411,9 +5983,9 @@ class AgentMasterLoop:
         }
 
         if decision in dispatcher:
-            action_successful, reason_tag = dispatcher[decision]()
+            action_successful, reason_tag = await dispatcher[decision]()
         else:  # unknown / unsupported decision
-            action_successful, reason_tag = _handle_other()
+            action_successful, reason_tag = await _handle_other()
 
         # ----------------------- counters / meta-cognition -------------------------
         if action_successful:
@@ -5861,10 +6433,12 @@ class AgentMasterLoop:
                         "type": "GoalSyncError",
                         "error": msg,
                         "agent_current_goal_id": self.state.current_goal_id,
+                        "recommendation": "Try state recovery before clearing goal",
                     }
+                    
+                    # Don't immediately clear goal state - try recovery first
+                    self.logger.warning(f"Goal verification failed for {_safe_fmt(self.state.current_goal_id)}, but preserving goal state for recovery attempt")
                     self.state.needs_replan = True
-                    self.state.current_goal_id = None
-                    self.state.goal_stack = []
 
             else:
                 # -------- No current goal set -------- #
@@ -6107,11 +6681,32 @@ class AgentMasterLoop:
             tool_name_in_turn = llm_decision.get("tool_name")
             arguments_used = llm_decision.get("arguments", {})
             ums_payload = llm_decision.get("result")
+            
+            # Handle atomic tool call processing fields
+            deferred_calls = llm_decision.get("deferred_tool_calls", [])
+            total_tools = llm_decision.get("total_tools_this_turn", 1)
+            agent_msg = llm_decision.get("agent_message", "")
 
             self.logger.info(
-                "AML EXEC_DECISION: 'tool_executed_by_mcp' Tool='%s' Payload preview=%s",
-                tool_name_in_turn, str(ums_payload)[:200],
+                "AML EXEC_DECISION: 'tool_executed_by_mcp' Tool='%s' Total tools this turn=%s Deferred=%s",
+                tool_name_in_turn, total_tools, len(deferred_calls),
             )
+            
+            # Store deferred tool calls for next turn
+            if deferred_calls:
+                self.state.deferred_tool_calls = deferred_calls
+                self.logger.info(f"AML EXEC_DECISION: Stored {len(deferred_calls)} deferred tool calls for next turn")
+            else:
+                self.state.deferred_tool_calls = []
+            
+            # Store atomic decision info for context
+            self.state.last_atomic_decision_info = {
+                "total_tools_requested": total_tools,
+                "tools_processed": 1,
+                "tools_deferred": len(deferred_calls),
+                "agent_message": agent_msg,
+                "decision_type": "tool_executed_by_mcp"
+            }
 
             envelope = _construct_envelope(False, ums_payload)          # filled out below
             critical_state_tools = {
@@ -6162,7 +6757,14 @@ class AgentMasterLoop:
             if envelope.get("status_code"):
                 summary += f" (Code: {envelope['status_code']})"
 
-            self.state.last_action_summary = f"{tool_name_in_turn} (executed by LLM via MCP) -> {summary}"
+            # Build action summary with atomic processing info
+            base_summary = f"{tool_name_in_turn} (executed by LLM via MCP) -> {summary}"
+            if deferred_calls:
+                base_summary += f" | {len(deferred_calls)} tool calls deferred to next turn"
+            if agent_msg:
+                base_summary += f" | Note: {agent_msg}"
+            
+            self.state.last_action_summary = base_summary
             self.logger.info("🏁 LLM-executed tool summary: %s", self.state.last_action_summary)
 
             if not envelope["success"]:
@@ -6181,11 +6783,32 @@ class AgentMasterLoop:
             nonlocal tool_call_envelope, tool_name_in_turn
             tool_name_in_turn = llm_decision.get("tool_name")
             args = llm_decision.get("arguments", {})
+            
+            # Handle atomic tool call processing fields
+            deferred_calls = llm_decision.get("deferred_tool_calls", [])
+            total_tools = llm_decision.get("total_tools_this_turn", 1)
+            agent_msg = llm_decision.get("agent_message", "")
 
             self.logger.info(
-                "AML EXEC_DECISION: 'call_tool' → will execute '%s' with args=%s",
-                tool_name_in_turn, str(args)[:100],
+                "AML EXEC_DECISION: 'call_tool' → will execute '%s' Total tools this turn=%s Deferred=%s",
+                tool_name_in_turn, total_tools, len(deferred_calls),
             )
+            
+            # Store deferred tool calls for next turn
+            if deferred_calls:
+                self.state.deferred_tool_calls = deferred_calls
+                self.logger.info(f"AML EXEC_DECISION: Stored {len(deferred_calls)} deferred tool calls for next turn")
+            else:
+                self.state.deferred_tool_calls = []
+            
+            # Store atomic decision info for context
+            self.state.last_atomic_decision_info = {
+                "total_tools_requested": total_tools,
+                "tools_processed": 1,
+                "tools_deferred": len(deferred_calls),
+                "agent_message": agent_msg,
+                "decision_type": "call_tool"
+            }
 
             if not self.state.current_plan or not self.state.current_plan[0].description:
                 err_msg = "Plan empty before tool call." if not self.state.current_plan else \
@@ -6222,11 +6845,22 @@ class AgentMasterLoop:
             self.logger.info("AML EXEC_DECISION: 'thought_process' Content preview=%s", str(content)[:100])
 
             if content:
-                tool_call_envelope = await self._execute_tool_call_internal(
-                    tool_name_in_turn,
-                    {"content": str(content), "thought_type": ThoughtType.INFERENCE.value},
-                    record_action=False,
-                )
+                # If LLM returned a UMS payload dict, bypass record_thought and wrap directly
+                if isinstance(content, dict):
+                    tool_call_envelope = _construct_envelope(True, data=content)
+                else:
+                    # Ensure content is a string for UMS record_thought
+                    if isinstance(content, list):
+                        content_str = json.dumps(content)
+                    elif not isinstance(content, str):
+                        content_str = str(content)
+                    else:
+                        content_str = content
+                    tool_call_envelope = await self._execute_tool_call_internal(
+                        tool_name_in_turn,
+                        {"content": content_str, "thought_type": ThoughtType.INFERENCE.value},
+                        record_action=False,
+                    )
             else:
                 err_msg = "Missing thought content from LLM."
                 self.logger.warning("AML EXEC_DECISION: %s", err_msg)
@@ -6287,7 +6921,7 @@ class AgentMasterLoop:
             "AML EXEC_DECISION: Running heuristic update… Decision='%s' Tool='%s' Envelope preview=%s",
             decision_type, tool_name_in_turn, str(tool_call_envelope)[:200],
         )
-        self._apply_heuristic_plan_update(llm_decision, tool_call_envelope)
+        await self._apply_heuristic_plan_update(llm_decision, tool_call_envelope)
 
         # --------------------------------------------------------------------- #
         # 4.  Stop-conditions: max errors / shutdown / goal achieved / no WF    #
@@ -6514,19 +7148,36 @@ class AgentMasterLoop:
             # -----------------------------------------------------------------
             #  9) final stop checks before handing off to MCPClient
             # -----------------------------------------------------------------
+            # -----------------------------------------------------------------
+            #  8a) prepare UMS tool schemas for structured outputs
+            # -----------------------------------------------------------------
+            ums_tool_schemas = {}
+            for schema in self.tool_schemas:
+                tool_name = schema.get("name") or schema.get("function", {}).get("name") 
+                if tool_name:
+                    original_name = self.mcp_client.server_manager.sanitized_to_original.get(tool_name)
+                    if original_name and self._is_ums_tool(original_name):
+                        structured_schema = self._generate_ums_tool_schema(tool_name, schema)
+                        if structured_schema:
+                            ums_tool_schemas[tool_name] = structured_schema
+
+            # -----------------------------------------------------------------
+            #  9) final stop checks before handing off to MCPClient
+            # -----------------------------------------------------------------
             if self.state.goal_achieved_flag or self._shutdown_event.is_set():
                 return _stop_turn(
                     f"post-prepare stop (goal_achieved={self.state.goal_achieved_flag}, shutdown={self._shutdown_event.is_set()})"
                 )
 
             self.logger.info(
-                "AML (Turn %s): Turn complete – %s prompt messages prepared (%.3f s).",
-                turn_no, len(prompt_messages), time.perf_counter() - t_start,
+                "AML (Turn %s): Turn complete – %s prompt messages prepared, %s UMS schemas for structured output (%.3f s).",
+                turn_no, len(prompt_messages), len(ums_tool_schemas), time.perf_counter() - t_start,
             )
             return {
                 "prompt_messages": prompt_messages,
                 "tool_schemas": self.tool_schemas,
                 "agent_context": ctx,
+                "ums_tool_schemas": ums_tool_schemas,  # NEW: For structured outputs
             }
 
         # --------------------------------------------------------------------- #

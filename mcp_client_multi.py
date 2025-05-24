@@ -9,7 +9,6 @@
 #     "rich>=13.6.0",
 #     "httpx>=0.25.0",
 #     "pyyaml>=6.0.1",
-#     "python-dotenv>=1.0.0",
 #     "colorama>=0.4.6",
 #     "psutil>=5.9.5",
 #     "zeroconf>=0.39.0",
@@ -267,7 +266,12 @@ from rich.tree import Tree
 from starlette.responses import FileResponse
 from typing_extensions import Annotated, Literal, TypeAlias
 from zeroconf import EventLoopBlocked, NonUniqueNameException, ServiceBrowser, ServiceInfo, Zeroconf
-from agent_master_loop import MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA, MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT, MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT
+
+from agent_master_loop import (
+    MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA,
+    MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT,
+    MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT,
+)
 
 if TYPE_CHECKING:
     from agent_master_loop import AgentMasterLoop, PlanStep
@@ -394,19 +398,23 @@ AGENT_UPDATE_PLAN_ARGUMENT_SCHEMA = {
                     "description": {"type": "string"},
                     "status": {"type": "string", "default": "planned"},
                     "depends_on": {"type": "array", "items": {"type": "string"}, "default": []},
-                    "assigned_tool": {"type": ["string", "null"]}, # Nullable string
-                    "tool_args": {"type": ["object", "null"], "additionalProperties": True}, # Nullable object
-                    "result_summary": {"type": ["string", "null"]}, # Nullable string
-                    "is_parallel_group": {"type": ["string", "null"]} # Nullable string
+                    "assigned_tool": {"type": ["string", "null"]},
+                    "tool_args": {
+                        "type": ["object", "null"], 
+                        "description": "Arguments for the assigned tool. Can be any valid JSON object."
+                        # No "properties" and no "additionalProperties: False" here means it accepts any object.
+                    },
+                    "result_summary": {"type": ["string", "null"]},
+                    "is_parallel_group": {"type": ["string", "null"]}
                 },
-                "required": ["id", "description"], # status, depends_on have defaults
-                "additionalProperties": False # Important for strictness
+                "required": ["id", "description"],
+                "additionalProperties": False # For the PlanStep object itself
             },
             "description": "The new complete list of plan steps for the agent."
         }
     },
     "required": ["plan"],
-    "additionalProperties": False # The top-level arguments object
+    "additionalProperties": False # For the top-level arguments object
 }
 
 
@@ -7688,7 +7696,52 @@ class MCPClient:
             #    - On successful parsing of UMS JSON: {"success": True, "actual_ums_key1": ..., "actual_ums_key2": ...}
             #    - On successful parsing of non-dict JSON (e.g. string from summarize_text): {"success": True, "_raw_non_dict_data": "string_content"}
             #    - On parsing failure: {"success": False, "error": "parse error msg", "error_type": "ParseErrorType", ...}
+            
+            # ===== DETAILED RESPONSE LOGGING =====
+            import json as json_lib
+
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.syntax import Syntax
+            
+            debug_console = Console()
+            
+            # Log the raw MCP response
+            try:
+                raw_content_str = str(raw_call_tool_result_obj.content) if raw_call_tool_result_obj.content is not None else "None"
+                debug_console.print(Panel(
+                    f"[bold cyan]RAW MCP RESPONSE for {tool_name_mcp}:[/]\n"
+                    f"isError: {raw_call_tool_result_obj.isError}\n"
+                    f"Content Type: {type(raw_call_tool_result_obj.content)}\n"
+                    f"Content: {raw_content_str[:1000]}{'...' if len(raw_content_str) > 1000 else ''}",
+                    title="🔍 Raw MCP Response",
+                    border_style="blue"
+                ))
+            except Exception as e:
+                self.logger.warning(f"Failed to log raw MCP response: {e}")
+            
             parsed_dict_from_robust_parse = robust_parse_mcp_tool_content(raw_call_tool_result_obj.content)
+            
+            # Log the result of robust parsing
+            try:
+                if isinstance(parsed_dict_from_robust_parse, dict):
+                    parsed_json = json_lib.dumps(parsed_dict_from_robust_parse, indent=2, default=str)
+                    syntax = Syntax(parsed_json, "json", theme="monokai", line_numbers=True)
+                else:
+                    syntax = f"Non-dict result: {type(parsed_dict_from_robust_parse)} = {parsed_dict_from_robust_parse}"
+                
+                debug_console.print(Panel(
+                    syntax,
+                    title="🧩 Robust Parse Result",
+                    border_style="green"
+                ))
+            except Exception as e:
+                debug_console.print(Panel(
+                    f"Failed to format parsed result: {e}\nRaw: {parsed_dict_from_robust_parse}",
+                    title="🧩 Robust Parse Result (Raw)",
+                    border_style="yellow"
+                ))
+            
             self.logger.debug(
                 f"MCPC._exec_tool_and_parse_FOR_AGENT: Result from robust_parse for '{tool_name_mcp}': "
                 f"Success Flag in Parsed: {parsed_dict_from_robust_parse.get('success', 'N/A')}, "
@@ -7723,17 +7776,20 @@ class MCPClient:
 
             elif isinstance(parsed_dict_from_robust_parse, dict):
                 # MCP transport OK. The result of robust_parse dictates the envelope.
-                # It is ALREADY in the standard envelope format if robust_parse created an error dict.
-                # Or, it's the UMS tool's payload if robust_parse successfully parsed UMS JSON.
-                standard_agent_envelope = parsed_dict_from_robust_parse.copy()
+                if parsed_dict_from_robust_parse.get("success") and "data" not in parsed_dict_from_robust_parse:
+                    # This is a successful UMS tool payload that needs to be wrapped in the data field
+                    standard_agent_envelope["success"] = True
+                    standard_agent_envelope["data"] = parsed_dict_from_robust_parse
+                    standard_agent_envelope["error_type"] = None
+                    standard_agent_envelope["error_message"] = None
+                else:
+                    # This is already in the standard envelope format (either error dict or already has data field)
+                    standard_agent_envelope = parsed_dict_from_robust_parse.copy()
 
                 # If UMS payload had success=True, but robust_parse had to wrap non-dict JSON,
                 # ensure `data` field holds the actual data.
                 if standard_agent_envelope.get("success") and "_raw_non_dict_data" in standard_agent_envelope:
                     standard_agent_envelope["data"] = standard_agent_envelope.pop("_raw_non_dict_data")
-                # If UMS payload was a success dict but didn't explicitly include a "data" field (e.g. just {"success": true}),
-                # then standard_agent_envelope["data"] will be None (from the initial envelope def), which is fine.
-                # If UMS payload was a success dict with its own data, it's already in standard_agent_envelope["data"]
 
             elif parsed_dict_from_robust_parse is not None:  # Parsed to non-dict (e.g. string summary) and robust_parse didn't make it an error.
                 standard_agent_envelope["success"] = True
@@ -7753,6 +7809,31 @@ class MCPClient:
                 self.logger.error(
                     f"MCPC._exec_tool_and_parse_FOR_AGENT: CRITICAL - robust_parse_mcp_tool_content returned None for tool '{tool_name_mcp}'. Raw CallToolResult content was: {str(raw_call_tool_result_obj.content)[:200]}"
                 )
+
+            # ===== LOG FINAL ENVELOPE =====
+            try:
+                final_envelope_json = json_lib.dumps(standard_agent_envelope, indent=2, default=str)
+                final_syntax = Syntax(final_envelope_json, "json", theme="monokai", line_numbers=True)
+                debug_console.print(Panel(
+                    final_syntax,
+                    title="📦 Final Agent Envelope",
+                    border_style="magenta"
+                ))
+                
+                # Also log a summary of the transformation
+                debug_console.print(Panel(
+                    f"[bold]TRANSFORMATION SUMMARY:[/]\n"
+                    f"Tool: {tool_name_mcp}\n"
+                    f"MCP isError: {raw_call_tool_result_obj.isError}\n"
+                    f"Parsed Success: {parsed_dict_from_robust_parse.get('success', 'N/A') if isinstance(parsed_dict_from_robust_parse, dict) else 'N/A'}\n"
+                    f"Final Success: {standard_agent_envelope.get('success', 'N/A')}\n"
+                    f"Has Data Field: {'data' in standard_agent_envelope}\n"
+                    f"Data Type: {type(standard_agent_envelope.get('data', None))}\n",
+                    title="📊 Processing Summary",
+                    border_style="cyan"
+                ))
+            except Exception as e:
+                self.logger.warning(f"Failed to log final envelope: {e}")
 
             return standard_agent_envelope
 
@@ -10008,6 +10089,107 @@ class MCPClient:
         except Exception as e:
             log.warning(f"MCPC: Error relaying agent LLM event '{prefixed_event_type}' to UI: {e}", exc_info=False)
 
+    def _detect_ums_tool_in_request(
+        self, 
+        formatted_tools_for_api: List[Dict[str, Any]], 
+        ums_tool_schemas: Dict[str, Dict[str, Any]]
+    ) -> Optional[str]:
+        """
+        Detect if exactly one UMS tool is available for structured output.
+        
+        Returns the LLM-seen tool name if exactly one UMS tool is available,
+        None otherwise (to avoid schema conflicts with multiple UMS tools).
+        """
+        ums_tools_found = []
+        
+        for tool_def in formatted_tools_for_api:
+            tool_name = None
+            if isinstance(tool_def, dict):
+                if tool_def.get("type") == "function" and isinstance(tool_def.get("function"), dict):
+                    tool_name = tool_def["function"].get("name")
+                else:
+                    tool_name = tool_def.get("name")
+            
+            if tool_name and tool_name in ums_tool_schemas:
+                ums_tools_found.append(tool_name)
+        
+        # Only apply structured output if exactly one UMS tool is available
+        # This avoids schema conflicts and ensures the right schema is used
+        if len(ums_tools_found) == 1:
+            log.info(f"Single UMS tool detected for structured output: {ums_tools_found[0]}")
+            return ums_tools_found[0]
+        elif len(ums_tools_found) > 1:
+            log.warning(f"Multiple UMS tools available ({ums_tools_found}), skipping structured output to avoid schema conflicts")
+            return None
+        else:
+            return None
+
+    def _apply_ums_structured_output(
+        self, 
+        completion_params: Dict[str, Any], 
+        schema_for_tool: Dict[str, Any], 
+        model_name: str, 
+        provider_name: str
+    ) -> None:
+        """
+        Apply structured output for UMS tools using OpenAI-compatible providers.
+        """
+        try:
+            # Check if model supports json_schema format
+            use_json_schema_format = False
+            if provider_name == Provider.OPENAI.value:
+                if any(prefix in model_name.lower() for prefix in MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT):
+                    use_json_schema_format = True
+            elif provider_name == Provider.MISTRAL.value:
+                if model_name.lower() in MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA:
+                    use_json_schema_format = True
+            
+            if use_json_schema_format:
+                completion_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": f"ums_tool_structured_output",
+                        "description": "Structured output for UMS tool call",
+                        "strict": True,
+                        "schema": schema_for_tool
+                    }
+                }
+                log.info(f"[{provider_name}] Applied json_schema structured output for UMS tool on model {model_name}")
+            elif any(prefix in model_name.lower() for prefix in MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT) or \
+                 provider_name in [Provider.DEEPSEEK.value, Provider.GEMINI.value, Provider.GROK.value, 
+                                  Provider.GROQ.value, Provider.CEREBRAS.value, Provider.OPENROUTER.value]:
+                completion_params["response_format"] = {"type": "json_object"}
+                log.info(f"[{provider_name}] Applied json_object structured output for UMS tool on model {model_name}")
+            else:
+                log.warning(f"[{provider_name}] Model {model_name} does not support structured output for UMS tools")
+        except Exception as e:
+            log.error(f"[{provider_name}] Error applying UMS structured output: {e}", exc_info=False)
+            # Continue without structured output rather than failing the request
+
+    def _apply_ums_structured_output_anthropic(
+        self, 
+        stream_params: Dict[str, Any], 
+        schema_for_tool: Dict[str, Any], 
+        tool_name: str
+    ) -> None:
+        """
+        Apply structured output for UMS tools using Anthropic by modifying the system prompt.
+        """
+        try:
+            structured_instruction = f"\n\nVERY IMPORTANT: When calling the tool '{tool_name}', you MUST respond with valid JSON that exactly matches this schema:\n"
+            structured_instruction += f"```json\n{json.dumps(schema_for_tool, indent=2)}\n```\n"
+            structured_instruction += "Ensure all required fields are included and follow the exact structure shown above."
+            
+            if stream_params.get("system"):
+                stream_params["system"] = stream_params["system"] + structured_instruction
+            else:
+                stream_params["system"] = structured_instruction
+            
+            log.info(f"[anthropic] Applied structured output instruction for UMS tool: {tool_name}")
+        except Exception as e:
+            log.error(f"[anthropic] Error applying UMS structured output: {e}", exc_info=False)
+            # Continue without structured output rather than failing the request
+
     async def process_streaming_query(
         self,
         query: str,
@@ -10019,6 +10201,7 @@ class MCPClient:
         ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
         force_structured_output: bool = False,
         force_tool_choice: Optional[str] = None,
+        ums_tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,  # NEW: For UMS structured outputs
     ) -> AsyncGenerator[Tuple[str, Any], None]:
         span: Optional[trace.Span] = None
         span_context_manager = None
@@ -10211,6 +10394,16 @@ class MCPClient:
                         if system_prompt_for_api:
                             stream_params_anthropic["system"] = system_prompt_for_api
 
+                        # Handle UMS tool structured outputs BEFORE generic structured output
+                        if ums_tool_schemas and formatted_tools_for_api:
+                            ums_tool_being_called = self._detect_ums_tool_in_request(formatted_tools_for_api, ums_tool_schemas)
+                            if ums_tool_being_called:
+                                schema_for_ums_tool = ums_tool_schemas[ums_tool_being_called]
+                                self._apply_ums_structured_output_anthropic(
+                                    stream_params_anthropic, schema_for_ums_tool, ums_tool_being_called
+                                )
+                                log.info(f"[{provider_name}] Applied structured output for UMS tool: {ums_tool_being_called}")
+
                         # Add structured output forcing for Anthropic
                         if force_structured_output:
                             # For Anthropic, we use the system prompt to enforce JSON response with specific format
@@ -10277,6 +10470,16 @@ class MCPClient:
                         if formatted_tools_for_api:
                             completion_params_openai["tools"] = formatted_tools_for_api
 
+                        # Handle UMS tool structured outputs BEFORE generic structured output
+                        if ums_tool_schemas and formatted_tools_for_api:
+                            ums_tool_being_called = self._detect_ums_tool_in_request(formatted_tools_for_api, ums_tool_schemas)
+                            if ums_tool_being_called:
+                                schema_for_ums_tool = ums_tool_schemas[ums_tool_being_called]
+                                self._apply_ums_structured_output(
+                                    completion_params_openai, schema_for_ums_tool, actual_model_name_string_for_api, provider_name
+                                )
+                                log.info(f"[{provider_name}] Applied structured output for UMS tool: {ums_tool_being_called}")
+
                         if force_structured_output:
                             llm_seen_agent_update_plan_name = AGENT_TOOL_UPDATE_PLAN 
                             if formatted_tools_for_api:
@@ -10318,7 +10521,7 @@ class MCPClient:
                                     "json_schema": { # This is the new OpenAI API structure for response_format json_schema
                                         "name": "agent_plan_update_direct_output", 
                                         "description": "Strict schema for the agent's plan update, structured as a tool call to agent:update_plan.",
-                                        "strict": True, 
+                                        "strict": False, 
                                         "schema": agent_plan_direct_output_schema
                                     }
                                 }
@@ -10864,6 +11067,361 @@ class MCPClient:
             else:
                 log.warning("Stream wrapper did not capture final stats/reason.")
 
+    def _should_attempt_plan_parsing(self, full_text_response: str, llm_requested_tool_calls: List[Dict[str, Any]], 
+                                     force_structured_output: bool, force_tool_choice: Optional[str], llm_stop_reason: str) -> bool:
+        """Determine if we should attempt plan parsing based on various signals."""
+        return (force_structured_output or llm_requested_tool_calls or 
+                llm_stop_reason == "agent_internal_tool_request" or
+                any(keyword in full_text_response.lower() for keyword in ["plan", "steps", "```json", "agent_update_plan"]) or
+                full_text_response.lower().strip().startswith("goal achieved")) and full_text_response.strip()
+
+    def _validate_plan_steps(self, steps) -> bool:
+        """Validate that plan steps have the required structure."""
+        return (isinstance(steps, list) and len(steps) > 0 and 
+               all(isinstance(step, dict) and "description" in step and step.get("description", "").strip() 
+                   for step in steps))
+
+    def _process_multiple_tool_calls_atomically(self, llm_requested_tool_calls: List[Dict[str, Any]], 
+                                               executed_tool_details_for_agent: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Process multiple tool calls from a single LLM turn atomically.
+        
+        This handles the case where LLMs (especially Anthropic) make multiple tool calls
+        in a single turn. We need to process them all consistently or fail atomically.
+        """
+        logger_to_use = self.logger
+        
+        if not llm_requested_tool_calls and not executed_tool_details_for_agent:
+            return {"decision": "error", "message": "No tool calls to process", "error_type_for_agent": "NoToolCalls"}
+        
+        # Categorize tool calls
+        plan_update_calls = []
+        other_tool_calls = []
+        executed_tools = []
+        
+        # Add any executed tool to the list
+        if executed_tool_details_for_agent:
+            executed_tools.append(executed_tool_details_for_agent)
+        
+        # Get LLM-seen name for agent:update_plan
+        agent_llm_seen_name = None
+        for llm_name, original_name in self.server_manager.sanitized_to_original.items():
+            if original_name == AGENT_TOOL_UPDATE_PLAN:
+                agent_llm_seen_name = llm_name
+                break
+        
+        # Categorize requested tool calls
+        for tool_call in llm_requested_tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_name = tool_call.get("name", "")
+            
+            if tool_name in [AGENT_TOOL_UPDATE_PLAN, agent_llm_seen_name]:
+                plan_update_calls.append(tool_call)
+            else:
+                other_tool_calls.append(tool_call)
+        
+        logger_to_use.info(f"MCPC Atomic Processing: Plan updates: {len(plan_update_calls)}, Other tools: {len(other_tool_calls)}, Executed: {len(executed_tools)}")
+        
+        # RULE 1: Multiple plan updates in one turn is invalid
+        if len(plan_update_calls) > 1:
+            logger_to_use.warning(f"MCPC Atomic Processing: Multiple plan updates detected ({len(plan_update_calls)}). Invalid.")
+            return {
+                "decision": "thought_process",
+                "content": f"LLM Error: Multiple plan updates in one turn ({len(plan_update_calls)} calls). Only one allowed.",
+                "_mcp_client_force_replan_after_thought_": True
+            }
+        
+        # RULE 2: If executed tools AND requested tools, prefer executed (already happened)
+        if executed_tools and (plan_update_calls or other_tool_calls):
+            logger_to_use.info(f"MCPC Atomic Processing: Both executed and requested tools found. Prioritizing executed.")
+            return {
+                "decision": "tool_executed_by_mcp",
+                "tool_name": executed_tools[0]["tool_name"],
+                "arguments": executed_tools[0]["arguments"],
+                "result": executed_tools[0]["result"],
+                "deferred_tool_calls": plan_update_calls + other_tool_calls,
+                "total_tools_this_turn": len(executed_tools) + len(plan_update_calls) + len(other_tool_calls)
+            }
+        
+        # RULE 3: Process plan update if present (highest priority)
+        if plan_update_calls:
+            plan_call = plan_update_calls[0]
+            plan_steps = plan_call.get("input", {}).get("plan")
+            
+            if self._validate_plan_steps(plan_steps):
+                decision = {
+                    "decision": "call_tool",
+                    "tool_name": AGENT_TOOL_UPDATE_PLAN,
+                    "arguments": {"plan": plan_steps},
+                    "tool_use_id": plan_call.get("id"),
+                    "deferred_tool_calls": other_tool_calls,
+                    "total_tools_this_turn": len(plan_update_calls) + len(other_tool_calls)
+                }
+                
+                if other_tool_calls:
+                    logger_to_use.info(f"MCPC Atomic Processing: Processing plan update, deferring {len(other_tool_calls)} other tools")
+                    decision["agent_message"] = f"Plan updated. {len(other_tool_calls)} other tool calls deferred to next turn."
+                
+                return decision
+            else:
+                logger_to_use.warning(f"MCPC Atomic Processing: Plan update call had invalid structure")
+                return {
+                    "decision": "thought_process", 
+                    "content": f"LLM Error: Plan update call had invalid structure. Plan: {plan_steps}",
+                    "_mcp_client_force_replan_after_thought_": True
+                }
+        
+        # RULE 4: Process other tool calls (non-plan)
+        if other_tool_calls:
+            first_tool = other_tool_calls[0]
+            deferred_tools = other_tool_calls[1:]
+            
+            decision = {
+                "decision": "call_tool",
+                "tool_name": first_tool.get("name"),
+                "arguments": first_tool.get("input", {}),
+                "tool_use_id": first_tool.get("id"),
+                "deferred_tool_calls": deferred_tools,
+                "total_tools_this_turn": len(other_tool_calls)
+            }
+            
+            if deferred_tools:
+                logger_to_use.info(f"MCPC Atomic Processing: Processing '{first_tool.get('name')}', deferring {len(deferred_tools)} tools")
+                decision["agent_message"] = f"Processed {first_tool.get('name')}. {len(deferred_tools)} other calls deferred."
+            
+            return decision
+        
+        # RULE 5: Only executed tools
+        if executed_tools:
+            return {
+                "decision": "tool_executed_by_mcp",
+                "tool_name": executed_tools[0]["tool_name"], 
+                "arguments": executed_tools[0]["arguments"],
+                "result": executed_tools[0]["result"]
+            }
+        
+        # RULE 6: Fallback
+        return {"decision": "error", "message": "No valid tool calls found", "error_type_for_agent": "NoValidToolCalls"}
+
+    def _parse_agent_plan_unified(self, full_text_response: str, llm_requested_tool_calls: List[Dict[str, Any]], 
+                                 force_structured_output: bool, force_tool_choice: Optional[str], llm_stop_reason: str) -> Dict[str, Any]:
+        """
+        Simplified, robust plan parsing focused on the most common cases.
+        
+        Priority: 
+        1. Formal tool calls (highest confidence)
+        2. Well-formed JSON in text (medium confidence) 
+        3. Everything else is a thought (lowest complexity)
+        """
+        logger_to_use = self.logger
+        
+        # Get LLM-seen name for agent:update_plan
+        agent_llm_seen_name = None
+        for llm_name, original_name in self.server_manager.sanitized_to_original.items():
+            if original_name == AGENT_TOOL_UPDATE_PLAN:
+                agent_llm_seen_name = llm_name
+                break
+        
+        logger_to_use.debug(f"MCPC Unified Parser: Looking for plan updates using names: '{AGENT_TOOL_UPDATE_PLAN}' or '{agent_llm_seen_name}'")
+        
+        def create_plan_decision(plan_steps: List[Dict[str, Any]], source: str) -> Dict[str, Any]:
+            logger_to_use.info(f"MCPC Plan Parser: ✅ Found valid plan from {source} with {len(plan_steps)} steps")
+            return {"decision": "call_tool", "tool_name": AGENT_TOOL_UPDATE_PLAN, 
+                   "arguments": {"plan": plan_steps}, "tool_use_id": str(uuid.uuid4())}
+        
+        def create_thought_decision(content: str, force_replan: bool = False) -> Dict[str, Any]:
+            decision = {"decision": "thought_process", "content": content}
+            if force_replan:
+                decision["_mcp_client_force_replan_after_thought_"] = True
+            return decision
+            
+        def extract_plan_from_dict(data: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+            """Extract plan steps from various dict formats."""
+            # Direct plan key
+            if "plan" in data and self._validate_plan_steps(data["plan"]):
+                return data["plan"]
+                
+            # Tool call format: {"tool": "agent_update_plan", "tool_input": {"plan": [...]}}
+            tool_name = data.get("tool") or data.get("name")
+            if tool_name in [AGENT_TOOL_UPDATE_PLAN, agent_llm_seen_name]:
+                tool_args = data.get("tool_input") or data.get("arguments") or {}
+                if isinstance(tool_args, dict) and self._validate_plan_steps(tool_args.get("plan")):
+                    return tool_args["plan"]
+                    
+            return None
+
+        def extract_tool_call_from_dict(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            """Extract a general tool call from JSON response."""
+            if not isinstance(data, dict):
+                return None
+                
+            # Standard tool call format: {"name": "tool_name", "arguments": {...}}
+            tool_name = data.get("name")
+            tool_args = data.get("arguments") 
+            
+            if tool_name and isinstance(tool_args, dict):
+                # Convert LLM-seen name back to original MCP name
+                original_mcp_name = self.server_manager.sanitized_to_original.get(tool_name, tool_name)
+                return {
+                    "decision": "call_tool",
+                    "tool_name": original_mcp_name,
+                    "arguments": tool_args,
+                    "tool_use_id": str(uuid.uuid4())
+                }
+                
+            # Alternative format: {"tool": "tool_name", "tool_input": {...}}
+            tool_name = data.get("tool")
+            tool_args = data.get("tool_input")
+            
+            if tool_name and isinstance(tool_args, dict):
+                # Convert LLM-seen name back to original MCP name
+                original_mcp_name = self.server_manager.sanitized_to_original.get(tool_name, tool_name)
+                return {
+                    "decision": "call_tool", 
+                    "tool_name": original_mcp_name,
+                    "arguments": tool_args,
+                    "tool_use_id": str(uuid.uuid4())
+                }
+                
+            return None
+        
+
+        
+        # Check formal tool calls first
+        if llm_requested_tool_calls:
+            for tool_call in llm_requested_tool_calls:
+                if isinstance(tool_call, dict) and tool_call.get("name") in [AGENT_TOOL_UPDATE_PLAN, agent_llm_seen_name]:
+                    plan_steps = tool_call.get("input", {}).get("plan")
+                    if self._validate_plan_steps(plan_steps):
+                        return create_plan_decision(plan_steps, "formal tool call")
+                    return create_thought_decision(f"LLM attempted formal plan update but invalid structure", True)
+        
+        # Handle forced structured output (highest reliability expected)
+        if force_structured_output and force_tool_choice:
+            logger_to_use.debug(f"MCPC Plan Parser: Processing forced structured output for tool: {force_tool_choice}")
+            
+            if (force_tool_choice == agent_llm_seen_name or 
+                self.server_manager.sanitized_to_original.get(force_tool_choice) == AGENT_TOOL_UPDATE_PLAN):
+                
+                # Strategy 1: Try direct JSON parsing first
+                try:
+                    response_stripped = full_text_response.strip()
+                    parsed = json.loads(response_stripped)
+                    plan_steps = extract_plan_from_dict(parsed) if isinstance(parsed, dict) else (parsed if self._validate_plan_steps(parsed) else None)
+                    if plan_steps:
+                        logger_to_use.info(f"MCPC Plan Parser: ✅ Forced structured output parsed successfully (direct JSON)")
+                        return create_plan_decision(plan_steps, "forced_structured_direct")
+                except json.JSONDecodeError:
+                    logger_to_use.debug("MCPC Plan Parser: Direct JSON parsing failed for forced output")
+                
+                # Strategy 2: Try extracting from markdown
+                try:
+                    json_content = extract_json_from_markdown(full_text_response)
+                    if json_content.strip():
+                        parsed = json.loads(json_content)
+                        plan_steps = extract_plan_from_dict(parsed) if isinstance(parsed, dict) else (parsed if self._validate_plan_steps(parsed) else None)
+                        if plan_steps:
+                            logger_to_use.info(f"MCPC Plan Parser: ✅ Forced structured output parsed successfully (markdown extraction)")
+                            return create_plan_decision(plan_steps, "forced_structured_markdown")
+                except (json.JSONDecodeError, AttributeError):
+                    logger_to_use.debug("MCPC Plan Parser: Markdown JSON extraction failed for forced output")
+                
+                # If forced structured output fails, this is a serious issue
+                logger_to_use.error(f"MCPC Plan Parser: 🚨 Forced structured output completely failed to parse! Response: {full_text_response[:200]}...")
+                return create_thought_decision(f"LLM forced structured output failed - response was: {full_text_response[:100]}...", True)
+        
+        # Parse from text content - simplified approach
+        if full_text_response:
+            response_stripped = full_text_response.strip()
+            logger_to_use.debug(f"MCPC Plan Parser: Checking text response (length: {len(response_stripped)})")
+            
+            # Strategy 1: Whole response is JSON
+            if response_stripped.startswith('{') and response_stripped.endswith('}'):
+                try:
+                    parsed = json.loads(response_stripped)
+                    # First check for plan updates
+                    plan_steps = extract_plan_from_dict(parsed)
+                    if plan_steps:
+                        return create_plan_decision(plan_steps, "whole_response_json")
+                    # Then check for general tool calls
+                    tool_call_result = extract_tool_call_from_dict(parsed)
+                    if tool_call_result:
+                        logger_to_use.debug(f"MCPC Plan Parser: Recognized tool call: {tool_call_result['tool_name']}")
+                        return tool_call_result
+                except json.JSONDecodeError:
+                    logger_to_use.debug("MCPC Plan Parser: Whole response is not valid JSON")
+            
+            # Strategy 2: Extract from code blocks  
+            code_block_match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", response_stripped)
+            if code_block_match:
+                try:
+                    parsed = json.loads(code_block_match.group(1).strip())
+                    # First check for plan updates
+                    plan_steps = extract_plan_from_dict(parsed)
+                    if plan_steps:
+                        return create_plan_decision(plan_steps, "code_block_json")
+                    # Then check for general tool calls
+                    tool_call_result = extract_tool_call_from_dict(parsed)
+                    if tool_call_result:
+                        logger_to_use.debug(f"MCPC Plan Parser: Recognized tool call in code block: {tool_call_result['tool_name']}")
+                        return tool_call_result
+                except json.JSONDecodeError:
+                    logger_to_use.debug("MCPC Plan Parser: Code block content is not valid JSON")
+            
+            # Strategy 3: Find balanced JSON objects
+            def find_first_json_object(text: str) -> Optional[str]:
+                """Find the first complete JSON object in text."""
+                brace_count = 0
+                start_pos = None
+                
+                for i, char in enumerate(text):
+                    if char == '{':
+                        if brace_count == 0:
+                            start_pos = i
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0 and start_pos is not None:
+                            return text[start_pos:i+1]
+                return None
+            
+            json_obj = find_first_json_object(response_stripped)
+            if json_obj:
+                try:
+                    parsed = json.loads(json_obj)
+                    # First check for plan updates
+                    plan_steps = extract_plan_from_dict(parsed)
+                    if plan_steps:
+                        return create_plan_decision(plan_steps, "extracted_json_object")
+                    # Then check for general tool calls
+                    tool_call_result = extract_tool_call_from_dict(parsed)
+                    if tool_call_result:
+                        logger_to_use.debug(f"MCPC Plan Parser: Recognized tool call in extracted JSON: {tool_call_result['tool_name']}")
+                        return tool_call_result
+                except json.JSONDecodeError:
+                    logger_to_use.debug("MCPC Plan Parser: Extracted JSON object is not valid")
+            
+            logger_to_use.debug("MCPC Plan Parser: No valid plan found in text response")
+            
+            # Handle special cases
+            if llm_stop_reason == "agent_internal_tool_request":
+                return create_thought_decision(f"LLM indicated plan update but no valid structure found", True)
+            
+            if full_text_response.lower().strip().startswith("goal achieved"):
+                summary = full_text_response.split(":", 1)[1].strip() if ":" in full_text_response else full_text_response[len("goal achieved"):].strip()
+                return {"decision": "complete", "summary": summary}
+            
+            # Check for other tool calls
+            if llm_requested_tool_calls:
+                first_tool = llm_requested_tool_calls[0]
+                return {"decision": "call_tool", "tool_name": first_tool.get("name"),
+                       "arguments": first_tool.get("input", {}), "tool_use_id": first_tool.get("id")}
+            
+            return create_thought_decision(full_text_response)
+        
+        return {"decision": "error", "message": "No actionable content from LLM", "error_type_for_agent": "LLMOutputError"}
+
     async def process_agent_llm_turn(
         self,
         prompt_messages: List[Dict[str, Any]],  # This is InternalMessageList
@@ -10872,6 +11430,7 @@ class MCPClient:
         ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
         force_structured_output: bool = False,
         force_tool_choice: Optional[str] = None,
+        ums_tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,  # NEW: For UMS structured outputs
     ) -> Dict[str, Any]:
         self.safe_print(f"MCPC: Processing LLM turn for Agent. Model: {model_name}. Provided Tools: {len(tool_schemas) if tool_schemas else 'None'}")
 
@@ -10954,12 +11513,20 @@ class MCPClient:
                     ui_websocket_sender=ui_websocket_sender,
                     force_structured_output=force_structured_output,
                     force_tool_choice=force_tool_choice,
+                    ums_tool_schemas=ums_tool_schemas,  # NEW: Pass UMS tool schemas
                 )
             ):
                 if ui_websocket_sender:
                     await self._relay_agent_llm_event_to_ui(ui_websocket_sender, event_type, event_data)
-
-                if event_type == "text_chunk":
+                # Clean logging - only log significant events, not every text chunk
+                if event_type in ["tool_call_start", "tool_call_end", "mcp_tool_executed_for_agent", "error", "final_stats"]:
+                    if isinstance(event_data, dict) and event_data.get("name"):
+                        logger_to_use.debug(f"LLM Stream Event: {event_type} - {event_data.get('name')}")
+                    elif event_type == "final_stats":
+                        logger_to_use.debug(f"LLM Stream Event: {event_type} - Stop reason: {event_data.get('stop_reason', 'unknown')}")
+                    elif event_type == "error":
+                        logger_to_use.error(f"LLM Stream Event: {event_type} - {str(event_data)[:200]}")
+                if event_type == "text":
                     full_text_response_accumulated += str(event_data)
                 elif event_type == "tool_call_end":
                     if isinstance(event_data, dict) and event_data.get("id") and event_data.get("name"):
@@ -11010,314 +11577,20 @@ class MCPClient:
             # --- Formulate the final decision for AgentMasterLoop ---
             if llm_error_message:
                 final_decision = {"decision": "error", "message": llm_error_message, "error_type_for_agent": "LLMError"}
-
-            # PRIORITY 1: LLM explicitly requested AGENT_TOOL_UPDATE_PLAN (formal tool call)
-            # This means the LLM outputted a structured tool_call for agent:update_plan
-            elif llm_requested_tool_calls and any(
-                isinstance(tc, dict) and tc.get("name") == AGENT_TOOL_UPDATE_PLAN for tc in llm_requested_tool_calls
-            ):
-                agent_plan_update_request = next(
-                    (tc for tc in llm_requested_tool_calls if isinstance(tc, dict) and tc.get("name") == AGENT_TOOL_UPDATE_PLAN), None
+            elif executed_tool_details_for_agent or llm_requested_tool_calls:
+                # ATOMIC TOOL CALL PROCESSING - handles multiple tool calls properly
+                final_decision = self._process_multiple_tool_calls_atomically(
+                    llm_requested_tool_calls, executed_tool_details_for_agent
                 )
-                if agent_plan_update_request:  # Should always be true if the 'any' check passed
-                    plan_from_input = agent_plan_update_request.get("input", {}).get("plan")  # For Anthropic-style, "input" holds args
-                    # OpenAI-style might be directly in input if not further nested, or specific field based on how your _handle_openai_compatible_stream structures it.
-                    # Let's assume for now 'input' is the primary key from llm_requested_tool_calls for parsed arguments.
-
-                    if isinstance(plan_from_input, list) and all(isinstance(step, dict) and "description" in step for step in plan_from_input):
-                        final_decision = {
-                            "decision": "call_tool",
-                            "tool_name": AGENT_TOOL_UPDATE_PLAN,
-                            "arguments": {"plan": plan_from_input},  # AML expects arguments: {plan: [...]}
-                            "tool_use_id": agent_plan_update_request.get("id"),
-                        }
-                        logger_to_use.info(
-                            f"MCPC (Agent Turn): LLM formally requested '{AGENT_TOOL_UPDATE_PLAN}' with a valid plan list ({len(plan_from_input)} steps). AML will handle."
-                        )
-                    else:  # LLM requested agent:update_plan but "plan" arg is missing or not a list
-                        malformed_input_content = agent_plan_update_request.get("input", "N/A")
-                        logger_to_use.warning(
-                            f"MCPC (Agent Turn): LLM formally requested '{AGENT_TOOL_UPDATE_PLAN}' but provided invalid/missing 'plan' list in arguments. "
-                            f"Input received: {str(malformed_input_content)[:200]}. Converting to thought and forcing replan."
-                        )
-                        final_decision = {
-                            "decision": "thought_process",
-                            "content": f"LLM Action: Attempted to call {AGENT_TOOL_UPDATE_PLAN} but failed to provide a valid 'plan' list in arguments. LLM's textual output this turn may contain reasoning: {full_text_response_accumulated}",
-                            "_mcp_client_force_replan_after_thought_": True,
-                        }
-
-            # PRIORITY 1.5: LLM stop_reason suggests internal tool (like plan update) BUT it wasn't formally in llm_requested_tool_calls.
-            # This implies the LLM might have put the plan JSON in its text output.
-            elif llm_stop_reason == "agent_internal_tool_request" and not (
-                llm_requested_tool_calls
-                and any(
-                    isinstance(tc, dict) and tc.get("name") == AGENT_TOOL_UPDATE_PLAN and isinstance(tc.get("input", {}).get("plan"), list)
-                    for tc in llm_requested_tool_calls
+            else:
+                # UNIFIED PLAN PARSING - for text-based content only
+                final_decision = self._parse_agent_plan_unified(
+                    full_text_response_accumulated, llm_requested_tool_calls, 
+                    force_structured_output, force_tool_choice, llm_stop_reason
                 )
-            ):
-                logger_to_use.info(
-                    f"MCPC (Agent Turn): LLM stop_reason='agent_internal_tool_request' but no valid '{AGENT_TOOL_UPDATE_PLAN}' formal tool call found. Attempting to parse plan from text output."
-                )
-                parsed_plan_from_text = False
-                if full_text_response_accumulated:
-                    json_str_to_parse = None
-                    json_match = re.search(r"```(?:json|JSON)?\s*([\s\S]+?)\s*```", full_text_response_accumulated)  # More robust regex for ```json
-                    direct_json_match = None if json_match else re.search(r"({[\s\S]*})", full_text_response_accumulated)
+                
 
-                    if json_match:
-                        json_str_to_parse = json_match.group(1).strip()
-                        logger_to_use.info(f"MCPC (Agent Turn P1.5): Attempting to parse plan from FENCED JSON: '{json_str_to_parse[:200]}...'")
-                    elif direct_json_match:
-                        json_str_to_parse = direct_json_match.group(1).strip()
-                        logger_to_use.info(f"MCPC (Agent Turn P1.5): Attempting to parse plan from DIRECT JSON: '{json_str_to_parse[:200]}...'")
-
-                    if json_str_to_parse:
-                        parsed_json_content = None
-                        try:
-                            parsed_json_content = json.loads(json_str_to_parse)
-                        except json.JSONDecodeError as je:
-                            logger_to_use.warning(f"MCPC (Agent Turn P1.5): Initial JSON parse failed for plan: {je}. Attempting repair...")
-                            repaired_str = _repair_json(json_str_to_parse, aggressive=True)
-                            try:
-                                parsed_json_content = json.loads(repaired_str)
-                                logger_to_use.info("MCPC (Agent Turn P1.5): Successfully parsed REPAIRED plan JSON.")
-                            except json.JSONDecodeError as je2:
-                                logger_to_use.error(
-                                    f"MCPC (Agent Turn P1.5): Failed to parse plan JSON even after repair: {je2}. Original: '{json_str_to_parse[:200]}...', Repaired: '{repaired_str[:200]}...'"
-                                )
-
-                        if isinstance(parsed_json_content, dict):
-                            plan_list = None
-                            # Check for OpenAI/Standard tool call format in text
-                            if parsed_json_content.get("tool") == AGENT_TOOL_UPDATE_PLAN and isinstance(
-                                parsed_json_content.get("tool_input", {}).get("plan"), list
-                            ):
-                                plan_list = parsed_json_content["tool_input"]["plan"]
-                                logger_to_use.info("MCPC (Agent Turn P1.5): Parsed agent:update_plan from OpenAI-style tool call in text.")
-                            # Check for Anthropic/older tool call format in text
-                            elif parsed_json_content.get("name") == AGENT_TOOL_UPDATE_PLAN and isinstance(
-                                parsed_json_content.get("arguments", {}).get("plan"), list
-                            ):
-                                plan_list = parsed_json_content["arguments"]["plan"]
-                                logger_to_use.info("MCPC (Agent Turn P1.5): Parsed agent:update_plan from Anthropic-style tool call in text.")
-
-                            if plan_list is not None and all(isinstance(step, dict) and "description" in step for step in plan_list):
-                                final_decision = {
-                                    "decision": "call_tool",
-                                    "tool_name": AGENT_TOOL_UPDATE_PLAN,
-                                    "arguments": {"plan": plan_list},
-                                    "tool_use_id": str(uuid.uuid4()),
-                                }
-                                parsed_plan_from_text = True
-                                logger_to_use.info(
-                                    f"MCPC (Agent Turn P1.5): Extracted agent:update_plan tool call from JSON text with {len(plan_list)} steps."
-                                )
-                            elif plan_list is not None:  # Plan list was there but steps invalid
-                                logger_to_use.warning(
-                                    f"MCPC (Agent Turn P1.5): Parsed JSON for agent:update_plan from text, but 'plan' array contains invalid step data. JSON: {str(parsed_json_content)[:300]}"
-                                )
-
-                        elif isinstance(parsed_json_content, list) and all(
-                            isinstance(step, dict) and "description" in step for step in parsed_json_content
-                        ):
-                            final_decision = {
-                                "decision": "plan_update",
-                                "updated_plan_steps": parsed_json_content,
-                                "original_text": full_text_response_accumulated,
-                            }
-                            parsed_plan_from_text = True
-                            logger_to_use.info(
-                                f"MCPC (Agent Turn P1.5): Parsed direct plan list from LLM stream text ({len(parsed_json_content)} steps) for AML."
-                            )
-                        elif parsed_json_content is not None:  # Parsed to something but not the right plan structure
-                            logger_to_use.warning(
-                                f"MCPC (Agent Turn P1.5): Parsed JSON from text, but not a valid plan structure. Type: {type(parsed_json_content)}"
-                            )
-
-                if not parsed_plan_from_text:  # If parsing from text failed for P1.5
-                    logger_to_use.warning(
-                        f"MCPC (Agent Turn P1.5): LLM stop_reason was 'agent_internal_tool_request' but failed to parse a plan from text. "
-                        f"Converting LLM's text output to a thought and forcing replan."
-                    )
-                    final_decision = {
-                        "decision": "thought_process",
-                        "content": f"LLM Action: Indicated plan update intent (stop_reason: {llm_stop_reason}) but did not provide a valid '{AGENT_TOOL_UPDATE_PLAN}' tool call or parsable plan in text. LLM's textual output this turn: {full_text_response_accumulated}",
-                        "_mcp_client_force_replan_after_thought_": True,
-                    }
-
-            # PRIORITY 2: UMS/Server tool was executed by MCPC (e.g., Anthropic parallel call)
-            elif executed_tool_details_for_agent:
-                final_decision = {
-                    "decision": "tool_executed_by_mcp",
-                    "tool_name": executed_tool_details_for_agent.get("tool_name"),
-                    "arguments": executed_tool_details_for_agent.get("arguments"),  # This should be the input args used
-                    "result": executed_tool_details_for_agent.get("result"),
-                }
-                logger_to_use.info(
-                    f"MCPC (Agent Turn): LLM initiated UMS tool '{executed_tool_details_for_agent.get('tool_name')}' "
-                    "was executed by MCPClient. Passing its result to AML for side-effects."
-                )
-
-            # PRIORITY 3: Other (non-agent:update_plan, non-UMS) tool call formally requested by LLM
-            elif llm_requested_tool_calls:
-                first_other_tool_request = llm_requested_tool_calls[0]
-                logger_to_use.info(
-                    f"MCPC (Agent Turn): LLM formally requested other tool call: '{first_other_tool_request.get('name')}'. AML to handle."
-                )
-                final_decision = {
-                    "decision": "call_tool",
-                    "tool_name": first_other_tool_request.get("name"),
-                    "arguments": first_other_tool_request.get("input", {}),
-                    "tool_use_id": first_other_tool_request.get("id"),
-                }
-
-            # PRIORITY 4: LLM signaled overall goal completion (text-based)
-            elif full_text_response_accumulated.lower().startswith("goal achieved:"):
-                summary = full_text_response_accumulated[len("goal achieved:") :].strip()
-                final_decision = {"decision": "complete", "summary": summary}
-                logger_to_use.info(f"MCPC (Agent Turn): LLM signaled overall goal completion. Summary: {summary[:100]}...")
-
-            # PRIORITY 5: LLM provided a plan update via text (heuristic parsing)
-            # This block now acts as a general fallback if other specific conditions for plan update weren't met,
-            # but the text still strongly suggests a plan.
-            elif (
-                (
-                    "plan:" in full_text_response_accumulated.lower()
-                    or "steps:" in full_text_response_accumulated.lower()
-                    or "```json" in full_text_response_accumulated
-                    or "```JSON" in full_text_response_accumulated  # Case-insensitive fence tag
-                    or '{"name":' in full_text_response_accumulated
-                    or '{"tool":' in full_text_response_accumulated
-                )
-                and not llm_requested_tool_calls
-                and not executed_tool_details_for_agent
-            ):
-                logger_to_use.info("MCPC (Agent Turn): Entering PRIORITY 5 textual plan parsing (general fallback).")
-                parsed_plan_from_text_p5 = False
-                if full_text_response_accumulated:
-                    json_str_to_parse_p5 = None
-                    json_match_p5 = re.search(r"```(?:json|JSON)?\s*([\s\S]+?)\s*```", full_text_response_accumulated)
-                    direct_json_match_p5 = None if json_match_p5 else re.search(r"({[\s\S]*})", full_text_response_accumulated)
-
-                    if json_match_p5:
-                        json_str_to_parse_p5 = json_match_p5.group(1).strip()
-                        logger_to_use.info(f"MCPC (Agent Turn P5): Attempting to parse plan from FENCED JSON: '{json_str_to_parse_p5[:200]}...'")
-                    elif direct_json_match_p5:
-                        json_str_to_parse_p5 = direct_json_match_p5.group(1).strip()
-                        logger_to_use.info(f"MCPC (Agent Turn P5): Attempting to parse plan from DIRECT JSON: '{json_str_to_parse_p5[:200]}...'")
-
-                    if json_str_to_parse_p5:
-                        parsed_json_content_p5 = None
-                        try:
-                            parsed_json_content_p5 = json.loads(json_str_to_parse_p5)
-                        except json.JSONDecodeError as je_p5:
-                            logger_to_use.warning(f"MCPC (Agent Turn P5): Initial JSON parse failed: {je_p5}. Attempting repair...")
-                            repaired_str_p5 = _repair_json(json_str_to_parse_p5, aggressive=True)
-                            try:
-                                parsed_json_content_p5 = json.loads(repaired_str_p5)
-                                logger_to_use.info("MCPC (Agent Turn P5): Successfully parsed REPAIRED plan JSON.")
-                            except json.JSONDecodeError as je2_p5:
-                                logger_to_use.error(
-                                    f"MCPC (Agent Turn P5): Failed to parse plan JSON even after repair: {je2_p5}. Original: '{json_str_to_parse_p5[:200]}...', Repaired: '{repaired_str_p5[:200]}...'"
-                                )
-
-                        if isinstance(parsed_json_content_p5, dict):
-                            plan_list_p5 = None
-                            if parsed_json_content_p5.get("tool") == AGENT_TOOL_UPDATE_PLAN and isinstance(
-                                parsed_json_content_p5.get("tool_input", {}).get("plan"), list
-                            ):
-                                plan_list_p5 = parsed_json_content_p5["tool_input"]["plan"]
-                            elif parsed_json_content_p5.get("name") == AGENT_TOOL_UPDATE_PLAN and isinstance(
-                                parsed_json_content_p5.get("arguments", {}).get("plan"), list
-                            ):
-                                plan_list_p5 = parsed_json_content_p5["arguments"]["plan"]
-
-                            if plan_list_p5 is not None and all(isinstance(step, dict) and "description" in step for step in plan_list_p5):
-                                final_decision = {
-                                    "decision": "call_tool",
-                                    "tool_name": AGENT_TOOL_UPDATE_PLAN,
-                                    "arguments": {"plan": plan_list_p5},
-                                    "tool_use_id": str(uuid.uuid4()),
-                                }
-                                parsed_plan_from_text_p5 = True
-                                logger_to_use.info(
-                                    f"MCPC (Agent Turn P5): Extracted agent:update_plan from JSON text with {len(plan_list_p5)} steps."
-                                )
-                            elif plan_list_p5 is not None:
-                                logger_to_use.warning(
-                                    f"MCPC (Agent Turn P5): Parsed JSON for agent:update_plan from text, but 'plan' array invalid. JSON: {str(parsed_json_content_p5)[:300]}"
-                                )
-                        elif isinstance(parsed_json_content_p5, list) and all(
-                            isinstance(step, dict) and "description" in step for step in parsed_json_content_p5
-                        ):
-                            final_decision = {
-                                "decision": "plan_update",
-                                "updated_plan_steps": parsed_json_content_p5,
-                                "original_text": full_text_response_accumulated,
-                            }
-                            parsed_plan_from_text_p5 = True
-                            logger_to_use.info(f"MCPC (Agent Turn P5): Parsed direct plan list from LLM text ({len(parsed_json_content_p5)} steps).")
-
-                if not parsed_plan_from_text_p5:  # If PRIORITY 5 parsing failed
-                    logger_to_use.warning(
-                        f"MCPC (Agent Turn P5): Textual plan parsing failed. Treating as thought. Content: {full_text_response_accumulated[:200]}..."
-                    )
-                    final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
-
-            # PRIORITY 6: LLM provided textual thought/reasoning (and no plan-like clues from P5)
-            elif full_text_response_accumulated and not llm_requested_tool_calls and not executed_tool_details_for_agent:
-                logger_to_use.info(f"MCPC (Agent Turn): LLM stream response is textual thought/reasoning (PRIORITY 6).")
-                final_decision = {"decision": "thought_process", "content": full_text_response_accumulated}
-
-            # Fallback/Emergency Plan (if no decision yet and text might contain steps)
-            # This is only hit if final_decision is STILL the default error one.
-            if final_decision.get("decision") == "error" and final_decision.get("message", "").startswith("MCPClient: No actionable decision"):
-                plan_step_pattern = re.compile(
-                    r'step-[a-f0-9]{8}|"description":\s*"[^"]+"|Research|Analyze|Create|Write|Summarize', re.IGNORECASE
-                )  # From original
-                if plan_step_pattern.search(full_text_response_accumulated):
-                    logger_to_use.warning(
-                        f"MCPC (Agent Turn): EMERGENCY plan extraction. No formal decision, but text hints at plan steps. Raw: {full_text_response_accumulated[:200]}..."
-                    )
-                    # Construct a minimal valid plan
-                    emergency_plan = [
-                        {
-                            "id": f"step-{uuid.uuid4().hex[:8]}",
-                            "description": "CRITICAL FALLBACK: LLM output contained unparsed plan-like text. Review and correct plan.",
-                            "status": "planned",
-                            "depends_on": [],
-                        }
-                    ]
-                    if "Research the impact of exercise" in full_text_response_accumulated:  # Heuristic for the specific task
-                        emergency_plan.insert(
-                            0,
-                            {
-                                "id": f"step-{uuid.uuid4().hex[:8]}",
-                                "description": "Research the impact of exercise on mental health using scientific studies",
-                                "status": "planned",
-                                "depends_on": [],
-                            },
-                        )
-                    final_decision = {
-                        "decision": "call_tool",
-                        "tool_name": AGENT_TOOL_UPDATE_PLAN,
-                        "arguments": {"plan": emergency_plan},
-                        "tool_use_id": str(uuid.uuid4()),
-                        "_emergency_plan_created": True,
-                    }
-                    logger_to_use.info(f"MCPC (Agent Turn): Created EMERGENCY plan with {len(emergency_plan)} step(s).")
-
-            # If final_decision is still the default error (meaning none of the above handlers set a valid decision)
-            if final_decision.get("decision") == "error" and final_decision.get("message", "").startswith("MCPClient: No actionable decision"):
-                if not llm_error_message:  # Only if no API error already set
-                    logger_to_use.warning(
-                        f"MCPC (Agent Turn): LLM stream yielded no actionable content matching prioritized types. LLM Stop reason: {llm_stop_reason}. Accumulated text: '{full_text_response_accumulated[:100]}...'"
-                    )
-                    final_decision = {
-                        "decision": "error",
-                        "message": f"LLM stream provided no actionable decision (text, prioritized tool request, or recognized command). LLM stop reason: {llm_stop_reason}. Text: {full_text_response_accumulated[:100]}",
-                        "error_type_for_agent": "LLMOutputError",
-                    }
+                
 
         except asyncio.CancelledError:
             logger_to_use.warning("MCPC (Agent Turn): LLM turn processing stream was cancelled by MCPClient or external signal.")
@@ -11883,6 +12156,9 @@ class MCPClient:
                     log.info(f"MCPC: Agent needs replan - forcing structured output and tool choice: {sanitized_tool_name}")
 
             try:
+                # Extract ums_tool_schemas from the turn_data_for_llm_dict if available
+                ums_tool_schemas = turn_data_for_llm_dict.get("ums_tool_schemas", {})
+                
                 llm_decision = await self.process_agent_llm_turn(
                     prompt_messages=prompt_messages,  # Now correctly assigned
                     tool_schemas=tool_schemas,  # Now correctly assigned
@@ -11890,6 +12166,7 @@ class MCPClient:
                     ui_websocket_sender=ui_websocket_sender,
                     force_structured_output=force_structured_output,
                     force_tool_choice=force_tool_choice,
+                    ums_tool_schemas=ums_tool_schemas,  # NEW: Pass UMS schemas for structured outputs
                 )
             except Exception as llm_call_err:
                 self.safe_print(f"[bold red]MCPC: Critical error calling LLM for agent: {str(llm_call_err)[:200]}[/]")

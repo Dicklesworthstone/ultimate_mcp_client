@@ -173,3 +173,5 @@ __pycache__/
 claude_desktop_config.jsonOLD
 .mcpclient_multi_config/
 default_conversation.json
+debugging_fix.txt
+mcp_client_multi.py.backup
