@@ -123,7 +123,7 @@ The system uses numerous constants for configuration, many of which can be overr
 
 ```python
 # File and agent identification
-AGENT_STATE_FILE = "agent_loop_state_v4.1.json"
+AGENT_STATE_FILE = "agent_loop_state_v4.2_direct_mcp_names.json"
 AGENT_NAME = "EidenticEngine4.1"
 MASTER_LEVEL_AGENT_LLM_MODEL_STRING = "claude-3-5-sonnet-20240620"
 

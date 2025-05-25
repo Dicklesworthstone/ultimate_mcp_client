@@ -2506,7 +2506,7 @@ class Config:
         and applying environment variable overrides for simple settings.
         """
         log.debug("Initializing Config object...")
-        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.1_integrated.json")  # Default agent state file
+        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.2_direct_mcp_names.json")  # Default agent state file
         self._set_defaults()
         self.dotenv_path = find_dotenv(raise_error_if_not_found=False, usecwd=True)
         if self.dotenv_path:
@@ -2576,7 +2576,7 @@ class Config:
         self.port_scan_concurrency: int = 50
         self.port_scan_timeout: float = 4.5
         self.port_scan_targets: List[str] = ["127.0.0.1"]
-        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.1_integrated.json")
+        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.2_direct_mcp_names.json")
 
         # Complex structures
         self.servers: Dict[str, ServerConfig] = {}
@@ -11082,7 +11082,7 @@ class MCPClient:
                    for step in steps))
 
     def _process_multiple_tool_calls_atomically(self, llm_requested_tool_calls: List[Dict[str, Any]], 
-                                               executed_tool_details_for_agent: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+                                               executed_tool_details_for_agent: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Process multiple tool calls from a single LLM turn atomically.
         
@@ -11097,11 +11097,7 @@ class MCPClient:
         # Categorize tool calls
         plan_update_calls = []
         other_tool_calls = []
-        executed_tools = []
-        
-        # Add any executed tool to the list
-        if executed_tool_details_for_agent:
-            executed_tools.append(executed_tool_details_for_agent)
+        executed_tools = executed_tool_details_for_agent  # Already a list
         
         # Get LLM-seen name for agent:update_plan
         agent_llm_seen_name = None
@@ -11135,14 +11131,25 @@ class MCPClient:
         # RULE 2: If executed tools AND requested tools, prefer executed (already happened)
         if executed_tools and (plan_update_calls or other_tool_calls):
             logger_to_use.info(f"MCPC Atomic Processing: Both executed and requested tools found. Prioritizing executed.")
-            return {
-                "decision": "tool_executed_by_mcp",
-                "tool_name": executed_tools[0]["tool_name"],
-                "arguments": executed_tools[0]["arguments"],
-                "result": executed_tools[0]["result"],
-                "deferred_tool_calls": plan_update_calls + other_tool_calls,
-                "total_tools_this_turn": len(executed_tools) + len(plan_update_calls) + len(other_tool_calls)
-            }
+            if len(executed_tools) == 1:
+                # Single executed tool - return as before
+                return {
+                    "decision": "tool_executed_by_mcp",
+                    "tool_name": executed_tools[0]["tool_name"],
+                    "arguments": executed_tools[0]["arguments"],
+                    "result": executed_tools[0]["result"],
+                    "deferred_tool_calls": plan_update_calls + other_tool_calls,
+                    "total_tools_this_turn": len(executed_tools) + len(plan_update_calls) + len(other_tool_calls)
+                }
+            else:
+                # Multiple executed tools - return as multi-tool execution
+                return {
+                    "decision": "multiple_tools_executed_by_mcp",
+                    "executed_tools": executed_tools,
+                    "deferred_tool_calls": plan_update_calls + other_tool_calls,
+                    "total_tools_this_turn": len(executed_tools) + len(plan_update_calls) + len(other_tool_calls),
+                    "agent_message": f"MCP executed {len(executed_tools)} tools: {', '.join(t['tool_name'] for t in executed_tools)}"
+                }
         
         # RULE 3: Process plan update if present (highest priority)
         if plan_update_calls:
@@ -11172,37 +11179,111 @@ class MCPClient:
                     "_mcp_client_force_replan_after_thought_": True
                 }
         
-        # RULE 4: Process other tool calls (non-plan)
+        # RULE 4: Enhanced multi-tool processing for other tool calls
         if other_tool_calls:
-            first_tool = other_tool_calls[0]
-            deferred_tools = other_tool_calls[1:]
+            # Check if we can execute multiple tools efficiently in this turn
+            can_execute_multiple = self._can_execute_multiple_tools(other_tool_calls)
             
-            decision = {
-                "decision": "call_tool",
-                "tool_name": first_tool.get("name"),
-                "arguments": first_tool.get("input", {}),
-                "tool_use_id": first_tool.get("id"),
-                "deferred_tool_calls": deferred_tools,
-                "total_tools_this_turn": len(other_tool_calls)
-            }
-            
-            if deferred_tools:
-                logger_to_use.info(f"MCPC Atomic Processing: Processing '{first_tool.get('name')}', deferring {len(deferred_tools)} tools")
-                decision["agent_message"] = f"Processed {first_tool.get('name')}. {len(deferred_tools)} other calls deferred."
-            
-            return decision
+            if can_execute_multiple and len(other_tool_calls) <= 3:  # Cap at 3 tools per turn for safety
+                # Execute multiple tools in sequence for this turn
+                logger_to_use.info(f"MCPC Atomic Processing: Executing {len(other_tool_calls)} tools in sequence this turn")
+                return {
+                    "decision": "call_multiple_tools",
+                    "tool_calls": other_tool_calls,
+                    "total_tools_this_turn": len(other_tool_calls),
+                    "agent_message": f"Executing {len(other_tool_calls)} tools in sequence for efficiency."
+                }
+            else:
+                # Original single-tool processing with deferral
+                first_tool = other_tool_calls[0]
+                deferred_tools = other_tool_calls[1:]
+                
+                decision = {
+                    "decision": "call_tool",
+                    "tool_name": first_tool.get("name"),
+                    "arguments": first_tool.get("input", {}),
+                    "tool_use_id": first_tool.get("id"),
+                    "deferred_tool_calls": deferred_tools,
+                    "total_tools_this_turn": len(other_tool_calls)
+                }
+                
+                if deferred_tools:
+                    logger_to_use.info(f"MCPC Atomic Processing: Processing '{first_tool.get('name')}', deferring {len(deferred_tools)} tools")
+                    decision["agent_message"] = f"Processed {first_tool.get('name')}. {len(deferred_tools)} other calls deferred."
+                
+                return decision
         
         # RULE 5: Only executed tools
         if executed_tools:
-            return {
-                "decision": "tool_executed_by_mcp",
-                "tool_name": executed_tools[0]["tool_name"], 
-                "arguments": executed_tools[0]["arguments"],
-                "result": executed_tools[0]["result"]
-            }
+            if len(executed_tools) == 1:
+                # Single executed tool
+                return {
+                    "decision": "tool_executed_by_mcp",
+                    "tool_name": executed_tools[0]["tool_name"], 
+                    "arguments": executed_tools[0]["arguments"],
+                    "result": executed_tools[0]["result"]
+                }
+            else:
+                # Multiple executed tools
+                return {
+                    "decision": "multiple_tools_executed_by_mcp",
+                    "executed_tools": executed_tools,
+                    "total_tools_this_turn": len(executed_tools),
+                    "agent_message": f"MCP executed {len(executed_tools)} tools: {', '.join(t['tool_name'] for t in executed_tools)}"
+                }
         
         # RULE 6: Fallback
         return {"decision": "error", "message": "No valid tool calls found", "error_type_for_agent": "NoValidToolCalls"}
+
+    def _can_execute_multiple_tools(self, tool_calls: List[Dict[str, Any]]) -> bool:
+        """
+        Determine if multiple tools can be executed efficiently in one turn.
+        
+        ENHANCED CRITERIA for more aggressive multi-tool execution:
+        1. Exclude only the most disruptive meta/planning tools
+        2. Allow most productive tools to be batched together
+        3. Focus on artifact creation and research efficiency
+        """
+        if not tool_calls or len(tool_calls) > 5:  # Increased limit to 5 tools
+            return False
+            
+        # Explicitly prohibited patterns (tools that must run alone)
+        prohibited_patterns = [
+            "update_plan", "create_workflow", "update_workflow_status", 
+            "record_action_start", "record_action_completion", 
+            "save_cognitive_state", "get_rich_context_package"
+        ]
+        
+        # Highly encouraged patterns for multi-execution (artifact creation focus)
+        encouraged_patterns = [
+            "search", "browse", "write_file", "read_file", "record_artifact",
+            "record_thought", "create_goal", "store_memory", "query_memories",
+            "smart_browser", "filesystem", "artifact", "mcp_browser", "web_search"
+        ]
+        
+        prohibited_count = 0
+        encouraged_count = 0
+        
+        for tool_call in tool_calls:
+            tool_name = tool_call.get("name", "").lower()
+            
+            # Count prohibited patterns
+            if any(prohibited in tool_name for prohibited in prohibited_patterns):
+                prohibited_count += 1
+            
+            # Count encouraged patterns  
+            if any(encouraged in tool_name for encouraged in encouraged_patterns):
+                encouraged_count += 1
+        
+        # Allow multi-execution if:
+        # 1. No prohibited tools, OR
+        # 2. Mostly encouraged tools (at least 60% are encouraged)
+        if prohibited_count == 0:
+            return True
+        elif encouraged_count > 0 and (encouraged_count / len(tool_calls)) >= 0.6:
+            return True
+        else:
+            return False
 
     def _parse_agent_plan_unified(self, full_text_response: str, llm_requested_tool_calls: List[Dict[str, Any]], 
                                  force_structured_output: bool, force_tool_choice: Optional[str], llm_stop_reason: str) -> Dict[str, Any]:
@@ -11493,7 +11574,7 @@ class MCPClient:
 
         full_text_response_accumulated: str = ""
         llm_requested_tool_calls: List[Dict[str, Any]] = []
-        executed_tool_details_for_agent: Optional[Dict[str, Any]] = None
+        executed_tool_details_for_agent: List[Dict[str, Any]] = []  # Changed to list to capture multiple tools
 
         final_decision: Dict[str, Any] = {  # Default error state
             "decision": "error",
@@ -11544,22 +11625,16 @@ class MCPClient:
 
                 elif event_type == "mcp_tool_executed_for_agent":
                     if isinstance(event_data, dict) and event_data.get("name"):
-                        if executed_tool_details_for_agent is None:
-                            executed_tool_details_for_agent = {
-                                "tool_name": event_data["name"],  # Original MCP name
-                                "arguments": event_data.get("input", {}),
-                                "result": event_data.get("result", {"success": False, "error": "Result missing"}),
-                            }
-                            log.info(
-                                f"MCPC (Agent Turn Stream): Captured MCPC-executed UMS tool for AML. "
-                                f"Tool='{executed_tool_details_for_agent['tool_name']}'"
-                            )
-                        else:
-                            log.warning(
-                                f"MCPC (Agent Turn Stream): Multiple UMS tools executed by MCPC this turn. "
-                                f"Already captured '{executed_tool_details_for_agent.get('tool_name')}', "
-                                f"ignoring subsequent '{event_data.get('name')}'."
-                            )
+                        tool_details = {
+                            "tool_name": event_data["name"],  # Original MCP name
+                            "arguments": event_data.get("input", {}),
+                            "result": event_data.get("result", {"success": False, "error": "Result missing"}),
+                        }
+                        executed_tool_details_for_agent.append(tool_details)
+                        log.info(
+                            f"MCPC (Agent Turn Stream): Captured MCPC-executed UMS tool #{len(executed_tool_details_for_agent)} for AML. "
+                            f"Tool='{tool_details['tool_name']}'"
+                        )
                     else:
                         logger_to_use.warning(f"MCPC (Agent Turn Stream): Malformed 'mcp_tool_executed_for_agent' event: {event_data}")
 
