@@ -367,25 +367,25 @@ UMS_FUNC_CREATE_THOUGHT_CHAIN = "create_thought_chain"
 UMS_FUNC_GET_THOUGHT_CHAIN = "get_thought_chain"
 UMS_FUNC_STORE_MEMORY = "store_memory"
 UMS_FUNC_GET_MEMORY_BY_ID = "get_memory_by_id"
-UMS_FUNC_CREATE_LINK = "create_memory_link"  # Corrected from create_memory_link
+UMS_FUNC_CREATE_LINK = "create_memory_link"
 UMS_FUNC_SEARCH_SEMANTIC_MEMORIES = "search_semantic_memories"
 UMS_FUNC_QUERY_MEMORIES = "query_memories"
-UMS_FUNC_HYBRID_SEARCH = "hybrid_search_memories"  # Corrected from hybrid_search
+UMS_FUNC_HYBRID_SEARCH = "hybrid_search_memories"
 UMS_FUNC_UPDATE_MEMORY = "update_memory"
 UMS_FUNC_GET_LINKED_MEMORIES = "get_linked_memories"
 UMS_FUNC_GET_WORKING_MEMORY = "get_working_memory"
 UMS_FUNC_FOCUS_MEMORY = "focus_memory"
-UMS_FUNC_OPTIMIZE_WM = "optimize_working_memory"  # Corrected from optimize_working_memory
+UMS_FUNC_OPTIMIZE_WM = "optimize_working_memory"
 UMS_FUNC_SAVE_COGNITIVE_STATE = "save_cognitive_state"
 UMS_FUNC_LOAD_COGNITIVE_STATE = "load_cognitive_state"
-UMS_FUNC_AUTO_FOCUS = "auto_update_focus"  # Corrected from auto_update_focus
-UMS_FUNC_PROMOTE_MEM = "promote_memory_level"  # Corrected from promote_memory_level
-UMS_FUNC_CONSOLIDATION = "consolidate_memories"  # Corrected from consolidate_memories
-UMS_FUNC_REFLECTION = "generate_reflection"  # Corrected from generate_reflection
+UMS_FUNC_AUTO_FOCUS = "auto_update_focus"
+UMS_FUNC_PROMOTE_MEM = "promote_memory_level"
+UMS_FUNC_CONSOLIDATION = "consolidate_memories"
+UMS_FUNC_REFLECTION = "generate_reflection"
 UMS_FUNC_SUMMARIZE_TEXT = "summarize_text"
 UMS_FUNC_SUMMARIZE_CONTEXT_BLOCK = "summarize_context_block"
 UMS_FUNC_DELETE_EXPIRED_MEMORIES = "delete_expired_memories"
-UMS_FUNC_COMPUTE_STATS = "compute_memory_statistics"  # Corrected from compute_memory_statistics
+UMS_FUNC_COMPUTE_STATS = "compute_memory_statistics"
 UMS_FUNC_LIST_WORKFLOWS = "list_workflows"
 UMS_FUNC_GET_WORKFLOW_DETAILS = "get_workflow_details"
 UMS_FUNC_GET_RECENT_ACTIONS = "get_recent_actions"
@@ -787,8 +787,8 @@ def _safe_json_dumps(obj: Any) -> str:
         return json.dumps(obj, indent=2, ensure_ascii=False, default=str)
     except TypeError:
         # Force full stringify fallback (rare but contracts against explosions)
-        serialisable = json.loads(json.dumps(obj, default=str))
-        return json.dumps(serialisable, indent=2, ensure_ascii=False, default=str)
+        # Convert the entire object to string and then wrap in JSON
+        return json.dumps(str(obj), indent=2, ensure_ascii=False)
 
 
 def _truncate_context(context: Dict[str, Any], max_len: int = 25_000) -> str:  # noqa: C901 – intentionally complex
@@ -4999,13 +4999,13 @@ class AgentMasterLoop:
         
         # Fallback to rule-based suggestions (generic patterns)
         if "search" in last_action.lower() or "research" in last_action.lower():
-            return [UMS_FUNC_STORE_MEMORY, UMS_FUNC_RECORD_ARTIFACT]
+            return [self._get_ums_tool_mcp_name(UMS_FUNC_STORE_MEMORY), self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ARTIFACT)]
         elif "research" in current_goal_desc.lower() and not last_action:
-            return [UMS_FUNC_HYBRID_SEARCH, UMS_FUNC_STORE_MEMORY, UMS_FUNC_RECORD_ARTIFACT]
+            return [self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH), self._get_ums_tool_mcp_name(UMS_FUNC_STORE_MEMORY), self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ARTIFACT)]
         elif any(word in current_goal_desc.lower() for word in ["create", "generate", "write", "build"]):
-            return [UMS_FUNC_HYBRID_SEARCH, UMS_FUNC_STORE_MEMORY, UMS_FUNC_RECORD_ARTIFACT]
+            return [self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH), self._get_ums_tool_mcp_name(UMS_FUNC_STORE_MEMORY), self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ARTIFACT)]
         elif any(word in current_goal_desc.lower() for word in ["analyze", "report", "summary"]):
-            return [UMS_FUNC_HYBRID_SEARCH, UMS_FUNC_STORE_MEMORY, UMS_FUNC_RECORD_ARTIFACT]
+            return [self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH), self._get_ums_tool_mcp_name(UMS_FUNC_STORE_MEMORY), self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ARTIFACT)]
         
         return []
     
@@ -6236,7 +6236,7 @@ class AgentMasterLoop:
         tasks_to_run: List[Tuple[str, Dict[str, any]]] = []
         trigger_reasons: List[str] = []
 
-        def add_task(tool_name: str, args: Dict[str, any], reason: str) -> None:
+        def add_task(tool_name: str, args: Dict[str, Any], reason: str) -> None:
             """Idempotently queue a task and record its trigger reason."""
             if any(t[0] == tool_name for t in tasks_to_run):
                 return  # already queued
