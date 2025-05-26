@@ -1134,6 +1134,12 @@ class AgentMasterLoop:
         self.tool_schemas: list[dict[str, Any]] = []
 
         # ------------------------------------------------------------------ #
+        # 4a. Artifact file management                                       #
+        # ------------------------------------------------------------------ #
+        self._task_artifact_directories: Dict[str, str] = {}  # workflow_id -> directory_path
+        self._artifact_base_dir = "/home/ubuntu/ultimate_mcp_server/storage/generated_agent_artifacts"
+
+        # ------------------------------------------------------------------ #
         # 5. Build quick-lookup set of all UMS base-function names           #
         #    (e.g., {"create_workflow", "save_memory", …})                   #
         # ------------------------------------------------------------------ #
@@ -1445,6 +1451,132 @@ class AgentMasterLoop:
                 return ".txt"
         else:
             return ".txt"  # Default fallback
+
+    def _create_task_artifact_directory(self, workflow_id: str) -> str:
+        """
+        Create and return the task-specific directory path for artifacts.
+        
+        Directory structure: /home/ubuntu/ultimate_mcp_server/storage/generated_agent_artifacts/[task_name]_[task_id]/
+        
+        Returns the full path to the created directory.
+        """
+        if workflow_id in self._task_artifact_directories:
+            return self._task_artifact_directories[workflow_id]
+        
+        try:
+            # Get the task name from the current goal
+            task_name = "agent_task"
+            if self.state.goal_stack and self.state.goal_stack[0]:
+                root_goal = self.state.goal_stack[0]
+                if isinstance(root_goal, dict) and root_goal.get("description"):
+                    task_name = root_goal["description"]
+                elif isinstance(root_goal, dict) and root_goal.get("title"):
+                    task_name = root_goal["title"]
+            
+            # Sanitize task name for use as directory name
+            safe_task_name = self._sanitize_task_name_for_directory(task_name)
+            
+            # Create directory name with task name and truncated workflow ID
+            truncated_id = workflow_id[:8] if workflow_id else "unknown"
+            dir_name = f"{safe_task_name}_{truncated_id}"
+            
+            # Full directory path
+            full_dir_path = os.path.join(self._artifact_base_dir, dir_name)
+            
+            # Create the directory
+            os.makedirs(full_dir_path, exist_ok=True)
+            
+            # Cache the directory path
+            self._task_artifact_directories[workflow_id] = full_dir_path
+            
+            self.logger.info(f"📁 Created task artifact directory: {full_dir_path}")
+            return full_dir_path
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create task artifact directory: {e}")
+            # Fallback to a safe directory
+            fallback_dir = os.path.join(self._artifact_base_dir, f"fallback_{workflow_id[:8] if workflow_id else 'unknown'}")
+            os.makedirs(fallback_dir, exist_ok=True)
+            self._task_artifact_directories[workflow_id] = fallback_dir
+            return fallback_dir
+    
+    def _sanitize_task_name_for_directory(self, task_name: str) -> str:
+        """Convert a task description into a safe directory name."""
+        if not task_name:
+            return "unnamed_task"
+        
+        # Convert to lowercase and replace spaces with underscores
+        safe_name = task_name.lower().replace(" ", "_")
+        
+        # Remove or replace unsafe characters for directory names
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', safe_name)
+        safe_name = re.sub(r'[^\w\-_.]', '_', safe_name)
+        safe_name = re.sub(r'_+', '_', safe_name)  # Collapse multiple underscores
+        safe_name = safe_name.strip('._')  # Remove leading/trailing dots and underscores
+        
+        # Truncate to reasonable length
+        if len(safe_name) > 50:
+            safe_name = safe_name[:50].rstrip('_')
+        
+        return safe_name or "unnamed_task"
+    
+    async def _save_artifact_to_file(self, artifact_data: Dict[str, Any], workflow_id: str) -> Optional[str]:
+        """
+        Save an artifact to a file in the task-specific directory.
+        
+        Args:
+            artifact_data: The artifact data from UMS (should include content, name, artifact_type, etc.)
+            workflow_id: The workflow ID to determine the directory
+            
+        Returns:
+            The file path where the artifact was saved, or None if saving failed
+        """
+        try:
+            if not artifact_data or not isinstance(artifact_data, dict):
+                self.logger.warning("Invalid artifact data for file saving")
+                return None
+            
+            content = artifact_data.get("content", "")
+            if not content:
+                self.logger.warning("Artifact has no content to save")
+                return None
+            
+            # Get artifact details
+            artifact_name = artifact_data.get("name", "unnamed_artifact")
+            artifact_type = artifact_data.get("artifact_type", "text")
+            artifact_id = artifact_data.get("artifact_id", "unknown")  # noqa: F841
+            
+            # Get or create the task directory
+            task_dir = self._create_task_artifact_directory(workflow_id)
+            
+            # Generate filename
+            safe_name = self._sanitize_filename(artifact_name)
+            file_extension = self._get_file_extension_for_artifact_type(artifact_type, content)
+            
+            if not safe_name.endswith(file_extension):
+                safe_name += file_extension
+            
+            # Handle filename conflicts by checking existing files
+            base_name, ext = os.path.splitext(safe_name)
+            counter = 1
+            final_filename = safe_name
+            final_path = os.path.join(task_dir, final_filename)
+            
+            while os.path.exists(final_path):
+                final_filename = f"{base_name}_v{counter}{ext}"
+                final_path = os.path.join(task_dir, final_filename)
+                counter += 1
+            
+            # Write the file
+            async with aiofiles.open(final_path, 'w', encoding='utf-8') as f:
+                await f.write(content)
+            
+            self.logger.info(f"💾 Saved artifact '{artifact_name}' ({artifact_type}) → {final_path}")
+            return final_path
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save artifact to file: {e}", exc_info=True)
+            return None
     
     def _detect_and_update_focus_mode(self, tool_name: str, success: bool) -> None:
         """
@@ -1454,48 +1586,98 @@ class AgentMasterLoop:
         - Agent is actively creating, writing, or working on deliverables
         - Plan contains artifact creation steps
         - Recent actions suggest artifact work
+        - Research workflows with web searching (ENHANCED)
         """
-        # Artifact-related tool patterns
+        # Artifact-related tool patterns (EXPANDED)
         artifact_patterns = [
             "write_file", "record_artifact", "smart_browser", "mcp_browser", 
-            "filesystem", "search", "browse", "web_search", "create_artifact"
+            "filesystem", "search", "browse", "web_search", "create_artifact",
+            "web_search", "smart_browser", "search_web", "browser"
         ]
         
-        # Check if current tool is artifact-related
-        is_artifact_tool = any(pattern in tool_name.lower() for pattern in artifact_patterns)
+        # Research workflow patterns (NEW)
+        research_patterns = [
+            "hybrid_search", "search_semantic", "query_memories", "store_memory",
+            "web_search", "browser", "smart_browser", "mcp_browser"
+        ]
         
-        # Check if plan suggests artifact work
+        # Check if current tool is artifact-related or research-related
+        is_artifact_tool = any(pattern in tool_name.lower() for pattern in artifact_patterns)
+        is_research_tool = any(pattern in tool_name.lower() for pattern in research_patterns)
+        
+        # Check if goal suggests research workflow (NEW)
+        goal_suggests_research = False
+        if self.state.goal_stack and self.state.goal_stack[-1]:
+            goal_desc = self.state.goal_stack[-1].get("description", "").lower()
+            research_keywords = [
+                "research", "search", "find information", "investigate", "study",
+                "explore", "gather", "collect information", "web search", "articles"
+            ]
+            goal_suggests_research = any(keyword in goal_desc for keyword in research_keywords)
+        
+        # Check if plan suggests artifact work OR research work (ENHANCED)
         plan_suggests_artifacts = False
+        plan_suggests_research = False
         if self.state.current_plan:
             current_step_desc = self.state.current_plan[0].description.lower()
             artifact_keywords = [
                 "write", "create", "generate", "build", "develop", "code", "report", 
                 "quiz", "html", "file", "document", "artifact", "deliverable", "output"
             ]
+            research_keywords = [
+                "search", "research", "find", "investigate", "gather", "explore",
+                "web search", "browse", "look up", "study"
+            ]
             plan_suggests_artifacts = any(keyword in current_step_desc for keyword in artifact_keywords)
+            plan_suggests_research = any(keyword in current_step_desc for keyword in research_keywords)
         
-        if success and (is_artifact_tool or plan_suggests_artifacts):
+        # NEW: Enter focus mode for research workflows earlier
+        if success and (is_research_tool or goal_suggests_research or plan_suggests_research):
+            self.state.consecutive_artifact_actions += 1
+            # Enter focus mode after 2 research actions (less aggressive)
+            if self.state.consecutive_artifact_actions >= 2 and not self.state.artifact_focus_mode:
+                self.state.artifact_focus_mode = True
+                self.logger.info("🎯 RESEARCH FOCUS MODE ACTIVATED: Agent is actively researching/gathering information")
+        
+        # Original artifact focus logic (keep threshold at 2 for actual artifacts)
+        elif success and (is_artifact_tool or plan_suggests_artifacts):
             self.state.consecutive_artifact_actions += 1
             # Enter focus mode after 2 consecutive artifact actions
             if self.state.consecutive_artifact_actions >= 2:
                 if not self.state.artifact_focus_mode:
                     self.state.artifact_focus_mode = True
-                    self.logger.info("🎯 FOCUS MODE ACTIVATED: Agent is actively working on deliverables")
+                    self.logger.info("🎯 ARTIFACT FOCUS MODE ACTIVATED: Agent is actively working on deliverables")
         else:
-            # Reset counter if not doing artifact work
+            # Reset counter if not doing productive work
             if self.state.consecutive_artifact_actions > 0:
                 self.state.consecutive_artifact_actions = max(0, self.state.consecutive_artifact_actions - 1)
             
-            # Exit focus mode if we haven't done artifact work for a while
-            if self.state.consecutive_artifact_actions == 0 and self.state.artifact_focus_mode:
+            # Exit focus mode if we haven't done productive work for a while OR periodically check for completion
+            should_exit_focus = (
+                self.state.consecutive_artifact_actions == 0 or
+                (self.state.current_loop > 0 and self.state.current_loop % 7 == 0)  # Check every 7 loops
+            )
+            if should_exit_focus and self.state.artifact_focus_mode:
                 self.state.artifact_focus_mode = False
                 self.logger.info("🎯 FOCUS MODE DEACTIVATED: Returning to normal meta-cognition levels")
     
     def _get_effective_thresholds(self) -> Tuple[int, int]:
         """Get the current effective reflection and consolidation thresholds, adjusted for focus mode."""
         if self.state.artifact_focus_mode:
-            reflection_threshold = int(self.state.current_reflection_threshold * FOCUS_MODE_REFLECTION_MULTIPLIER)
-            consolidation_threshold = int(self.state.current_consolidation_threshold * FOCUS_MODE_CONSOLIDATION_MULTIPLIER)
+            # Be even more aggressive about reducing meta-cognition during research
+            is_research_workflow = False
+            if self.state.goal_stack and self.state.goal_stack[-1]:
+                goal_desc = self.state.goal_stack[-1].get("description", "").lower()
+                research_keywords = ["research", "search", "investigate", "study", "gather", "explore", "articles"]
+                is_research_workflow = any(keyword in goal_desc for keyword in research_keywords)
+            
+            if is_research_workflow:
+                # Higher multipliers for research workflows
+                reflection_threshold = int(self.state.current_reflection_threshold * (FOCUS_MODE_REFLECTION_MULTIPLIER * 1.5))
+                consolidation_threshold = int(self.state.current_consolidation_threshold * (FOCUS_MODE_CONSOLIDATION_MULTIPLIER * 1.5))
+            else:
+                reflection_threshold = int(self.state.current_reflection_threshold * FOCUS_MODE_REFLECTION_MULTIPLIER)
+                consolidation_threshold = int(self.state.current_consolidation_threshold * FOCUS_MODE_CONSOLIDATION_MULTIPLIER)
             return reflection_threshold, consolidation_threshold
         else:
             return self.state.current_reflection_threshold, self.state.current_consolidation_threshold
@@ -1706,14 +1888,20 @@ class AgentMasterLoop:
                 f"• **Batch Operations**: When creating multiple items, use multiple tool calls in one turn",
                 f"• **Multi-Tool Planning**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` when planning complex tool sequences or need guidance on tool combinations",
                 "",
-                "📁 **FILE STORAGE BEST PRACTICES** (CRITICAL for file creation):",
-                "• **Safe Locations**: Always use writable directories like:",
-                "  - `/home/ubuntu/ultimate_mcp_server/storage/` (preferred)",
-                "  - `~/.ultimate_mcp_server/artifacts/`", 
-                "  - Project workspace subdirectories",
-                "• **Avoid System Directories**: Never write to `/usr/`, `/etc/`, `/var/`, `/root/`",
-                "• **File Permissions**: Use `diagnose_file_access_issues` tool if you encounter permission errors",
-                "• **Auto-Recovery**: The system will auto-fix many file path issues, but use safe paths from the start",
+                            "📁 **FILE STORAGE BEST PRACTICES** (CRITICAL for file creation):",
+            "• **Safe Locations**: Always use writable directories like:",
+            "  - `/home/ubuntu/ultimate_mcp_server/storage/` (preferred)",
+            "  - `~/.ultimate_mcp_server/artifacts/`", 
+            "  - Project workspace subdirectories",
+            "• **Avoid System Directories**: Never write to `/usr/`, `/etc/`, `/var/`, `/root/`",
+            "• **File Permissions**: Use `diagnose_file_access_issues` tool if you encounter permission errors",
+            "• **Auto-Recovery**: The system will auto-fix many file path issues, but use safe paths from the start",
+            "",
+            "🔍 **DUPLICATE PREVENTION** (CRITICAL before creating artifacts):",
+            f"• **Check First**: Before creating artifacts, query for similar existing ones with `{UMS_FUNC_QUERY_MEMORIES}`",
+            "• **Avoid Redundancy**: Don't create multiple nearly-identical artifacts for the same task",
+            "• **Build on Existing**: If similar artifacts exist, consider updating or referencing them instead",
+            "• **Clear Purpose**: Each new artifact should have a distinct, well-defined purpose",
                 "",
                 "🔧 **MULTI-TOOL OPERATIONS** (Execute multiple tools in single turns):",
                 f"• **UMS Support**: The UMS fully supports multiple tool calls per turn - no batching required",
@@ -1850,7 +2038,7 @@ class AgentMasterLoop:
         user_prompt_blocks.append(f"Current Goal Reminder: {current_goal_desc_for_reminder}")
         user_prompt_blocks.append("")
 
-        # Add proactive tool suggestions
+        # Add proactive tool suggestions (enhanced for research workflows)
         tool_suggestions = self._suggest_next_tools(
             current_goal_desc_for_reminder, 
             self.state.last_action_summary,
@@ -1858,6 +2046,12 @@ class AgentMasterLoop:
         )
         if tool_suggestions:
             user_prompt_blocks.append(tool_suggestions)
+        
+        # Add research workflow-specific multi-tool suggestions
+        if any(keyword in current_goal_desc_for_reminder.lower() for keyword in ["research", "search", "investigate", "study"]):
+            research_suggestions = self._suggest_research_tool_patterns(current_goal_desc_for_reminder, self.state.last_action_summary)
+            if research_suggestions:
+                user_prompt_blocks.append(research_suggestions)
 
         # ---------- 7. Final instruction branch logic (plus hard constraint) --------
         instruction_append = " Remember: output MUST be either a single JSON object for a tool call or the 'Goal Achieved…' sentence - no markdown, no additional keys."  # [ADDED]
@@ -2124,7 +2318,7 @@ class AgentMasterLoop:
         task      = asyncio.create_task(_wrapper(), name=task_name)
 
         # track & cleanup exactly as before
-        asyncio.create_task(self._add_bg_task(task))
+        asyncio.create_task(self._add_bg_task(task))  # Schedule async task, don't await
         task.add_done_callback(self._background_task_done)
 
         self.logger.debug(f"🚀 Started background task '{task_name}' for WF {_fmt_id(snapshot_wf_id)}")
@@ -4473,6 +4667,35 @@ class AgentMasterLoop:
                 exc_info=False,
             )
 
+    async def _save_artifact_to_file_background(
+        self,
+        artifact_data: Dict[str, Any],
+        *,
+        workflow_id: str,
+    ) -> None:
+        """
+        Background task to save an artifact to file in the task-specific directory.
+        
+        This runs asynchronously to avoid blocking the main agent loop.
+        """
+        if not workflow_id or self._shutdown_event.is_set():
+            return
+        
+        try:
+            # Save the artifact to file
+            file_path = await self._save_artifact_to_file(artifact_data, workflow_id)
+            
+            if file_path:
+                self.logger.info(f"📁 Background file save completed: {file_path}")
+            else:
+                self.logger.warning(f"📁 Background file save failed for artifact: {artifact_data.get('name', 'unknown')}")
+                
+        except Exception as exc:
+            self.logger.warning(
+                f"Error during background artifact file save (WF {_fmt_id(workflow_id)}): {exc}",
+                exc_info=False,
+            )
+
 
     async def _decompose_large_goal(self, goal_description: str, workflow_id: str) -> List[Dict[str, str]]:
         """
@@ -4569,17 +4792,18 @@ class AgentMasterLoop:
         
         # Fresh start suggestions
         if not last_action or "initialized" in last_action.lower() or "loop initialized" in last_action.lower():
-            if any(word in current_goal.lower() for word in ["quiz", "test", "questions", "assessment"]):
-                suggestions.append(f"🔍 Start with {UMS_FUNC_HYBRID_SEARCH} to research the quiz topic")
-                suggestions.append(f"📝 Then use {UMS_FUNC_STORE_MEMORY} to organize findings")
-                suggestions.append(f"🎯 Finally use {UMS_FUNC_RECORD_ARTIFACT} to create the quiz")
-            elif any(word in current_goal.lower() for word in ["report", "analysis", "summary", "research"]):
+            if any(word in current_goal.lower() for word in ["create", "build", "develop", "generate"]):
+                suggestions.append(f"🔍 Start with {UMS_FUNC_HYBRID_SEARCH} to research requirements")
+                suggestions.append(f"📝 Use {UMS_FUNC_STORE_MEMORY} to organize findings")  
+                suggestions.append(f"🔍 Check for existing similar artifacts with {UMS_FUNC_QUERY_MEMORIES}")
+                suggestions.append(f"🎯 Create deliverable with {UMS_FUNC_RECORD_ARTIFACT}")
+            elif any(word in current_goal.lower() for word in ["analyze", "report", "summary", "research"]):
                 suggestions.append(f"🔍 Begin with {UMS_FUNC_HYBRID_SEARCH} to gather information")
                 suggestions.append(f"📊 Use {UMS_FUNC_STORE_MEMORY} to organize findings")
-                suggestions.append(f"📄 Create report with {UMS_FUNC_RECORD_ARTIFACT}")
-            elif any(word in current_goal.lower() for word in ["create", "build", "develop", "generate"]):
-                suggestions.append(f"🔍 Research with {UMS_FUNC_HYBRID_SEARCH} for requirements")
-                suggestions.append(f"🎯 Create deliverable with {UMS_FUNC_RECORD_ARTIFACT}")
+                suggestions.append(f"📄 Create deliverable with {UMS_FUNC_RECORD_ARTIFACT}")
+            elif any(word in current_goal.lower() for word in ["write", "document", "explain"]):
+                suggestions.append(f"🔍 Research with {UMS_FUNC_HYBRID_SEARCH} for background")
+                suggestions.append(f"🎯 Create content with {UMS_FUNC_RECORD_ARTIFACT}")
         
         # Post-search suggestions  
         elif any(search_tool in last_action for search_tool in [UMS_FUNC_HYBRID_SEARCH, "search", "research"]):
@@ -4600,30 +4824,111 @@ class AgentMasterLoop:
         if any(keyword in current_goal.lower() for keyword in ["complex", "comprehensive", "detailed", "thorough", "analysis"]):
             suggestions.append(f"🔧 Use {UMS_FUNC_GET_MULTI_TOOL_GUIDANCE} for planning complex tool sequences")
         
-        # Focus mode suggestions
+        # Focus mode suggestions (supplement, don't override)
         if getattr(self.state, 'artifact_focus_mode', False):
-            suggestions = [f"🎯 **FOCUS MODE**: Continue with {UMS_FUNC_RECORD_ARTIFACT} to maintain productivity flow"]
+            # Check if we already have artifacts created and might need to progress to next part
+            if "artifact" in last_action.lower() or "record" in last_action.lower():
+                # If we just created an artifact, suggest checking for additional requirements
+                suggestions.insert(0, f"🎯 **FOCUS MODE**: Check if task requires additional deliverables or components")
+                suggestions.append(f"💡 Use {UMS_FUNC_GET_GOAL_DETAILS} to verify if all requirements are met")
+                suggestions.append(f"🔍 Consider checking existing artifacts to avoid duplication")
+            else:
+                suggestions.insert(0, f"🎯 **FOCUS MODE**: Continue with productive work using {UMS_FUNC_RECORD_ARTIFACT}")
         
         if suggestions:
             suggestion_text = "\n".join(f"  • {s}" for s in suggestions[:3])  # Limit to 3 suggestions
             return f"\n\n**💡 SUGGESTED NEXT ACTIONS**:\n{suggestion_text}\n"
         
-        return ""
+    def _suggest_research_tool_patterns(self, current_goal: str, last_action: str) -> str:
+        """Suggest efficient multi-tool patterns specifically for research workflows"""
+        suggestions = []
         
+        goal_lower = current_goal.lower()
+        action_lower = last_action.lower()
+        
+        # Determine research phase
+        if ("initialized" in action_lower or "started" in action_lower or 
+            not any(tool in action_lower for tool in ["search", "web", "browser", "store"])):
+            # Beginning of research
+            suggestions.append("**🔬 RESEARCH WORKFLOW - EFFICIENT PATTERNS:**")
+            suggestions.append(f"• **Quick Start**: Use `{UMS_FUNC_HYBRID_SEARCH}` immediately to gather background knowledge")
+            suggestions.append(f"• **Multi-Search Pattern**: Chain web searches with `{UMS_FUNC_STORE_MEMORY}` to build knowledge base")
+            suggestions.append(f"• **Research & Write**: Follow pattern: search → store_memory → search more → create artifact")
+            
+        elif any(search_term in action_lower for search_term in ["search", "web", "browser"]):
+            # In research phase
+            suggestions.append("**🔍 RESEARCH IN PROGRESS - NEXT PATTERNS:**")
+            suggestions.append(f"• **Store & Continue**: Use `{UMS_FUNC_STORE_MEMORY}` to save findings, then search for more details")
+            suggestions.append(f"• **Deep Dive**: Use `{UMS_FUNC_HYBRID_SEARCH}` for internal knowledge + web tools for current info")
+            suggestions.append(f"• **Ready to Write**: If sufficient research gathered, use `{UMS_FUNC_RECORD_ARTIFACT}` to create report")
+            
+        elif "store" in action_lower or "memory" in action_lower:
+            # Knowledge storage phase
+            suggestions.append("**📚 KNOWLEDGE BUILDING - NEXT PATTERNS:**")
+            suggestions.append(f"• **More Research**: Continue with web searches if more info needed")
+            suggestions.append(f"• **Start Writing**: Use `{UMS_FUNC_RECORD_ARTIFACT}` to create comprehensive report")
+            suggestions.append(f"• **Multi-Source**: Combine `{UMS_FUNC_HYBRID_SEARCH}` + web tools for complete coverage")
+            
+        elif "record" in action_lower or "artifact" in action_lower or "write" in action_lower:
+            # Creation phase - check for multi-part tasks and duplicates
+            if any(keyword in goal_lower for keyword in ["and", "then", "also", "plus", "both", "multiple"]):
+                # Potential multi-part task detected
+                suggestions.append("**📋 MULTI-PART TASK DETECTED:**")
+                suggestions.append(f"• **Check Requirements**: Use `{UMS_FUNC_GET_GOAL_DETAILS}` to verify all deliverables needed")
+                suggestions.append(f"• **Check Existing**: Query existing artifacts to avoid duplicates")
+                suggestions.append(f"• **Create Missing**: Use `{UMS_FUNC_RECORD_ARTIFACT}` for any missing deliverables")
+                suggestions.append(f"• **Examples**: Multi-part tasks might include report + code, analysis + visualization, etc.")
+            else:
+                suggestions.append("**📄 CREATION COMPLETE - FINALIZATION:**")
+                suggestions.append(f"• **Duplicate Check**: Verify no similar artifacts already exist in this workflow")
+                suggestions.append(f"• **Goal Verification**: Use `{UMS_FUNC_GET_GOAL_DETAILS}` to check if all requirements met")
+                suggestions.append(f"• **Quality Review**: Ensure deliverable meets specified requirements")
+        
+        # Add efficiency tips for research workflows
+        if suggestions:
+            suggestions.append("")
+            suggestions.append("**⚡ RESEARCH EFFICIENCY TIPS:**")
+            suggestions.append("• Execute multiple related tools in single turns (search→store→search)")
+            suggestions.append("• Use specific, focused search queries rather than broad ones")
+            suggestions.append("• Save intermediate findings to avoid losing research progress")
+            suggestions.append(f"• Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for complex research operations")
+        
+        if suggestions:
+            return "\n".join(suggestions) + "\n"
+        
+        return ""
+
     def _classify_goal_type(self, goal_description: str) -> str:
         """Classify goal into a pattern category for learning"""
         goal_lower = goal_description.lower()
         
-        if any(word in goal_lower for word in ["quiz", "test", "questions", "assessment", "exam"]):
-            return "quiz_creation"
-        elif any(word in goal_lower for word in ["report", "analysis", "summary", "research paper"]):
-            return "report_creation"  
-        elif any(word in goal_lower for word in ["code", "program", "script", "software", "app"]):
-            return "code_creation"
-        elif any(word in goal_lower for word in ["plan", "strategy", "roadmap", "proposal"]):
+        # Content creation patterns
+        if any(word in goal_lower for word in ["create", "generate", "build", "develop", "write", "produce"]):
+            if any(word in goal_lower for word in ["code", "program", "script", "software", "app"]):
+                return "code_creation"
+            elif any(word in goal_lower for word in ["report", "document", "analysis", "summary"]):
+                return "document_creation"
+            elif any(word in goal_lower for word in ["test", "quiz", "questions", "assessment"]):
+                return "assessment_creation"
+            else:
+                return "content_creation"
+        
+        # Analysis patterns
+        elif any(word in goal_lower for word in ["analyze", "research", "investigate", "study", "examine"]):
+            if any(word in goal_lower for word in ["data", "statistics", "metrics", "numbers"]):
+                return "data_analysis"
+            else:
+                return "research_analysis"
+        
+        # Planning patterns
+        elif any(word in goal_lower for word in ["plan", "strategy", "roadmap", "proposal", "design"]):
             return "planning"
-        elif any(word in goal_lower for word in ["data", "analyze", "statistics", "metrics"]):
-            return "data_analysis"
+        
+        # Generic patterns based on action verbs
+        elif any(word in goal_lower for word in ["explain", "describe", "summarize"]):
+            return "explanation"
+        elif any(word in goal_lower for word in ["compare", "contrast", "evaluate"]):
+            return "comparison"
         else:
             return "general_task"
 
@@ -4692,17 +4997,89 @@ class AgentMasterLoop:
                 self.logger.info(f"🧠 Using learned pattern for {goal_type}")
                 return learned_sequence[:3]  # Return first 3 tools
         
-        # Fallback to rule-based suggestions
-        if "search" in last_action.lower() and "quiz" in current_goal_desc.lower():
+        # Fallback to rule-based suggestions (generic patterns)
+        if "search" in last_action.lower() or "research" in last_action.lower():
             return [UMS_FUNC_STORE_MEMORY, UMS_FUNC_RECORD_ARTIFACT]
         elif "research" in current_goal_desc.lower() and not last_action:
             return [UMS_FUNC_HYBRID_SEARCH, UMS_FUNC_STORE_MEMORY, UMS_FUNC_RECORD_ARTIFACT]
-        elif any(word in current_goal_desc.lower() for word in ["quiz", "test", "questions"]):
+        elif any(word in current_goal_desc.lower() for word in ["create", "generate", "write", "build"]):
             return [UMS_FUNC_HYBRID_SEARCH, UMS_FUNC_STORE_MEMORY, UMS_FUNC_RECORD_ARTIFACT]
-        elif any(word in current_goal_desc.lower() for word in ["report", "analysis"]):
+        elif any(word in current_goal_desc.lower() for word in ["analyze", "report", "summary"]):
             return [UMS_FUNC_HYBRID_SEARCH, UMS_FUNC_STORE_MEMORY, UMS_FUNC_RECORD_ARTIFACT]
         
         return []
+    
+    async def _check_for_similar_artifacts(self, artifact_name: str, artifact_description: str = "") -> List[Dict[str, Any]]:
+        """Check for existing similar artifacts in the current workflow to prevent duplication"""
+        if not self.state.workflow_id:
+            return []
+        
+        try:
+            # Query for artifact creation memories in this workflow
+            query_tool = self._get_ums_tool_mcp_name(UMS_FUNC_QUERY_MEMORIES)
+            if not self._find_tool_server(query_tool):
+                self.logger.debug("Cannot check for similar artifacts: query_memories tool not available")
+                return []
+            
+            result = await self._execute_tool_call_internal(
+                query_tool,
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_type": MemoryType.ARTIFACT_CREATION.value,
+                    "limit": 20,  # Check recent artifacts
+                    "include_content": True
+                },
+                record_action=False
+            )
+            
+            if not result.get("success"):
+                self.logger.debug("Failed to query existing artifacts")
+                return []
+            
+            similar_artifacts = []
+            existing_memories = result.get("data", {}).get("memories", [])
+            
+            # Simple similarity check based on name and description
+            artifact_name_lower = artifact_name.lower()
+            artifact_desc_lower = artifact_description.lower()
+            
+            for memory in existing_memories:
+                if not isinstance(memory, dict):
+                    continue
+                    
+                content = memory.get("content", "")
+                if not content:
+                    continue
+                
+                content_lower = content.lower()
+                
+                # Check for similar names or descriptions
+                if (self._are_artifacts_similar(artifact_name_lower, content_lower) or
+                    (artifact_desc_lower and self._are_artifacts_similar(artifact_desc_lower, content_lower))):
+                    similar_artifacts.append(memory)
+            
+            if similar_artifacts:
+                self.logger.info(f"🔍 Found {len(similar_artifacts)} potentially similar artifacts in current workflow")
+                
+            return similar_artifacts
+            
+        except Exception as e:
+            self.logger.warning(f"Error checking for similar artifacts: {e}")
+            return []
+    
+    def _are_artifacts_similar(self, name1: str, content2: str) -> bool:
+        """Simple heuristic to check if artifacts are similar based on name overlap"""
+        # Extract key terms from the new artifact name
+        key_terms = [term for term in name1.split() if len(term) > 3]
+        if len(key_terms) < 2:
+            return False
+        
+        # Check if most key terms appear in the existing artifact content
+        matches = sum(1 for term in key_terms if term in content2)
+        similarity_ratio = matches / len(key_terms)
+        
+        # Consider similar if >60% of key terms match
+        return similarity_ratio > 0.6
 
     async def _attempt_auto_fix(self, tool_name: str, args: Dict, error_envelope: Dict) -> Optional[Dict]:
         """Attempt automatic fixes for common errors"""
@@ -5513,6 +5890,26 @@ class AgentMasterLoop:
                 )
                 return await _bail(envelope, mark_replan=True, summary_prefix="Schema validation failed")
 
+        # ───────────────────────────── check for duplicate artifacts ─────────────────────
+        if current_base == UMS_FUNC_RECORD_ARTIFACT and record_action:
+            artifact_name = final_args.get("name", "")
+            artifact_description = final_args.get("description", "")
+            
+            if artifact_name:
+                similar_artifacts = await self._check_for_similar_artifacts(artifact_name, artifact_description)
+                
+                if similar_artifacts:
+                    # Found similar artifacts - log warning and include in error details
+                    similar_names = [mem.get("content", "")[:100] for mem in similar_artifacts[:3]]
+                    warning_msg = (f"⚠️ Found {len(similar_artifacts)} similar artifacts in current workflow. "
+                                 f"Consider checking if '{artifact_name}' is truly needed or if existing artifacts can be used/updated. "
+                                 f"Similar artifacts: {similar_names}")
+                    self.logger.warning(warning_msg)
+                    
+                    # Add warning to arguments for LLM context, but don't block creation
+                    final_args["_duplicate_warning"] = warning_msg
+                    final_args["_similar_artifacts_found"] = len(similar_artifacts)
+
         # ───────────────────── prerequisite dependency check ───────────────────────
         if planned_dependencies:
             ok, reason = await self._check_prerequisites(planned_dependencies)
@@ -5680,6 +6077,13 @@ class AgentMasterLoop:
                         workflow_id=bg_wf_id,
                         context_id=bg_ctx_id,
                     )
+                    # Also save the artifact to file
+                    if bg_wf_id:
+                        self._start_background_task(
+                            AgentMasterLoop._save_artifact_to_file_background,
+                            artifact_data=data,
+                            workflow_id=bg_wf_id,
+                        )
                 elif current_base == UMS_FUNC_RECORD_THOUGHT and data.get("linked_memory_id"):
                     self._start_background_task(
                         AgentMasterLoop._run_auto_linking,
@@ -5863,7 +6267,6 @@ class AgentMasterLoop:
         self.state.loops_since_stats_adaptation += 1
         try:
             if self.state.loops_since_stats_adaptation >= STATS_ADAPTATION_INTERVAL:
-                self.state.loops_since_stats_adaptation = 0  # reset early
                 full_stats_tool_name, stats_tool_available = tool_info["stats"]
                 if not stats_tool_available:
                     self.logger.warning("%s: Stats tool '%s' unavailable.", log_prefix, full_stats_tool_name)
@@ -6564,10 +6967,11 @@ class AgentMasterLoop:
         elif base_tool_func_name == UMS_FUNC_CREATE_GOAL:
             # LLM called create_goal directly
             
-            # First check if we already have a goal for this workflow
+            # Check if we already have a goal for this workflow AND it's not a sub-goal
             if (self.state.current_goal_id and 
                 self.state.workflow_id and 
-                arguments.get("workflow_id") == self.state.workflow_id):
+                arguments.get("workflow_id") == self.state.workflow_id and
+                not arguments.get("parent_goal_id")):  # Allow sub-goals
                 self.logger.warning(
                     f"{log_prefix}: Ignoring duplicate create_goal attempt - "
                     f"goal {self.state.current_goal_id} already exists for workflow"
@@ -7163,9 +7567,17 @@ class AgentMasterLoop:
                         )
                         self.logger.info(f"Smart chaining suggested next tool: {suggested_tools[0]}")
                     else:
-                        self.state.current_plan.append(
-                            PlanStep(description="Plan finished. Analyze overall result and decide if workflow goal met.")
-                        )
+                        # Check for multi-part tasks before declaring completion
+                        if (current_goal_desc and 
+                            any(keyword in current_goal_desc.lower() for keyword in ["and", "then", "also", "both", "multiple", "plus"]) and
+                            "artifact" in self.state.last_action_summary.lower()):
+                            self.state.current_plan.append(
+                                PlanStep(description=f"Check if all deliverables from multi-part task are complete using {UMS_FUNC_GET_GOAL_DETAILS}")
+                            )
+                        else:
+                            self.state.current_plan.append(
+                                PlanStep(description="Plan finished. Check for duplicate artifacts and decide if workflow goal met.")
+                            )
 
                 # Clear error only if same tool now succeeded
                 if (
@@ -7429,7 +7841,8 @@ class AgentMasterLoop:
             self.logger.info(
                 f"{direction} {label} threshold: {curr} → {new_val} {meta}"
             )
-            return setattr(self.state, f"current_{label}_threshold", new_val) or True  # setattr returns None
+            setattr(self.state, f"current_{label}_threshold", new_val)
+            return True
 
         changed = False
         self.logger.debug("Adapting thresholds with stats: %s", stats)
@@ -7676,11 +8089,35 @@ class AgentMasterLoop:
         current_plan_hash = hashlib.md5(str(self.state.current_plan).encode()).hexdigest()
         cache_age = time.time() - self.state.context_cache_timestamp
         
+        # Determine if this is a research workflow for smarter caching
+        is_research_workflow = False
+        cache_duration = 30  # Default 30 seconds
+        
+        if self.state.goal_stack and self.state.goal_stack[-1]:
+            goal_desc = self.state.goal_stack[-1].get("description", "").lower()
+            research_keywords = ["research", "search", "investigate", "study", "gather", "explore", "articles"]
+            is_research_workflow = any(keyword in goal_desc for keyword in research_keywords)
+        
+        # Extend cache duration for research workflows and focus mode
+        if is_research_workflow or self.state.artifact_focus_mode:
+            cache_duration = 120  # 2 minutes for research workflows
+            
+        # For research workflows, be less strict about plan hash matching
+        plan_hash_matches = current_plan_hash == self.state.context_cache_plan_hash
+        if is_research_workflow and not plan_hash_matches:
+            # Check if plan changes are just minor (e.g., status updates)
+            if self.state.last_context_cache and len(self.state.current_plan) > 0:
+                # If first step description is similar, consider it a match
+                current_step = self.state.current_plan[0].description.lower()
+                if any(keyword in current_step for keyword in ["search", "research", "write", "create"]):
+                    plan_hash_matches = True  # Allow cache reuse for research steps
+        
         if (self.state.last_context_cache and 
-            cache_age < 30 and  # 30 second cache
-            current_plan_hash == self.state.context_cache_plan_hash and
+            cache_age < cache_duration and
+            plan_hash_matches and
             not self.state.last_error_details):
-            self.logger.info("🏎️ Using cached context (age: {:.1f}s)".format(cache_age))
+            cache_type = "research" if is_research_workflow else "standard"
+            self.logger.info("🏎️ Using cached context ({} - age: {:.1f}s)".format(cache_type, cache_age))
             return self.state.last_context_cache
         
         # Generate new context and cache it
@@ -7689,6 +8126,132 @@ class AgentMasterLoop:
         self.state.context_cache_timestamp = time.time()
         self.state.context_cache_plan_hash = current_plan_hash
         return context
+
+    async def _gather_research_optimized_context(self) -> Dict[str, Any]:
+        """
+        Build a research-optimized context package for research workflows.
+        
+        This is a middle ground between lightweight and comprehensive context,
+        optimized for research tasks that need some UMS context but not everything.
+        """
+        t_start = time.time()
+        self.logger.info("🔬 Gathering research-optimized context for LLM "
+                        f"(Loop: {self.state.current_loop}).")
+        
+        agent_retrieval_ts = datetime.now(timezone.utc).isoformat()
+        
+        # Core agent state (same as lightweight)
+        context_payload: Dict[str, Any] = {
+            "agent_name": AGENT_NAME,
+            "current_loop": self.state.current_loop,
+            "current_plan_snapshot": [
+                p.model_dump(exclude_none=True) for p in self.state.current_plan
+            ],
+            "last_action_summary": self.state.last_action_summary,
+            "consecutive_error_count": self.state.consecutive_error_count,
+            "last_error_details": copy.deepcopy(self.state.last_error_details),
+            "needs_replan": self.state.needs_replan,
+            "workflow_id": self.state.workflow_id,
+            "cognitive_context_id_agent": self.state.context_id,
+            "current_thought_chain_id": self.state.current_thought_chain_id,
+            "retrieval_timestamp_agent_state": agent_retrieval_ts,
+            "status_message_from_agent": "Research-optimized context for workflow efficiency.",
+            "artifact_focus_mode": True,
+            "focus_mode_message": "🔬 RESEARCH MODE: Optimized context for research workflows",
+            "errors_in_context_gathering": [],
+        }
+        
+        # Include goal context (important for research direction)
+        goal_ctx_block: Dict[str, Any] = {
+            "retrieved_at": agent_retrieval_ts,
+            "current_goal_details_from_ums": None,
+            "goal_stack_summary_from_agent_state": [
+                {
+                    "goal_id": _fmt_id(g.get("goal_id")),
+                    "description": (g.get("description") or "")[:200] + "...",  # Longer for research context
+                    "status": g.get("status"),
+                }
+                for g in self.state.goal_stack[-2:]  # Just last 2 goals
+                if isinstance(g, dict)
+            ] if self.state.goal_stack else [],
+            "data_source_comment": "Goal context for research workflow focus.",
+            "synchronization_status": "research_mode_cached",
+        }
+        context_payload["agent_assembled_goal_context"] = goal_ctx_block
+        
+        # Get minimal UMS context - just working memory and core context
+        ums_tool_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_GET_RICH_CONTEXT_PACKAGE)
+        ums_pkg: Dict[str, Any] = {}
+        ums_pkg_status = "research_optimized"
+        
+        if self._find_tool_server(ums_tool_mcp) and self.state.workflow_id and self.state.context_id:
+            try:
+                # Minimal UMS parameters for research mode
+                ums_params = {
+                    "workflow_id": self.state.workflow_id,
+                    "context_id": self.state.context_id,
+                    "current_plan_step_description": self.state.current_plan[0].description if self.state.current_plan else "",
+                    "fetch_limits": {
+                        "recent_actions": 3,         # Fewer recent actions
+                        "important_memories": 5,     # Key memories only
+                        "key_thoughts": 3,           # Minimal thoughts
+                        "proactive_memories": 3,     # Reduce proactive
+                        "procedural_memories": 1,    # Minimal procedures
+                        "link_traversal": 2,         # Minimal link traversal
+                    },
+                    "show_limits": {
+                        "working_memory": 5,         # Focus on working memory
+                        "link_traversal": 2,
+                    },
+                    "include_core_context": True,        # Still need workflow goal
+                    "include_working_memory": True,      # Important for research
+                    "include_proactive_memories": False, # Skip proactive in research mode
+                    "include_relevant_procedures": False, # Skip procedures in research mode  
+                    "include_contextual_links": False,   # Skip links in research mode
+                    "compression_token_threshold": 8000, # Lower threshold
+                    "compression_target_tokens": 3000,   # Smaller target
+                }
+                
+                ums_raw = await self._execute_tool_call_internal(
+                    ums_tool_mcp, ums_params, record_action=False
+                )
+                
+                if ums_raw.get("success"):
+                    pk = ums_raw.get("context_package", {})
+                    if isinstance(pk, dict):
+                        ums_pkg = pk
+                        ums_pkg_status = "research_optimized_success"
+                        self.logger.info("🔬 Research-optimized UMS context retrieved")
+                    else:
+                        ums_pkg = {"error": "Invalid UMS package type in research mode"}
+                        ums_pkg_status = "research_optimized_invalid"
+                else:
+                    ums_pkg = {"error": f"UMS call failed in research mode: {ums_raw.get('error')}"}
+                    ums_pkg_status = "research_optimized_failed"
+                    
+            except Exception as exc:
+                context_payload["errors_in_context_gathering"].append(f"Research mode UMS error: {exc}")
+                ums_pkg = {"error_research_mode": str(exc)}
+                ums_pkg_status = "research_optimized_exception"
+        else:
+            ums_pkg = {"error": "UMS tool unavailable or missing workflow/context IDs"}
+            ums_pkg_status = "research_optimized_tool_unavailable"
+        
+        context_payload.update(
+            ums_context_package=ums_pkg,
+            ums_package_retrieval_status=ums_pkg_status,
+        )
+        
+        # Always clear meta-feedback in research mode too
+        self.state.last_meta_feedback = None
+        
+        context_payload["processing_time_sec"] = time.time() - t_start
+        
+        self.logger.info("Agent Context: Research-optimized gathering complete. "
+                        f"Time: {context_payload['processing_time_sec']:.3f}s "
+                        "(Research mode - optimized for efficiency)")
+        
+        return context_payload
         
     async def _gather_context_fresh(self) -> Dict[str, Any]:
         """
@@ -7705,6 +8268,19 @@ class AgentMasterLoop:
             self.state.successful_actions_since_reflection > 2):  # Ensure some real progress made
             self.logger.info("🏃 Using lightweight context for simple task (≤2 plan steps)")
             return await self._gather_lightweight_context()
+        
+        # Use research-optimized context for research workflows in mid-execution
+        is_research_workflow = False
+        if self.state.goal_stack and self.state.goal_stack[-1]:
+            goal_desc = self.state.goal_stack[-1].get("description", "").lower()
+            research_keywords = ["research", "search", "investigate", "study", "gather", "explore", "articles"]
+            is_research_workflow = any(keyword in goal_desc for keyword in research_keywords)
+        
+        if (is_research_workflow and 
+            self.state.current_loop > 3 and  # After initial setup
+            self.state.artifact_focus_mode):  # In focus mode
+            self.logger.info("🔬 Using research-optimized context for research workflow")
+            return await self._gather_research_optimized_context()
         
         t_start = time.time()
         self.logger.info("🛰️ Gathering comprehensive context for LLM "
