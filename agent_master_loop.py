@@ -1007,6 +1007,7 @@ class AgentState:
     successful_patterns: Dict[str, List[List[str]]] = field(default_factory=dict)  # goal_type -> list of tool_sequences  
     pattern_success_count: Dict[str, int] = field(default_factory=dict)  # pattern_hash -> success_count
     last_workflow_tools: List[str] = field(default_factory=list)  # Track tools used in current workflow
+    # Note: Automatic goal decomposition has been completely DISABLED to prevent infinite recursion loops
 
 # =====================================================================
 # Agent Master Loop
@@ -4697,6 +4698,97 @@ class AgentMasterLoop:
             )
 
 
+    def _score_goal_complexity(self, goal_description: str) -> int:
+        """
+        Score goal complexity on a scale from 0-100 based on the number of discrete, 
+        complex actions or tool usages it would require.
+        
+        Returns:
+            int: Complexity score from 0-100 where:
+            - 0-30: Simple, single-step tasks
+            - 31-60: Moderate tasks requiring 2-3 tools
+            - 61-85: Complex tasks requiring multiple steps/tools
+            - 86-100: Very complex tasks requiring decomposition
+        """
+        if not goal_description:
+            return 0
+        
+        goal_lower = goal_description.lower()
+        complexity_score = 0
+        
+        # Base complexity from length (longer descriptions often indicate complexity)
+        if len(goal_description) > 200:
+            complexity_score += 25
+        elif len(goal_description) > 100:
+            complexity_score += 15
+        elif len(goal_description) > 50:
+            complexity_score += 5
+        
+        # Count action words (each suggests a discrete step)
+        action_words = [
+            "research", "analyze", "create", "build", "develop", "write", "generate",
+            "investigate", "examine", "study", "design", "implement", "plan", "execute",
+            "compare", "contrast", "evaluate", "summarize", "document", "report",
+            "test", "validate", "verify", "review", "compile", "organize", "format"
+        ]
+        action_count = sum(1 for word in action_words if word in goal_lower)
+        complexity_score += action_count * 8  # Each action adds complexity
+        
+        # Multiple deliverables/outputs increase complexity
+        deliverable_indicators = [
+            "and then", "also create", "additionally", "furthermore", "plus",
+            "as well as", "both", "multiple", "several", "various", "different types"
+        ]
+        deliverable_count = sum(1 for indicator in deliverable_indicators if indicator in goal_lower)
+        complexity_score += deliverable_count * 15
+        
+        # Technical complexity indicators
+        technical_indicators = [
+            "html", "css", "javascript", "code", "program", "script", "interactive",
+            "api", "database", "algorithm", "optimization", "integration", "framework"
+        ]
+        technical_count = sum(1 for indicator in technical_indicators if indicator in goal_lower)
+        complexity_score += technical_count * 10
+        
+        # Research depth indicators
+        research_indicators = [
+            "comprehensive", "detailed", "thorough", "extensive", "complete",
+            "in-depth", "systematic", "scholarly", "academic", "citations"
+        ]
+        research_depth = sum(1 for indicator in research_indicators if indicator in goal_lower)
+        complexity_score += research_depth * 8
+        
+        # Multi-step process indicators
+        process_indicators = [
+            "first", "then", "next", "finally", "step", "phase", "stage",
+            "process", "workflow", "pipeline", "sequence"
+        ]
+        process_count = sum(1 for indicator in process_indicators if indicator in goal_lower)
+        complexity_score += process_count * 6
+        
+        # Complex conjunction patterns (indicate multiple requirements)
+        conjunction_patterns = [
+            " and ", " or ", " while ", " during ", " after ", " before ",
+            " including ", " with ", " using ", " through ", " via "
+        ]
+        conjunction_count = sum(1 for pattern in conjunction_patterns if pattern in goal_lower)
+        complexity_score += conjunction_count * 4
+        
+        # Specific high-complexity scenarios
+        if "quiz" in goal_lower and ("html" in goal_lower or "interactive" in goal_lower):
+            complexity_score += 20  # Interactive quiz creation is complex
+        
+        if "report" in goal_lower and ("research" in goal_lower or "sources" in goal_lower):
+            complexity_score += 15  # Research reports require multiple steps
+        
+        if "analyze" in goal_lower and "create" in goal_lower:
+            complexity_score += 15  # Analysis + creation requires multiple phases
+        
+        # Cap at 100
+        complexity_score = min(100, complexity_score)
+        
+        return complexity_score
+
     async def _decompose_large_goal(self, goal_description: str, workflow_id: str) -> List[Dict[str, str]]:
         """
         Decompose a large/complex goal into smaller, actionable sub-goals.
@@ -4716,35 +4808,57 @@ class AgentMasterLoop:
         if not needs_decomposition or len(goal_description) < 100:
             return []  # Goal is simple enough
         
-        # Common decomposition patterns
+        # Improved decomposition patterns with short, atomic descriptions
         sub_goals = []
         
-        if "research" in goal_lower and "report" in goal_lower:
+        # Extract key topic/subject from goal for more specific sub-goals
+        topic_keywords = []
+        for word in goal_description.split():
+            if len(word) > 3 and word.lower() not in ['research', 'create', 'write', 'analyze', 'build', 'develop']:
+                topic_keywords.append(word)
+        
+        main_topic = " ".join(topic_keywords[:3]) if topic_keywords else "the subject"
+        
+        if "research" in goal_lower and ("report" in goal_lower or "write" in goal_lower):
             sub_goals = [
-                {"title": "Research Phase", "description": f"Gather information and sources for: {goal_description}"},
-                {"title": "Analysis Phase", "description": f"Analyze and organize findings from research"},
-                {"title": "Report Creation", "description": f"Write and format the final report/deliverable"}
+                {"title": "Web Research", "description": f"Search web for key information about {main_topic[:40]}"},
+                {"title": "Report Writing", "description": "Create comprehensive written report from findings"}
             ]
-        elif "quiz" in goal_lower or "questions" in goal_lower:
+        elif ("quiz" in goal_lower or "questions" in goal_lower) and "html" in goal_lower:
             sub_goals = [
-                {"title": "Content Research", "description": f"Research the subject matter for quiz creation"},
-                {"title": "Question Development", "description": f"Create quiz questions with appropriate difficulty"},
-                {"title": "Quiz Assembly", "description": f"Format and finalize the quiz deliverable"}
+                {"title": "Content Research", "description": f"Research {main_topic[:40]} content for quiz questions"},
+                {"title": "Interactive Quiz", "description": "Create HTML quiz with JavaScript functionality"}
+            ]
+        elif "research" in goal_lower and "quiz" in goal_lower:
+            sub_goals = [
+                {"title": "Research Task", "description": f"Research {main_topic[:40]} and gather key information"},
+                {"title": "Quiz Creation", "description": "Design and create quiz based on research findings"}
             ]
         elif "analyze" in goal_lower and "create" in goal_lower:
             sub_goals = [
-                {"title": "Data Gathering", "description": f"Collect relevant information for analysis"},
-                {"title": "Analysis", "description": f"Perform detailed analysis of the gathered data"},
-                {"title": "Deliverable Creation", "description": f"Create the final output based on analysis"}
+                {"title": "Analysis Task", "description": f"Analyze available information about {main_topic[:40]}"},
+                {"title": "Content Creation", "description": "Create deliverable based on analysis results"}
             ]
-        else:
-            # Generic decomposition for complex goals
-            if len(goal_description) > 200:
+        elif len(goal_description) > 200 and ("then" in goal_lower or "and" in goal_lower):
+            # Multi-part goals - split into major components
+            if "html" in goal_lower or "interactive" in goal_lower:
                 sub_goals = [
-                    {"title": "Planning & Research", "description": f"Plan approach and gather information for: {goal_description[:100]}..."},
-                    {"title": "Implementation", "description": f"Execute the main work toward the goal"},
-                    {"title": "Finalization", "description": f"Complete and deliver the final result"}
+                    {"title": "Research Phase", "description": f"Gather information about {main_topic[:40]}"},
+                    {"title": "Interactive Development", "description": "Build HTML/JavaScript interactive component"}
                 ]
+            else:
+                sub_goals = [
+                    {"title": "Information Gathering", "description": f"Research and collect data about {main_topic[:40]}"},
+                    {"title": "Deliverable Creation", "description": "Create final output from gathered information"}
+                ]
+        else:
+            # Generic decomposition with very short descriptions to avoid re-decomposition
+            action_words = [word for word in goal_description.split() if word.lower() in ["research", "create", "build", "analyze", "write", "develop"]]
+            main_action = action_words[0] if action_words else "complete"
+            sub_goals = [
+                {"title": "Preparation", "description": f"Gather information needed to {main_action.lower()}"},
+                {"title": "Execution", "description": f"Execute the main {main_action.lower()} task"}
+            ]
         
         self.logger.info(f"🎯 Decomposed large goal into {len(sub_goals)} sub-goals")
         return sub_goals
@@ -7097,42 +7211,33 @@ class AgentMasterLoop:
                 self.state.consecutive_error_count = 0
                 self.logger.info(f"{log_prefix}: Goal {_fmt_id(goal_id)} successfully established, error state cleared")
 
-                # Check if goal should be decomposed:
+                # AUTOMATIC GOAL DECOMPOSITION **COMPLETELY DISABLED**
+                # This was causing infinite recursive goal creation loops.
+                # The agent should work directly on goals without creating sub-goals.
+                
                 goal_desc = goal_obj.get("description", "")
-                if goal_desc and len(goal_desc) > 80:  # Only for substantial goals
-                    sub_goals = await self._decompose_large_goal(goal_desc, self.state.workflow_id)
-                    if sub_goals:
-                        create_goal_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_CREATE_GOAL)
-                        if self._find_tool_server(create_goal_mcp):
-                            # Create the first sub-goal
-                            first_sub = sub_goals[0]
-                            sub_goal_args = {
-                                "workflow_id": self.state.workflow_id,
-                                "description": first_sub["description"],
-                                "title": first_sub["title"],
-                                "parent_goal_id": goal_id,
-                                "initial_status": GoalStatus.ACTIVE.value,
-                            }
-                            
-                            try:
-                                sub_goal_env = await self._execute_tool_call_internal(
-                                    create_goal_mcp, sub_goal_args, record_action=False
-                                )
-                                if sub_goal_env.get("success"):
-                                    sub_goal_data = sub_goal_env.get("data", {}).get("goal", {})
-                                    if sub_goal_data.get("goal_id"):
-                                        # Switch focus to the sub-goal
-                                        self.state.goal_stack.append(sub_goal_data)
-                                        self.state.current_goal_id = sub_goal_data["goal_id"]
-                                        self.logger.info(f"🎯 Created and focused on first sub-goal: {first_sub['title']}")
-                                        
-                                        # Update plan for the sub-goal
-                                        self.state.current_plan = [
-                                            PlanStep(description=f"Work on sub-goal: {first_sub['description']}")
-                                        ]
-                                        self.state.needs_replan = False
-                            except Exception as e:
-                                self.logger.warning(f"Failed to create sub-goal: {e}")
+                self.logger.info(f"🎯 Goal established: '{goal_desc[:80]}...' - AUTO-DECOMPOSITION DISABLED")
+                
+                # Create a direct action plan for the goal
+                if not self.state.current_plan or self.state.current_plan[0].description == DEFAULT_PLAN_STEP:
+                    if "research" in goal_desc.lower():
+                        self.state.current_plan = [
+                            PlanStep(description="Search the web for relevant information")
+                        ]
+                    elif "create" in goal_desc.lower() or "write" in goal_desc.lower():
+                        self.state.current_plan = [
+                            PlanStep(description="Create the requested content or artifact")
+                        ]
+                    elif "analyze" in goal_desc.lower():
+                        self.state.current_plan = [
+                            PlanStep(description="Analyze the available information")
+                        ]
+                    else:
+                        self.state.current_plan = [
+                            PlanStep(description="Execute the first step toward goal completion")
+                        ]
+                    self.state.needs_replan = False
+                    self.logger.info(f"🎯 Created direct action plan for goal")
 
             # Record a thought (best-effort)
             record_thought_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_THOUGHT)
