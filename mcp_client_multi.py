@@ -504,7 +504,695 @@ EMOJI_MAP["status_unknown"] = EMOJI_MAP["question_mark"]
 
 AGENT_TOOL_UPDATE_PLAN = "agent:update_plan"
 
-# =============================================================================
+# ==========================================================================
+# JSON SCHEMAS FOR STRUCTURED OUTPUT QUERIES
+# ==========================================================================
+
+# Schema for memory similarity analysis
+MEMORY_SIMILARITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "similarity_score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Semantic similarity score from 0-100"
+        },
+        "decision": {
+            "type": "string",
+            "enum": ["store_new", "store_with_note", "skip_similar", "skip_duplicate"],
+            "description": "Decision on how to handle the memory"
+        },
+        "reason": {
+            "type": "string",
+            "description": "Brief explanation for the decision"
+        }
+    },
+    "required": ["similarity_score", "decision", "reason"],
+    "additionalProperties": False
+}
+
+# Schema for semantic similarity scoring
+SEMANTIC_SIMILARITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Semantic similarity score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for consolidation decision
+CONSOLIDATION_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Consolidation necessity score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for unique content analysis
+UNIQUE_CONTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "unique_items": {
+            "type": "array",
+            "items": {
+                "type": "integer",
+                "minimum": 1
+            },
+            "description": "List of item numbers (1-based) that contain unique information"
+        }
+    },
+    "required": ["unique_items"],
+    "additionalProperties": False
+}
+
+# Schema for complexity scoring
+COMPLEXITY_SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Task complexity score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for research intensity scoring
+RESEARCH_INTENSITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Research intensity score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for creation focus scoring
+CREATION_FOCUS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Creation focus score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for deliverable type prediction
+DELIVERABLE_TYPE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "report": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Likelihood of producing analytical reports or research summaries"
+        },
+        "html_file": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Likelihood of producing web pages or HTML documents"
+        },
+        "interactive_quiz": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Likelihood of producing quizzes, tests, or assessments"
+        },
+        "code_file": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Likelihood of producing programming code or scripts"
+        },
+        "document": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Likelihood of producing general text documents or papers"
+        },
+        "general_artifact": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Likelihood of producing other types of deliverables"
+        }
+    },
+    "required": ["report", "html_file", "interactive_quiz", "code_file", "document", "general_artifact"],
+    "additionalProperties": False
+}
+
+# Schema for multi-part task analysis
+MULTI_PART_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Multi-part task score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for integration needs analysis
+INTEGRATION_NEEDS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "External integration needs score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for action phase analysis
+ACTION_PHASE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "phase": {
+            "type": "string",
+            "enum": ["initialization", "planning", "research", "development", "testing", "refinement", "completion", "error_recovery"],
+            "description": "Current phase of work based on action analysis"
+        },
+        "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Confidence in phase classification"
+        }
+    },
+    "required": ["phase", "confidence"],
+    "additionalProperties": False
+}
+
+# Schema for progress reasonableness assessment
+PROGRESS_REASONABLENESS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Progress reasonableness score from 0-100"
+        },
+        "reasoning": {
+            "type": "string",
+            "description": "Brief explanation of the assessment"
+        }
+    },
+    "required": ["score", "reasoning"],
+    "additionalProperties": False
+}
+
+# Schema for goal classification
+GOAL_CLASSIFICATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string",
+            "enum": ["research", "development", "analysis", "creation", "optimization", "maintenance", "learning", "communication"],
+            "description": "Primary goal category"
+        },
+        "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Confidence in classification"
+        },
+        "secondary_categories": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": ["research", "development", "analysis", "creation", "optimization", "maintenance", "learning", "communication"]
+            },
+            "description": "Additional relevant categories"
+        }
+    },
+    "required": ["category", "confidence"],
+    "additionalProperties": False
+}
+
+# Schema for activity category assessment
+ACTIVITY_CATEGORY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "categories": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Activity category name"
+                    },
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Relevance score for this category"
+                    }
+                },
+                "required": ["name", "score"],
+                "additionalProperties": False
+            }
+        }
+    },
+    "required": ["categories"],
+    "additionalProperties": False
+}
+
+# Schema for replan necessity assessment
+REPLAN_NECESSITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Replan necessity score from 0-100"
+        },
+        "reasoning": {
+            "type": "string",
+            "description": "Explanation for the replan assessment"
+        }
+    },
+    "required": ["score", "reasoning"],
+    "additionalProperties": False
+}
+
+# Schema for file creation assessment
+FILE_CREATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "File creation likelihood score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for error planning assessment
+ERROR_PLANNING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Error planning-relatedness score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for plan step vagueness assessment
+PLAN_VAGUENESS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Plan step vagueness score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for workflow type matching
+WORKFLOW_MATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Workflow type match score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for markdown format detection
+MARKDOWN_FORMAT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_markdown": {
+            "type": "boolean",
+            "description": "Whether the text is markdown formatted"
+        },
+        "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Confidence in the assessment"
+        }
+    },
+    "required": ["is_markdown", "confidence"],
+    "additionalProperties": False
+}
+
+# Schema for content quality assessment
+CONTENT_QUALITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Content quality score from 0-100"
+        },
+        "aspects": {
+            "type": "object",
+            "properties": {
+                "clarity": {"type": "integer", "minimum": 0, "maximum": 100},
+                "completeness": {"type": "integer", "minimum": 0, "maximum": 100},
+                "accuracy": {"type": "integer", "minimum": 0, "maximum": 100},
+                "relevance": {"type": "integer", "minimum": 0, "maximum": 100}
+            },
+            "required": ["clarity", "completeness", "accuracy", "relevance"],
+            "additionalProperties": False
+        }
+    },
+    "required": ["score", "aspects"],
+    "additionalProperties": False
+}
+
+# Schema for simple goal classification (just category name)
+SIMPLE_GOAL_CLASSIFICATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string",
+            "enum": ["creation", "analysis", "planning", "communication", "evaluation", "problem_solving", "general_task"],
+            "description": "Single goal category classification"
+        }
+    },
+    "required": ["category"],
+    "additionalProperties": False
+}
+
+# Schema for completion readiness analysis
+COMPLETION_READINESS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "completion_readiness": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Goal completion readiness score from 0-100"
+        },
+        "force_completion": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Force completion necessity score from 0-100"
+        },
+        "has_deliverable": {
+            "type": "boolean",
+            "description": "Whether deliverable exists or has been created"
+        },
+        "reason": {
+            "type": "string",
+            "description": "Brief explanation of the completion assessment"
+        }
+    },
+    "required": ["completion_readiness", "force_completion", "has_deliverable", "reason"],
+    "additionalProperties": False
+}
+
+# Schema for simple scoring (0-100)
+SIMPLE_SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Simple numerical score from 0-100"
+        }
+    },
+    "required": ["score"],
+    "additionalProperties": False
+}
+
+# Schema for boolean analysis with confidence
+BOOLEAN_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "result": {
+            "type": "boolean",
+            "description": "Boolean result of the analysis"
+        },
+        "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Confidence in the boolean assessment"
+        }
+    },
+    "required": ["result", "confidence"],
+    "additionalProperties": False
+}
+
+# Schema for error classification scoring
+ERROR_CLASSIFICATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Error classification confidence score from 0-100"
+        },
+        "classification": {
+            "type": "string",
+            "enum": ["memory_type_error", "artifact_type_error", "missing_fields_error", "workflow_id_error", "file_access_error", "planning_error", "other"],
+            "description": "Type of error classification"
+        }
+    },
+    "required": ["score", "classification"],
+    "additionalProperties": False
+}
+
+# Schema for enhanced goal classification with multiple scores
+ENHANCED_GOAL_CLASSIFICATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "creation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Creation work likelihood score"
+        },
+        "analysis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Analysis work likelihood score"
+        },
+        "planning": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Planning work likelihood score"
+        },
+        "communication": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Communication work likelihood score"
+        },
+        "evaluation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Evaluation work likelihood score"
+        },
+        "problem_solving": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Problem solving work likelihood score"
+        }
+    },
+    "required": ["creation", "analysis", "planning", "communication", "evaluation", "problem_solving"],
+    "additionalProperties": False
+}
+
+# Schema for JSON parsing extraction
+JSON_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "completion_readiness": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Extracted completion readiness score"
+        },
+        "force_completion": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Extracted force completion score"
+        },
+        "has_deliverable": {
+            "type": "boolean",
+            "description": "Extracted deliverable existence flag"
+        },
+        "reason": {
+            "type": "string",
+            "description": "Extracted reason explanation"
+        }
+    },
+    "required": ["completion_readiness", "force_completion", "has_deliverable", "reason"],
+    "additionalProperties": False
+}
+
+# Schema for tool type classification
+TOOL_TYPE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tool_type": {
+            "type": "string",
+            "enum": ["artifact_tool", "research_tool", "analysis_tool", "creation_tool", "storage_tool", "processing_tool", "other"],
+            "description": "Classification of tool type"
+        },
+        "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Confidence in the classification"
+        }
+    },
+    "required": ["tool_type", "confidence"],
+    "additionalProperties": False
+}
+
+# Schema for multi-category activity analysis
+ACTIVITY_CATEGORIES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "categories": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": ["information_gathering", "knowledge_storage", "content_creation", "analysis_thinking", "data_processing", "collaboration", "general_work"]
+            },
+            "description": "List of activity categories that score 40+ points"
+        }
+    },
+    "required": ["categories"],
+    "additionalProperties": False
+}
+
+# Schema for tool list parsing
+TOOL_LIST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tools": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "description": "List of recommended tools"
+        }
+    },
+    "required": ["tools"],
+    "additionalProperties": False
+}
+
+# Schema for improvement indicator analysis
+IMPROVEMENT_INDICATORS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "indicators": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "description": "List of improvement indicators identified"
+        }
+    },
+    "required": ["indicators"],
+    "additionalProperties": False
+}
+
+# Schema for text format detection
+TEXT_FORMAT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "format": {
+            "type": "string",
+            "enum": ["markdown", "html", "plain_text", "json", "xml", "code", "other"],
+            "description": "Detected text format"
+        },
+        "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Confidence in format detection"
+        }
+    },
+    "required": ["format", "confidence"],
+    "additionalProperties": False
+}
+
+# Schema for raw text response
+RAW_TEXT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "result": {
+            "type": "string",
+            "description": "Raw text result from analysis"
+        }
+    },
+    "required": ["result"],
+    "additionalProperties": False
+}
+
+# ==========================================================================
 # Model -> Provider Mapping
 # =============================================================================
 # Maps known model identifiers (or prefixes) to their provider's enum value string.
@@ -834,6 +1522,7 @@ class AgentInjectThoughtRequest(BaseModel):
 # Model for the GET /api/config response (excluding sensitive data)
 class ConfigGetResponse(BaseModel):
     default_model: str = Field(..., alias="defaultModel")
+    default_cheap_and_fast_model: str = Field(..., alias="defaultCheapAndFastModel")
     default_max_tokens: int = Field(..., alias="defaultMaxTokens")
     history_size: int = Field(..., alias="historySize")
     auto_discover: bool = Field(..., alias="autoDiscover")
@@ -901,6 +1590,7 @@ class ConfigUpdateRequest(BaseModel):
     # --- General Settings (Optional) ---
     # Note: Setting these via API only affects the current session.
     default_model: Optional[str] = Field(None, alias="defaultModel")
+    default_cheap_and_fast_model: Optional[str] = Field(None, alias="defaultCheapAndFastModel")
     default_max_tokens: Optional[int] = Field(None, alias="defaultMaxTokens")
     history_size: Optional[int] = Field(None, alias="historySize")
     auto_discover: Optional[bool] = Field(None, alias="autoDiscover")
@@ -2474,6 +3164,7 @@ PROVIDER_ENV_URL_MAP = {
 # Mapping for simple settings <-> Env Var Names
 SIMPLE_SETTINGS_ENV_MAP = {
     "DEFAULT_MODEL": "default_model",
+    "DEFAULT_CHEAP_AND_FAST_MODEL": "default_cheap_and_fast_model",
     "DEFAULT_MAX_TOKENS": "default_max_tokens",
     "HISTORY_SIZE": "history_size",
     "AUTO_DISCOVER": "auto_discover",
@@ -2546,7 +3237,8 @@ class Config:
         self.openrouter_base_url: Optional[str] = "https://openrouter.ai/api/v1"
 
         # Default model
-        self.default_model: str = DEFAULT_MODELS.get(Provider.OPENAI.value, "gpt-4.1-mini")
+        self.default_model: str = "gpt-4.1"
+        self.default_cheap_and_fast_model: str = "gemini-2.5-flash-preview-05-20"  # Default cheap model, will be overridden by .env
 
         # Other settings
         self.default_max_tokens: int = 8000
@@ -5171,6 +5863,12 @@ class MCPClient:
         self.cache_hit_count = 0
         self.cache_miss_count = 0
         self.tokens_saved_by_cache = 0
+        
+        # Token and cost tracking for cheap/fast requests
+        self.cheap_request_count = 0
+        self.cheap_input_tokens = 0
+        self.cheap_output_tokens = 0
+        self.cheap_total_cost = 0.0
 
         # Agent related properties
         self.agent_loop_instance: Optional[AgentMasterLoop] = None
@@ -7729,6 +8427,7 @@ class MCPClient:
             
             # ===== STREAMLINED RESPONSE LOGGING =====
             import json as json_lib
+
             from rich.console import Console
             from rich.panel import Panel
             from rich.syntax import Syntax
@@ -8728,6 +9427,553 @@ class MCPClient:
             log.error(f"Unexpected error during internal LLM call ({provider_name}): {e}", exc_info=True)
 
         return None
+
+    def _log_cheap_request(
+        self,
+        prompt_messages: List[Dict[str, str]],
+        schema_name: str,
+        model_used: str,
+        response_data: Optional[Dict[str, Any]] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        cost_usd: Optional[float] = None,
+        error: Optional[str] = None
+    ) -> None:
+        """
+        Log cheap/fast LLM request with rich formatting and comprehensive details.
+        """
+        from rich.columns import Columns
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        
+        # Create a rich console for this specific log message
+        safe_console = get_safe_console()
+        
+        # Get request content (truncated)
+        request_text = ""
+        if prompt_messages:
+            for msg in prompt_messages:
+                content = msg.get("content", "")
+                if len(content) > 150:
+                    request_text += f"[{msg.get('role', 'unknown')}] {content[:150]}..."
+                else:
+                    request_text += f"[{msg.get('role', 'unknown')}] {content}"
+                request_text += "\n"
+        request_text = request_text.strip()
+        
+        # Get response content (truncated)
+        response_text = ""
+        if response_data:
+            response_str = str(response_data)
+            if len(response_str) > 200:
+                response_text = f"{response_str[:200]}..."
+            else:
+                response_text = response_str
+        
+        # Create the main table
+        info_table = Table(show_header=False, box=None, padding=(0, 1))
+        info_table.add_column("Label", style="dim cyan", width=12)
+        info_table.add_column("Value", style="white")
+        
+        # Add rows
+        info_table.add_row("🏷️ Schema", schema_name)
+        info_table.add_row("🧠 Model", f"[green]{model_used}[/green]")
+        
+        if input_tokens is not None:
+            info_table.add_row("📥 Input", f"{input_tokens:,} tokens")
+        if output_tokens is not None:
+            info_table.add_row("📤 Output", f"{output_tokens:,} tokens")
+        if cost_usd is not None:
+            info_table.add_row("💰 Cost", f"${cost_usd:.6f}")
+        
+        # Update totals
+        self.cheap_request_count += 1
+        if input_tokens:
+            self.cheap_input_tokens += input_tokens
+        if output_tokens:
+            self.cheap_output_tokens += output_tokens
+        if cost_usd:
+            self.cheap_total_cost += cost_usd
+            
+        info_table.add_row("📊 Session", f"{self.cheap_request_count} requests, ${self.cheap_total_cost:.4f} total")
+        
+        # Show request content
+        if request_text:
+            request_panel = Panel(
+                Text(request_text, style="dim white"),
+                title="📤 Request",
+                border_style="blue",
+                padding=(0, 1)
+            )
+        else:
+            request_panel = Panel("[dim]No request content[/dim]", title="📤 Request", border_style="dim")
+        
+        # Show response content or error
+        if error:
+            response_panel = Panel(
+                Text(error, style="red"),
+                title="❌ Error",
+                border_style="red",
+                padding=(0, 1)
+            )
+        elif response_text:
+            response_panel = Panel(
+                Text(response_text, style="green"),
+                title="📥 Response",
+                border_style="green",
+                padding=(0, 1)
+            )
+        else:
+            response_panel = Panel("[dim]No response content[/dim]", title="📥 Response", border_style="dim")
+        
+        # Create columns layout
+        columns = Columns([
+            Panel(info_table, title="ℹ️ Details", border_style="cyan", padding=(0, 1)),
+            request_panel,
+            response_panel
+        ], equal=True, expand=True)
+        
+        # Main panel with icon
+        main_panel = Panel(
+            columns,
+            title="⚡ Cheap & Fast LLM Request",
+            border_style="cyan",
+            padding=(1, 1)
+        )
+        
+        # Print with proper spacing
+        safe_console.print()
+        safe_console.print(main_panel)
+        safe_console.print()
+
+    def _calculate_token_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
+        """
+        Calculate the cost in USD for a given model and token usage.
+        """
+        model_costs = COST_PER_MILLION_TOKENS.get(model_name, {"input": 0, "output": 0})
+        
+        input_cost = (input_tokens / 1_000_000) * model_costs["input"]
+        output_cost = (output_tokens / 1_000_000) * model_costs["output"]
+        
+        return input_cost + output_cost
+
+    def _extract_token_usage(self, response: Any) -> tuple[Optional[int], Optional[int]]:
+        """
+        Extract token usage from various response formats.
+        Returns (input_tokens, output_tokens) or (None, None) if not available.
+        """
+        try:
+            # Handle different response structures
+            if hasattr(response, 'usage'):
+                # OpenAI-style response
+                usage = response.usage
+                if hasattr(usage, 'prompt_tokens') and hasattr(usage, 'completion_tokens'):
+                    return usage.prompt_tokens, usage.completion_tokens
+                elif hasattr(usage, 'input_tokens') and hasattr(usage, 'output_tokens'):
+                    return usage.input_tokens, usage.output_tokens
+            
+            # Handle dict-style response
+            if isinstance(response, dict):
+                usage = response.get('usage', {})
+                if 'prompt_tokens' in usage and 'completion_tokens' in usage:
+                    return usage['prompt_tokens'], usage['completion_tokens']
+                elif 'input_tokens' in usage and 'output_tokens' in usage:
+                    return usage['input_tokens'], usage['output_tokens']
+            
+            # Handle Anthropic-style response
+            if hasattr(response, 'input_tokens') and hasattr(response, 'output_tokens'):
+                return response.input_tokens, response.output_tokens
+            
+        except Exception as e:
+            log.debug(f"Could not extract token usage: {e}")
+        
+        return None, None
+
+    def get_session_stats(self) -> Dict[str, Any]:
+        """
+        Get comprehensive session statistics including both regular and cheap requests.
+        """
+        total_tokens = self.session_input_tokens + self.session_output_tokens
+        cheap_total_tokens = self.cheap_input_tokens + self.cheap_output_tokens
+        grand_total_tokens = total_tokens + cheap_total_tokens
+        grand_total_cost = self.session_total_cost + self.cheap_total_cost
+        
+        return {
+            "regular_requests": {
+                "input_tokens": self.session_input_tokens,
+                "output_tokens": self.session_output_tokens,
+                "total_tokens": total_tokens,
+                "total_cost": self.session_total_cost,
+                "cache_hits": self.cache_hit_count,
+                "cache_misses": self.cache_miss_count,
+                "tokens_saved": self.tokens_saved_by_cache
+            },
+            "cheap_requests": {
+                "request_count": self.cheap_request_count,
+                "input_tokens": self.cheap_input_tokens,
+                "output_tokens": self.cheap_output_tokens,
+                "total_tokens": cheap_total_tokens,
+                "total_cost": self.cheap_total_cost
+            },
+            "grand_totals": {
+                "total_tokens": grand_total_tokens,
+                "total_cost": grand_total_cost,
+                "total_requests": self.cache_hit_count + self.cache_miss_count + self.cheap_request_count
+            }
+        }
+
+    def print_session_stats(self) -> None:
+        """
+        Print comprehensive session statistics with rich formatting.
+        """
+        from rich.panel import Panel
+        from rich.table import Table
+        
+        stats = self.get_session_stats()
+        safe_console = get_safe_console()
+        
+        # Create main stats table
+        stats_table = Table(show_header=True, box=box.ROUNDED)
+        stats_table.add_column("Category", style="cyan", width=15)
+        stats_table.add_column("Requests", justify="right", style="white")
+        stats_table.add_column("Input Tokens", justify="right", style="blue")
+        stats_table.add_column("Output Tokens", justify="right", style="green")
+        stats_table.add_column("Total Tokens", justify="right", style="yellow")
+        stats_table.add_column("Cost (USD)", justify="right", style="red")
+        
+        # Regular requests
+        reg = stats["regular_requests"]
+        stats_table.add_row(
+            "🧠 Full MCP",
+            f"{reg['cache_hits'] + reg['cache_misses']:,}",
+            f"{reg['input_tokens']:,}",
+            f"{reg['output_tokens']:,}",
+            f"{reg['total_tokens']:,}",
+            f"${reg['total_cost']:.4f}"
+        )
+        
+        # Cheap requests
+        cheap = stats["cheap_requests"]
+        stats_table.add_row(
+            "⚡ Cheap/Fast",
+            f"{cheap['request_count']:,}",
+            f"{cheap['input_tokens']:,}",
+            f"{cheap['output_tokens']:,}",
+            f"{cheap['total_tokens']:,}",
+            f"${cheap['total_cost']:.4f}"
+        )
+        
+        # Totals
+        total = stats["grand_totals"]
+        stats_table.add_row(
+            "📊 TOTAL",
+            f"{total['total_requests']:,}",
+            f"{reg['input_tokens'] + cheap['input_tokens']:,}",
+            f"{reg['output_tokens'] + cheap['output_tokens']:,}",
+            f"{total['total_tokens']:,}",
+            f"${total['total_cost']:.4f}",
+            style="bold"
+        )
+        
+        # Cache stats
+        cache_table = Table(show_header=False, box=None)
+        cache_table.add_column("Metric", style="dim")
+        cache_table.add_column("Value", style="white")
+        cache_table.add_row("Cache Hits", f"{reg['cache_hits']:,}")
+        cache_table.add_row("Cache Misses", f"{reg['cache_misses']:,}")
+        cache_table.add_row("Tokens Saved", f"{reg['tokens_saved']:,}")
+        
+        # Print results
+        safe_console.print(Panel(stats_table, title="📈 Session Statistics", border_style="green"))
+        safe_console.print(Panel(cache_table, title="💾 Cache Statistics", border_style="blue"))
+
+    async def query_llm(
+        self,
+        prompt_messages: List[Dict[str, str]],
+        model_override: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        stream: bool = False,
+        use_cheap_model: bool = True,
+        response_format: Optional[Dict[str, Any]] = None
+    ) -> Optional[Any]:
+        """
+        Execute a lightweight LLM query without MCP tools, optimized for simple classification/scoring tasks.
+        
+        This method is designed for simple LLM requests that don't need the full MCP tool payload,
+        such as classification, scoring, semantic analysis, etc. It uses a cheaper, faster model
+        by default to optimize costs for these simple operations.
+        
+        Args:
+            prompt_messages: List of message dictionaries with 'role' and 'content' keys
+            model_override: Specific model to use (overrides cheap model selection)
+            max_tokens: Maximum tokens for response (defaults to 500 for efficiency)
+            temperature: Temperature for generation (defaults to 0.1 for classification tasks)
+            stream: Whether to stream the response (currently not supported, always False)
+            use_cheap_model: Whether to use the cheap model (True by default)
+            response_format: Optional structured output format (e.g., JSON schema)
+            
+        Returns:
+            Response object with .content attribute containing the generated text
+        """
+        # Determine which model to use
+        target_model = None
+        if model_override:
+            target_model = model_override
+        elif use_cheap_model:
+            # Get cheap model from config (which handles environment variables via decouple)
+            cheap_model = getattr(self.config, 'default_cheap_and_fast_model', None)
+            if cheap_model:
+                target_model = cheap_model
+                log.debug(f"query_llm: Using cheap model from config: {cheap_model}")
+            else:
+                target_model = self.current_model
+                log.debug(f"query_llm: No cheap model configured, using current model: {target_model}")
+        else:
+            target_model = self.current_model
+            
+        # Set defaults optimized for simple queries
+        max_tokens_to_use = max_tokens or 500  # Cap at 500 for cheap requests
+        temperature_to_use = temperature if temperature is not None else 0.1  # Lower temp for classification
+        
+        # Convert to internal message format
+        internal_messages = []
+        for msg in prompt_messages:
+            internal_messages.append({
+                "role": msg.get("role", "user"),
+                "content": msg.get("content", "")
+            })
+
+        log.debug(f"query_llm: Model='{target_model}', Use Cheap={use_cheap_model}, Max Tokens={max_tokens_to_use}")
+
+        try:
+            # Use process_streaming_query with tools disabled
+            accumulated_text = ""
+            had_error = False
+            error_message = ""
+            
+            # Collect the streamed response
+            async for chunk_type, chunk_data in self.process_streaming_query(
+                query="",  # Empty since we're using messages_override
+                model=target_model,
+                max_tokens=max_tokens_to_use,
+                temperature=temperature_to_use,
+                messages_override=internal_messages,
+                tools_override=[],  # Disable all tools for lightweight queries
+                force_structured_output=bool(response_format),
+                ums_tool_schemas=None  # No UMS tools needed
+            ):
+                if chunk_type == "text_chunk":
+                    accumulated_text += str(chunk_data)
+                elif chunk_type == "error":
+                    had_error = True
+                    error_message = str(chunk_data)
+                    log.error(f"query_llm error: {error_message}")
+                    break
+                # Ignore other chunk types (status, tool_call_*, final_usage, etc.)
+            
+            if had_error:
+                log.error(f"query_llm failed: {error_message}")
+                return None
+
+            # Create a simple response object that mimics the expected interface
+            class SimpleResponse:
+                def __init__(self, content: str):
+                    self.content = content
+
+            if accumulated_text:
+                log.debug(f"query_llm completed successfully. Response length: {len(accumulated_text)} chars")
+                return SimpleResponse(accumulated_text.strip())
+            else:
+                log.warning("query_llm: No content received from LLM")
+                return None
+                
+        except Exception as e:
+            log.error(f"query_llm unexpected error: {e}", exc_info=True)
+            return None
+
+    async def query_llm_structured(
+        self,
+        prompt_messages: List[Dict[str, str]],
+        response_schema: Dict[str, Any],
+        schema_name: str = "structured_response",
+        model_override: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        use_cheap_model: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Execute a structured LLM query that returns JSON according to a schema.
+        
+        This method uses proper OpenAI-compatible structured output formatting
+        for reliable JSON schema adherence.
+        
+        Args:
+            prompt_messages: List of message dictionaries
+            response_schema: JSON schema for the expected response structure
+            schema_name: Name for the schema (used by OpenAI structured output)
+            model_override: Specific model to use
+            max_tokens: Maximum tokens for response  
+            temperature: Temperature for generation
+            use_cheap_model: Whether to use the cheap model
+            
+        Returns:
+            Parsed JSON response as a dictionary, or None if failed
+        """
+        # Determine model for structured output compatibility
+        target_model = None
+        if model_override:
+            target_model = model_override
+        elif use_cheap_model:
+            cheap_model = getattr(self.config, 'default_cheap_and_fast_model', None)
+            target_model = cheap_model if cheap_model else self.current_model
+        else:
+            target_model = self.current_model
+            
+        provider_name = self.get_provider_from_model(target_model)
+        
+        # Prepare structured output format based on provider and model capabilities
+        structured_format = None
+        
+        # Check if model supports json_schema format (OpenAI structured outputs)
+        actual_model_name = target_model
+        providers_to_strip = [Provider.OPENROUTER.value, Provider.GROQ.value, Provider.CEREBRAS.value]
+        if provider_name in providers_to_strip:
+            prefix_to_strip = f"{provider_name}/"
+            if target_model.lower().startswith(prefix_to_strip):
+                actual_model_name = target_model[len(prefix_to_strip):]
+        
+        if actual_model_name in MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT:
+            # Use full JSON Schema with strict mode
+            structured_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "description": f"Structured response for {schema_name}",
+                    "strict": True,
+                    "schema": response_schema
+                }
+            }
+        elif actual_model_name in MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT or provider_name in [
+            Provider.DEEPSEEK.value, Provider.GEMINI.value, Provider.GROK.value, 
+            Provider.GROQ.value, Provider.CEREBRAS.value, Provider.OPENROUTER.value
+        ]:
+            # Fallback to json_object mode
+            structured_format = {"type": "json_object"}
+        else:
+            # No structured output support, will rely on prompt instructions
+            structured_format = None
+            
+        log.debug(f"query_llm_structured: Using format {structured_format} for model {target_model}")
+        
+        try:
+            # Use the basic query_llm with structured format
+            response = await self.query_llm(
+                prompt_messages=prompt_messages,
+                model_override=target_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                use_cheap_model=False,  # We already determined the model above
+                response_format=structured_format
+            )
+            
+            # Extract token usage and calculate cost
+            input_tokens, output_tokens = self._extract_token_usage(response)
+            cost_usd = None
+            if input_tokens and output_tokens:
+                cost_usd = self._calculate_token_cost(target_model, input_tokens, output_tokens)
+            
+            if response and hasattr(response, 'content') and response.content:
+                # Try to parse as JSON
+                import json
+                try:
+                    parsed_json = json.loads(response.content.strip())
+                    
+                    # Log successful cheap request
+                    self._log_cheap_request(
+                        prompt_messages=prompt_messages,
+                        schema_name=schema_name,
+                        model_used=target_model,
+                        response_data=parsed_json,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cost_usd=cost_usd
+                    )
+                    
+                    return parsed_json
+                except json.JSONDecodeError as e:
+                    error_msg = f"Failed to parse JSON response: {e}"
+                    log.warning(f"query_llm_structured: {error_msg}")
+                    log.debug(f"Raw response: {response.content}")
+                    
+                    # Try to extract JSON from markdown or repair it
+                    try:
+                        from mcp_client_multi import extract_json_from_markdown
+                        repaired_json = extract_json_from_markdown(response.content)
+                        if repaired_json:
+                            try:
+                                parsed_json = json.loads(repaired_json)
+                                
+                                # Log successful repair
+                                self._log_cheap_request(
+                                    prompt_messages=prompt_messages,
+                                    schema_name=schema_name,
+                                    model_used=target_model,
+                                    response_data=parsed_json,
+                                    input_tokens=input_tokens,
+                                    output_tokens=output_tokens,
+                                    cost_usd=cost_usd
+                                )
+                                
+                                return parsed_json
+                            except json.JSONDecodeError:
+                                log.warning(f"query_llm_structured: JSON repair also failed")
+                    except ImportError:
+                        log.debug("extract_json_from_markdown not available")
+                    
+                    # Log failed request
+                    self._log_cheap_request(
+                        prompt_messages=prompt_messages,
+                        schema_name=schema_name,
+                        model_used=target_model,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cost_usd=cost_usd,
+                        error=error_msg
+                    )
+                    
+                    return None
+            else:
+                error_msg = "No content received from LLM"
+                log.warning(f"query_llm_structured: {error_msg}")
+                
+                # Log failed request
+                self._log_cheap_request(
+                    prompt_messages=prompt_messages,
+                    schema_name=schema_name,
+                    model_used=target_model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_usd=cost_usd,
+                    error=error_msg
+                )
+                
+                return None
+                
+        except Exception as e:
+            error_msg = f"query_llm_structured error: {e}"
+            log.error(error_msg, exc_info=True)
+            
+            # Log failed request
+            self._log_cheap_request(
+                prompt_messages=prompt_messages,
+                schema_name=schema_name,
+                model_used=target_model,
+                error=error_msg
+            )
+            
+            return None
 
     async def summarize_conversation(self, target_tokens: Optional[int] = None, model: Optional[str] = None) -> Optional[str]:
         """
@@ -12046,9 +13292,24 @@ class MCPClient:
                     agent_current_ums_goal_desc = current_op_goal_obj_from_stack.get("description", "Unnamed UMS Operational Goal")
                 else:
                     agent_current_ums_goal_desc = f"UMS Goal ID '{_fmt_id(agent_state.current_goal_id)}' (Details not in local stack)"
-                    log.warning(
-                        f"MCPC: Agent's current_goal_id {_fmt_id(agent_state.current_goal_id)} not found in its local goal_stack of {len(agent_state.goal_stack)} items."
-                    )
+                    
+                    # Throttle this warning to prevent log spam - only warn once per 30 seconds per goal ID
+                    warning_key = f"goal_sync_warning_{agent_state.current_goal_id}"
+                    import time
+                    current_time = time.time()
+                    
+                    if not hasattr(self, '_last_warning_times'):
+                        self._last_warning_times = {}
+                    
+                    last_warning_time = self._last_warning_times.get(warning_key, 0)
+                    if current_time - last_warning_time > 30:  # Only warn every 30 seconds
+                        log.warning(
+                            f"MCPC: Agent's current_goal_id {_fmt_id(agent_state.current_goal_id)} not found in its local goal_stack of {len(agent_state.goal_stack)} items. "
+                            f"This usually indicates a temporary sync issue that resolves automatically."
+                        )
+                        self._last_warning_times[warning_key] = current_time
+                    else:
+                        log.debug(f"MCPC: Goal sync mismatch (throttled warning) - current_goal_id {_fmt_id(agent_state.current_goal_id)} not in local stack")
 
                 # Summarize the agent's local view of the UMS goal stack for the API
                 # The stack in agent_state.goal_stack is already ordered root-to-leaf
@@ -12238,15 +13499,32 @@ class MCPClient:
                 # Extract ums_tool_schemas from the turn_data_for_llm_dict if available
                 ums_tool_schemas = turn_data_for_llm_dict.get("ums_tool_schemas", {})
                 
-                llm_decision = await self.process_agent_llm_turn(
-                    prompt_messages=prompt_messages,  # Now correctly assigned
-                    tool_schemas=tool_schemas,  # Now correctly assigned
-                    model_name=agent_loop.agent_llm_model,
-                    ui_websocket_sender=ui_websocket_sender,
-                    force_structured_output=force_structured_output,
-                    force_tool_choice=force_tool_choice,
-                    ums_tool_schemas=ums_tool_schemas,  # NEW: Pass UMS schemas for structured outputs
+                # Add timeout protection for LLM calls (3 minutes max)
+                llm_decision = await asyncio.wait_for(
+                    self.process_agent_llm_turn(
+                        prompt_messages=prompt_messages,  # Now correctly assigned
+                        tool_schemas=tool_schemas,  # Now correctly assigned
+                        model_name=agent_loop.agent_llm_model,
+                        ui_websocket_sender=ui_websocket_sender,
+                        force_structured_output=force_structured_output,
+                        force_tool_choice=force_tool_choice,
+                        ums_tool_schemas=ums_tool_schemas,  # NEW: Pass UMS schemas for structured outputs
+                    ),
+                    timeout=180.0  # 3 minutes timeout
                 )
+            except asyncio.TimeoutError:
+                self.safe_print(f"[bold red]MCPC: LLM call timeout (3 minutes) - agent may be stuck or model overloaded[/]")
+                log.error(f"MCPC: LLM call timeout after 180 seconds for turn {loop_num_mcp_managed + 1}")
+                llm_decision = {
+                    "decision": "error",
+                    "message": "LLM call timed out after 3 minutes. Consider using a faster model or simpler prompts.",
+                    "error_type_for_agent": "LLMTimeoutError",
+                }
+                self.agent_status = "failed"
+                self.agent_last_message = "LLM call timed out"
+                if not agent_loop._shutdown_event.is_set():
+                    await agent_loop.shutdown()
+                break
             except Exception as llm_call_err:
                 self.safe_print(f"[bold red]MCPC: Critical error calling LLM for agent: {str(llm_call_err)[:200]}[/]")
                 log.error(f"MCPC: Unhandled exception in self.process_agent_llm_turn: {llm_call_err}", exc_info=True)

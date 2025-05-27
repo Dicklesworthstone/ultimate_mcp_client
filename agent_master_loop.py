@@ -318,27 +318,41 @@ MEMORY_PROMOTION_LOOP_INTERVAL = int(os.environ.get("PROMOTION_INTERVAL", "75"))
 STATS_ADAPTATION_INTERVAL = int(os.environ.get("STATS_ADAPTATION_INTERVAL", "60"))
 MAINTENANCE_INTERVAL = int(os.environ.get("MAINTENANCE_INTERVAL", "100"))
 
+# LLM-based scoring thresholds (all scores are 0-100)
+LLM_SIMILARITY_CONSOLIDATION_THRESHOLD = 60    # Consolidate memories if similarity >= 60
+LLM_PROGRESS_REASONABLENESS_THRESHOLD = 51     # Progress is reasonable if score >= 51
+LLM_GOAL_CLASSIFICATION_THRESHOLD = 40         # Valid goal classification if confidence >= 40
+LLM_ACTIVITY_CATEGORY_THRESHOLD = 40           # Include activity category if score >= 40
+LLM_COMPLEXITY_HIGH_THRESHOLD = 70             # Task is highly complex if score >= 70
+LLM_RESEARCH_INTENSIVE_THRESHOLD = 60          # Task is research-intensive if score >= 60
+LLM_CREATION_FOCUSED_THRESHOLD = 60            # Task is creation-focused if score >= 60
+LLM_REPLAN_NECESSITY_THRESHOLD = 65            # Replan if feedback score >= 65
+LLM_FILE_CREATION_THRESHOLD = 60               # Task involves file creation if score >= 60
+LLM_ERROR_PLANNING_THRESHOLD = 70              # Error is planning-related if score >= 70
+LLM_VAGUENESS_THRESHOLD = 60                   # Plan step is vague if score >= 60
+LLM_WORKFLOW_MATCH_THRESHOLD = 70              # Workflow type matches if score >= 70
+
 # Focus mode thresholds - when agent is actively creating artifacts, reduce meta-cognition
 FOCUS_MODE_REFLECTION_MULTIPLIER = 2.5  # Multiply thresholds by this when in focus mode
 FOCUS_MODE_CONSOLIDATION_MULTIPLIER = 2.0
 
 AUTO_LINKING_DELAY_SECS: Tuple[float, float] = (1.5, 3.0)
 DEFAULT_PLAN_STEP = "Execute immediate action: Use available tools to make progress toward the goal."
-CONTEXT_RECENT_ACTIONS_FETCH_LIMIT = 10
-CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT = 7
-CONTEXT_KEY_THOUGHTS_FETCH_LIMIT = 7
-CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT = 3
-CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT = 5
-CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT = 5
-CONTEXT_GOAL_DETAILS_FETCH_LIMIT = 3
-CONTEXT_RECENT_ACTIONS_SHOW_LIMIT = 7
-CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT = 5
-CONTEXT_KEY_THOUGHTS_SHOW_LIMIT = 5
-CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT = 2
-CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT = 3
-CONTEXT_WORKING_MEMORY_SHOW_LIMIT = 10
-CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT = 3
-CONTEXT_GOAL_STACK_SHOW_LIMIT = 5
+CONTEXT_RECENT_ACTIONS_FETCH_LIMIT = 30  # **CRITICAL FIX**: Increased from 10 to 30 to fetch more recent actions
+CONTEXT_IMPORTANT_MEMORIES_FETCH_LIMIT = 25  # **CRITICAL FIX**: Increased from 7 to 25 to avoid losing critical info  
+CONTEXT_KEY_THOUGHTS_FETCH_LIMIT = 20  # **CRITICAL FIX**: Increased from 7 to 20 for better reasoning continuity
+CONTEXT_PROCEDURAL_MEMORIES_FETCH_LIMIT = 8  # **CRITICAL FIX**: Increased from 3 to 8
+CONTEXT_PROACTIVE_MEMORIES_FETCH_LIMIT = 12  # **CRITICAL FIX**: Increased from 5 to 12
+CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT = 12  # **CRITICAL FIX**: Increased from 5 to 12
+CONTEXT_GOAL_DETAILS_FETCH_LIMIT = 8  # **CRITICAL FIX**: Increased from 3 to 8
+CONTEXT_RECENT_ACTIONS_SHOW_LIMIT = 20  # **CRITICAL FIX**: Increased from 7 to 20 so agent can see what it just did
+CONTEXT_IMPORTANT_MEMORIES_SHOW_LIMIT = 15  # **CRITICAL FIX**: Increased from 5 to 15 to avoid losing recent memories
+CONTEXT_KEY_THOUGHTS_SHOW_LIMIT = 12  # **CRITICAL FIX**: Increased from 5 to 12 for better continuity
+CONTEXT_PROCEDURAL_MEMORIES_SHOW_LIMIT = 5  # **CRITICAL FIX**: Increased from 2 to 5
+CONTEXT_PROACTIVE_MEMORIES_SHOW_LIMIT = 8  # **CRITICAL FIX**: Increased from 3 to 8  
+CONTEXT_WORKING_MEMORY_SHOW_LIMIT = 20  # **CRITICAL FIX**: Increased from 10 to 20
+CONTEXT_LINK_TRAVERSAL_SHOW_LIMIT = 8  # **CRITICAL FIX**: Increased from 3 to 8
+CONTEXT_GOAL_STACK_SHOW_LIMIT = 10  # **CRITICAL FIX**: Increased from 5 to 10
 CONTEXT_MAX_TOKENS_COMPRESS_THRESHOLD = 15_000
 CONTEXT_COMPRESSION_TARGET_TOKENS = 5_000
 MAX_CONSECUTIVE_ERRORS = 3
@@ -531,17 +545,25 @@ class StateRecoveryManager:
     async def attempt_state_recovery(self, issue_description: str, error_details: Optional[Dict[str, Any]] = None) -> bool:
         """
         Attempt to recover from state issues instead of immediate replanning.
+        Enhanced with completion-aware recovery strategies.
         
         Returns:
             True if recovery was successful, False if replanning is needed
         """
         self.logger.info(f"🔧 Attempting state recovery for: {issue_description}")
         
+        # **COMPLETION-AWARE RECOVERY**: Check if we should prioritize completion over complex recovery
+        completion_recovery_result = await self._attempt_completion_recovery(issue_description, error_details)
+        if completion_recovery_result:
+            return True
+        
         recovery_attempts = [
             self._recover_goal_stack_sync,
             self._recover_workflow_context_sync,
             self._recover_thought_chain,
             self._recover_plan_validation,
+            self._recover_infinite_loop_state,  # New: Handle loop states
+            self._recover_to_completion_track,  # New: Direct to completion
         ]
         
         for recovery_func in recovery_attempts:
@@ -624,6 +646,679 @@ class StateRecoveryManager:
             return True
             
         return False
+    
+    async def _attempt_completion_recovery(self, issue_description: str, error_details: Optional[Dict[str, Any]]) -> bool:
+        """Attempt recovery by directing toward goal completion rather than complex recovery"""
+        try:
+            # Check if we have a current goal and can assess completion
+            if not self.aml.state.current_goal_id or not self.aml.state.goal_stack:
+                return False
+            
+            current_goal = self.aml.state.goal_stack[-1]
+            goal_desc = current_goal.get("description", "")
+            
+            if not goal_desc or goal_desc == "Overall UMS Workflow Goal or Initial Task":
+                return False
+            
+            # Check if goal is ready for completion
+            completion_status = await self.aml._check_goal_completion_readiness(goal_desc)
+            
+            # If ready for completion or should be forced, direct to completion
+            if completion_status["ready_for_completion"] or completion_status["force_completion"]:
+                self.logger.info("🎯 COMPLETION RECOVERY: Goal ready for completion - directing to completion instead of complex recovery")
+                
+                # Reset error tracking state
+                self.aml.state.consecutive_error_count = 0
+                self.aml.state.last_error_details = None
+                
+                # Set completion-focused plan
+                criteria = completion_status["completion_criteria"]
+                completion_plan = PlanStep(
+                    description=f"Create {criteria['expected_deliverable']} to complete the goal",
+                    assigned_tool=self.aml._get_ums_tool_mcp_name("record_artifact")
+                )
+                self.aml.state.current_plan = [completion_plan]
+                self.aml.state.needs_replan = False
+                
+                return True
+            
+            # If we've exceeded reasonable limits, force completion recovery
+            if (self.aml.state.search_attempts_count >= 3 or 
+                self.aml.state.turns_since_artifact_creation >= 8 or
+                self.aml.state.consecutive_same_tool_count >= 3):
+                
+                self.logger.info("🚨 COMPLETION RECOVERY: Exceeded limits - forcing completion recovery")
+                
+                # Reset problematic state
+                self.aml.state.search_attempts_count = 1
+                self.aml.state.consecutive_same_tool_count = 0
+                self.aml.state.last_tool_executed = None
+                self.aml.state.consecutive_error_count = 0
+                
+                # Force to completion stage
+                criteria = completion_status["completion_criteria"]
+                completion_plan = PlanStep(
+                    description=f"Complete goal by creating {criteria['expected_deliverable']} with available information",
+                    assigned_tool=self.aml._get_ums_tool_mcp_name("record_artifact")
+                )
+                self.aml.state.current_plan = [completion_plan]
+                self.aml.state.plan_progression_stage = "completion"
+                self.aml.state.needs_replan = False
+                
+                return True
+                
+        except Exception as e:
+            self.logger.debug(f"Completion recovery failed: {e}")
+        
+        return False
+    
+    async def _recover_infinite_loop_state(self, error_details: Optional[Dict[str, Any]]) -> bool:
+        """Recover from infinite loop states"""
+        try:
+            if self.aml.state.consecutive_same_tool_count >= 3:
+                self.logger.info("🔄 LOOP RECOVERY: Resetting infinite loop state")
+                
+                # Reset loop tracking
+                self.aml.state.consecutive_same_tool_count = 0
+                self.aml.state.last_tool_executed = None
+                self.aml.state.recent_tool_sequence = []
+                
+                # Force progression to different stage
+                if self.aml.state.plan_progression_stage == "research":
+                    self.aml.state.plan_progression_stage = "creation"
+                elif self.aml.state.plan_progression_stage == "initial":
+                    self.aml.state.plan_progression_stage = "analysis"
+                else:
+                    self.aml.state.plan_progression_stage = "completion"
+                
+                return True
+                
+        except Exception as e:
+            self.logger.debug(f"Infinite loop recovery failed: {e}")
+        
+        return False
+    
+    async def _recover_to_completion_track(self, error_details: Optional[Dict[str, Any]]) -> bool:
+        """Direct recovery to completion track when other approaches fail"""
+        try:
+            # If we have goal info, try to direct to completion
+            if self.aml.state.goal_stack and self.aml.state.goal_stack[-1]:
+                current_goal = self.aml.state.goal_stack[-1]
+                goal_desc = current_goal.get("description", "")
+                
+                if goal_desc and goal_desc != "Overall UMS Workflow Goal or Initial Task":
+                    goal_type = self.aml._classify_goal_type(goal_desc)
+                    criteria = self.aml._get_goal_completion_criteria(goal_type, goal_desc)
+                    
+                    self.logger.info("🎯 COMPLETION TRACK RECOVERY: Directing to deliverable creation")
+                    
+                    # Create completion-focused plan
+                    completion_plan = PlanStep(
+                        description=f"Recover by creating {criteria['expected_deliverable']} to complete {goal_type} goal",
+                        assigned_tool=self.aml._get_ums_tool_mcp_name("record_artifact")
+                    )
+                    
+                    # Replace plan with completion focus
+                    self.aml.state.current_plan = [completion_plan]
+                    self.aml.state.plan_progression_stage = "completion"
+                    self.aml.state.needs_replan = False
+                    
+                    # Reset error states
+                    self.aml.state.consecutive_error_count = 0
+                    self.aml.state.last_error_details = None
+                    
+                    return True
+                    
+        except Exception as e:
+            self.logger.debug(f"Completion track recovery failed: {e}")
+        
+        return False
+
+
+class IntelligentMemoryManager:
+    """
+    Handles intelligent memory consolidation and duplicate prevention
+    to avoid storing the same information repeatedly.
+    """
+    
+    def __init__(self, agent_master_loop: "AgentMasterLoop"):
+        self.aml = agent_master_loop
+        self.logger = agent_master_loop.logger
+    
+    async def should_store_memory(self, content: str, memory_type: str, description: str = "") -> Dict[str, Any]:
+        """
+        Determine if a memory should be stored or if similar content already exists.
+        Returns decision with reasoning and suggested actions.
+        """
+        try:
+            # Check for similar existing memories
+            similar_memories = await self._find_similar_memories(content, memory_type)
+            
+            if similar_memories:
+                # Analyze the similarity and determine action
+                decision = self._analyze_memory_similarity(content, similar_memories, memory_type)
+                return decision
+            
+            # No similar memories found - safe to store
+            return {
+                "should_store": True,
+                "reason": "No similar memories found",
+                "action": "store_new",
+                "similar_count": 0
+            }
+            
+        except Exception as e:
+            self.logger.debug(f"Memory duplication check failed: {e}")
+            # Default to allowing storage if check fails
+            return {
+                "should_store": True,
+                "reason": "Duplication check failed - defaulting to store",
+                "action": "store_new",
+                "similar_count": 0
+            }
+    
+    async def _find_similar_memories(self, content: str, memory_type: str) -> List[Dict[str, Any]]:
+        """Find existing memories similar to the proposed content"""
+        if not self.aml.state.workflow_id:
+            return []
+        
+        try:
+            # Use semantic search to find similar content
+            search_tool = self.aml._get_ums_tool_mcp_name("search_semantic_memories")
+            if not self.aml._find_tool_server(search_tool):
+                return []
+            
+            # Search for semantically similar content
+            search_result = await self.aml._execute_tool_call_internal(
+                search_tool,
+                {
+                    "workflow_id": self.aml.state.workflow_id,
+                    "query": content[:500],  # Limit search query length
+                    "memory_types": [memory_type],
+                    "limit": 10,
+                    "similarity_threshold": 0.7  # High threshold for duplicates
+                },
+                record_action=False
+            )
+            
+            if search_result.get("success"):
+                data = search_result.get("data", {})
+                memories = data.get("memories", [])
+                return memories
+                
+        except Exception as e:
+            self.logger.debug(f"Similar memory search failed: {e}")
+        
+        return []
+    
+    async def _analyze_memory_similarity(self, new_content: str, existing_memories: List[Dict[str, Any]], memory_type: str) -> Dict[str, Any]:
+        """Analyze similarity between new content and existing memories using LLM-based semantic understanding"""
+        
+        similarity_analysis = await self._analyze_content_similarity_with_llm(new_content, existing_memories)
+        
+        return similarity_analysis if similarity_analysis else {
+            "should_store": True,
+            "reason": "LLM analysis failed - defaulting to store",
+            "action": "store_new",
+            "similar_count": 0
+        }
+    
+    async def _analyze_content_similarity_with_llm(self, new_content: str, existing_memories: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Use LLM to analyze content similarity for memory deduplication"""
+        
+        if not existing_memories:
+            return {
+                "should_store": True,
+                "reason": "No existing memories to compare against",
+                "action": "store_new",
+                "similar_count": 0
+            }
+        
+        # Prepare content comparison for LLM
+        existing_content_samples = []
+        for i, memory in enumerate(existing_memories[:5]):  # Limit to 5 for LLM context
+            content = memory.get("content", "")[:200]  # Truncate for LLM
+            existing_content_samples.append(f"Memory {i+1}: {content}")
+        
+        comparison_prompt = f"""
+Analyze whether this new content should be stored or if it's too similar to existing memories.
+
+New Content: "{new_content[:500]}"
+
+Existing Memories:
+{chr(10).join(existing_content_samples)}
+
+Rate similarity and provide decision:
+- Rate overall similarity to existing content on 0-100 scale
+- If 0-40: Store new (sufficiently different)
+- If 41-70: Store with note (some similarity but adds value)  
+- If 71-85: Consider skipping (high similarity)
+- If 86-100: Skip duplicate (too similar/redundant)
+
+Respond in this format:
+similarity_score: [0-100]
+decision: [store_new/store_with_note/skip_similar/skip_duplicate]
+reason: [brief explanation]
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": comparison_prompt}],
+                model_override=None,
+                max_tokens=50,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                # Parse LLM response
+                lines = response.content.strip().split('\n')
+                similarity_score = 0
+                decision = "store_new"
+                reason = "LLM analysis completed"
+                
+                for line in lines:
+                    if ':' in line:
+                        key, value = line.split(':', 1)
+                        key = key.strip().lower()
+                        value = value.strip()
+                        
+                        if key == "similarity_score":
+                            try:
+                                similarity_score = int(value)
+                            except ValueError:
+                                pass
+                        elif key == "decision":
+                            decision = value
+                        elif key == "reason":
+                            reason = value
+                
+                # Convert LLM decision to memory analysis format
+                should_store = decision in ["store_new", "store_with_note"]
+                
+                return {
+                    "should_store": should_store,
+                    "reason": f"LLM analysis (similarity={similarity_score}): {reason}",
+                    "action": decision,
+                    "similar_count": len(existing_memories),
+                    "llm_similarity_score": similarity_score
+                }
+                
+        except Exception as e:
+            self.logger.debug(f"LLM memory similarity analysis failed: {e}")
+        
+        return None
+    
+
+    
+    async def _are_contents_semantically_identical(self, content1: str, content2: str) -> bool:
+        """Use LLM to determine if contents are semantically identical"""
+        # Use higher threshold for identity check
+        similarity = await self._calculate_content_similarity(content1, content2)
+        return similarity > 0.95  # Very high threshold for identity
+    
+    async def _calculate_content_similarity(self, content1: str, content2: str) -> float:
+        """Calculate semantic similarity using LLM analysis with intelligent fallback"""
+        if not content1 or not content2:
+            return 0.0
+        
+        # Cache to avoid repeated LLM calls
+        content_hash = hash(f"{content1[:300]}|{content2[:300]}")
+        if not hasattr(self, '_content_similarity_cache'):
+            self._content_similarity_cache = {}
+        
+        if content_hash in self._content_similarity_cache:
+            return self._content_similarity_cache[content_hash]
+        
+        # Use LLM for semantic similarity analysis
+        similarity_score = await self._get_semantic_similarity_with_llm(content1, content2)
+        self._content_similarity_cache[content_hash] = similarity_score
+        
+        return similarity_score
+    
+    async def _get_semantic_similarity_with_llm(self, content1: str, content2: str) -> float:
+        """Use LLM to calculate semantic similarity between content"""
+        
+        similarity_prompt = f"""
+Analyze the semantic similarity between these two pieces of content and provide a similarity score.
+
+Content 1: "{content1[:500]}"
+Content 2: "{content2[:500]}"
+
+Rate the semantic similarity on a scale of 0-100:
+- 0-10: Completely different topics and meanings
+- 11-25: Loosely related but distinct content
+- 26-40: Some shared concepts but different focus
+- 41-60: Moderately similar with notable overlap
+- 61-80: Highly similar with substantial content overlap
+- 81-100: Nearly identical meaning and content
+
+Consider:
+1. Topic and subject matter alignment
+2. Conceptual overlap and shared information
+3. Purpose and functional similarity
+4. Information redundancy level
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": similarity_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    similarity_score = int(response.content.strip())
+                    if 0 <= similarity_score <= 100:
+                        # Convert to 0-1 scale for compatibility
+                        return similarity_score / 100.0
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM semantic similarity failed: {e}")
+        
+        # Fallback to intelligent semantic analysis if LLM fails
+        return await self._get_semantic_similarity_intelligent_fallback(content1, content2)
+    
+    async def _get_semantic_similarity_intelligent_fallback(self, content1: str, content2: str) -> float:
+        """LLM-based semantic similarity with intelligent fallback - NO MORE PRIMITIVE CHARACTER COUNTING!"""
+        
+        # Use LLM for true semantic understanding - NO FALLBACKS!
+        similarity_score = await self._get_llm_semantic_similarity_score(content1, content2)
+        return similarity_score / 100.0 if similarity_score is not None else 0.0
+    
+    async def _get_llm_semantic_similarity_score(self, content1: str, content2: str) -> Optional[int]:
+        """Use LLM to score semantic similarity from 0-100 instead of primitive character counting"""
+        
+        if not content1 or not content2:
+            return 0
+            
+        # Truncate for LLM context
+        content1_sample = content1[:500]
+        content2_sample = content2[:500]
+        
+        similarity_prompt = f"""
+Rate the semantic similarity between these two pieces of content on a scale of 0-100:
+
+Content 1: "{content1_sample}"
+Content 2: "{content2_sample}"
+
+Scoring criteria:
+0-10: Completely different topics, no meaningful overlap
+11-25: Loosely related but fundamentally different content
+26-40: Some shared concepts but different focus/purpose
+41-60: Moderately similar with notable conceptual overlap
+61-80: Highly similar content with substantial overlap
+81-95: Nearly identical meaning with minor variations
+96-100: Semantically identical or functionally equivalent
+
+Focus on:
+- Conceptual and semantic overlap (not just word matching)
+- Purpose and functional similarity
+- Information content redundancy
+- Thematic alignment
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": similarity_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    score = int(response.content.strip())
+                    if 0 <= score <= 100:
+                        return score
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM semantic similarity scoring failed: {e}")
+        
+        return None
+    
+
+    
+    # REMOVED: _extract_semantic_concepts and _are_concepts_related - replaced with LLM-based semantic understanding
+    
+    async def consolidate_similar_memories(self, memory_type: str = None) -> int:
+        """
+        Consolidate very similar memories to reduce redundancy.
+        Returns number of memories consolidated.
+        """
+        try:
+            if not self.aml.state.workflow_id:
+                return 0
+            
+            # Query recent memories for consolidation
+            query_tool = self.aml._get_ums_tool_mcp_name("query_memories")
+            if not self.aml._find_tool_server(query_tool):
+                return 0
+            
+            query_args = {
+                "workflow_id": self.aml.state.workflow_id,
+                "limit": 50,
+                "include_content": True,
+                "sort_by": "created_at",
+                "sort_order": "desc"
+            }
+            
+            if memory_type:
+                query_args["memory_type"] = memory_type
+            
+            result = await self.aml._execute_tool_call_internal(
+                query_tool, query_args, record_action=False
+            )
+            
+            if not result.get("success"):
+                return 0
+            
+            memories = result.get("data", {}).get("memories", [])
+            if len(memories) < 2:
+                return 0
+            
+            # Find groups of similar memories
+            consolidation_groups = await self._find_consolidation_groups(memories)
+            
+            consolidated_count = 0
+            for group in consolidation_groups:
+                if await self._consolidate_memory_group(group):
+                    consolidated_count += len(group) - 1  # -1 because we keep one
+            
+            if consolidated_count > 0:
+                self.logger.info(f"📚 MEMORY CONSOLIDATION: Consolidated {consolidated_count} duplicate memories")
+            
+            return consolidated_count
+            
+        except Exception as e:
+            self.logger.debug(f"Memory consolidation failed: {e}")
+            return 0
+    
+    async def _find_consolidation_groups(self, memories: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """Find groups of memories that should be consolidated using LLM-based semantic analysis"""
+        consolidation_groups = []
+        used_indices = set()
+        
+        for i, memory1 in enumerate(memories):
+            if i in used_indices:
+                continue
+            
+            content1 = memory1.get("content", "")
+            if not content1:
+                continue
+            
+            group = [memory1]
+            used_indices.add(i)
+            
+            for j, memory2 in enumerate(memories[i+1:], i+1):
+                if j in used_indices:
+                    continue
+                
+                content2 = memory2.get("content", "")
+                if not content2:
+                    continue
+                
+                # Use LLM-based semantic similarity with intelligent scoring
+                similarity_score = await self._get_llm_semantic_similarity_score(content1, content2)
+                
+                # Use LLM-based decision for consolidation instead of primitive threshold
+                should_consolidate = await self._should_consolidate_memories_llm(content1, content2, similarity_score)
+                
+                if should_consolidate:
+                    group.append(memory2)
+                    used_indices.add(j)
+            
+            # Only consider groups with 2 or more similar memories
+            if len(group) >= 2:
+                consolidation_groups.append(group)
+        
+        return consolidation_groups
+    
+    async def _should_consolidate_memories_llm(self, content1: str, content2: str, similarity_score: Optional[int]) -> bool:
+        """Use LLM to decide if memories should be consolidated instead of primitive thresholds"""
+        
+        if similarity_score is None:
+            return False  # No LLM score = no consolidation
+        
+        # Use LLM-based decision with 0-100 scoring
+        consolidation_prompt = f"""
+Should these two memory contents be consolidated (merged) to reduce redundancy?
+
+Memory 1: "{content1[:300]}"
+Memory 2: "{content2[:300]}"
+Similarity Score: {similarity_score}/100
+
+Rate consolidation necessity on 0-100 scale:
+0-20: Keep separate - significantly different information
+21-40: Keep separate - some overlap but distinct value
+41-60: Consider consolidating - moderate redundancy
+61-80: Should consolidate - high redundancy with minor differences
+81-100: Must consolidate - essentially duplicate information
+
+Consider:
+- Information redundancy vs unique value
+- Risk of losing important details
+- Memory pollution from duplicates
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": consolidation_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    consolidation_score = int(response.content.strip())
+                    if 0 <= consolidation_score <= 100:
+                        return consolidation_score >= LLM_SIMILARITY_CONSOLIDATION_THRESHOLD
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM consolidation decision failed: {e}")
+            return False  # No LLM = no consolidation
+    
+    async def _consolidate_memory_group(self, group: List[Dict[str, Any]]) -> bool:
+        """Consolidate a group of similar memories into one enhanced memory"""
+        try:
+            if len(group) < 2:
+                return False
+            
+            # Keep the most recent memory as the base
+            base_memory = max(group, key=lambda m: m.get("created_at", ""))
+            
+            # Create consolidated content
+            all_content = [mem.get("content", "") for mem in group]
+            unique_points = await self._extract_unique_points_semantically(all_content)
+            
+            if len(unique_points) <= 1:
+                # Not enough unique content to warrant keeping separate
+                # Delete the older memories
+                for memory in group:
+                    if memory["memory_id"] != base_memory["memory_id"]:
+                        await self._delete_memory(memory["memory_id"])
+                return True
+            
+            return False  # Don't consolidate if there's significant unique content
+            
+        except Exception as e:
+            self.logger.debug(f"Memory group consolidation failed: {e}")
+            return False
+    
+    async def _extract_unique_points_semantically(self, content_list: List[str]) -> List[str]:
+        """Extract unique information points using LLM-based semantic analysis"""
+        
+        if not content_list or len(content_list) <= 1:
+            return content_list
+        
+        # Use LLM to identify unique vs redundant information
+        unique_analysis_prompt = f"""
+Analyze this list of content items and identify which contain unique information vs. redundant content.
+
+Content Items:
+{chr(10).join([f"{i+1}. {content[:200]}" for i, content in enumerate(content_list)])}
+
+Identify which items contain substantially unique information that would be lost if removed.
+List the item numbers that contain unique, non-redundant information.
+
+Respond with just the numbers separated by commas (e.g., "1,3,4").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": unique_analysis_prompt}],
+                model_override=None,
+                max_tokens=20,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                # Parse unique item numbers
+                unique_numbers = []
+                numbers_text = response.content.strip()
+                for num_str in numbers_text.split(','):
+                    try:
+                        num = int(num_str.strip())
+                        if 1 <= num <= len(content_list):
+                            unique_numbers.append(num - 1)  # Convert to 0-based index
+                    except ValueError:
+                        continue
+                
+                # Return unique content items
+                if unique_numbers:
+                    return [content_list[i] for i in unique_numbers]
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM unique points analysis failed: {e}")
+        
+        # Intelligent fallback - assume all items are unique if analysis fails
+        return content_list
+    
+    async def _delete_memory(self, memory_id: str) -> bool:
+        """Delete a memory (placeholder - implement if UMS supports deletion)"""
+        # Note: This would require a delete_memory function in UMS
+        # For now, just log the consolidation
+        self.logger.debug(f"Would delete memory {memory_id} during consolidation")
+        return True
 
 
 class EnhancedStateValidator:
@@ -653,6 +1348,8 @@ class EnhancedStateValidator:
             ("goal_stack_consistent", self._validate_goal_stack_consistent),
             ("thought_chain_exists", self._validate_thought_chain_exists),
             ("plan_structure_valid", self._validate_plan_structure_valid),
+            ("goal_completion_state", self._validate_goal_completion_state),
+            ("progress_tracking_state", self._validate_progress_tracking_state),
         ]
         
         issues_found = []
@@ -674,9 +1371,17 @@ class EnhancedStateValidator:
         
         recovery_success = True
         for check_name, issue_desc in issues_found:
-            recovered = await self.recovery_manager.attempt_state_recovery(
-                f"{check_name}: {issue_desc}"
-            )
+            # Use specific recovery methods for our new validation types
+            if check_name == "goal_completion_state":
+                recovered = await self._recover_goal_completion_state()
+            elif check_name == "progress_tracking_state":
+                recovered = await self._recover_progress_tracking_state()
+            else:
+                # Use the general recovery manager for other issues
+                recovered = await self.recovery_manager.attempt_state_recovery(
+                    f"{check_name}: {issue_desc}"
+                )
+            
             if not recovered:
                 recovery_success = False
                 self.logger.warning(f"❌ Could not recover from: {check_name}: {issue_desc}")
@@ -707,18 +1412,41 @@ class EnhancedStateValidator:
         return True, ""
     
     async def _validate_goal_stack_consistent(self) -> Tuple[bool, str]:
-        """Validate that goal stack is consistent with UMS."""
+        """Validate that goal stack is consistent with UMS and repair if needed."""
         if not self.aml.state.current_goal_id:
             return True, ""  # No goal is a valid state
             
         try:
+            # Check if current goal is in local stack
+            current_goal_found = any(
+                isinstance(g, dict) and g.get("goal_id") == self.aml.state.current_goal_id
+                for g in self.aml.state.goal_stack
+            )
+            
+            if not current_goal_found:
+                # Try to fetch and synchronize with UMS
+                ums_stack = await self.aml._fetch_goal_stack_from_ums(self.aml.state.current_goal_id)
+                if ums_stack:
+                    # Verify the current goal is in the UMS stack
+                    current_goal_in_ums = any(
+                        isinstance(g, dict) and g.get("goal_id") == self.aml.state.current_goal_id
+                        for g in ums_stack
+                    )
+                    if current_goal_in_ums:
+                        self.aml.state.goal_stack = ums_stack
+                        self.aml.logger.info(f"🔄 RECOVERY: Synchronized goal stack with UMS - goal {self.aml.state.current_goal_id} now found")
+                        return True, "Recovered by synchronizing with UMS"
+                    else:
+                        return False, "Current goal not found in UMS stack either"
+                else:
+                    return False, "Could not fetch goal stack from UMS"
+            
+            # Additional check - ensure UMS and local are consistent
             ums_stack = await self.aml._fetch_goal_stack_from_ums(self.aml.state.current_goal_id)
-            if not ums_stack:
-                return False, "Could not fetch goal stack from UMS"
-                
-            # Check if current goal matches UMS
-            if ums_stack and ums_stack[-1].get("goal_id") != self.aml.state.current_goal_id:
-                return False, "Current goal ID mismatch with UMS"
+            if ums_stack and len(ums_stack) != len(self.aml.state.goal_stack):
+                # Stack size mismatch - update local to match UMS
+                self.aml.state.goal_stack = ums_stack
+                self.aml.logger.info(f"🔄 SYNC: Updated local goal stack to match UMS size ({len(ums_stack)} items)")
                 
         except Exception as e:
             return False, f"Goal stack validation error: {e}"
@@ -741,6 +1469,200 @@ class EnhancedStateValidator:
                 return False, f"Plan step {i} has empty description"
                 
         return True, ""
+    
+    async def _validate_goal_completion_state(self) -> Tuple[bool, str]:
+        """Validate that goal completion state is consistent and reasonable."""
+        if not self.aml.state.current_goal_id or not self.aml.state.goal_stack:
+            return True, ""  # No goal to validate
+        
+        current_goal = self.aml.state.goal_stack[-1] if self.aml.state.goal_stack else {}
+        goal_desc = current_goal.get("description", "")
+        
+        if not goal_desc or goal_desc == "Overall UMS Workflow Goal or Initial Task":
+            return True, ""  # Skip generic goals
+        
+        try:
+            # Check if completion readiness is working properly
+            completion_status = await self.aml._check_goal_completion_readiness(goal_desc)
+            
+            # Validate completion state consistency
+            if completion_status["force_completion"] and not completion_status["ready_for_completion"]:
+                if self.aml.state.search_attempts_count >= 3 or self.aml.state.turns_since_artifact_creation >= 5:
+                    # Should be ready for completion if force is triggered
+                    return False, f"Goal should be ready for completion (force={completion_status['force_completion']}, ready={completion_status['ready_for_completion']})"
+            
+            # Check for stuck patterns
+            if (self.aml.state.search_attempts_count >= 4 and 
+                self.aml.state.turns_since_artifact_creation >= 8 and
+                not completion_status["force_completion"]):
+                return False, "Goal appears stuck without triggering force completion"
+                
+        except Exception as e:
+            return False, f"Goal completion validation error: {e}"
+        
+        return True, ""
+    
+    async def _validate_progress_tracking_state(self) -> Tuple[bool, str]:
+        """Validate progress tracking using LLM-based assessment instead of primitive thresholds."""
+        
+        # Use LLM to assess if progress state is reasonable
+        progress_assessment = await self._assess_progress_reasonableness_with_llm()
+        
+        if progress_assessment["is_reasonable"]:
+            return True, ""
+        else:
+            return False, progress_assessment["issue_description"]
+    
+    async def _assess_progress_reasonableness_with_llm(self) -> Dict[str, Any]:
+        """Use LLM to assess if current progress state is reasonable instead of primitive thresholds"""
+        
+        # Build context for LLM assessment
+        current_goal = self.aml.state.goal_stack[-1] if self.aml.state.goal_stack else {}
+        goal_description = current_goal.get("description", "Unknown goal")
+        
+        progress_context = f"""
+Current Goal: "{goal_description}"
+Progression Stage: {self.aml.state.plan_progression_stage}
+Search Attempts: {self.aml.state.search_attempts_count}
+Turns Since Artifact Creation: {self.aml.state.turns_since_artifact_creation}
+Consecutive Same Tool Count: {self.aml.state.consecutive_same_tool_count}
+Current Loop: {self.aml.state.current_loop}
+Last Tool: {self.aml.state.last_tool_executed or "None"}
+"""
+
+        assessment_prompt = f"""
+Assess if this agent's progress state is reasonable and healthy.
+
+{progress_context}
+
+Rate the reasonableness of this progress state on 0-100 scale:
+
+0-25: Severely problematic state (stuck, infinite loops, excessive attempts)
+26-50: Concerning state (inefficient patterns, potential issues)
+51-75: Acceptable state (minor concerns but generally reasonable)
+76-100: Healthy state (good progress, reasonable metrics)
+
+Consider:
+- Is the agent making reasonable progress toward the goal?
+- Are search attempts reasonable for this type of goal?
+- Is the time since artifact creation appropriate?
+- Are there signs of being stuck or in infinite loops?
+- Does the progression stage match the activity pattern?
+
+Respond in this format:
+reasonableness_score: [0-100]
+primary_concern: [main issue if score < 51, or "none" if reasonable]
+recommendation: [brief suggestion for improvement]
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": assessment_prompt}],
+                model_override=None,
+                max_tokens=100,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                # Parse LLM response
+                lines = response.content.strip().split('\n')
+                reasonableness_score = 60  # Default reasonable
+                primary_concern = "none"
+                recommendation = "continue current approach"
+                
+                for line in lines:
+                    if ':' in line:
+                        key, value = line.split(':', 1)
+                        key = key.strip().lower()
+                        value = value.strip()
+                        
+                        if key == "reasonableness_score":
+                            try:
+                                reasonableness_score = int(value)
+                            except ValueError:
+                                pass
+                        elif key == "primary_concern":
+                            primary_concern = value
+                        elif key == "recommendation":
+                            recommendation = value
+                
+                is_reasonable = reasonableness_score >= LLM_PROGRESS_REASONABLENESS_THRESHOLD
+                
+                if is_reasonable:
+                    return {
+                        "is_reasonable": True,
+                        "score": reasonableness_score,
+                        "issue_description": ""
+                    }
+                else:
+                    return {
+                        "is_reasonable": False,
+                        "score": reasonableness_score,
+                        "issue_description": f"Progress state issue (score={reasonableness_score}): {primary_concern}. {recommendation}"
+                    }
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM progress assessment failed: {e}")
+            # No LLM = assume reasonable progress
+            return {"is_reasonable": True, "score": 50, "issue_description": ""}
+    
+
+    
+    async def _recover_goal_completion_state(self) -> bool:
+        """Attempt to recover from goal completion state issues."""
+        try:
+            # Reset completion tracking to reasonable values
+            if self.aml.state.search_attempts_count > 10:
+                self.aml.state.search_attempts_count = 2
+                self.aml.logger.info("🔧 RECOVERY: Reset excessive search attempts count")
+            
+            if self.aml.state.turns_since_artifact_creation > 15:
+                self.aml.state.turns_since_artifact_creation = 5
+                self.aml.logger.info("🔧 RECOVERY: Reset excessive turns without artifacts")
+            
+            if self.aml.state.consecutive_same_tool_count > 5:
+                self.aml.state.consecutive_same_tool_count = 0
+                self.aml.state.last_tool_executed = None
+                self.aml.logger.info("🔧 RECOVERY: Reset infinite tool loop")
+            
+            # Force progression if stuck
+            if (self.aml.state.search_attempts_count >= 3 and 
+                self.aml.state.turns_since_artifact_creation >= 5):
+                self.aml.state.plan_progression_stage = "creation"
+                self.aml.logger.info("🔧 RECOVERY: Forced progression to creation stage")
+            
+            return True
+            
+        except Exception as e:
+            self.aml.logger.error(f"❌ RECOVERY: Failed to recover goal completion state: {e}")
+            return False
+    
+    async def _recover_progress_tracking_state(self) -> bool:
+        """Attempt to recover from progress tracking state issues."""
+        try:
+            # Validate and fix progression stage
+            valid_stages = {"initial", "research", "analysis", "creation", "completion"}
+            if self.aml.state.plan_progression_stage not in valid_stages:
+                self.aml.state.plan_progression_stage = "initial"
+                self.aml.logger.info("🔧 RECOVERY: Reset invalid progression stage to 'initial'")
+            
+            # Reset tool sequence tracking if corrupted
+            if len(self.aml.state.recent_tool_sequence) > 10:
+                self.aml.state.recent_tool_sequence = self.aml.state.recent_tool_sequence[-5:]
+                self.aml.logger.info("🔧 RECOVERY: Trimmed excessive tool sequence history")
+            
+            # Fix stage-progression inconsistencies
+            if (self.aml.state.plan_progression_stage == "completion" and 
+                self.aml.state.turns_since_artifact_creation > 5):
+                self.aml.state.plan_progression_stage = "creation"
+                self.aml.logger.info("🔧 RECOVERY: Fixed completion stage inconsistency")
+            
+            return True
+            
+        except Exception as e:
+            self.aml.logger.error(f"❌ RECOVERY: Failed to recover progress tracking state: {e}")
+            return False
 
 
 class MemoryUtils:
@@ -962,6 +1884,7 @@ class PlanStep(BaseModel):
     tool_args: Optional[Dict[str, Any]] = None
     result_summary: Optional[str] = None
     is_parallel_group: Optional[str] = None
+    failure_count: int = Field(default=0)  # **CRITICAL FIX**: Track failures to enable plan advancement
 
 
 def _default_tool_stats() -> Dict[str, Dict[str, Union[int, float]]]:
@@ -1013,7 +1936,7 @@ class AgentState:
     consecutive_same_tool_count: int = 0  # Count of same tool executed consecutively
     last_tool_executed: Optional[str] = None  # Last tool name executed
     plan_progression_stage: str = "initial"  # Track: initial, research, analysis, creation, completion
-    turns_since_artifact_creation: int = 0  # Count turns since last artifact was created
+    turns_since_artifact_creation: int = 1  # Count turns since last artifact was created (starts at 1, resets to 0 only when artifact is actually created)
     search_attempts_count: int = 0  # Count search attempts to prevent endless searching
 
 # =====================================================================
@@ -1133,6 +2056,7 @@ class AgentMasterLoop:
         # State management components for Fix C: Atomic State Management
         self.state_transaction_manager = StateTransactionManager(self)
         self.state_validator = EnhancedStateValidator(self)
+        self.memory_manager = IntelligentMemoryManager(self)
         
         self._shutdown_event = asyncio.Event()
         self._bg_tasks_lock = asyncio.Lock()
@@ -1429,31 +2353,34 @@ class AgentMasterLoop:
         if artifact_type == "json":
             return ".json"
         elif artifact_type == "code":
-            # Try to detect language from content
-            if any(keyword in content.lower() for keyword in ["<html", "<!doctype", "<script"]):
+            # Use semantic content analysis instead of hardcoded patterns
+            content_analysis = self._analyze_content_format_semantically(content)
+            if content_analysis["primary_format"] == "html":
                 return ".html"
-            elif any(keyword in content for keyword in ["def ", "import ", "class ", "from "]):
+            elif content_analysis["primary_format"] == "python":
                 return ".py"
-            elif any(keyword in content for keyword in ["function", "const ", "let ", "var "]):
+            elif content_analysis["primary_format"] == "javascript":
                 return ".js"
-            elif any(keyword in content for keyword in ["#include", "int main", "void "]):
+            elif content_analysis["primary_format"] == "c_cpp":
                 return ".c"
             else:
                 return ".txt"
         elif artifact_type == "data":
-            # Try to detect data format from content
-            content_lower = content.lower().strip()
-            if content_lower.startswith(("{", "[")):
+            # Use semantic content analysis for data format detection
+            content_analysis = self._analyze_content_format_semantically(content)
+            data_format = content_analysis["primary_format"]
+            if data_format == "json":
                 return ".json"
-            elif "," in content and "\n" in content:
+            elif data_format == "csv":
                 return ".csv"
-            elif content_lower.startswith("<?xml"):
+            elif data_format == "xml":
                 return ".xml"
             else:
                 return ".txt"
         elif artifact_type == "text":
-            # Check if it's markdown-like content
-            if any(marker in content for marker in ["# ", "## ", "### ", "**", "```", "[", "]("]):
+            # Use LLM semantic understanding to detect markdown content
+            format_analysis = self._analyze_content_format_semantically(content)
+            if format_analysis.get("primary_format") == "markdown":
                 return ".md"
             else:
                 return ".txt"
@@ -1609,35 +2536,23 @@ class AgentMasterLoop:
             "web_search", "browser", "smart_browser", "mcp_browser"
         ]
         
-        # Check if current tool is artifact-related or research-related
-        is_artifact_tool = any(pattern in tool_name.lower() for pattern in artifact_patterns)
-        is_research_tool = any(pattern in tool_name.lower() for pattern in research_patterns)
+        # Use semantic classification for tool and workflow analysis
+        is_artifact_tool = self._is_tool_artifact_related_semantically(tool_name, artifact_patterns)
+        is_research_tool = self._is_tool_research_related_semantically(tool_name, research_patterns)
         
-        # Check if goal suggests research workflow (NEW)
+        # Check if goal suggests research workflow using semantic understanding
         goal_suggests_research = False
         if self.state.goal_stack and self.state.goal_stack[-1]:
-            goal_desc = self.state.goal_stack[-1].get("description", "").lower()
-            research_keywords = [
-                "research", "search", "find information", "investigate", "study",
-                "explore", "gather", "collect information", "web search", "articles"
-            ]
-            goal_suggests_research = any(keyword in goal_desc for keyword in research_keywords)
+            goal_desc = self.state.goal_stack[-1].get("description", "")
+            goal_suggests_research = self._is_research_workflow_semantically(goal_desc)
         
-        # Check if plan suggests artifact work OR research work (ENHANCED)
+        # Check if plan suggests artifact work OR research work using semantic analysis
         plan_suggests_artifacts = False
         plan_suggests_research = False
         if self.state.current_plan:
-            current_step_desc = self.state.current_plan[0].description.lower()
-            artifact_keywords = [
-                "write", "create", "generate", "build", "develop", "code", "report", 
-                "content", "file", "document", "artifact", "deliverable", "output"
-            ]
-            research_keywords = [
-                "search", "research", "find", "investigate", "gather", "explore",
-                "web search", "browse", "look up", "study"
-            ]
-            plan_suggests_artifacts = any(keyword in current_step_desc for keyword in artifact_keywords)
-            plan_suggests_research = any(keyword in current_step_desc for keyword in research_keywords)
+            current_step_desc = self.state.current_plan[0].description
+            plan_suggests_artifacts = self._suggests_artifact_work_semantically(current_step_desc)
+            plan_suggests_research = self._suggests_research_work_semantically(current_step_desc)
         
         # NEW: Enter focus mode for research workflows earlier
         if success and (is_research_tool or goal_suggests_research or plan_suggests_research):
@@ -1675,9 +2590,8 @@ class AgentMasterLoop:
             # Be even more aggressive about reducing meta-cognition during research
             is_research_workflow = False
             if self.state.goal_stack and self.state.goal_stack[-1]:
-                goal_desc = self.state.goal_stack[-1].get("description", "").lower()
-                research_keywords = ["research", "search", "investigate", "study", "gather", "explore", "articles"]
-                is_research_workflow = any(keyword in goal_desc for keyword in research_keywords)
+                goal_desc = self.state.goal_stack[-1].get("description", "")
+                is_research_workflow = self._is_research_workflow_semantically(goal_desc)
             
             if is_research_workflow:
                 # Higher multipliers for research workflows
@@ -1690,7 +2604,7 @@ class AgentMasterLoop:
         else:
             return self.state.current_reflection_threshold, self.state.current_consolidation_threshold
     
-    def _construct_agent_prompt(self, current_task_goal_desc: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def _construct_agent_prompt(self, current_task_goal_desc: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Build the gigantic system+user prompt that steers the LLM each turn.
         """
@@ -1877,13 +2791,56 @@ class AgentMasterLoop:
                 system_blocks.extend(tool_entry_lines)
         system_blocks.append("")
 
-        # ---- 4c. ACTION-FIRST Process (replaces planning-heavy instructions) ----
+        # ---- 4c. STRATEGIC TOOL SELECTION GUIDANCE ----
+        system_blocks.extend(
+            [
+                "🧠 **STRATEGIC TOOL SELECTION** (Leverage your complete MCP toolkit):",
+                "",
+                "**STEP 1: ANALYZE YOUR CURRENT SITUATION**",
+                "• What type of work am I doing? (research, analysis, creation, problem-solving)",
+                "• What information do I already have vs. what do I need?",
+                "• What deliverable am I ultimately trying to create?",
+                "• What data sources, documents, or systems might I need to access?",
+                "• What constraints or requirements must I consider?",
+                "",
+                "**STEP 2: REVIEW ALL AVAILABLE TOOLS** (Look beyond just UMS tools)",
+                "• **Information Gathering**: Web search, document search, database query tools",
+                "• **Document Processing**: PDF/DOC/PPT converters, text extractors, format transformers", 
+                "• **Data Analysis**: Database tools, spreadsheet processors, statistical analyzers",
+                "• **Content Creation**: Document generators, code writers, report builders",
+                "• **External Services**: API connectors, specialized service integrations",
+                "• **UMS Memory/Organization**: Knowledge storage, linking, reflection tools",
+                "• **Workflow Management**: Task delegation, multi-step orchestration tools",
+                "",
+                "**STEP 3: MATCH EXTERNAL TOOLS TO TASK REQUIREMENTS**",
+                "• **Research Tasks**: Consider web search tools AND document search tools AND database query tools",
+                "• **Document Analysis**: Look for PDF/DOC converters, text extractors, content analyzers", 
+                "• **Data Tasks**: Check for database connectors, spreadsheet tools, statistical processors",
+                "• **Integration Needs**: Review API tools, service connectors, external system interfaces",
+                "• **Automation Opportunities**: Consider task delegation tools, workflow orchestrators",
+                "",
+                "**STEP 4: DESIGN STRATEGIC TOOL WORKFLOWS**",
+                "• **External → Internal**: Gather from external sources → store in UMS → analyze → create",
+                "• **Process → Transform**: Convert documents → extract data → analyze → synthesize",
+                "• **Query → Analyze**: Database/API calls → process results → store insights → report",
+                "• **Delegate → Review**: Send subtasks to specialized tools → integrate results → finalize",
+                "",
+                "**STEP 5: OPTIMIZE FOR EFFICIENCY**",
+                "• **Parallel Processing**: Use multiple external tools simultaneously when possible",
+                "• **Tool Chaining**: Combine complementary tools (search→convert→analyze→store→create)",
+                "• **Delegation**: Use task delegation tools for routine/specialized work",
+                "• **Caching**: Store processed results to avoid re-processing",
+                "",
+            ]
+        )
+
+        # ---- 4d. ACTION-FIRST Process (replaces planning-heavy instructions) ----
         system_blocks.extend(
             [
                 "🎯 **ACTION-FIRST PROCESS** (Complete tasks in 2-3 turns, not 20+):",
                 "1. **QUICK SCAN**: Check for errors in `last_error_details`, current goal, available tools",
-                "2. **IMMEDIATE ACTION**: Choose and execute the most logical tool RIGHT NOW",
-                "3. **TOOL EXECUTION**: Call tools with appropriate arguments - don't overthink",
+                "2. **STRATEGIC SELECTION**: Use the tool selection guidance above to pick the right tool(s)",
+                "3. **IMMEDIATE ACTION**: Execute your chosen tool(s) with appropriate arguments",
                 "",
                 "🚀 **TOOL USAGE PRIORITIES** (DELIVERABLE-FIRST APPROACH):",
                 f"• **CREATE FIRST**: Use `{UMS_FUNC_RECORD_ARTIFACT}` IMMEDIATELY if you can create any deliverable",
@@ -1909,15 +2866,17 @@ class AgentMasterLoop:
             "• **File Permissions**: Use `diagnose_file_access_issues` tool if you encounter permission errors",
             "• **Auto-Recovery**: The system will auto-fix many file path issues, but use safe paths from the start",
             "",
-            "🔍 **DUPLICATE PREVENTION** (CRITICAL before creating artifacts):",
-            f"• **Check First**: Before creating artifacts, query for similar existing ones with `{UMS_FUNC_QUERY_MEMORIES}`",
-            "• **Avoid Redundancy**: Don't create multiple nearly-identical artifacts for the same task",
-            "• **Build on Existing**: If similar artifacts exist, consider updating or referencing them instead",
-            "• **Clear Purpose**: Each new artifact should have a distinct, well-defined purpose",
+            "🔍 **DUPLICATE PREVENTION** (CRITICAL before storing memories or creating artifacts):",
+            f"• **Before storing memories**: ALWAYS query existing memories first with `{UMS_FUNC_QUERY_MEMORIES}` or `{UMS_FUNC_HYBRID_SEARCH}` to check if similar information already exists",
+            f"• **Before creating artifacts**: Query for similar existing ones with `{UMS_FUNC_QUERY_MEMORIES}`", 
+            "• **Avoid Redundancy**: Don't store the same facts multiple times or create nearly-identical artifacts",
+            "• **Build on Existing**: If similar memories/artifacts exist, reference them instead of duplicating",
+            "• **Clear Purpose**: Each new memory/artifact should have a distinct, well-defined purpose",
+            "• **CRITICAL**: If you find existing similar information, use it rather than storing duplicates",
                 "",
                 "🔧 **MULTI-TOOL OPERATIONS** (Execute multiple tools in single turns):",
                 f"• **UMS Support**: The UMS fully supports multiple tool calls per turn - no batching required",
-                f"• **Common Patterns**: search→store_memory→create_link, get_context→analyze→record_artifact",
+                f"• **Common Patterns**: search→check_existing→store_memory→create_link, query_memories→analyze→record_artifact",
                 f"• **Get Guidance**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for complex operations or when unsure about tool combinations",
                 f"• **No Delays**: Tools are optimized for concurrent use - execute immediately without artificial delays",
                 f"• **Tool Synergies**: Many tools work better together (e.g., store_memory + create_memory_link)",
@@ -1928,19 +2887,41 @@ class AgentMasterLoop:
                 "• Don't overthink - if you need info, search for it; if you have content, create the artifact",
                 "• Don't write thoughts about what you 'should do' - just do it",
                 "",
-                "✅ **DECISION LOGIC** (DELIVERABLE-FIRST):",
+                "📋 **WORKFLOW-SPECIFIC TOOL PATTERNS** (Choose pattern that matches your scenario):",
+                "",
+                "**RESEARCH & ANALYSIS WORKFLOWS:**",
+                f"• Pattern: `{UMS_FUNC_QUERY_MEMORIES}` → `{UMS_FUNC_HYBRID_SEARCH}` → check duplicates → `{UMS_FUNC_STORE_MEMORY}` → `{UMS_FUNC_RECORD_ARTIFACT}`",
+                f"• When: Need to gather information and create deliverable",  
+                f"• Critical: Check existing knowledge BEFORE external search, avoid storing duplicate facts",
+                f"• Limit: Max 2 search calls, then MUST create artifact",
+                "",
+                "**CONTENT CREATION WORKFLOWS:**",
+                f"• Pattern: `{UMS_FUNC_QUERY_MEMORIES}` → `{UMS_FUNC_RECORD_ARTIFACT}` → `{UMS_FUNC_CREATE_LINK}`",
+                f"• When: Building on existing knowledge and connecting to related work",
+                f"• Focus: Create first, enhance later",
+                "",
+                "**PROBLEM SOLVING WORKFLOWS:**",
+                f"• Pattern: `{UMS_FUNC_RECORD_THOUGHT}` → `{UMS_FUNC_DIAGNOSE_FILE_ACCESS}` → `{UMS_FUNC_RECORD_ARTIFACT}`",
+                f"• When: Debugging issues or working through complex problems",
+                f"• Strategy: Think, investigate, then implement solution",
+                "",
+                "**COMPLEX MULTI-STEP WORKFLOWS:**",
+                f"• Pattern: `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` → [guided tools] → `{UMS_FUNC_REFLECTION}`",
+                f"• When: Unclear how to proceed or multiple approaches possible",
+                f"• Benefit: Get strategic guidance before committing to approach",
+                "",
+                "✅ **DECISION LOGIC** (SYSTEMATIC TOOL SELECTION):",
                 f"    *   **NO WORKFLOW**: Call `{UMS_FUNC_CREATE_WORKFLOW}` with the task description",
                 f"    *   **NO GOAL SET**: Call `{UMS_FUNC_CREATE_GOAL}` to establish the root goal",
-                f"    *   **CAN CREATE NOW**: Call `{UMS_FUNC_RECORD_ARTIFACT}` immediately (don't wait for more info)",
-                f"    *   **CREATION GOAL**: Take immediate action to produce the requested deliverable",
-                f"    *   **ANALYSIS GOAL**: Create comprehensive analysis immediately with available info",
-                f"    *   **TECHNICAL GOAL**: Create the requested technical solution immediately",
-                f"    *   **MISSING CRITICAL INFO**: Call `{UMS_FUNC_HYBRID_SEARCH}` ONCE, then create deliverable",
-                f"    *   **ALREADY SEARCHED**: Call `{UMS_FUNC_RECORD_ARTIFACT}` (NO MORE SEARCHING)",
+                f"    *   **INFORMATION TASKS**: Use research pattern above - search → store → create",
+                f"    *   **CREATION TASKS**: Check existing knowledge first, then create deliverable immediately",
+                f"    *   **ANALYSIS TASKS**: Think through problem, gather data if needed, analyze and create findings",
+                f"    *   **PROBLEM-SOLVING**: Diagnose issue, apply fix, document solution",
+                f"    *   **COMPLEX/UNCLEAR**: Start with `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for strategy",
+                f"    *   **ALREADY SEARCHED 2x**: STOP researching - create deliverable with current info",
                 f"    *   **GOAL COMPLETE**: Call `{UMS_FUNC_UPDATE_GOAL_STATUS}` then signal completion",
                 f"    *   **ERROR/REPLAN**: Call `{llm_seen_agent_update_plan_name_for_instr}` with corrected plan",
-                f"    *   **COMPLEX OPERATION**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for multi-tool planning guidance",
-                "    *   **IN DOUBT**: CREATE the deliverable with available information (don't search more)",
+                "    *   **IN DOUBT**: Choose the tool that produces tangible progress toward deliverable",
                 "",
                 "🏁 **OUTPUT**: Respond with ONLY a valid JSON tool call or 'Goal Achieved...' text",
             ]
@@ -1977,7 +2958,8 @@ class AgentMasterLoop:
                 f"*   `CognitiveStateError`: Error saving or loading agent's cognitive state. This is serious. Attempt to record key information as memories and then try to re-establish state or simplify the current task.",
                 f"*   `InternalStateSetupError`: Critical internal error during agent/workflow setup. Analyze error. May require `{llm_seen_agent_update_plan_name_for_instr}` to fix plan or re-initiate a step.",
                 f"*   `FilePermissionError` / `FileAccessError`: Use safe file paths (e.g., `/home/ubuntu/ultimate_mcp_server/storage/`). Call `{UMS_FUNC_DIAGNOSE_FILE_ACCESS}` tool for path diagnosis and alternatives. Avoid system directories.",
-                f"*   `InfiniteLoopDetected` / `InfiniteLoopDetectedOnFailure`: Agent is stuck repeating the same tool without progress. CRITICAL: You MUST break the pattern by: (1) Creating a deliverable immediately with `{UMS_FUNC_RECORD_ARTIFACT}`, (2) Using a completely different tool/approach, or (3) Simplifying the goal. DO NOT repeat the same action that caused the loop.",
+                f"*   `InfiniteLoopDetected` / `InfiniteLoopDetectedOnFailure`: Agent is stuck repeating the same tool without progress. CRITICAL: You MUST break the pattern by: (1) Creating a deliverable immediately with `{UMS_FUNC_RECORD_ARTIFACT}`, (2) Using a completely different tool/approach, or (3) Taking concrete action with available information. DO NOT repeat the same action that caused the loop.",
+                f"*   `DuplicateMemoryPrevention`: Tried to store information that already exists. CRITICAL: STOP storing duplicate facts and START creating deliverables. Use `{UMS_FUNC_RECORD_ARTIFACT}` to create the required output with information you already have. DO NOT store more memories - proceed to goal completion.",
                 f"*   `UnknownError` / `UnexpectedExecutionError` / `AgentError` / `MCPClientError` / `LLMError` / `LLMOutputError`: Analyze error message carefully. Simplify step, use different approach, or record_thought if stuck. If related to agent state, try to save essential info and restart a simpler sub-task.",
             ]
         )
@@ -2039,7 +3021,7 @@ class AgentMasterLoop:
                     "**REQUIRED ACTION - Choose ONE of these approaches:**",
                     f"1. **FORCE PROGRESSION**: Create a deliverable NOW using `{UMS_FUNC_RECORD_ARTIFACT}` with whatever information you have",
                     f"2. **CHANGE APPROACH**: Use a completely different tool or method than '{self.state.last_error_details.get('tool')}'",
-                    f"3. **SIMPLIFY GOAL**: Break down the current goal into smaller, achievable steps using `{UMS_FUNC_CREATE_GOAL}`",
+                    f"3. **SEARCH FOR INFO**: Use `{UMS_FUNC_HYBRID_SEARCH}` to gather specific information needed for the goal",
                     "",
                     "**DO NOT repeat the same search/analysis patterns. Take CONCRETE ACTION to create progress.**",
                     "",
@@ -2077,13 +3059,40 @@ class AgentMasterLoop:
         user_prompt_blocks.append(f"Current Goal Reminder: {current_goal_desc_for_reminder}")
         user_prompt_blocks.append("")
 
+        # Add goal completion status and guidance
+        if current_goal_desc_for_reminder and current_goal_desc_for_reminder != "Overall UMS Workflow Goal or Initial Task":
+            completion_status = await self._check_goal_completion_readiness(current_goal_desc_for_reminder)
+            goal_type = completion_status["goal_type"]
+            criteria = completion_status["completion_criteria"]
+            
+            user_prompt_blocks.append("🎯 **GOAL COMPLETION STATUS & GUIDANCE**:")
+            user_prompt_blocks.append(f"• **Goal Type**: {goal_type.replace('_', ' ').title()}")
+            user_prompt_blocks.append(f"• **Expected Deliverable**: {criteria['expected_deliverable']}")
+            user_prompt_blocks.append(f"• **Deliverable Format**: {criteria['deliverable_format']}")
+            user_prompt_blocks.append(f"• **Current Status**: {completion_status['completion_message']}")
+            
+            if completion_status["ready_for_completion"]:
+                user_prompt_blocks.append("🎉 **GOAL READY FOR COMPLETION**: All criteria met. Signal completion with 'Goal Achieved...' message.")
+            elif completion_status["force_completion"]:
+                user_prompt_blocks.append("⚠️ **FORCE COMPLETION**: Exceeded limits. Create deliverable NOW and signal completion.")
+            else:
+                missing_items = []
+                if not completion_status["has_deliverable"]:
+                    missing_items.append("create deliverable artifact")
+                if not completion_status["has_sufficient_facts"]:
+                    missing_items.append(f"gather {criteria['min_facts_required'] - completion_status['fact_count']} more key facts")
+                user_prompt_blocks.append(f"🔄 **NEXT STEPS**: {', '.join(missing_items)}")
+            
+            user_prompt_blocks.append(f"• **Completion Criteria**: {'; '.join(criteria['completion_criteria'])}")
+            user_prompt_blocks.append("")
+
         # Add CRITICAL infinite loop prevention warnings based on current state
         loop_warnings = self._generate_loop_prevention_warnings(current_goal_desc_for_reminder)
         if loop_warnings:
             user_prompt_blocks.append(loop_warnings)
 
         # Add proactive tool suggestions (enhanced for research workflows)
-        tool_suggestions = self._suggest_next_tools(
+        tool_suggestions = await self._suggest_next_tools(
             current_goal_desc_for_reminder, 
             self.state.last_action_summary,
             len(self.state.current_plan)
@@ -2190,11 +3199,34 @@ class AgentMasterLoop:
                     )
         else:
             # Normal operational case: workflow and goal exist, no replanning needed
+            # Add goal-type-specific completion guidance
+            completion_guidance = ""
+            if current_goal_desc_for_reminder and current_goal_desc_for_reminder != "Overall UMS Workflow Goal or Initial Task":
+                completion_status = await self._check_goal_completion_readiness(current_goal_desc_for_reminder)
+                
+                if completion_status["ready_for_completion"]:
+                    completion_guidance = (
+                        f"🎉 GOAL COMPLETION READY: All criteria met for this {completion_status['goal_type'].replace('_', ' ')} goal. "
+                        f"Signal completion by responding with: 'Goal Achieved: [brief summary of deliverable created]' "
+                    )
+                elif completion_status["force_completion"]:
+                    completion_guidance = (
+                        f"⚠️ FORCE COMPLETION: You've exceeded search limits or time constraints. "
+                        f"Create the required {completion_status['completion_criteria']['expected_deliverable']} NOW using available information, "
+                        f"then signal completion. "
+                    )
+                elif not completion_status["has_deliverable"]:
+                    completion_guidance = (
+                        f"🎯 DELIVERABLE REQUIRED: Create the expected {completion_status['completion_criteria']['expected_deliverable']} "
+                        f"as an artifact with is_output=True. "
+                    )
+            
             final_instruction_text = (
                 f"Instruction: You are actively working on the current UMS goal. "
+                f"{completion_guidance}"
                 f"Review your current plan and progress, then execute the next logical action. "
-                f"This may involve calling a UMS tool, using available tools to make progress, or "
-                f"signaling goal completion if all necessary work is done."
+                f"IMPORTANT: Do NOT create sub-goals - work directly on the current goal using available tools. "
+                f"Take action to search for information, create deliverables, or signal completion when done."
                 + instruction_append
             )
         
@@ -3543,12 +4575,47 @@ class AgentMasterLoop:
         
         self.state.current_loop += 1
         
+        # CRITICAL: Check if current goal is ready for completion before gathering context
+        if self.state.current_goal_id and self.state.goal_stack:
+            current_goal = self.state.goal_stack[-1] if self.state.goal_stack else {}
+            goal_desc = current_goal.get("description", "")
+            
+            if goal_desc and goal_desc != "Overall UMS Workflow Goal or Initial Task":
+                completion_status = await self._check_goal_completion_readiness(goal_desc)
+                
+                # Force completion if goal is ready or exceeded limits
+                if completion_status["ready_for_completion"] or completion_status["force_completion"]:
+                    self.logger.info(f"🎯 Goal completion detected - triggering automatic completion: {completion_status['completion_message']}")
+                    
+                    # Set goal achieved flag to trigger proper completion
+                    self.state.goal_achieved_flag = True
+                    self.state.last_action_summary = f"Goal automatically completed: {completion_status['completion_message']}"
+                    
+                    # Update goal status to completed
+                    try:
+                        update_goal_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_GOAL_STATUS)
+                        if self._find_tool_server(update_goal_mcp):
+                            await self._execute_tool_call_internal(
+                                update_goal_mcp,
+                                {
+                                    "goal_id": self.state.current_goal_id,
+                                    "status": GoalStatus.COMPLETED.value,
+                                    "completion_message": f"Auto-completed: {completion_status['completion_message']}"
+                                },
+                                record_action=False
+                            )
+                            self.logger.info(f"✅ Updated goal {self.state.current_goal_id} status to completed")
+                    except Exception as e:
+                        self.logger.error(f"Failed to update goal status: {e}")
+                    
+                    return None  # Signal termination due to goal completion
+        
         # Gather context for the LLM turn
         try:
             context_payload = await self._gather_context()
             
             # Construct prompt messages using the existing method
-            prompt_messages = self._construct_agent_prompt(overall_goal, context_payload)
+            prompt_messages = await self._construct_agent_prompt(overall_goal, context_payload)
             
             # Return data in the format MCPClient expects
             return {
@@ -3575,7 +4642,7 @@ class AgentMasterLoop:
             }
             
             # Construct error recovery prompt
-            error_prompt_messages = self._construct_agent_prompt(overall_goal, error_context)
+            error_prompt_messages = await self._construct_agent_prompt(overall_goal, error_context)
             
             return {
                 "prompt_messages": error_prompt_messages,
@@ -4554,14 +5621,32 @@ class AgentMasterLoop:
                 record_action=False,
             )
 
-            if (
-                not src_resp.get("success")
-                or src_resp.get("workflow_id") != snapshot_wf_id
-            ):
+            # Enhanced validation with better error messages
+            if not src_resp.get("success"):
                 self.logger.warning(
-                    "Auto-linking: failed to fetch source mem %s (resp=%s)",
+                    "Auto-linking: failed to fetch source mem %s - tool call unsuccessful: %s",
                     _fmt_id(memory_id),
-                    str(src_resp)[:120],
+                    src_resp.get("error_message", "Unknown error")
+                )
+                return
+            
+            # Check for workflow ID mismatch (common during state transitions)
+            response_wf_id = src_resp.get("workflow_id")
+            if response_wf_id != snapshot_wf_id:
+                self.logger.debug(
+                    "Auto-linking: skipping mem %s - workflow ID mismatch (expected %s, got %s)",
+                    _fmt_id(memory_id),
+                    _fmt_id(snapshot_wf_id),
+                    _fmt_id(response_wf_id)
+                )
+                return
+                
+            # Validate response structure
+            if not isinstance(src_resp, dict):
+                self.logger.warning(
+                    "Auto-linking: source mem %s response is not dict: %s",
+                    _fmt_id(memory_id),
+                    type(src_resp)
                 )
                 return
 
@@ -4750,23 +5835,34 @@ class AgentMasterLoop:
             "link_traversal": CONTEXT_LINK_TRAVERSAL_FETCH_LIMIT,
         }
         
-        # Simple task optimization - reduce context for short plans
+        # **CRITICAL FIX**: Establish minimum limits to prevent agent blindness
+        minimum_limits = {
+            "recent_actions": 15,  # Always see at least 15 recent actions
+            "important_memories": 10,  # Always see at least 10 key memories
+            "key_thoughts": 8,  # Always see at least 8 thoughts for continuity
+            "proactive_memories": 5,  # Minimum proactive context
+            "procedural_memories": 3,  # Minimum procedural context
+            "link_traversal": 5,  # Minimum link context
+        }
+        
+        # Simple task optimization - but maintain minimum visibility
         if len(self.state.current_plan) <= 2:
-            multiplier = 0.5
-            self.logger.debug("🏃 Reducing context limits for simple task")
-            return {k: max(1, int(v * multiplier)) for k, v in base_limits.items()}
+            multiplier = 0.7  # Reduced reduction from 0.5 to 0.7
+            self.logger.debug("🏃 Slightly reducing context limits for simple task")
+            result = {k: max(minimum_limits[k], int(v * multiplier)) for k, v in base_limits.items()}
+            return result
         
         # Error recovery mode - increase context when struggling
         if self.state.consecutive_error_count > 1:
             multiplier = 1.5
             self.logger.debug(f"🔍 Increasing context limits due to {self.state.consecutive_error_count} errors")
-            return {k: min(20, int(v * multiplier)) for k, v in base_limits.items()}
+            return {k: max(minimum_limits[k], min(30, int(v * multiplier))) for k, v in base_limits.items()}
         
-        # Focus mode - minimal context to avoid interrupting flow
+        # Focus mode - but maintain minimum visibility to prevent blindness
         if getattr(self.state, 'artifact_focus_mode', False):
-            multiplier = 0.3
-            self.logger.debug("🎯 Reducing context limits during focus mode")  
-            return {k: max(1, int(v * multiplier)) for k, v in base_limits.items()}
+            multiplier = 0.6  # Reduced reduction from 0.3 to 0.6
+            self.logger.debug("🎯 Reducing context limits during focus mode but maintaining minimum visibility")  
+            return {k: max(minimum_limits[k], int(v * multiplier)) for k, v in base_limits.items()}
         
         # Long-running task - increase context for complex workflows
         if self.state.current_loop > 10:
@@ -4776,58 +5872,986 @@ class AgentMasterLoop:
         
         return base_limits
 
-    def _suggest_next_tools(self, current_goal: str, last_action: str, plan_length: int) -> str:
-        """Suggest the most logical next tools based on GENERIC action-oriented principles"""
+    async def _get_completion_biased_suggestions(self, current_goal: str) -> List[str]:
+        """Get suggestions biased toward goal completion rather than endless research"""
         suggestions = []
         
-        # GENERIC ACTION-FIRST PRINCIPLES: Always prioritize concrete action over endless information gathering
-        goal_lower = current_goal.lower()
+        if not current_goal or current_goal == "Overall UMS Workflow Goal or Initial Task":
+            return suggestions
         
-        # Fresh start suggestions - BIAS TOWARD ACTION
-        if not last_action or "initialized" in last_action.lower() or "loop initialized" in last_action.lower():
-            if any(word in goal_lower for word in ["create", "build", "develop", "generate", "write", "make", "produce"]):
-                suggestions.append(f"🎯 **TAKE ACTION IMMEDIATELY**: Execute the requested action with available knowledge")
-                suggestions.append(f"💡 Don't wait for 'perfect' information - act with what you have!")
-            elif any(word in goal_lower for word in ["research", "investigate", "study", "find", "explore"]):
-                suggestions.append(f"🔍 **LIMITED SEARCH**: Use {UMS_FUNC_HYBRID_SEARCH} for ONE focused search")
-                suggestions.append(f"🎯 **THEN ACT**: Take concrete action immediately after search")
-            else:
-                suggestions.append(f"🎯 **ACTION-FIRST**: Take concrete action toward the goal")
-                suggestions.append(f"🔍 If truly missing critical info, ONE search with {UMS_FUNC_HYBRID_SEARCH}")
+        try:
+            completion_status = await self._check_goal_completion_readiness(current_goal)
+            
+            # Force completion if ready
+            if completion_status["ready_for_completion"]:
+                suggestions.append("🎉 **GOAL COMPLETION READY**: All criteria met - signal completion now!")
+                suggestions.append("✅ **COMPLETE NOW**: Respond with 'Goal Achieved: [brief summary]'")
+                return suggestions
+            
+            # Force completion if exceeded limits
+            if completion_status["force_completion"]:
+                suggestions.append("🚨 **FORCE COMPLETION**: You've exceeded reasonable limits!")
+                suggestions.append(f"🎯 **CREATE NOW**: Use `{UMS_FUNC_RECORD_ARTIFACT}` with available information")
+                suggestions.append("⚠️ **STOP RESEARCHING**: Take action with what you have")
+                return suggestions
+            
+            # Guide toward completion
+            if not completion_status["has_deliverable"]:
+                expected = completion_status["completion_criteria"]["expected_deliverable"]
+                suggestions.append(f"🎯 **FOCUS ON DELIVERABLE**: Create {expected} as your primary objective")
+                suggestions.append(f"📋 **USE**: `{UMS_FUNC_RECORD_ARTIFACT}` with is_output=True")
+            
+            if not completion_status["has_sufficient_facts"] and completion_status["within_search_limits"]:
+                needed = completion_status["completion_criteria"]["min_facts_required"] - completion_status["fact_count"]
+                suggestions.append(f"📚 **GATHER {needed} MORE KEY FACTS**: Then immediately create deliverable")
+                suggestions.append("⚠️ **NO ENDLESS RESEARCH**: Limit information gathering")
+            
+        except Exception as e:
+            self.logger.debug(f"Error in completion bias suggestions: {e}")
         
-        # Post-search suggestions - FORCE ACTION
-        elif any(search_tool in last_action for search_tool in [UMS_FUNC_HYBRID_SEARCH, "search", "research"]):
-            suggestions.append(f"🚨 **STOP SEARCHING**: Take concrete action based on information gathered")
-            suggestions.append(f"⚠️ NO MORE RESEARCH - you have enough information!")
-            suggestions.append(f"💡 Act with current knowledge, don't perfect it")
+        return suggestions
+    
+    async def _suggest_next_tools(self, current_goal: str, last_action: str, plan_length: int) -> str:
+        """Suggest the most logical next tools using intelligent semantic analysis and LLM-based understanding"""
+        suggestions = []
         
-        # Post-storage suggestions - IMMEDIATE ACTION
-        elif UMS_FUNC_STORE_MEMORY in last_action or "stored" in last_action.lower():
-            suggestions.append(f"🚨 **IMMEDIATE ACTION**: Use stored information to take concrete action")
-            suggestions.append(f"⚠️ Don't store more - ACT on what you have!")
+        # **COMPLETION-FIRST BIAS**: Check if goal is ready for completion
+        completion_guidance = await self._get_completion_biased_suggestions(current_goal)
+        if completion_guidance:
+            suggestions.extend(completion_guidance)
+            
+            # If we have completion guidance, prioritize it over other suggestions
+            if any("COMPLETION READY" in s or "FORCE COMPLETION" in s for s in completion_guidance):
+                result = "**🎯 GOAL COMPLETION PRIORITY:**\n" + "\n".join(f"• {s}" for s in suggestions)
+                result += "\n\n💡 **Remember:** Goal completion takes priority over additional research!"
+                return result
         
-        # Warn about inefficient patterns
-        if plan_length > 4:
-            suggestions.insert(0, "🚨 **EFFICIENCY WARNING**: Plan is too long - take concrete action immediately!")
+        # Use intelligent semantic analysis instead of hardcoded patterns
+        task_analysis = self._analyze_task_semantically(current_goal, last_action)
+        progress_analysis = self._analyze_progress_semantically(last_action, current_goal)
         
-        # Detect and warn about research loops
-        if self.state.search_attempts_count >= 1:
-            suggestions.insert(0, f"🚨 **LOOP WARNING**: {self.state.search_attempts_count} searches done - TAKE ACTION NOW!")
+        # REMOVED: Massive hardcoded task_characteristics and progress_state dictionaries
+        # REPLACED: With intelligent semantic analysis functions
         
-        # Focus mode - be even more aggressive about action
-        if getattr(self.state, 'artifact_focus_mode', False):
-            suggestions.insert(0, f"🎯 **FOCUS MODE**: Take concrete action to maintain productivity")
+        # Generate intelligent strategic suggestions based on semantic analysis
+        suggestions.extend(self._generate_strategic_suggestions_semantically(task_analysis, progress_analysis))
         
-        # Special warning for turns without concrete action
-        if self.state.turns_since_artifact_creation >= 3:
-            suggestions.insert(0, f"⚠️ **{self.state.turns_since_artifact_creation} TURNS WITHOUT ACTION**: Take concrete action NOW!")
+        # Generate intelligent state context and format result
+        state_context = self._generate_state_context_semantically()
+        loop_warnings = self._generate_loop_prevention_warnings(current_goal)
         
-        if suggestions:
-            suggestion_text = "\n".join(f"  • {s}" for s in suggestions[:4])  # Show more warnings
-            return f"\n\n**💡 ACTION-FIRST SUGGESTIONS**:\n{suggestion_text}\n"
+        result = "**🎯 STRATEGIC NEXT STEPS:**\n" + "\n".join(f"• {s}" for s in suggestions) if suggestions else ""
+        
+        if state_context:
+            result += f"\n\n**📊 Current State:** {state_context}"
+        
+        result += "\n\n**💡 Remember:** Review your COMPLETE MCP toolkit - you have access to web search, document processors, database tools, API connectors, and more beyond just UMS tools!"
+        
+        if loop_warnings:
+            result += loop_warnings
+        
+        # Schedule background LLM improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_tool_suggestions_with_llm,
+                current_goal, last_action, suggestions
+            )
+        
+        return result
+    
+    async def _analyze_task_semantically(self, goal_description: str, last_action: str) -> Dict[str, Any]:
+        """Semantically analyze task characteristics using intelligent heuristics and LLM-based semantic understanding"""
+        
+        # Use intelligent semantic scoring instead of simple keyword matching
+        analysis = {
+            "primary_type": self._classify_goal_type_semantically(goal_description),
+            "complexity_score": self._calculate_complexity_score_semantically(goal_description),
+            "research_intensity": self._assess_research_intensity_semantically(goal_description),
+            "creation_focus": self._assess_creation_focus_semantically(goal_description),
+            "deliverable_type": self._predict_deliverable_type_semantically(goal_description),
+            "has_multi_part_indicators": await self._detect_multi_part_task_semantically(goal_description),
+            "external_integration_needed": await self._detect_integration_needs_semantically(goal_description)
+        }
+        
+        return analysis
+    
+    def _analyze_progress_semantically(self, last_action: str, goal_description: str) -> Dict[str, Any]:
+        """Semantically analyze current progress state using intelligent understanding"""
+        
+        # Intelligent progress phase detection
+        analysis = {
+            "current_phase": self._detect_current_phase_semantically(last_action),
+            "recent_activities": self._categorize_recent_activities_semantically(last_action),
+            "search_fatigue": self.state.search_attempts_count >= 2,
+            "artifact_creation_gap": self.state.turns_since_artifact_creation >= 3,
+            "tool_repetition_concern": self.state.consecutive_same_tool_count >= 2,
+            "error_recovery_mode": self.state.consecutive_error_count >= 1
+        }
+        
+        return analysis
+    
+    def _generate_strategic_suggestions_semantically(self, task_analysis: Dict, progress_analysis: Dict) -> List[str]:
+        """Generate intelligent strategic suggestions based on semantic analysis"""
+        
+        suggestions = []
+        
+        # Strategic routing based on semantic understanding
+        if progress_analysis["current_phase"] == "initialization":
+            suggestions.extend(self._get_initialization_suggestions_semantically(task_analysis))
+        elif progress_analysis["current_phase"] == "research":
+            suggestions.extend(self._get_research_phase_suggestions_semantically(task_analysis, progress_analysis))
+        elif progress_analysis["current_phase"] == "creation":
+            suggestions.extend(self._get_creation_suggestions_semantically(task_analysis, progress_analysis))
+        elif progress_analysis["current_phase"] == "error_recovery":
+            suggestions.extend(self._get_error_recovery_suggestions_semantically(task_analysis, progress_analysis))
+        else:
+            suggestions.extend(self._get_general_suggestions_semantically(task_analysis, progress_analysis))
+        
+        # Add cross-cutting strategic guidance
+        if task_analysis["complexity_score"] > 7:
+            suggestions.append(f"📚 **STRATEGIC GUIDANCE**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for complex task orchestration")
+        
+        if progress_analysis["search_fatigue"]:
+            suggestions.append("🚨 **SEARCH LIMIT REACHED**: Move to concrete action with available information")
+        
+        if progress_analysis["artifact_creation_gap"]:
+            suggestions.append(f"🎯 **DELIVERABLE FOCUS**: Use `{UMS_FUNC_RECORD_ARTIFACT}` to create tangible output")
+        
+        return suggestions
+    
+    def _generate_state_context_semantically(self) -> str:
+        """Generate intelligent state context summary"""
+        
+        context_parts = []
+        
+        if self.state.search_attempts_count > 0:
+            context_parts.append(f"Research: {self.state.search_attempts_count}/2 searches")
+        
+        if self.state.consecutive_same_tool_count > 1:
+            tool_name = self.state.last_tool_executed or "unknown"
+            context_parts.append(f"Tool repetition: {tool_name} ({self.state.consecutive_same_tool_count}x)")
+        
+        if self.state.turns_since_artifact_creation > 0:
+            context_parts.append(f"No artifacts: {self.state.turns_since_artifact_creation} turns")
+        
+        if self.state.artifact_focus_mode:
+            context_parts.append("Mode: Artifact Creation")
+        elif self.state.research_focus_mode:
+            context_parts.append("Mode: Research Focus")
+        
+        return ", ".join(context_parts)
+    
+    # SEMANTIC ANALYSIS HELPER FUNCTIONS (replacing brittle pattern matching)
+    
+    def _calculate_complexity_score_semantically(self, goal_description: str) -> int:
+        """Calculate semantic complexity score using LLM analysis with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        goal_hash = hash(goal_description.strip())
+        if not hasattr(self, '_complexity_score_cache'):
+            self._complexity_score_cache = {}
+        
+        if goal_hash in self._complexity_score_cache:
+            return self._complexity_score_cache[goal_hash]
+        
+        # Immediate intelligent fallback (no more primitive scoring!)
+        fallback_score = self._get_complexity_score_intelligent_fallback(goal_description)
+        self._complexity_score_cache[goal_hash] = fallback_score
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_complexity_score_with_llm,
+                goal_description, goal_hash
+            )
+        
+        return fallback_score
+    
+    def _get_complexity_score_intelligent_fallback(self, goal_description: str) -> int:
+        """LLM-based complexity scoring with direct API call"""
+        
+        # Try direct LLM call for immediate analysis
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self._analyze_goal_complexity_score_with_llm_sync(goal_description))
+        except Exception:
+            return 50  # No LLM = assume moderate complexity
+    
+    async def _analyze_goal_complexity_score_with_llm_sync(self, goal_description: str) -> int:
+        """Synchronous LLM-based goal complexity scoring (0-100)"""
+        
+        complexity_prompt = f"""
+Rate the complexity of this goal/task on a scale of 0-100.
+
+Goal: "{goal_description}"
+
+Complexity factors:
+- Number of distinct steps required
+- Technical sophistication needed
+- Coordination between different types of work
+- Domain expertise required
+- Time and resource investment
+- Dependencies and sequencing challenges
+
+Scoring guide:
+- 0-20: Simple, single-step task requiring minimal expertise
+- 21-40: Multi-step but straightforward with clear methodology
+- 41-60: Moderately complex, requires planning and coordination
+- 61-80: Complex, requires significant expertise and coordination
+- 81-100: Highly complex, multi-domain, extensive planning
+
+Respond with just the numerical complexity score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": complexity_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    complexity_score = int(response.content.strip())
+                    if 0 <= complexity_score <= 100:
+                        return complexity_score
+                except ValueError:
+                    pass
+                    
+        except Exception:
+            pass
+            
+        return 50  # Default moderate complexity
+    
+    async def _improve_complexity_score_with_llm(self, goal_description: str, goal_hash: int):
+        """Use LLM to provide more accurate complexity assessment"""
+        
+        complexity_prompt = f"""
+Analyze this task/goal and rate its complexity on a scale of 0-100 based on:
+
+1. Number of distinct steps required
+2. Technical sophistication needed  
+3. Coordination requirements
+4. Domain expertise required
+5. Time/resource investment needed
+
+Goal: "{goal_description}"
+
+Scoring guide:
+- 0-20: Simple, single-step task requiring minimal expertise
+- 21-40: Multi-step but straightforward with clear methodology
+- 41-60: Moderately complex, requires planning and some expertise
+- 61-80: Complex, requires significant expertise and coordination
+- 81-100: Highly complex, multi-domain, extensive planning and expertise
+
+Consider:
+- Conceptual difficulty and depth of understanding required
+- Number of moving parts and dependencies
+- Likelihood of encountering unexpected challenges
+
+Respond with just the numerical complexity score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": complexity_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    complexity_score = int(response.content.strip())
+                    if 0 <= complexity_score <= 100:
+                        self._complexity_score_cache[goal_hash] = complexity_score
+                        self.logger.debug(f"🧠 LLM complexity score: {complexity_score}/100")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM complexity scoring failed: {e}")
+    
+    def _assess_research_intensity_semantically(self, goal_description: str) -> int:
+        """Assess research intensity using LLM analysis with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        goal_hash = hash(f"research_intensity:{goal_description.strip()}")
+        if not hasattr(self, '_research_intensity_cache'):
+            self._research_intensity_cache = {}
+        
+        if goal_hash in self._research_intensity_cache:
+            return self._research_intensity_cache[goal_hash]
+        
+        # Intelligent fallback instead of primitive word counting
+        fallback_score = self._get_research_intensity_intelligent_fallback(goal_description)
+        self._research_intensity_cache[goal_hash] = fallback_score
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_research_intensity_with_llm,
+                goal_description, goal_hash
+            )
+        
+        return fallback_score
+    
+    def _get_research_intensity_intelligent_fallback(self, goal_description: str) -> int:
+        """Simple intelligent default - LLM analysis is scheduled for background improvement"""
+        
+        # NO MORE PRIMITIVE KEYWORD MATCHING!
+        # LLM analysis is scheduled in background for true semantic understanding
+        return 50  # Default moderate research intensity
+    
+    async def _improve_research_intensity_with_llm(self, goal_description: str, goal_hash: int):
+        """Use LLM to assess research intensity more accurately"""
+        
+        research_prompt = f"""
+Analyze this task and rate how research-intensive it is on a scale of 0-100:
+
+0-20: Minimal research needed (task can be completed with existing knowledge)
+21-40: Light research (1-2 quick searches for basic information)
+41-60: Moderate research (systematic information gathering from multiple sources)
+61-80: Heavy research (extensive investigation, analysis of multiple sources)
+81-100: Very intensive research (comprehensive study requiring deep investigation)
+
+Task: "{goal_description}"
+
+Consider:
+- How much external information is needed?
+- How many sources would need to be consulted?
+- How deep does the investigation need to go?
+- Complexity and breadth of information gathering required
+
+Respond with just the numerical intensity score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": research_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    intensity_score = int(response.content.strip())
+                    if 0 <= intensity_score <= 100:
+                        self._research_intensity_cache[goal_hash] = intensity_score
+                        self.logger.debug(f"🧠 LLM research intensity: {intensity_score}/100")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM research intensity assessment failed: {e}")
+    
+    def _assess_creation_focus_semantically(self, goal_description: str) -> int:
+        """Assess creation focus using LLM analysis with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        goal_hash = hash(f"creation_focus:{goal_description.strip()}")
+        if not hasattr(self, '_creation_focus_cache'):
+            self._creation_focus_cache = {}
+        
+        if goal_hash in self._creation_focus_cache:
+            return self._creation_focus_cache[goal_hash]
+        
+        # No LLM result = assume moderate creation focus
+        self._creation_focus_cache[goal_hash] = 50
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_creation_focus_with_llm,
+                goal_description, goal_hash
+            )
+        
+        return 50
+    
+
+    
+    async def _improve_creation_focus_with_llm(self, goal_description: str, goal_hash: int):
+        """Use LLM to assess creation focus more accurately"""
+        
+        creation_prompt = f"""
+Analyze this task and rate how creation-focused it is on a scale of 0-100:
+
+0-20: Minimal creation (mostly reading, understanding, analyzing existing content)
+21-40: Light creation (minor modifications, simple outputs)
+41-60: Moderate creation (substantive content creation, documents, reports)
+61-80: Heavy creation (complex deliverables, interactive content, detailed outputs)
+81-100: Primary creation focus (main goal is to build/create something significant)
+
+Task: "{goal_description}"
+
+Consider:
+- Is the primary goal to create something new?
+- How substantial is the deliverable?
+- How much original content needs to be produced?
+- Complexity and scope of creation work required
+
+Respond with just the numerical creation focus score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": creation_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    focus_score = int(response.content.strip())
+                    if 0 <= focus_score <= 100:
+                        self._creation_focus_cache[goal_hash] = focus_score
+                        self.logger.debug(f"🧠 LLM creation focus: {focus_score}/100")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM creation focus assessment failed: {e}")
+    
+    def _predict_deliverable_type_semantically(self, goal_description: str) -> str:
+        """Predict deliverable type using LLM analysis with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        goal_hash = hash(f"deliverable_type:{goal_description.strip()}")
+        if not hasattr(self, '_deliverable_type_cache'):
+            self._deliverable_type_cache = {}
+        
+        if goal_hash in self._deliverable_type_cache:
+            return self._deliverable_type_cache[goal_hash]
+        
+        # No LLM result = assume general artifact
+        self._deliverable_type_cache[goal_hash] = "general_artifact"
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_deliverable_type_with_llm,
+                goal_description, goal_hash
+            )
+        
+        return "general_artifact"
+    
+
+    
+    async def _improve_deliverable_type_with_llm(self, goal_description: str, goal_hash: int):
+        """Use LLM to predict deliverable type more accurately"""
+        
+        deliverable_prompt = f"""
+Analyze this task and rate the likelihood (0-100) for each possible deliverable type.
+
+Task: "{goal_description}"
+
+Rate each deliverable type from 0-100:
+
+report: How likely is this to produce analytical reports, research summaries, or findings documents?
+html_file: How likely is this to produce web pages, interactive content, or HTML documents?
+interactive_quiz: How likely is this to produce quizzes, tests, assessments, or Q&A content?
+code_file: How likely is this to produce programming code, scripts, algorithms, or functions?
+document: How likely is this to produce general text documents, papers, essays, or articles?
+general_artifact: How likely is this to produce other types of deliverables not fitting above categories?
+
+Consider:
+- Primary output mentioned or implied
+- Format that would best serve the goal
+- Type of content being created
+
+Respond in this exact format:
+report: [0-100]
+html_file: [0-100]
+interactive_quiz: [0-100]
+code_file: [0-100]
+document: [0-100]
+general_artifact: [0-100]
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": deliverable_prompt}],
+                model_override=None,
+                max_tokens=20,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    # Parse confidence scores for each deliverable type
+                    lines = response.content.strip().split('\n')
+                    scores = {}
+                    for line in lines:
+                        if ':' in line:
+                            type_name, score_str = line.split(':', 1)
+                            type_name = type_name.strip().lower()
+                            score = int(score_str.strip())
+                            if 0 <= score <= 100:
+                                scores[type_name] = score
+                    
+                    if scores:
+                        # Find the highest confidence type
+                        best_type = max(scores, key=scores.get)
+                        best_score = scores[best_type]
+                        
+                        # Only use if confidence is reasonable (50+)
+                        if best_score >= 50:
+                            # Update cache with LLM result
+                            self._deliverable_type_cache[goal_hash] = best_type
+                            self.logger.debug(f"🧠 LLM deliverable type: {best_type} (confidence={best_score}, scores={scores})")
+                        else:
+                            # Fall back to general_artifact if no high confidence
+                            self._deliverable_type_cache[goal_hash] = "general_artifact"
+                            self.logger.debug(f"🧠 LLM deliverable type: general_artifact (low confidence, max={best_score})")
+                except (ValueError, IndexError):
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM deliverable type prediction failed: {e}")
+    
+    async def _detect_multi_part_task_semantically(self, goal_description: str) -> bool:
+        """Detect if task has multiple distinct parts using LLM-based semantic understanding"""
+        
+        # Cache to avoid repeated LLM calls
+        goal_hash = hash(f"multi_part:{goal_description[:200]}")
+        if not hasattr(self, '_multi_part_cache'):
+            self._multi_part_cache = {}
+        
+        if goal_hash in self._multi_part_cache:
+            return self._multi_part_cache[goal_hash]
+        
+        # Use LLM for semantic analysis
+        is_multi_part = await self._analyze_multi_part_with_llm(goal_description)
+        
+        if is_multi_part is not None:
+            self._multi_part_cache[goal_hash] = is_multi_part
+            return is_multi_part
+        
+        # No LLM result = assume single-part task
+        self._multi_part_cache[goal_hash] = False
+        return False
+    
+    async def _analyze_multi_part_with_llm(self, goal_description: str) -> Optional[bool]:
+        """Use LLM to analyze if task has multiple distinct parts"""
+        
+        multi_part_prompt = f"""
+Analyze this task and determine if it has multiple distinct parts or sub-tasks.
+
+Task: "{goal_description}"
+
+Rate how strongly this task has multiple distinct parts on a 0-100 scale:
+
+- 0-20: Single, unified task with one main objective
+- 21-40: Primarily single task but may have minor sub-components
+- 41-60: Moderate complexity, has some distinct parts
+- 61-80: Multiple distinct parts or sub-tasks
+- 81-100: Clearly has multiple distinct parts that need to be done separately
+
+Consider:
+1. Are there multiple distinct objectives?
+2. Do different parts require different approaches/tools?
+3. Could parts be done independently?
+4. Are there clear sequences or dependencies?
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": multi_part_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    score = int(response.content.strip())
+                    if 0 <= score <= 100:
+                        # Use threshold of 60+ for considering task multi-part
+                        MULTI_PART_THRESHOLD = 60
+                        is_multi_part = score >= MULTI_PART_THRESHOLD
+                        self.logger.debug(f"🧠 LLM multi-part analysis: score={score}, is_multi_part={is_multi_part}")
+                        return is_multi_part
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM multi-part analysis failed: {e}")
+        
+        return None
+    
+
+    
+    async def _detect_integration_needs_semantically(self, goal_description: str) -> bool:
+        """Detect if task needs external system integration using LLM-based semantic understanding"""
+        
+        # Cache to avoid repeated LLM calls
+        goal_hash = hash(f"integration:{goal_description[:200]}")
+        if not hasattr(self, '_integration_cache'):
+            self._integration_cache = {}
+        
+        if goal_hash in self._integration_cache:
+            return self._integration_cache[goal_hash]
+        
+        # Use LLM for semantic analysis
+        needs_integration = await self._analyze_integration_needs_with_llm(goal_description)
+        
+        if needs_integration is not None:
+            self._integration_cache[goal_hash] = needs_integration
+            return needs_integration
+        
+        # No LLM result = assume no integration needed
+        self._integration_cache[goal_hash] = False
+        return False
+    
+    async def _analyze_integration_needs_with_llm(self, goal_description: str) -> Optional[bool]:
+        """Use LLM to analyze if task needs external system integration"""
+        
+        integration_prompt = f"""
+Analyze this task and determine if it requires integration with external systems, APIs, or services.
+
+Task: "{goal_description}"
+
+Rate how strongly this task needs external system integration on a 0-100 scale:
+
+- 0-20: Self-contained task, no external integration needed
+- 21-40: Minimal external needs, mostly internal processing
+- 41-60: Some external data/services might be helpful
+- 61-80: Likely needs external APIs, databases, or services
+- 81-100: Definitely requires external system integration
+
+Consider:
+1. Does it mention specific external services/platforms?
+2. Does it need real-time data from external sources?
+3. Does it require connecting different systems?
+4. Does it need external APIs or databases?
+5. Does it involve cross-platform operations?
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": integration_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    score = int(response.content.strip())
+                    if 0 <= score <= 100:
+                        # Use threshold of 60+ for considering integration needed
+                        INTEGRATION_THRESHOLD = 60
+                        needs_integration = score >= INTEGRATION_THRESHOLD
+                        self.logger.debug(f"🧠 LLM integration analysis: score={score}, needs_integration={needs_integration}")
+                        return needs_integration
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM integration analysis failed: {e}")
+        
+        return None
+    
+
+    
+    def _detect_current_phase_semantically(self, last_action: str) -> str:
+        """Detect current phase of work based on semantic analysis"""
+        
+        action_lower = last_action.lower()
+        
+        # Initialize/start phase
+        if not last_action or "initialized" in action_lower or "started" in action_lower:
+            return "initialization"
+        
+        # Error recovery phase
+        if "error" in action_lower or "failed" in action_lower:
+            return "error_recovery"
+        
+        # Use LLM-based action phase analysis instead of primitive keyword matching
+        return await self._analyze_action_phase_with_llm_fallback(action_lower)
+    
+    async def _analyze_action_phase_with_llm_fallback(self, action_description: str) -> str:
+        """Use LLM to analyze action phase instead of primitive keyword matching"""
+        
+        # Cache to avoid repeated LLM calls
+        action_hash = hash(f"action_phase:{action_description[:200]}")
+        if not hasattr(self, '_action_phase_cache'):
+            self._action_phase_cache = {}
+        
+        if action_hash in self._action_phase_cache:
+            return self._action_phase_cache[action_hash]
+        
+        # Use LLM for semantic action phase analysis
+        phase = await self._get_action_phase_with_llm(action_description)
+        
+        if phase:
+            self._action_phase_cache[action_hash] = phase
+            return phase
+        
+        # No LLM = default to general work
+        self._action_phase_cache[action_hash] = "general_work"
+        return "general_work"
+    
+    async def _get_action_phase_with_llm(self, action_description: str) -> Optional[str]:
+        """Use LLM to analyze what phase an action represents"""
+        
+        phase_prompt = f"""
+Analyze this action description and determine which work phase it represents.
+
+Action: "{action_description}"
+
+Rate how strongly this action fits each phase on 0-100 scale:
+
+research: Information gathering, searching, investigating, browsing, studying
+creation: Creating, building, generating content, recording artifacts, writing
+processing: Converting, extracting, transforming, processing data/documents
+analysis: Analyzing, thinking, reasoning, evaluating, understanding
+general_work: Other productive work activities
+
+Consider:
+- Primary purpose of the action
+- Type of work being performed
+- Expected outcome or result
+
+Respond with just the phase name that scored highest.
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": phase_prompt}],
+                model_override=None,
+                max_tokens=10,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                phase = response.content.strip().lower()
+                valid_phases = {"research", "creation", "processing", "analysis", "general_work"}
+                if phase in valid_phases:
+                    return phase
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM action phase analysis failed: {e}")
+        
+        return None
+    
+
+    
+    async def _categorize_recent_activities_semantically(self, last_action: str) -> List[str]:
+        """Categorize recent activities using LLM-based semantic understanding"""
+        
+        # Use LLM for multi-category activity analysis
+        categories = await self._analyze_activity_categories_with_llm(last_action)
+        
+        return categories if categories else ["general_work"]
+    
+    async def _analyze_activity_categories_with_llm(self, action_description: str) -> Optional[List[str]]:
+        """Use LLM to categorize action into multiple activity types"""
+        
+        categorization_prompt = f"""
+Analyze this action and rate how strongly it represents each activity type on 0-100 scale.
+
+Action: "{action_description}"
+
+Rate each category (an action can fit multiple categories):
+
+information_gathering: Searching, researching, browsing, finding information
+knowledge_storage: Storing, saving, recording, organizing information
+content_creation: Creating, building, generating, writing new content
+analysis_thinking: Analyzing, reasoning, evaluating, understanding
+data_processing: Converting, extracting, transforming, processing data
+collaboration: Communicating, sharing, coordinating with others
+
+For each category scoring 40+ points, include it in the response.
+
+Respond with only the category names that score 40+ (e.g., "information_gathering,content_creation").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": categorization_prompt}],
+                model_override=None,
+                max_tokens=50,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                # Parse comma-separated categories
+                categories_text = response.content.strip()
+                valid_categories = {
+                    "information_gathering", "knowledge_storage", "content_creation", 
+                    "analysis_thinking", "data_processing", "collaboration"
+                }
+                
+                categories = []
+                for category in categories_text.split(','):
+                    category = category.strip().lower()
+                    if category in valid_categories:
+                        categories.append(category)
+                
+                if categories:
+                    return categories
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM activity categorization failed: {e}")
+        
+        return None
+    
+
+    
+    # PHASE-SPECIFIC SUGGESTION FUNCTIONS (replacing hardcoded logic)
+    
+    def _get_initialization_suggestions_semantically(self, task_analysis: Dict) -> List[str]:
+        """Get suggestions for task initialization phase"""
+        
+        suggestions = []
+        
+        if task_analysis["complexity_score"] > 70:
+            suggestions.append(f"📚 **STRATEGIC START**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for complex task orchestration")
+            suggestions.append("📋 **TOOLKIT SURVEY**: Review ALL available MCP tools systematically")
+        
+        if task_analysis["deliverable_type"] == "html_file":
+            suggestions.append("🌐 **WEB WORKFLOW**: Look for HTML generators, web creation tools, interactive builders")
+        elif task_analysis["deliverable_type"] == "report":
+            suggestions.append("📄 **RESEARCH WORKFLOW**: Plan information gathering → analysis → documentation chain")
+        elif task_analysis["deliverable_type"] == "code_file":
+            suggestions.append("💻 **DEVELOPMENT WORKFLOW**: Survey code generation and development tools")
+        else:
+            suggestions.append("🛠️ **TOOL DISCOVERY**: Survey complete MCP toolkit for relevant capabilities")
+        
+        if task_analysis["research_intensity"] > 60:
+            suggestions.append("🔍 **RESEARCH STRATEGY**: Plan systematic information gathering approach")
+            suggestions.append("⚠️ **EFFICIENCY NOTE**: Limit research iterations, focus on deliverable creation")
+        
+        return suggestions
+    
+    def _get_research_phase_suggestions_semantically(self, task_analysis: Dict, progress_analysis: Dict) -> List[str]:
+        """Get suggestions for research phase"""
+        
+        suggestions = []
+        
+        if progress_analysis["search_fatigue"]:
+            suggestions.append("🚨 **RESEARCH COMPLETE**: Stop searching, move to synthesis and creation")
+            suggestions.append(f"🎯 **CREATE NOW**: Use `{UMS_FUNC_RECORD_ARTIFACT}` with gathered information")
+        else:
+            suggestions.append(f"📝 **ORGANIZE FINDINGS**: Use `{UMS_FUNC_STORE_MEMORY}` to structure research")
+            suggestions.append("🔄 **PROCESS CHAIN**: Research → Store → Synthesize → Create deliverable")
+        
+        if task_analysis["external_integration_needed"]:
+            suggestions.append("🔗 **INTEGRATION TOOLS**: Check for API connectors and external service tools")
+        
+        return suggestions
+    
+    def _get_creation_suggestions_semantically(self, task_analysis: Dict, progress_analysis: Dict) -> List[str]:
+        """Get suggestions for creation phase"""
+        
+        suggestions = []
+        
+        if task_analysis["deliverable_type"] == "interactive_quiz":
+            suggestions.append("🎯 **INTERACTIVE CONTENT**: Use HTML/JS tools to create engaging quiz")
+            suggestions.append("📋 **QUIZ STRUCTURE**: Plan questions, answers, interactivity, and feedback")
+        elif task_analysis["deliverable_type"] == "report":
+            suggestions.append("📊 **COMPREHENSIVE REPORT**: Structure findings with analysis and conclusions")
+            suggestions.append("🔗 **LINK SOURCES**: Connect content to supporting research and evidence")
+        else:
+            suggestions.append(f"🎯 **CREATE DELIVERABLE**: Use `{UMS_FUNC_RECORD_ARTIFACT}` for final output")
+        
+        suggestions.append(f"🔗 **CONNECT CONTENT**: Use `{UMS_FUNC_CREATE_LINK}` to link related information")
+        
+        return suggestions
+    
+    def _get_error_recovery_suggestions_semantically(self, task_analysis: Dict, progress_analysis: Dict) -> List[str]:
+        """Get suggestions for error recovery"""
+        
+        suggestions = []
+        
+        suggestions.append("🔧 **DIAGNOSE ISSUE**: Analyze error message and context systematically")
+        suggestions.append(f"🔧 **FILE ACCESS**: Use `{UMS_FUNC_DIAGNOSE_FILE_ACCESS}` for file/path issues")
+        suggestions.append(f"🤔 **ANALYZE PROBLEM**: Use `{UMS_FUNC_RECORD_THOUGHT}` to understand failure")
+        suggestions.append("🛠️ **ALTERNATIVE APPROACH**: Try different tools or methods")
+        
+        if task_analysis["complexity_score"] > 60:
+            suggestions.append(f"📚 **GET GUIDANCE**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for strategy")
+        
+        return suggestions
+    
+    def _get_general_suggestions_semantically(self, task_analysis: Dict, progress_analysis: Dict) -> List[str]:
+        """Get general suggestions when phase is unclear"""
+        
+        suggestions = []
+        
+        if progress_analysis["artifact_creation_gap"]:
+            suggestions.append(f"🎯 **IMMEDIATE ACTION**: Use `{UMS_FUNC_RECORD_ARTIFACT}` to create progress")
+        
+        if task_analysis["creation_focus"] > 60:
+            suggestions.append("✅ **CHECK RESOURCES**: Query existing memories before creating new content")
+            suggestions.append("🎯 **FOCUS ON DELIVERABLE**: Prioritize tangible output creation")
+        
+        suggestions.append("🛠️ **STRATEGIC CHOICE**: Select most impactful tool for current objective")
+        
+        return suggestions
+    
+    async def _improve_tool_suggestions_with_llm(self, goal_desc: str, last_action: str, current_suggestions: List[str]):
+        """Background LLM improvement of tool suggestions"""
+        
+        suggestion_prompt = f"""
+Analyze this agent situation and suggest the most strategic next tools/actions:
+
+GOAL: {goal_desc}
+LAST ACTION: {last_action}
+CURRENT SUGGESTIONS: {current_suggestions[:3]}
+
+Agent has access to:
+- UMS tools (memory, artifacts, goals, reasoning)  
+- Web search tools
+- Document processing tools
+- Database/data tools
+- API integration tools
+- File system tools
+
+Focus on:
+1. What's the most logical next step?
+2. Which specific tools would be most effective?
+3. How to avoid infinite loops and create tangible progress?
+
+Provide 2-3 specific, actionable suggestions focusing on tool names and approach.
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": suggestion_prompt}],
+                model_override=None,
+                max_tokens=300,
+                temperature=0.2,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                self.logger.debug(f"🧠 LLM suggested improved tools: {response.content[:100]}...")
+                # Could be used to improve future suggestions via caching/learning
+                
+        except Exception as e:
+            self.logger.debug(f"Background LLM tool suggestion improvement failed: {e}")
         
     def _suggest_efficient_tool_patterns(self, current_goal: str, last_action: str) -> str:
-        """Suggest efficient multi-tool patterns for any workflow type"""
+        """Suggest efficient multi-tool patterns leveraging the full MCP toolkit"""
         suggestions = []
         
         goal_lower = current_goal.lower()
@@ -4835,49 +6859,64 @@ class AgentMasterLoop:
         
         # Determine workflow phase generically
         if ("initialized" in action_lower or "started" in action_lower or 
-            not any(tool in action_lower for tool in ["search", "store", "record"])):
+            not ("search" in action_lower or "store" in action_lower or "record" in action_lower)):
             # Beginning of workflow
-            suggestions.append("**🚀 WORKFLOW START - EFFICIENT PATTERNS:**")
-            suggestions.append(f"• **Information Gathering**: Use `{UMS_FUNC_HYBRID_SEARCH}` if information is needed")
-            suggestions.append(f"• **Knowledge Storage**: Use `{UMS_FUNC_STORE_MEMORY}` to save important findings")
-            suggestions.append(f"• **Action Pattern**: Follow: gather → store → act")
+            suggestions.append("**🚀 WORKFLOW START - STRATEGIC TOOL PATTERNS:**")
+            suggestions.append("• **Survey Your Toolkit**: Review ALL available MCP tools, not just UMS tools")
+            suggestions.append("• **Information Strategy**: Consider web search, document search, database tools")
+            suggestions.append("• **Processing Strategy**: Look for document converters, data processors, analyzers")
+            suggestions.append("• **Integration Strategy**: Check for API tools, external service connectors")
             
-        elif any(search_term in action_lower for search_term in ["search", "web", "browser"]):
+        elif ("search" in action_lower or "web" in action_lower or "browser" in action_lower or "query" in action_lower):
             # In information gathering phase
             suggestions.append("**🔍 INFORMATION GATHERING - NEXT PATTERNS:**")
-            suggestions.append(f"• **Store Findings**: Use `{UMS_FUNC_STORE_MEMORY}` to save what you found")
-            suggestions.append(f"• **Take Action**: Use gathered information to take concrete action")
-            suggestions.append(f"• **Avoid Over-Research**: Don't search more unless absolutely necessary")
+            suggestions.append("• **Process Results**: Use document converters if you got PDFs/docs")
+            suggestions.append("• **Extract Data**: Use text extraction tools for complex documents")
+            suggestions.append("• **Store Findings**: Save processed information in UMS for organization")
+            suggestions.append("• **Analyze Patterns**: Look for data analysis tools if you have structured data")
+            
+        elif "process" in action_lower or "convert" in action_lower:
+            # Document/data processing phase (use simple contains check, not primitive keyword lists)
+            suggestions.append("**🔄 PROCESSING PHASE - NEXT PATTERNS:**")
+            suggestions.append("• **Chain Processing**: Combine multiple processors for complex transformations")
+            suggestions.append("• **Store Processed Data**: Save transformed content for later use")
+            suggestions.append("• **Quality Check**: Validate processed results before proceeding")
+            suggestions.append("• **Analyze Results**: Use data analysis tools on processed information")
             
         elif "store" in action_lower or "memory" in action_lower:
             # Knowledge storage phase
-            suggestions.append("**📚 KNOWLEDGE STORED - NEXT PATTERNS:**")
-            suggestions.append(f"• **Take Action**: Use stored knowledge to take concrete action toward goal")
-            suggestions.append(f"• **More Info Only If**: Search more only if critical information is missing")
-            suggestions.append(f"• **Multi-Tool**: Combine tools efficiently for complex operations")
+            suggestions.append("**📚 KNOWLEDGE STORED - STRATEGIC NEXT STEPS:**")
+            suggestions.append("• **Cross-Reference**: Use database tools to check for related information")
+            suggestions.append("• **Validate Data**: Use external tools to verify key facts")
+            suggestions.append("• **Synthesize**: Combine stored knowledge with external tools for analysis")
+            suggestions.append("• **Create Deliverables**: Use your organized knowledge to build outputs")
             
         elif "record" in action_lower or "artifact" in action_lower:
             # Action completion phase
-            if any(keyword in goal_lower for keyword in ["and", "then", "also", "plus", "both", "multiple"]):
+            if ("and" in goal_lower or "multiple" in goal_lower or "both" in goal_lower):
                 # Potential multi-part task detected
-                suggestions.append("**📋 MULTI-PART TASK DETECTED:**")
-                suggestions.append(f"• **Check Requirements**: Use `{UMS_FUNC_GET_GOAL_DETAILS}` to verify all parts needed")
-                suggestions.append(f"• **Check Progress**: Query existing work to avoid duplicates")
-                suggestions.append(f"• **Complete Missing**: Address any remaining requirements")
+                suggestions.append("**📋 MULTI-PART TASK - ORCHESTRATION PATTERNS:**")
+                suggestions.append("• **Task Delegation**: Consider using delegation tools for subtasks")
+                suggestions.append("• **Parallel Processing**: Use multiple external tools simultaneously")
+                suggestions.append("• **Integration Tools**: Look for tools that can combine multiple results")
+                suggestions.append("• **Quality Assurance**: Use validation tools to check completeness")
             else:
-                suggestions.append("**✅ ACTION TAKEN - FINALIZATION:**")
-                suggestions.append(f"• **Verify Completion**: Use `{UMS_FUNC_GET_GOAL_DETAILS}` to check if goal is met")
-                suggestions.append(f"• **Quality Check**: Ensure action meets specified requirements")
-                suggestions.append(f"• **Goal Status**: Update goal status if work is complete")
+                suggestions.append("**✅ TASK COMPLETION - FINALIZATION PATTERNS:**")
+                suggestions.append("• **External Validation**: Use external tools to verify your results")
+                suggestions.append("• **Format Optimization**: Use document tools for final formatting")
+                suggestions.append("• **Distribution**: Consider tools for sharing or publishing results")
+                suggestions.append("• **Documentation**: Store process/results for future reference")
         
-        # Add generic efficiency tips
+        # Add comprehensive efficiency tips
         if suggestions:
             suggestions.append("")
-            suggestions.append("**⚡ GENERAL EFFICIENCY TIPS:**")
-            suggestions.append("• Execute multiple related tools in single turns when possible")
-            suggestions.append("• Be specific and focused rather than broad in tool usage")
-            suggestions.append("• Save important findings to avoid losing progress")
-            suggestions.append(f"• Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for complex operations")
+            suggestions.append("**⚡ STRATEGIC EFFICIENCY PRINCIPLES:**")
+            suggestions.append("• **Tool Discovery**: Regularly review your complete MCP toolkit")
+            suggestions.append("• **Workflow Chaining**: Connect external tools → UMS → external tools")
+            suggestions.append("• **Automation**: Use delegation tools for routine or specialized tasks")
+            suggestions.append("• **Parallel Processing**: Execute compatible external tools simultaneously")
+            suggestions.append("• **Result Caching**: Store intermediate results to avoid reprocessing")
+            suggestions.append("• **Integration Thinking**: Look for tools that bridge different systems/formats")
         
         if suggestions:
             return "\n".join(suggestions) + "\n"
@@ -4925,35 +6964,553 @@ class AgentMasterLoop:
         return ""
 
     def _classify_goal_type(self, goal_description: str) -> str:
-        """Classify goal into a pattern category for learning"""
-        goal_lower = goal_description.lower()
+        """Classify goal into a pattern category using LLM-based semantic understanding with caching"""
         
-        # Generic creation patterns (no task-specific hardcoding)
-        if any(word in goal_lower for word in ["create", "generate", "build", "develop", "write", "produce", "make"]):
-            return "creation"
+        # Cache classification to avoid repeated LLM calls for the same goal
+        goal_hash = hash(goal_description.strip())
+        if not hasattr(self, '_goal_classification_cache'):
+            self._goal_classification_cache = {}
         
-        # Generic analysis patterns
-        elif any(word in goal_lower for word in ["analyze", "research", "investigate", "study", "examine", "explore"]):
-            return "analysis"
+        if goal_hash in self._goal_classification_cache:
+            return self._goal_classification_cache[goal_hash]
         
-        # Generic planning patterns
-        elif any(word in goal_lower for word in ["plan", "strategy", "roadmap", "proposal", "design", "organize"]):
-            return "planning"
+        # Schedule async classification and return synchronous result
+        classification = self._get_cached_or_schedule_classification(goal_description, goal_hash)
         
-        # Generic communication patterns
-        elif any(word in goal_lower for word in ["explain", "describe", "summarize", "present", "communicate"]):
-            return "communication"
+        # Cache the result
+        self._goal_classification_cache[goal_hash] = classification
         
-        # Generic evaluation patterns
-        elif any(word in goal_lower for word in ["compare", "contrast", "evaluate", "assess", "review"]):
-            return "evaluation"
+        # Schedule LLM-based refinement in background (if not already done)
+        self._schedule_llm_classification_in_background(goal_description, goal_hash)
         
-        # Generic problem-solving patterns
-        elif any(word in goal_lower for word in ["solve", "fix", "debug", "troubleshoot", "optimize"]):
-            return "problem_solving"
+        return classification
+    
+    def _get_cached_or_schedule_classification(self, goal_description: str, goal_hash: int) -> str:
+        """Get classification synchronously, using fallback logic for immediate response"""
         
-        else:
-            return "general_task"
+        # Use LLM API call for intelligent classification instead of primitive word counting
+        return self._classify_goal_with_llm_fallback(goal_description)
+    
+    def _classify_goal_with_llm_fallback(self, goal_description: str) -> str:
+        """Use LLM for goal classification with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        goal_hash = hash(f"goal_classify:{goal_description[:300]}")
+        if not hasattr(self, '_goal_classify_cache'):
+            self._goal_classify_cache = {}
+        
+        if goal_hash in self._goal_classify_cache:
+            return self._goal_classify_cache[goal_hash]
+        
+        # Intelligent semantic fallback instead of primitive word counting
+        fallback_classification = self._get_goal_classification_intelligent_fallback(goal_description)
+        self._goal_classify_cache[goal_hash] = fallback_classification
+        
+        # Schedule LLM classification for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_goal_classification_with_llm,
+                goal_description, goal_hash
+            )
+        
+        return fallback_classification
+    
+    def _get_goal_classification_intelligent_fallback(self, goal_description: str) -> str:
+        """LLM-based goal classification with direct API call"""
+        
+        # Try synchronous LLM call for immediate classification
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self._classify_goal_type_with_llm_sync(goal_description))
+        except Exception:
+            return "general_task"  # No LLM = general task
+    
+    async def _classify_goal_type_with_llm_sync(self, goal_description: str) -> str:
+        """Synchronous LLM-based goal classification"""
+        
+        classification_prompt = f"""
+Classify this goal/task into ONE category based on its primary nature.
+
+Goal: "{goal_description}"
+
+Categories:
+- creation: Primary focus on creating, building, generating, producing something new
+- analysis: Primary focus on researching, analyzing, investigating, understanding information  
+- planning: Primary focus on creating plans, strategies, roadmaps, organizing future actions
+- communication: Primary focus on explaining, presenting, describing, communicating information
+- evaluation: Primary focus on comparing, assessing, rating, evaluating options/alternatives
+- problem_solving: Primary focus on solving problems, fixing issues, debugging, troubleshooting
+
+Respond with ONLY the category name (no explanation).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": classification_prompt}],
+                model_override=None,
+                max_tokens=10,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                classification = response.content.strip().lower()
+                valid_categories = {"creation", "analysis", "planning", "communication", "evaluation", "problem_solving"}
+                if classification in valid_categories:
+                    return classification
+                    
+        except Exception:
+            pass
+            
+        return "general_task"
+    
+    async def _improve_goal_classification_with_llm(self, goal_description: str, goal_hash: int):
+        """Use LLM to improve goal classification"""
+        
+        classification_prompt = f"""
+Analyze this goal/task description and rate how well it fits each category on a 0-100 scale.
+
+Goal to classify: "{goal_description}"
+
+Rate each category from 0-100:
+
+creation: How much does this involve creating, building, generating, or producing something new?
+analysis: How much does this involve researching, analyzing, investigating, or understanding information?
+planning: How much does this involve creating plans, strategies, roadmaps, or organizing future actions?
+communication: How much does this involve explaining, presenting, describing, or communicating information?
+evaluation: How much does this involve comparing, assessing, rating, or evaluating options/alternatives?
+problem_solving: How much does this involve solving problems, fixing issues, debugging, or troubleshooting?
+
+Consider:
+1. Primary action or outcome expected
+2. Type of work that dominates the task  
+3. Kind of deliverable implied
+
+Respond in this exact format:
+creation: [0-100]
+analysis: [0-100]
+planning: [0-100]
+communication: [0-100]
+evaluation: [0-100]
+problem_solving: [0-100]
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": classification_prompt}],
+                model_override=None,
+                max_tokens=15,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    # Parse confidence scores for each goal category
+                    lines = response.content.strip().split('\n')
+                    scores = {}
+                    for line in lines:
+                        if ':' in line:
+                            category, score_str = line.split(':', 1)
+                            category = category.strip().lower()
+                            score = int(score_str.strip())
+                            if 0 <= score <= 100:
+                                scores[category] = score
+                    
+                    if scores:
+                        # Find the highest confidence category
+                        best_category = max(scores, key=scores.get)
+                        best_score = scores[best_category]
+                        
+                        # Use threshold of 40+ for considering a valid classification
+                        GOAL_CLASSIFICATION_THRESHOLD = 40
+                        if best_score >= GOAL_CLASSIFICATION_THRESHOLD:
+                            # Update cache with LLM result
+                            self._goal_classify_cache[goal_hash] = best_category
+                            self.logger.debug(f"🎯 LLM goal classification: {best_category} (confidence={best_score}, scores={scores})")
+                        else:
+                            # Fall back to general_task if no high confidence
+                            self._goal_classify_cache[goal_hash] = "general_task"
+                            self.logger.debug(f"🎯 LLM goal classification: general_task (low confidence, max={best_score})")
+                except (ValueError, IndexError):
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM goal classification failed: {e}")
+    
+    def _schedule_llm_classification_in_background(self, goal_description: str, goal_hash: int):
+        """Schedule LLM-based classification to run in background and update cache"""
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            # Start background task to get better classification
+            self._start_background_task(self._classify_goal_with_llm_async, goal_description, goal_hash)
+    
+    async def _classify_goal_with_llm_async(self, goal_description: str, goal_hash: int):
+        """Async method to classify goal using LLM and update cache"""
+        classification_prompt = f"""
+Analyze this goal/task description and classify it into ONE of these categories based on the PRIMARY nature of the work:
+
+Categories:
+- creation: Primary focus is creating, building, generating, or producing something new
+- analysis: Primary focus is researching, analyzing, investigating, or understanding information  
+- planning: Primary focus is creating plans, strategies, roadmaps, or organizing future actions
+- communication: Primary focus is explaining, presenting, describing, or communicating information
+- evaluation: Primary focus is comparing, assessing, rating, or evaluating options/alternatives
+- problem_solving: Primary focus is solving problems, fixing issues, debugging, or troubleshooting
+
+Goal to classify: "{goal_description}"
+
+Respond with ONLY the category name (no explanation). If the goal involves multiple aspects, choose the PRIMARY focus.
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": classification_prompt}],
+                model_override=None,
+                max_tokens=15,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                classification = response.content.strip().lower()
+                
+                valid_categories = {"creation", "analysis", "planning", "communication", "evaluation", "problem_solving"}
+                if classification in valid_categories:
+                    # Update cache with LLM result
+                    if not hasattr(self, '_goal_classification_cache'):
+                        self._goal_classification_cache = {}
+                    self._goal_classification_cache[goal_hash] = classification
+                    self.logger.debug(f"🎯 LLM classified goal as: {classification}")
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM goal classification failed: {e}")
+            
+    def _get_goal_completion_criteria(self, goal_type: str, goal_description: str) -> Dict[str, Any]:
+        """Get completion criteria and expected deliverable for different goal types"""
+        if goal_type == "analysis":
+            return {
+                "expected_deliverable": "comprehensive analysis report",
+                "deliverable_format": "structured document with findings, sources, and conclusions", 
+                "completion_criteria": [
+                    "Key findings identified and documented",
+                    "Sources and evidence gathered", 
+                    "Analysis report artifact created with is_output=True",
+                    "Conclusions and insights summarized"
+                ],
+                "success_indicators": ["record_artifact with analysis findings", "comprehensive content with sources"],
+                "max_search_attempts": 3,
+                "min_facts_required": 5,
+                "suggested_sections": ["Executive Summary", "Key Findings", "Sources", "Conclusions"]
+            }
+        elif goal_type == "creation":
+            return {
+                "expected_deliverable": "created content or artifact",
+                "deliverable_format": "final deliverable as specified in goal",
+                "completion_criteria": [
+                    "Content created according to specifications",
+                    "Final artifact recorded with is_output=True", 
+                    "Quality and completeness verified"
+                ],
+                "success_indicators": ["record_artifact with created content", "specifications met"],
+                "max_search_attempts": 1,
+                "min_facts_required": 1,
+                "suggested_sections": ["Content", "Specifications Met", "Quality Notes"]
+            }
+        elif goal_type == "problem_solving":
+            return {
+                "expected_deliverable": "solution documentation",
+                "deliverable_format": "problem analysis and solution with implementation details",
+                "completion_criteria": [
+                    "Problem clearly defined and analyzed",
+                    "Solution identified and documented", 
+                    "Solution artifact created with is_output=True",
+                    "Implementation steps provided"
+                ],
+                "success_indicators": ["record_artifact with solution details", "implementation guidance"],
+                "max_search_attempts": 2,
+                "min_facts_required": 2,
+                "suggested_sections": ["Problem Definition", "Analysis", "Solution", "Implementation"]
+            }
+        elif goal_type == "planning":
+            return {
+                "expected_deliverable": "comprehensive plan",
+                "deliverable_format": "structured plan with timeline and action items",
+                "completion_criteria": [
+                    "Planning objectives identified",
+                    "Plan structure and timeline created",
+                    "Plan artifact recorded with is_output=True", 
+                    "Action items and milestones defined"
+                ],
+                "success_indicators": ["record_artifact with detailed plan", "actionable items listed"],
+                "max_search_attempts": 2,
+                "min_facts_required": 3,
+                "suggested_sections": ["Objectives", "Timeline", "Action Items", "Milestones"]
+            }
+        elif goal_type == "communication":
+            return {
+                "expected_deliverable": "communication document",
+                "deliverable_format": "clear explanation or presentation of topic",
+                "completion_criteria": [
+                    "Topic clearly explained with appropriate detail",
+                    "Communication artifact created with is_output=True",
+                    "Audience needs addressed"
+                ],
+                "success_indicators": ["record_artifact with explanation", "clear communication achieved"],
+                "max_search_attempts": 2,
+                "min_facts_required": 3,
+                "suggested_sections": ["Overview", "Key Points", "Details", "Summary"]
+            }
+        elif goal_type == "evaluation":
+            return {
+                "expected_deliverable": "evaluation report",
+                "deliverable_format": "comparative analysis with ratings and recommendations",
+                "completion_criteria": [
+                    "Items/options evaluated against criteria",
+                    "Evaluation report artifact created with is_output=True",
+                    "Recommendations provided"
+                ],
+                "success_indicators": ["record_artifact with evaluation results", "comparative analysis completed"],
+                "max_search_attempts": 2,
+                "min_facts_required": 3,
+                "suggested_sections": ["Evaluation Criteria", "Comparison", "Ratings", "Recommendations"]
+            }
+        else:  # general_task
+            return {
+                "expected_deliverable": "task completion documentation",
+                "deliverable_format": "summary of work completed with results",
+                "completion_criteria": [
+                    "Task requirements addressed",
+                    "Work performed and documented",
+                    "Results artifact created with is_output=True"
+                ],
+                "success_indicators": ["record_artifact with results", "task requirements met"],
+                "max_search_attempts": 2,
+                "min_facts_required": 2,
+                "suggested_sections": ["Objectives", "Work Performed", "Results"]
+            }
+            
+    async def _check_goal_completion_readiness(self, goal_description: str) -> Dict[str, Any]:
+        """Check if current goal is ready for completion using LLM-based semantic analysis"""
+        goal_type = self._classify_goal_type(goal_description)
+        
+        # Use LLM to analyze completion readiness semantically
+        return await self._analyze_goal_completion_semantically(goal_description, goal_type)
+
+    async def _analyze_goal_completion_semantically(self, goal_description: str, goal_type: str) -> Dict[str, Any]:
+        """Use LLM to semantically analyze goal completion readiness"""
+        
+        # Get current context for analysis
+        progress_context = self._get_current_progress_summary()
+        recent_actions = self._get_recent_actions_summary()
+        
+        completion_prompt = f"""
+Analyze whether this goal is ready for completion based on the current progress context.
+
+Goal: "{goal_description}"
+Goal Type: {goal_type}
+Progress Context: {progress_context}
+Recent Actions: {recent_actions}
+
+Rate on a scale of 0-100 how ready this goal is for completion:
+- 0-20: Just started, needs significant work
+- 21-40: Some progress made, more work needed
+- 41-60: Good progress, approaching completion
+- 61-80: Nearly complete, minor work remaining
+- 81-100: Ready for completion/deliverable exists
+
+Also rate 0-100 whether forced completion should occur due to:
+- Excessive searching without progress
+- Getting stuck in loops
+- Diminishing returns from continued work
+
+Respond in this exact format:
+COMPLETION_READINESS: [0-100]
+FORCE_COMPLETION: [0-100]
+HAS_DELIVERABLE: [yes/no]
+REASON: [brief explanation]
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": completion_prompt}],
+                model_override=None,
+                max_tokens=100,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                return await self._parse_completion_analysis(response.content, goal_type)
+                
+        except Exception as e:
+            self.logger.debug(f"LLM goal completion analysis failed: {e}")
+        
+        # Intelligent fallback using semantic progress analysis
+        return await self._analyze_completion_with_semantic_fallback(goal_description, goal_type)
+
+    async def _parse_completion_analysis(self, llm_response: str, goal_type: str) -> Dict[str, Any]:
+        """Parse LLM completion analysis response using intelligent JSON structure instead of primitive text parsing"""
+        
+        # Try to parse as JSON first (modern structured output approach)
+        try:
+            import json
+            response_data = json.loads(llm_response.strip())
+            
+            completion_readiness = response_data.get("completion_readiness", 0)
+            force_completion = response_data.get("force_completion", 0)
+            has_deliverable = response_data.get("has_deliverable", False)
+            reason = response_data.get("reason", "JSON analysis completed")
+            
+        except (json.JSONDecodeError, ValueError):
+            # Fallback: Use LLM to extract structured data from text response
+            parsed_data = await self._parse_completion_response_with_llm(llm_response)
+            completion_readiness = parsed_data.get("completion_readiness", 0)
+            force_completion = parsed_data.get("force_completion", 0)
+            has_deliverable = parsed_data.get("has_deliverable", False)
+            reason = parsed_data.get("reason", "LLM parsing completed")
+        
+        ready_for_completion = completion_readiness >= 70 or force_completion >= 70
+        force_needed = force_completion >= 70
+        
+        return {
+            "goal_type": goal_type,
+            "ready_for_completion": ready_for_completion,
+            "force_completion": force_needed,
+            "has_deliverable": has_deliverable,
+            "completion_readiness_score": completion_readiness,
+            "force_completion_score": force_completion,
+            "completion_message": f"Goal completion analysis: readiness={completion_readiness}%, force={force_completion}%, deliverable={has_deliverable}",
+            "reason": reason
+        }
+
+    async def _parse_completion_response_with_llm(self, response_text: str) -> Dict[str, Any]:
+        """Use LLM to extract structured data from text response instead of primitive parsing"""
+        
+        parsing_prompt = f"""
+Extract structured information from this completion analysis response and provide it as a JSON object.
+
+Response Text: "{response_text}"
+
+Extract these values:
+- completion_readiness: Score 0-100 for goal completion readiness
+- force_completion: Score 0-100 for whether completion should be forced
+- has_deliverable: Boolean for whether deliverable exists
+- reason: Brief explanation text
+
+Provide response as a JSON object:
+{{"completion_readiness": 0, "force_completion": 0, "has_deliverable": false, "reason": "explanation"}}
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": parsing_prompt}],
+                model_override=None,
+                max_tokens=100,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                import json
+                parsed_json = json.loads(response.content.strip())
+                
+                return {
+                    "completion_readiness": parsed_json.get("completion_readiness", 0),
+                    "force_completion": parsed_json.get("force_completion", 0), 
+                    "has_deliverable": parsed_json.get("has_deliverable", False),
+                    "reason": parsed_json.get("reason", "LLM extraction completed")
+                }
+                
+        except Exception as e:
+            self.logger.debug(f"LLM response parsing failed: {e}")
+        
+        # Final fallback with sensible defaults
+        return {
+            "completion_readiness": 0,
+            "force_completion": 0,
+            "has_deliverable": False,
+            "reason": "Response parsing failed"
+        }
+
+    async def _analyze_completion_with_semantic_fallback(self, goal_description: str, goal_type: str) -> Dict[str, Any]:
+        """Semantic fallback for completion analysis when LLM fails"""
+        
+        # Use semantic understanding of current state
+        has_recent_artifact = await self._check_recent_artifact_creation_semantically()
+        has_sufficient_progress = await self._check_sufficient_progress_semantically(goal_description)
+        should_force_completion = await self._check_force_completion_semantically()
+        
+        ready_for_completion = has_recent_artifact and (has_sufficient_progress or should_force_completion)
+        
+        return {
+            "goal_type": goal_type,
+            "ready_for_completion": ready_for_completion,
+            "force_completion": should_force_completion,
+            "has_deliverable": has_recent_artifact,
+            "completion_readiness_score": 70 if ready_for_completion else 30,
+            "force_completion_score": 80 if should_force_completion else 20,
+            "completion_message": f"Semantic analysis: deliverable={has_recent_artifact}, progress={has_sufficient_progress}, force={should_force_completion}",
+            "reason": "Semantic fallback analysis"
+        }
+    
+    async def _check_recent_artifact_creation_semantically(self) -> bool:
+        """Check if recent artifact creation occurred using semantic understanding"""
+        return self.state.turns_since_artifact_creation <= 3
+    
+    async def _check_sufficient_progress_semantically(self, goal_description: str) -> bool:
+        """Check if sufficient progress has been made using semantic analysis"""
+        progress_context = self._get_current_progress_summary()
+        
+        progress_prompt = f"""
+Rate how much meaningful progress has been made toward this goal.
+
+Goal: "{goal_description}"  
+Progress: {progress_context}
+
+Rate 0-100 how much substantial progress has occurred:
+- 0-30: Minimal progress, mostly searching
+- 31-60: Moderate progress, some concrete work done
+- 61-100: Significant progress, substantial work completed
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": progress_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                progress_score = int(response.content.strip())
+                return progress_score >= 60
+                
+        except Exception as e:
+            self.logger.debug(f"LLM progress analysis failed: {e}")
+        
+        # Semantic fallback - check if meaningful work beyond searching has occurred
+        return self.state.search_attempts_count > 0 and self.state.turns_since_artifact_creation <= 5
+    
+    async def _check_force_completion_semantically(self) -> bool:
+        """Check if forced completion should occur using semantic understanding"""
+        
+        # Semantic indicators of stuck/diminishing returns patterns
+        excessive_searching = self.state.search_attempts_count >= 5
+        stuck_without_artifacts = self.state.turns_since_artifact_creation >= 8
+        tool_repetition_loop = self.state.consecutive_same_tool_count >= 3
+        
+        return excessive_searching or stuck_without_artifacts or tool_repetition_loop
+    
+    def _get_recent_actions_summary(self) -> str:
+        """Get summary of recent actions for context"""
+        if hasattr(self.state, 'recent_tool_sequence') and self.state.recent_tool_sequence:
+            recent_tools = self.state.recent_tool_sequence[-3:]  # Last 3 tools
+            return f"Recent tools: {' → '.join(recent_tools)}"
+        return "No recent actions"
 
     def _record_successful_pattern(self, goal_type: str, tool_sequence: List[str]):
         """Learn from successful tool sequences for future use"""
@@ -5011,7 +7568,7 @@ class AgentMasterLoop:
         return []
 
     def _suggest_tool_chain(self, current_goal_desc: str, last_action: str) -> List[str]:
-        """Suggest logical next tools based on current context and learned patterns"""
+        """Suggest logical next tools based on semantic understanding and learned patterns"""
         # First try learned patterns
         if current_goal_desc:
             goal_type = self._classify_goal_type(current_goal_desc)
@@ -5020,17 +7577,636 @@ class AgentMasterLoop:
                 self.logger.info(f"🧠 Using learned pattern for {goal_type}")
                 return learned_sequence[:3]  # Return first 3 tools
         
-        # Fallback to rule-based suggestions (generic patterns)
-        if "search" in last_action.lower() or "research" in last_action.lower():
-            return [self._get_ums_tool_mcp_name(UMS_FUNC_STORE_MEMORY), self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ARTIFACT)]
-        elif "research" in current_goal_desc.lower() and not last_action:
-            return [self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH), self._get_ums_tool_mcp_name(UMS_FUNC_STORE_MEMORY), self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ARTIFACT)]
-        elif any(word in current_goal_desc.lower() for word in ["create", "generate", "write", "build"]):
-            return [self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH), self._get_ums_tool_mcp_name(UMS_FUNC_STORE_MEMORY), self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ARTIFACT)]
-        elif any(word in current_goal_desc.lower() for word in ["analyze", "report", "summary"]):
-            return [self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH), self._get_ums_tool_mcp_name(UMS_FUNC_STORE_MEMORY), self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_ARTIFACT)]
+        # Use LLM-based semantic understanding for tool suggestions
+        try:
+            suggested_tools = self._suggest_next_tools_with_llm(current_goal_desc, last_action)
+            if suggested_tools:
+                return suggested_tools[:3]  # Limit to 3 tools
+        except Exception as e:
+            self.logger.debug(f"LLM tool suggestion failed: {e}, using fallback")
+        
+        # Intelligent fallback based on goal classification
+        if current_goal_desc:
+            goal_type = self._classify_goal_type(current_goal_desc)
+            return self._get_fallback_tool_sequence_for_goal_type(goal_type)
         
         return []
+    
+    async def _suggest_next_tools_with_llm(self, goal_desc: str, last_action: str) -> List[str]:
+        """Use LLM to suggest next tools based on semantic understanding of context"""
+        
+        # Cache tool suggestions to avoid repeated LLM calls
+        context_hash = hash(f"{goal_desc}::{last_action}")
+        if not hasattr(self, '_tool_suggestion_cache'):
+            self._tool_suggestion_cache = {}
+        
+        if context_hash in self._tool_suggestion_cache:
+            return self._tool_suggestion_cache[context_hash]
+        
+        # Get current progress context
+        progress_context = self._get_current_progress_summary()
+
+        try:
+            # Schedule background LLM call for better suggestions
+            if hasattr(self, 'mcp_client') and self.mcp_client:
+                self._start_background_task(self._get_llm_tool_suggestions_async, goal_desc, last_action, context_hash)
+            
+            # Return immediate intelligent fallback
+            fallback_suggestions = await self._get_intelligent_tool_fallback(goal_desc, last_action, progress_context)
+            self._tool_suggestion_cache[context_hash] = fallback_suggestions
+            return fallback_suggestions
+            
+        except Exception as e:
+            self.logger.debug(f"Tool suggestion generation failed: {e}")
+            return []
+    
+    async def _get_llm_tool_suggestions_async(self, goal_desc: str, last_action: str, context_hash: int):
+        """Background task to get better tool suggestions from LLM"""
+        progress_context = self._get_current_progress_summary()
+        
+        suggestion_prompt = f"""
+Analyze the current situation and suggest the next 1-3 tools to use for making progress.
+
+Current Goal: {goal_desc}
+Last Action: {last_action or "Starting new task"}
+Progress Context: {progress_context}
+
+Available tool categories and their purposes:
+- search/research: hybrid_search_memories, search_semantic_memories, browse, search
+- information storage: store_memory, record_thought  
+- creation: record_artifact, write_file
+- analysis: get_artifacts, query_memories, get_workflow_details
+- web interaction: browse, search, download
+
+Consider:
+1. What information is needed vs. what we already have
+2. Whether we need to gather more data or start creating deliverables
+3. The natural progression from research → analysis → creation → completion
+4. Avoiding endless information gathering loops
+
+Respond with 1-3 tool base names (like "search", "store_memory", "record_artifact") separated by commas, in logical order.
+Focus on concrete progress toward the goal.
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": suggestion_prompt}],
+                model_override=None,
+                max_tokens=50,
+                temperature=0.2,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                # Parse tool suggestions
+                suggested_tools = []
+                tools_text = response.content.strip()
+                
+                # Extract tool names from response
+                tool_names = [name.strip() for name in tools_text.split(',')]
+                for tool_name in tool_names[:3]:  # Max 3 tools
+                    # Convert to MCP names
+                    mcp_tool_name = self._convert_base_to_mcp_tool_name(tool_name)
+                    if mcp_tool_name:
+                        suggested_tools.append(mcp_tool_name)
+                
+                if suggested_tools:
+                    # Update cache with LLM result
+                    if not hasattr(self, '_tool_suggestion_cache'):
+                        self._tool_suggestion_cache = {}
+                    self._tool_suggestion_cache[context_hash] = suggested_tools
+                    self.logger.debug(f"🛠️ LLM suggested tools: {suggested_tools}")
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM tool suggestion failed: {e}")
+    
+    async def _get_intelligent_tool_fallback(self, goal_desc: str, last_action: str, progress_context: str) -> List[str]:
+        """Intelligent fallback for tool suggestions when LLM is unavailable"""
+        
+        # Analyze current state using LLM semantic understanding  
+        has_searched = await self._analyze_progress_state_with_llm(progress_context, "search_activity")
+        has_info = await self._analyze_progress_state_with_llm(progress_context, "information_storage")
+        has_artifacts = await self._analyze_progress_state_with_llm(progress_context, "artifact_creation")
+        
+        # Get goal classification for context
+        goal_type = self._classify_goal_type(goal_desc)
+        
+        # Intelligent progression logic
+        if goal_type == "analysis" and not has_searched:
+            # Research phase - need to gather information
+            return [
+                self._get_ums_tool_mcp_name("hybrid_search_memories"),
+                self._get_ums_tool_mcp_name("search")
+            ]
+        elif goal_type == "analysis" and has_searched and not has_info:
+            # Information storage phase - gathered data but haven't stored it
+            return [
+                self._get_ums_tool_mcp_name("store_memory"),
+                self._get_ums_tool_mcp_name("record_thought")
+            ]
+        elif goal_type == "analysis" and has_searched and has_info and not has_artifacts:
+            # Analysis and creation phase - have information, now create deliverable
+            return [
+                self._get_ums_tool_mcp_name("record_artifact"),
+                self._get_ums_tool_mcp_name("store_memory")
+            ]
+        elif goal_type == "creation" and not has_artifacts:
+            # Direct creation phase
+            return [
+                self._get_ums_tool_mcp_name("record_artifact"),
+                self._get_ums_tool_mcp_name("write_file")
+            ]
+        elif has_artifacts:
+            # Completion phase
+            return [
+                self._get_ums_tool_mcp_name("get_artifacts"),
+                self._get_ums_tool_mcp_name("update_goal_status")
+            ]
+        else:
+            # Default progression - start with search
+            return [self._get_ums_tool_mcp_name("hybrid_search_memories")]
+    
+    def _convert_base_to_mcp_tool_name(self, base_name: str) -> Optional[str]:
+        """Convert base tool name to full MCP tool name"""
+        base_name = base_name.lower().strip()
+        
+        # Map common base names to UMS functions
+        base_to_ums = {
+            "search": "hybrid_search_memories",
+            "browse": "browse", 
+            "store_memory": "store_memory",
+            "record_thought": "record_thought",
+            "record_artifact": "record_artifact", 
+            "write_file": "write_file",
+            "get_artifacts": "get_artifacts",
+            "query_memories": "query_memories",
+            "get_workflow_details": "get_workflow_details",
+            "update_goal_status": "update_goal_status",
+            "search_semantic_memories": "search_semantic_memories",
+            "download": "download"
+        }
+        
+        if base_name in base_to_ums:
+            return self._get_ums_tool_mcp_name(base_to_ums[base_name])
+        
+        # Try to find partial matches
+        for key, value in base_to_ums.items():
+            if base_name in key or key in base_name:
+                return self._get_ums_tool_mcp_name(value)
+                
+        return None
+    
+    def _get_fallback_tool_sequence_for_goal_type(self, goal_type: str) -> List[str]:
+        """Get intelligent fallback tool sequence based on goal type"""
+        
+        sequences = {
+            "analysis": [
+                self._get_ums_tool_mcp_name("hybrid_search_memories"),
+                self._get_ums_tool_mcp_name("store_memory"),
+                self._get_ums_tool_mcp_name("record_artifact")
+            ],
+            "creation": [
+                self._get_ums_tool_mcp_name("record_artifact"),
+                self._get_ums_tool_mcp_name("write_file")
+            ],
+            "planning": [
+                self._get_ums_tool_mcp_name("hybrid_search_memories"),
+                self._get_ums_tool_mcp_name("record_artifact")
+            ],
+            "communication": [
+                self._get_ums_tool_mcp_name("get_artifacts"),
+                self._get_ums_tool_mcp_name("record_artifact")
+            ],
+            "evaluation": [
+                self._get_ums_tool_mcp_name("hybrid_search_memories"),
+                self._get_ums_tool_mcp_name("store_memory"),
+                self._get_ums_tool_mcp_name("record_artifact")
+            ],
+            "problem_solving": [
+                self._get_ums_tool_mcp_name("hybrid_search_memories"),
+                self._get_ums_tool_mcp_name("record_artifact")
+            ]
+        }
+        
+        return sequences.get(goal_type, [self._get_ums_tool_mcp_name("hybrid_search_memories")])
+    
+    def _get_current_progress_summary(self) -> str:
+        """Get a summary of current progress for context"""
+        summary_parts = []
+        
+        if self.state.search_attempts_count > 0:
+            summary_parts.append(f"Performed {self.state.search_attempts_count} searches")
+        
+        if self.state.turns_since_artifact_creation == 0:
+            summary_parts.append("Just created an artifact")
+        elif self.state.turns_since_artifact_creation < 5:
+            summary_parts.append(f"Created artifact {self.state.turns_since_artifact_creation} turns ago")
+            
+        if self.state.plan_progression_stage != "initial":
+            summary_parts.append(f"Current stage: {self.state.plan_progression_stage}")
+            
+        if self.state.last_action_summary:
+            summary_parts.append(f"Last action: {self.state.last_action_summary[:100]}")
+            
+        return ". ".join(summary_parts) or "Starting new task"
+    
+    async def _analyze_progress_state_with_llm(self, progress_context: str, state_type: str) -> bool:
+        """Use LLM to analyze progress state with 0-100 scoring"""
+        
+        state_descriptions = {
+            "search_activity": "searching, researching, investigating, or gathering information",
+            "information_storage": "storing, saving, recording, or documenting information in memory", 
+            "artifact_creation": "creating, generating, building, or producing artifacts, files, or deliverables"
+        }
+        
+        analysis_prompt = f"""
+Analyze this progress context and rate how much {state_descriptions[state_type]} has occurred.
+
+Progress Context: "{progress_context}"
+
+Rate on a scale of 0-100:
+- 0-20: No evidence of {state_descriptions[state_type]}
+- 21-40: Minimal {state_descriptions[state_type]} activity  
+- 41-60: Some {state_descriptions[state_type]} activity
+- 61-80: Significant {state_descriptions[state_type]} activity
+- 81-100: Extensive {state_descriptions[state_type]} activity
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": analysis_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                progress_score = int(response.content.strip())
+                if 0 <= progress_score <= 100:
+                    return progress_score >= 50  # Threshold for activity occurrence
+        except Exception as e:
+            self.logger.error(f"LLM progress analysis failed: {e}")
+            
+        return False  # Default if LLM fails
+    
+    async def _classify_memory_type_semantically(self, memory_type: str, content: str = "", description: str = "") -> Optional[str]:
+        """Semantically classify memory type using LLM"""
+        
+        # Valid memory types to map to
+        valid_types = {
+            "fact": "concrete information, data, research findings, evidence",
+            "insight": "understanding, realizations, conclusions, key takeaways", 
+            "reasoning_step": "logical thinking, analysis process, rationale",
+            "observation": "noticed patterns, what was observed or seen",
+            "procedure": "methods, processes, steps, techniques",
+            "summary": "overview, recap, condensed information",
+            "text": "general content, notes, descriptions"
+        }
+        
+        # Use LLM directly - no complex fallback nonsense!
+        return await self._classify_memory_type_with_heuristics(memory_type, content, description, valid_types)
+    
+    async def _classify_memory_type_with_heuristics(self, memory_type: str, content: str, description: str, valid_types: dict) -> str:
+        """Use LLM analysis for memory type classification"""
+        
+        # Combine all context for semantic understanding
+        full_context = f"{memory_type} {content} {description}".lower()
+        
+        # Use LLM semantic understanding - no primitive fallbacks!
+        return await self._classify_memory_type_with_llm_scoring(full_context, memory_type, valid_types)
+    
+    async def _classify_memory_type_with_llm_scoring(self, full_context: str, memory_type: str, valid_types: dict) -> str:
+        """Use LLM to score each memory type 0-100 and pick the best one"""
+        
+        scoring_prompt = f"""
+Analyze this memory content and classify it into the best memory type.
+
+Content: "{full_context}"
+Original Type Label: "{memory_type}"
+
+Available types:
+- fact: concrete information, data, research findings, evidence
+- insight: understanding, realizations, conclusions, key takeaways  
+- reasoning_step: logical thinking, analysis process, rationale
+- observation: noticed patterns, observations, behaviors
+- procedure: methods, processes, steps, techniques
+- summary: overview, recap, condensed information
+- text: general content, notes, descriptions
+
+Respond with just the best type name (e.g., "fact", "insight", "reasoning_step").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": scoring_prompt}],
+                model_override=None,
+                max_tokens=10,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                llm_type = response.content.strip().lower()
+                if llm_type in valid_types:
+                    return llm_type
+        except Exception as e:
+            self.logger.error(f"LLM memory type classification failed: {e}")
+            
+        return "text"  # Default if LLM fails
+    
+    async def _improve_memory_type_classification_with_llm(self, memory_type: str, content: str, description: str, context_hash: int, valid_types: dict):
+        """Use LLM to improve memory type classification"""
+        
+        memory_classification_prompt = f"""
+Classify this memory content into the most appropriate memory type based on its semantic meaning and purpose.
+
+Memory Type Label: {memory_type}
+Content: {content[:400]}
+Description: {description[:200]}
+
+Available types and their purposes:
+{chr(10).join([f"- {type_name}: {purpose}" for type_name, purpose in valid_types.items()])}
+
+Consider:
+1. What kind of information this represents
+2. How it was obtained or created  
+3. What purpose it serves in understanding
+4. The nature and structure of the content
+
+Respond with just the type name (e.g., "fact", "insight", "reasoning_step").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": memory_classification_prompt}],
+                model_override=None,
+                max_tokens=20,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                llm_classification = response.content.strip().lower()
+                
+                # Validate LLM response
+                if llm_classification in valid_types:
+                    # Update cache with LLM result
+                    self._memory_type_heuristic_cache[context_hash] = llm_classification
+                    self.logger.debug(f"🧠 LLM improved memory classification: '{memory_type}' → '{llm_classification}'")
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM memory classification failed: {e}")
+    
+    async def _improve_memory_classification_with_llm(self, memory_type: str, content: str, description: str, context_hash: int, valid_types: dict):
+        """Background task to improve memory classification using LLM"""
+        
+        classification_prompt = f"""
+Classify this memory content into the most appropriate memory type based on its semantic meaning and purpose.
+
+Memory Type Label: {memory_type}
+Content: {content[:500]}
+Description: {description[:200]}
+
+Available types and their purposes:
+{chr(10).join([f"- {type_name}: {purpose}" for type_name, purpose in valid_types.items()])}
+
+Consider:
+1. What kind of information this represents
+2. How it was obtained or created
+3. What purpose it serves in understanding
+
+Respond with just the type name (e.g., "fact", "insight", "reasoning_step").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": classification_prompt}],
+                model_override=None,
+                max_tokens=20,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                llm_classification = response.content.strip().lower()
+                
+                # Validate LLM response
+                if llm_classification in valid_types:
+                    # Update cache with LLM result
+                    if not hasattr(self, '_memory_type_cache'):
+                        self._memory_type_cache = {}
+                    self._memory_type_cache[context_hash] = llm_classification
+                    self.logger.debug(f"🧠 LLM improved memory classification: '{memory_type}' → '{llm_classification}'")
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM memory classification failed: {e}")
+    
+    def _classify_artifact_type_semantically(self, artifact_type: str, name: str = "", description: str = "", content: str = "") -> Optional[str]:
+        """Semantically classify artifact type using intelligent understanding"""
+        
+        # Cache classifications
+        context_hash = hash(f"{artifact_type}::{name[:50]}::{description[:50]}::{content[:100]}")
+        if not hasattr(self, '_artifact_type_cache'):
+            self._artifact_type_cache = {}
+        
+        if context_hash in self._artifact_type_cache:
+            return self._artifact_type_cache[context_hash]
+        
+        # Valid artifact types
+        valid_types = {
+            "file": "documents, reports, web pages, structured content that users can access",
+            "text": "simple text content, notes, descriptions",
+            "code": "programming code, scripts, functions, algorithms",
+            "data": "structured data, CSV, JSON, XML, YAML files",
+            "image": "pictures, photos, graphics, diagrams",
+            "chart": "graphs, plots, visualizations, charts",
+            "table": "tabular data, spreadsheets",
+            "json": "JSON formatted data structures",
+            "url": "web links, URLs, references to online content"
+        }
+        
+        # Use intelligent heuristics first
+        classified_type = self._classify_artifact_type_with_heuristics(artifact_type, name, description, content, valid_types)
+        self._artifact_type_cache[context_hash] = classified_type
+        
+        # Schedule background LLM improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_artifact_classification_with_llm,
+                artifact_type, name, description, content, context_hash, valid_types
+            )
+        
+        return classified_type
+    
+    def _classify_artifact_type_with_heuristics(self, artifact_type: str, name: str, description: str, content: str, valid_types: dict) -> str:
+        """Use LLM analysis for artifact type classification with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        context_text = f"{artifact_type}::{name[:50]}::{description[:100]}::{content[:150]}"
+        context_hash = hash(context_text)
+        if not hasattr(self, '_artifact_type_heuristic_cache'):
+            self._artifact_type_heuristic_cache = {}
+        
+        if context_hash in self._artifact_type_heuristic_cache:
+            return self._artifact_type_heuristic_cache[context_hash]
+        
+        # Intelligent fallback instead of primitive scoring
+        fallback_type = self._get_artifact_type_intelligent_fallback(artifact_type, name, description, content, valid_types)
+        self._artifact_type_heuristic_cache[context_hash] = fallback_type
+        
+        # Schedule LLM analysis for immediate improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_artifact_type_classification_with_llm,
+                artifact_type, name, description, content, context_hash, valid_types
+            )
+        
+        return fallback_type
+    
+    def _get_artifact_type_intelligent_fallback(self, artifact_type: str, name: str, description: str, content: str, valid_types: dict) -> str:
+        """Intelligent semantic fallback instead of primitive word counting"""
+        
+        # Combine all context for semantic understanding
+        full_context = f"{artifact_type} {name} {description}".lower()
+        content_snippet = content[:200].lower() if content else ""
+        
+        # Semantic understanding instead of primitive scoring
+        
+        # Use LLM semantic understanding instead of primitive hardcoded lists
+        return self._classify_artifact_type_with_llm_scoring(full_context, content_snippet, artifact_type, valid_types)
+    
+    async def _classify_artifact_type_with_llm_scoring(self, full_context: str, content_snippet: str, artifact_type: str, valid_types: dict) -> str:
+        """Use LLM to classify artifact type directly"""
+        
+        scoring_prompt = f"""
+Analyze this artifact and classify it into the best artifact type.
+
+Context: "{full_context}"
+Content Sample: "{content_snippet}"
+Original Type Label: "{artifact_type}"
+
+Available types:
+- file: documents, reports, web pages, structured content users can access
+- code: programming code, scripts, functions, algorithms
+- data: structured data, CSV, JSON, XML, YAML files, databases
+- chart: graphs, plots, visualizations, charts
+- image: pictures, photos, graphics, diagrams
+- url: web links, URLs, references to online content
+- table: tabular data, spreadsheets
+- text: simple text content, notes, descriptions
+
+Respond with just the best type name (e.g., "file", "code", "data").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": scoring_prompt}],
+                model_override=None,
+                max_tokens=10,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                llm_type = response.content.strip().lower()
+                if llm_type in valid_types:
+                    return llm_type
+        except Exception as e:
+            self.logger.error(f"LLM artifact type classification failed: {e}")
+            
+        return "text"  # Default if LLM fails
+    
+    async def _improve_artifact_type_classification_with_llm(self, artifact_type: str, name: str, description: str, content: str, context_hash: int, valid_types: dict):
+        """Use LLM to improve artifact type classification"""
+        
+        artifact_classification_prompt = f"""
+Classify this artifact into the most appropriate artifact type based on its content and purpose.
+
+Artifact Type Label: {artifact_type}
+Name: {name}
+Description: {description}
+Content Sample: {content[:400]}
+
+Available types and their purposes:
+{chr(10).join([f"- {type_name}: {purpose}" for type_name, purpose in valid_types.items()])}
+
+Consider:
+1. The nature of the content (text vs code vs data vs visual)
+2. How users would interact with this artifact
+3. The format and structure of the content
+4. The intended purpose and use case
+
+Respond with just the type name (e.g., "file", "code", "data").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": artifact_classification_prompt}],
+                model_override=None,
+                max_tokens=20,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                llm_classification = response.content.strip().lower()
+                
+                # Validate LLM response
+                if llm_classification in valid_types:
+                    # Update cache with LLM result
+                    self._artifact_type_heuristic_cache[context_hash] = llm_classification
+                    self.logger.debug(f"🧠 LLM improved artifact classification: '{artifact_type}' → '{llm_classification}'")
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM artifact classification failed: {e}")
+    
+    async def _improve_artifact_classification_with_llm(self, artifact_type: str, name: str, description: str, content: str, context_hash: int, valid_types: dict):
+        """Background task to improve artifact classification using LLM"""
+        
+        classification_prompt = f"""
+Classify this artifact into the most appropriate artifact type based on its content and purpose.
+
+Artifact Type Label: {artifact_type}
+Name: {name}
+Description: {description}
+Content Sample: {content[:300]}
+
+Available types and their purposes:
+{chr(10).join([f"- {type_name}: {purpose}" for type_name, purpose in valid_types.items()])}
+
+Consider:
+1. The nature of the content (text vs code vs data vs visual)
+2. How users would interact with this artifact
+3. The format and structure of the content
+
+Respond with just the type name (e.g., "file", "code", "data").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": classification_prompt}],
+                model_override=None,
+                max_tokens=20,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                llm_classification = response.content.strip().lower()
+                
+                # Validate LLM response
+                if llm_classification in valid_types:
+                    # Update cache with LLM result
+                    if not hasattr(self, '_artifact_type_cache'):
+                        self._artifact_type_cache = {}
+                    self._artifact_type_cache[context_hash] = llm_classification
+                    self.logger.debug(f"🧠 LLM improved artifact classification: '{artifact_type}' → '{llm_classification}'")
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM artifact classification failed: {e}")
     
     async def _check_for_similar_artifacts(self, artifact_name: str, artifact_description: str = "") -> List[Dict[str, Any]]:
         """Check for existing similar artifacts in the current workflow to prevent duplication"""
@@ -5089,22 +8265,179 @@ class AgentMasterLoop:
         except Exception as e:
             self.logger.warning(f"Error checking for similar artifacts: {e}")
             return []
+
+
     
     def _are_artifacts_similar(self, name1: str, content2: str) -> bool:
         """Simple heuristic to check if artifacts are similar based on name overlap"""
         # Extract key terms from the new artifact name
-        key_terms = [term for term in name1.split() if len(term) > 3]
-        if len(key_terms) < 2:
-            return False
+        # Use LLM-based semantic similarity instead of primitive word counting
+        return self._check_semantic_similarity_with_llm(name1, content2)
+    
+    def _check_semantic_similarity_with_llm(self, artifact_name: str, existing_content: str) -> bool:
+        """Use LLM to check semantic similarity between artifacts with intelligent fallback"""
         
-        # Check if most key terms appear in the existing artifact content
-        matches = sum(1 for term in key_terms if term in content2)
-        similarity_ratio = matches / len(key_terms)
+        # Cache to avoid repeated LLM calls
+        content_hash = hash(f"similarity:{artifact_name}:{existing_content[:200]}")
+        if not hasattr(self, '_similarity_cache'):
+            self._similarity_cache = {}
         
-        # Consider similar if >60% of key terms match
-        return similarity_ratio > 0.6
+        if content_hash in self._similarity_cache:
+            return self._similarity_cache[content_hash]
+        
+        # Intelligent fallback instead of primitive word counting
+        fallback_result = self._get_similarity_intelligent_fallback(artifact_name, existing_content)
+        self._similarity_cache[content_hash] = fallback_result
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_similarity_analysis_with_llm,
+                artifact_name, existing_content, content_hash
+            )
+        
+        return fallback_result
+    
+    def _get_similarity_intelligent_fallback(self, artifact_name: str, existing_content: str) -> bool:
+        """LLM-based semantic fallback for similarity checking instead of primitive word counting"""
+        
+        # Use LLM semantic understanding for similarity assessment
+        similarity_score = self._get_semantic_similarity_score_with_llm(artifact_name, existing_content)
+        
+        # Return True if similarity score indicates significant overlap (threshold of 60)
+        return similarity_score >= 60
+        
+    def _get_semantic_similarity_score_with_llm(self, artifact_name: str, existing_content: str) -> int:
+        """Use LLM to score semantic similarity from 0-100 instead of primitive character counting"""
+        
+        if not artifact_name or not existing_content:
+            return 0
+            
+        # Truncate for LLM context
+        content_sample = existing_content[:500]
+        
+        try:
+            # Cache for efficiency
+            context_hash = hash(f"{artifact_name}::{content_sample[:200]}")
+            if not hasattr(self, '_similarity_score_cache'):
+                self._similarity_score_cache = {}
+            
+            if context_hash in self._similarity_score_cache:
+                return self._similarity_score_cache[context_hash]
+            
+            # Default fallback score while scheduling LLM call
+            fallback_score = 30  # Conservative default
+            self._similarity_score_cache[context_hash] = fallback_score
+            
+            # Schedule background LLM analysis 
+            if hasattr(self, 'mcp_client') and self.mcp_client:
+                self._start_background_task(
+                    self._get_llm_similarity_score_async,
+                    artifact_name, existing_content, context_hash
+                )
+            
+            return fallback_score
+            
+        except Exception as e:
+            self.logger.debug(f"LLM similarity scoring failed: {e}")
+            return 30  # Conservative fallback
+    
+    async def _get_llm_similarity_score_async(self, artifact_name: str, existing_content: str, context_hash: int):
+        """Background task to get LLM similarity score"""
+        
+        content_sample = existing_content[:500]
+        
+        similarity_prompt = f"""
+Rate the semantic similarity between this artifact name and existing content on a scale of 0-100:
 
-    def _detect_infinite_loop(self, tool_name: str) -> bool:
+Artifact Name: "{artifact_name}"
+Existing Content: "{content_sample}"
+
+Scoring criteria:
+0-20: Completely unrelated topics and content
+21-40: Loosely related but distinct purposes
+41-60: Some shared concepts but different focus
+61-80: Highly related with substantial conceptual overlap
+81-100: Nearly identical or very similar content/purpose
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": similarity_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    similarity_score = int(response.content.strip())
+                    if 0 <= similarity_score <= 100:
+                        # Update cache with LLM result
+                        if not hasattr(self, '_similarity_score_cache'):
+                            self._similarity_score_cache = {}
+                        self._similarity_score_cache[context_hash] = similarity_score
+                        self.logger.debug(f"🧠 LLM similarity score updated: {similarity_score}")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM similarity scoring failed: {e}")
+    
+    async def _improve_similarity_analysis_with_llm(self, artifact_name: str, existing_content: str, content_hash: int):
+        """Use LLM to improve similarity analysis"""
+        
+        similarity_prompt = f"""
+Analyze the semantic similarity between these two artifacts and provide a similarity score.
+
+New Artifact Name: "{artifact_name}"
+Existing Content Sample: "{existing_content[:500]}"
+
+Rate the similarity on a scale of 0-100:
+- 0-20: Completely different topics/purposes
+- 21-40: Related but distinct focuses  
+- 41-60: Some overlap but still different enough
+- 61-80: Significant overlap, likely redundant
+- 81-100: Nearly identical or duplicate content
+
+Consider:
+1. Topic and subject matter alignment
+2. Purpose and functional similarity
+3. Information overlap and redundancy
+4. Whether both are truly needed
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": similarity_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    similarity_score = int(response.content.strip())
+                    if 0 <= similarity_score <= 100:
+                        # Use threshold of 65+ for considering items similar/duplicate
+                        SIMILARITY_THRESHOLD = 65
+                        is_similar = similarity_score >= SIMILARITY_THRESHOLD
+                        # Update cache with LLM result
+                        self._similarity_cache[content_hash] = is_similar
+                        self.logger.debug(f"🧠 LLM similarity analysis: score={similarity_score}, similar={is_similar} (threshold={SIMILARITY_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM similarity analysis failed: {e}")
+
+    async def _detect_infinite_loop(self, tool_name: str) -> bool:
         """Detect if the agent is stuck in an infinite loop with the same tool"""
         base_tool = self._get_base_function_name(tool_name)
         
@@ -5124,6 +8457,22 @@ class AgentMasterLoop:
         search_tools = {"hybrid_search_memories", "search_semantic_memories", "web_search", "smart_browser"}
         if base_tool in search_tools:
             self.state.search_attempts_count += 1
+        
+        # ENHANCED: Check if goal should be completed based on current progress
+        if (self.state.current_goal_id and self.state.goal_stack and 
+            self.state.search_attempts_count >= 2 and self.state.turns_since_artifact_creation >= 3):
+            
+            current_goal = self.state.goal_stack[-1] if self.state.goal_stack else {}
+            goal_desc = current_goal.get("description", "")
+            
+            if goal_desc and goal_desc != "Overall UMS Workflow Goal or Initial Task":
+                completion_status = await self._check_goal_completion_readiness(goal_desc)
+                
+                # If goal is ready for completion but agent keeps searching/looping, force completion
+                if completion_status["force_completion"]:
+                    self.logger.warning(f"🎯 COMPLETION LOOP: Goal ready for completion but agent continues looping - forcing completion")
+                    return True
+
         
         # Detect various loop patterns
         
@@ -5204,11 +8553,14 @@ class AgentMasterLoop:
         
         if self.state.plan_progression_stage == "initial":
             # ACTION-FIRST APPROACH: Bias toward concrete action over endless information gathering
-            if any(keyword in goal_lower for keyword in ["create", "write", "generate", "make", "build", "develop", "produce"]):
+            # Use semantic goal classification instead of primitive keyword matching
+            goal_type = self._classify_goal_type(current_goal_desc)
+            
+            if goal_type in ["creation", "communication"]:
                 plan_steps.append(PlanStep(
                     description="Take immediate action to fulfill the goal using available knowledge"
                 ))
-            elif any(keyword in goal_lower for keyword in ["research", "find", "search", "investigate", "study", "analyze"]):
+            elif goal_type in ["analysis", "evaluation"]:
                 # Only allow research if explicitly requested AND with limits
                 plan_steps.append(PlanStep(
                     description="Conduct ONE focused search for the most critical information needed",
@@ -5269,12 +8621,13 @@ class AgentMasterLoop:
         3. LIMITED RESEARCH with forced progression to action
         4. MEASURABLE OUTCOMES that can be evaluated
         """
-        goal_lower = goal_description.lower()
-        
         # GENERIC ACTION-FIRST PLANNING PRINCIPLES:
         
+        # Use semantic goal classification instead of primitive keyword matching  
+        goal_type = self._classify_goal_type(goal_description)
+        
         # If goal explicitly requires research/investigation, allow ONE focused search then ACT
-        if any(keyword in goal_lower for keyword in ["research", "investigate", "study", "find", "explore", "analyze"]):
+        if goal_type in ["analysis", "evaluation"]:
             return [
                 PlanStep(
                     description="Gather essential information for the task (ONE focused search)",
@@ -5288,7 +8641,7 @@ class AgentMasterLoop:
             ]
         
         # If goal is action-oriented, proceed directly to action
-        elif any(keyword in goal_lower for keyword in ["create", "write", "build", "develop", "generate", "make", "produce"]):
+        elif goal_type in ["creation", "communication"]:
             return [
                 PlanStep(
                     description=f"Execute the requested action: {goal_description[:120]}",
@@ -5358,172 +8711,300 @@ class AgentMasterLoop:
         ]
 
     async def _attempt_auto_fix(self, tool_name: str, args: Dict, error_envelope: Dict) -> Optional[Dict]:
-        """Attempt automatic fixes for common errors"""
+        """Attempt automatic fixes using intelligent semantic error analysis"""
+        
+        # Use semantic error analysis instead of brittle string matching
+        error_classification = self._classify_error_semantically(error_envelope, tool_name, args)
+        
+        # Route to appropriate semantic fix based on classification
+        if error_classification["category"] == "invalid_memory_type":
+            return await self._fix_memory_type_error_semantically(tool_name, args, error_classification)
+        elif error_classification["category"] == "invalid_artifact_type":
+            return await self._fix_artifact_type_error_semantically(tool_name, args, error_classification)
+        elif error_classification["category"] == "missing_required_fields":
+            return await self._fix_missing_fields_error_semantically(tool_name, args, error_classification)
+        elif error_classification["category"] == "workflow_id_issues":
+            return await self._fix_workflow_id_error_semantically(tool_name, args, error_classification)
+        elif error_classification["category"] == "file_access_issues":
+            return await self._fix_file_access_error_semantically(tool_name, args, error_classification)
+        elif error_classification["category"] == "planning_related":
+            return await self._suggest_planning_guidance_semantically(tool_name, args, error_classification)
+        
+        return None
+    
+    def _classify_error_semantically(self, error_envelope: Dict, tool_name: str, args: Dict) -> Dict[str, Any]:
+        """Semantically classify error type using intelligent analysis"""
+        
         error_type = error_envelope.get("error_type", "")
         error_msg = error_envelope.get("error_message", "").lower()
         
-        # Auto-fix invalid memory_type values (case-insensitive matching)
-        if ("invalid memory_type" in error_msg or "invalid memory type" in error_msg) and tool_name.endswith("store_memory"):
-            current_type = args.get("memory_type", "").lower()
-            # Comprehensive mapping of invalid memory types to valid ones
-            memory_type_mapping = {
-                # Common analysis/research terms
-                "analysis": "reasoning_step",
-                "research": "fact", 
-                "finding": "fact",
-                "findings": "fact",
-                "research_finding": "fact",
-                "research_findings": "fact",
-                "study": "fact",
-                "studies": "fact",
-                "investigation": "fact",
-                "examination": "fact",
-                
-                # Note-taking terms
-                "note": "text",
-                "notes": "text",
-                "annotation": "text",
-                "annotations": "text",
-                "comment": "text",
-                "comments": "text",
-                
-                # Information/data terms
-                "information": "fact",
-                "data": "fact",
-                "datum": "fact",
-                "result": "fact",
-                "results": "fact",
-                "outcome": "fact",
-                "outcomes": "fact",
-                "output": "fact",
-                "outputs": "fact",
-                
-                # Discovery/learning terms
-                "discovery": "insight",
-                "discoveries": "insight",
-                "learning": "insight",
-                "learnings": "insight",
-                "realization": "insight",
-                "realizations": "insight",
-                "understanding": "insight",
-                
-                # Observation terms
-                "observation": "observation",
-                "observations": "observation",
-                "notice": "observation",
-                "noticed": "observation",
-                
-                # Thought/reasoning terms
-                "thought": "reasoning_step",
-                "thoughts": "reasoning_step",
-                "thinking": "reasoning_step",
-                "reasoning": "reasoning_step",
-                "logic": "reasoning_step",
-                "rationale": "reasoning_step",
-                
-                # Ideas/concepts
-                "idea": "insight",
-                "ideas": "insight",
-                "concept": "fact",
-                "concepts": "fact",
-                "principle": "fact",
-                "principles": "fact",
-                "theory": "fact",
-                "theories": "fact",
-                
-                # Details/specifics
-                "detail": "fact",
-                "details": "fact",
-                "specific": "fact",
-                "specifics": "fact",
-                "particular": "fact",
-                "particulars": "fact",
-                
-                # Evidence/sources
-                "evidence": "fact",
-                "proof": "fact",
-                "source": "fact",
-                "sources": "fact",
-                "reference": "fact",
-                "references": "fact",
-                "citation": "fact",
-                "citations": "fact",
-                
-                # Conclusions/takeaways
-                "conclusion": "insight",
-                "conclusions": "insight",
-                "takeaway": "insight",
-                "takeaways": "insight",
-                "key_point": "fact",
-                "key_points": "fact",
-                "important": "fact",
-                "important_point": "fact",
-                "important_points": "fact",
-                
-                # Content types that might be confused
-                "content": "text",
-                "description": "text",
-                "summary": "summary",
-                "summaries": "summary",
-                "overview": "summary",
-                "recap": "summary",
-                
-                # Process/method terms
-                "method": "procedure",
-                "methods": "procedure",
-                "process": "procedure",
-                "processes": "procedure",
-                "step": "procedure",
-                "steps": "procedure",
-                "technique": "procedure",
-                "techniques": "procedure",
-                
-                # Knowledge/facts
-                "knowledge": "fact",
-                "fact": "fact",
-                "facts": "fact",
-                "truth": "fact",
-                "truths": "fact",
-                "reality": "fact",
-                
-                # Misc common terms
-                "item": "fact",
-                "items": "fact",
-                "element": "fact",
-                "elements": "fact",
-                "component": "fact",
-                "components": "fact",
-                "aspect": "fact",
-                "aspects": "fact",
-                "feature": "fact",
-                "features": "fact",
-                "characteristic": "fact",
-                "characteristics": "fact",
-                "attribute": "fact",
-                "attributes": "fact",
+        classification = {
+            "category": "unknown",
+            "confidence": 0.0,
+            "suggested_fix": None,
+            "context": {
+                "tool_name": tool_name,
+                "error_type": error_type,
+                "error_message": error_msg
             }
-            
-            if current_type in memory_type_mapping:
-                args["memory_type"] = memory_type_mapping[current_type]
-                self.logger.info(f"🔧 Auto-fixing memory_type '{current_type}' → '{args['memory_type']}'")
-                return await self._execute_tool_call_internal(tool_name, args, record_action=False)
-            else:
-                # If no mapping found, default to a safe fallback based on context
-                self.logger.warning(f"🔧 Unknown memory_type '{current_type}', using fallback")
-                if any(keyword in current_type for keyword in ["research", "study", "find", "discover", "learn"]):
-                    args["memory_type"] = "fact"
-                elif any(keyword in current_type for keyword in ["think", "reason", "analyze", "consider"]):
-                    args["memory_type"] = "reasoning_step"
-                elif any(keyword in current_type for keyword in ["insight", "understand", "realize", "conclude"]):
-                    args["memory_type"] = "insight"
-                else:
-                    args["memory_type"] = "text"  # Safe default
-                
-                self.logger.info(f"🔧 Auto-fixing unknown memory_type '{current_type}' → '{args['memory_type']}'")
-                return await self._execute_tool_call_internal(tool_name, args, record_action=False)
+        }
         
-        # Auto-fix workflow ID issues
-        if ("workflow" in error_msg and "not found" in error_msg) and self.state.workflow_id:
+        # Use semantic understanding for error classification
+        if self._is_memory_type_error_semantically(error_msg, tool_name):
+            classification.update({
+                "category": "invalid_memory_type",
+                "confidence": 0.9,
+                "suggested_fix": "reclassify_memory_type"
+            })
+        elif self._is_artifact_type_error_semantically(error_msg, tool_name):
+            classification.update({
+                "category": "invalid_artifact_type", 
+                "confidence": 0.9,
+                "suggested_fix": "reclassify_artifact_type"
+            })
+        elif self._is_missing_fields_error_semantically(error_msg, error_type):
+            classification.update({
+                "category": "missing_required_fields",
+                "confidence": 0.8,
+                "suggested_fix": "add_missing_fields"
+            })
+        elif self._is_workflow_id_error_semantically(error_msg):
+            classification.update({
+                "category": "workflow_id_issues",
+                "confidence": 0.8,
+                "suggested_fix": "fix_workflow_id"
+            })
+        elif self._is_file_access_error_semantically(error_msg):
+            classification.update({
+                "category": "file_access_issues",
+                "confidence": 0.7,
+                "suggested_fix": "diagnose_file_access"
+            })
+        elif self._is_planning_error_semantically(error_msg):
+            classification.update({
+                "category": "planning_related",
+                "confidence": 0.6,
+                "suggested_fix": "suggest_multi_tool_guidance"
+            })
+        
+        return classification
+    
+    # SEMANTIC ERROR CLASSIFICATION FUNCTIONS
+    
+    def _is_memory_type_error_semantically(self, error_msg: str, tool_name: str) -> bool:
+        """Use LLM analysis to detect memory type errors"""
+        
+        return self._classify_error_type_with_llm(error_msg, tool_name, "memory_type_error")
+    
+    def _is_artifact_type_error_semantically(self, error_msg: str, tool_name: str) -> bool:
+        """Use LLM analysis to detect artifact type errors"""
+        
+        return self._classify_error_type_with_llm(error_msg, tool_name, "artifact_type_error")
+    
+    def _is_missing_fields_error_semantically(self, error_msg: str, error_type: str) -> bool:
+        """Use LLM analysis to detect missing required fields errors"""
+        
+        return self._classify_error_type_with_llm(error_msg, f"error_type:{error_type}", "missing_fields_error")
+    
+    def _is_workflow_id_error_semantically(self, error_msg: str) -> bool:
+        """Use LLM analysis to detect workflow ID issues"""
+        
+        return self._classify_error_type_with_llm(error_msg, "", "workflow_id_error")
+    
+    def _is_file_access_error_semantically(self, error_msg: str) -> bool:
+        """Use LLM analysis to detect file access issues"""
+        
+        return self._classify_error_type_with_llm(error_msg, "", "file_access_error")
+    
+    def _is_planning_error_semantically(self, error_msg: str) -> bool:
+        """Use LLM analysis to detect planning-related errors"""
+        
+        return self._classify_error_type_with_llm(error_msg, "", "planning_error")
+    
+    def _classify_error_type_with_llm(self, error_msg: str, context: str, error_category: str) -> bool:
+        """Use LLM to classify error types with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        context_hash = hash(f"{error_category}:{error_msg[:200]}:{context}")
+        if not hasattr(self, '_error_classification_cache'):
+            self._error_classification_cache = {}
+        
+        if context_hash in self._error_classification_cache:
+            return self._error_classification_cache[context_hash]
+        
+        # Intelligent semantic fallback instead of primitive pattern matching
+        fallback_result = self._get_error_classification_intelligent_fallback(error_msg, context, error_category)
+        self._error_classification_cache[context_hash] = fallback_result
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_error_classification_with_llm,
+                error_msg, context, error_category, context_hash
+            )
+        
+        return fallback_result
+    
+    def _get_error_classification_intelligent_fallback(self, error_msg: str, context: str, error_category: str) -> bool:
+        """Intelligent semantic fallback for error classification"""
+        
+        # Use LLM semantic understanding instead of primitive hardcoded lists
+        return self._classify_error_category_with_llm_scoring(error_msg, context, error_category)
+        
+        return False
+    
+    async def _classify_error_category_with_llm_scoring(self, error_msg: str, context: str, error_category: str) -> bool:
+        """Use LLM to classify error category directly"""
+        
+        scoring_prompt = f"""
+Does this error match the category "{error_category}"?
+
+Error Message: "{error_msg}"
+Context: "{context}"
+Category: {error_category}
+
+Categories:
+- memory_type_error: invalid memory types or memory classification issues
+- artifact_type_error: invalid artifact types or artifact classification issues  
+- missing_fields_error: missing required fields, parameters, or validation failures
+- workflow_id_error: workflow ID issues, not found, or invalid workflow references
+- file_access_error: file permissions, access denied, file not found, or path issues
+- planning_error: planning, sequencing, dependencies, or complex operations
+
+Respond with just "yes" or "no".
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": scoring_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                result = response.content.strip().lower()
+                return result == "yes"
+        except Exception as e:
+            self.logger.error(f"LLM error category classification failed: {e}")
+            
+        return False  # Default if LLM fails
+    
+    async def _improve_error_classification_with_llm(self, error_msg: str, context: str, error_category: str, context_hash: int):
+        """Use LLM to improve error classification"""
+        
+        error_classification_prompt = f"""
+Analyze this error message and rate how well it matches the specified error category.
+
+Error Message: "{error_msg}"
+Context: "{context}"
+Category to check: {error_category}
+
+Error Categories:
+- memory_type_error: Errors related to invalid memory types or memory classification issues
+- artifact_type_error: Errors related to invalid artifact types or artifact classification issues  
+- missing_fields_error: Errors about missing required fields, parameters, or validation failures
+- workflow_id_error: Errors related to workflow ID issues, not found, or invalid workflow references
+- file_access_error: Errors related to file permissions, access denied, file not found, or path issues
+- planning_error: Errors related to planning, sequencing, dependencies, or complex operations
+
+Rate the confidence that this error matches the category on a scale of 0-100:
+- 0-20: Definitely not this error type
+- 21-40: Probably not this error type
+- 41-60: Uncertain, could be this type
+- 61-80: Likely this error type
+- 81-100: Definitely this error type
+
+Consider:
+1. Semantic alignment with error category
+2. Context supporting the classification
+3. Specific terminology and patterns
+
+Respond with just the numerical confidence score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": error_classification_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    confidence_score = int(response.content.strip())
+                    if 0 <= confidence_score <= 100:
+                        # Use threshold of 70+ for high confidence error classification  
+                        ERROR_CLASSIFICATION_THRESHOLD = 70
+                        matches_category = confidence_score >= ERROR_CLASSIFICATION_THRESHOLD
+                        # Update cache with LLM result
+                        self._error_classification_cache[context_hash] = matches_category
+                        self.logger.debug(f"🧠 LLM error classification: {error_category} confidence={confidence_score}, matches={matches_category} (threshold={ERROR_CLASSIFICATION_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM error classification failed: {e}")
+    
+    # SEMANTIC ERROR FIX FUNCTIONS
+    
+    async def _fix_memory_type_error_semantically(self, tool_name: str, args: Dict, error_classification: Dict) -> Optional[Dict]:
+        """Fix memory type errors using semantic understanding"""
+        
+        current_type = args.get("memory_type", "").lower()
+        # Use semantic understanding to classify memory type
+        corrected_type = self._classify_memory_type_semantically(
+            current_type, 
+            args.get("content", ""),
+            args.get("description", "")
+        )
+        
+        if corrected_type and corrected_type != current_type:
+            args["memory_type"] = corrected_type
+            self.logger.info(f"🔧 Semantically corrected memory_type '{current_type}' → '{corrected_type}'")
+            return await self._execute_tool_call_internal(tool_name, args, record_action=False)
+        
+        return None
+    
+    async def _fix_artifact_type_error_semantically(self, tool_name: str, args: Dict, error_classification: Dict) -> Optional[Dict]:
+        """Fix artifact type errors using semantic understanding"""
+        
+        current_type = args.get("artifact_type", "").lower()
+        # Use semantic understanding to classify artifact type
+        corrected_type = self._classify_artifact_type_semantically(
+            current_type,
+            args.get("name", ""),
+            args.get("description", ""),
+            args.get("content", "")
+        )
+        
+        if corrected_type and corrected_type != current_type:
+            args["artifact_type"] = corrected_type
+            self.logger.info(f"🔧 Semantically corrected artifact_type '{current_type}' → '{corrected_type}'")
+            return await self._execute_tool_call_internal(tool_name, args, record_action=False)
+        
+        return None
+    
+    async def _fix_missing_fields_error_semantically(self, tool_name: str, args: Dict, error_classification: Dict) -> Optional[Dict]:
+        """Fix missing required fields using semantic understanding"""
+        
+        # Intelligent field completion based on tool context
+        if await self._is_tool_hybrid_search_semantically(tool_name) and "query" not in args:
+            # Extract query from current plan step
+            query = self.state.current_plan[0].description if self.state.current_plan else "information"
+            args["query"] = query
+            self.logger.info(f"🔧 Auto-fixing missing query: '{query}'")
+            return await self._execute_tool_call_internal(tool_name, args, record_action=False)
+        
+        return None
+    
+    async def _fix_workflow_id_error_semantically(self, tool_name: str, args: Dict, error_classification: Dict) -> Optional[Dict]:
+        """Fix workflow ID issues using semantic understanding"""
+        
+        if self.state.workflow_id:
             # Check for workflow ID corruption or validation issues
             current_wf_id = args.get("workflow_id")
             if current_wf_id and current_wf_id != self.state.workflow_id:
@@ -5535,173 +9016,394 @@ class AgentMasterLoop:
                 args["workflow_id"] = self.state.workflow_id
                 return await self._execute_tool_call_internal(tool_name, args, record_action=False)
         
-        # Auto-fix invalid artifact_type values
-        if ("invalid artifact_type" in error_msg or "invalid artifact type" in error_msg) and tool_name.endswith("record_artifact"):
-            current_type = args.get("artifact_type", "").lower()
-            # Comprehensive mapping of invalid artifact types to valid ones
-            type_mapping = {
-                # Document/content types
-                "report": "file",
-                "document": "file", 
-                "article": "file",
-                "essay": "file",
-                "paper": "file",
-                "analysis": "file",
-                "summary": "file",
-                "overview": "file",
-                "review": "file",
-                "study": "file",
-                "research": "file",
-                
-                # Interactive and structured content
-                "interactive": "file",
-                "structured": "file",
-                "questionnaire": "file",
-                "survey": "file",
-                "form": "file",
-                
-                # Web content
-                "html": "file",
-                "webpage": "file",
-                "website": "file",
-                "page": "file",
-                "web": "file",
-                
-                # Code/script types
-                "script": "code",
-                "program": "code",
-                "software": "code",
-                "application": "code",
-                "app": "code",
-                "function": "code",
-                "method": "code",
-                "class": "code",
-                "module": "code",
-                
-                # Data formats
-                "dataset": "data",
-                "database": "data",
-                "spreadsheet": "data",
-                "csv": "data",
-                "excel": "data",
-                "xml": "data",
-                "yaml": "data",
-                "yml": "data",
-                "toml": "data",
-                "ini": "data",
-                "config": "data",
-                "configuration": "data",
-                
-                # Media types
-                "picture": "image",
-                "photo": "image",
-                "graphic": "image",
-                "diagram": "image",
-                "plot": "chart",
-                "graph": "chart",
-                "visualization": "chart",
-                "figure": "chart",
-                
-                # Structured content
-                "list": "text",
-                "outline": "text",
-                "notes": "text",
-                "memo": "text",
-                "message": "text",
-                "email": "text",
-                "letter": "text",
-                "content": "text",
-                "description": "text",
-                "documentation": "text",
-                "readme": "text",
-                "guide": "text",
-                "manual": "text",
-                "instructions": "text",
-                "tutorial": "text",
-                
-                # Output types
-                "output": "text",
-                "result": "text",
-                "response": "text",
-                "answer": "text",
-                "solution": "text",
-            }
-            
-            if current_type in type_mapping:
-                args["artifact_type"] = type_mapping[current_type]
-                self.logger.info(f"🔧 Auto-fixing artifact_type '{current_type}' → '{args['artifact_type']}'")
-                return await self._execute_tool_call_internal(tool_name, args, record_action=False)
-            else:
-                # Fallback logic for unknown artifact types
-                if any(keyword in current_type for keyword in ["code", "script", "program", "function", "class"]):
-                    args["artifact_type"] = "code"
-                elif any(keyword in current_type for keyword in ["data", "csv", "json", "xml", "yaml"]):
-                    args["artifact_type"] = "data"
-                elif any(keyword in current_type for keyword in ["image", "picture", "photo", "graphic"]):
-                    args["artifact_type"] = "image"
-                elif any(keyword in current_type for keyword in ["chart", "graph", "plot", "visualization"]):
-                    args["artifact_type"] = "chart"
-                elif any(keyword in current_type for keyword in ["url", "link", "website", "web"]):
-                    args["artifact_type"] = "url"
-                elif any(keyword in current_type for keyword in ["html", "document", "report", "file", "structured", "interactive"]):
-                    args["artifact_type"] = "file"
-                else:
-                    args["artifact_type"] = "text"  # Safe default
-                
-                self.logger.info(f"🔧 Auto-fixing unknown artifact_type '{current_type}' → '{args['artifact_type']}'")
-                return await self._execute_tool_call_internal(tool_name, args, record_action=False)
+        return None
+    
+    async def _fix_file_access_error_semantically(self, tool_name: str, args: Dict, error_classification: Dict) -> Optional[Dict]:
+        """Fix file access issues using semantic understanding"""
         
-        # Auto-fix missing required fields
-        if "missing required" in error_msg or "InvalidInputError" in error_type:
-            if tool_name.endswith("hybrid_search_memories") and "query" not in args:
-                # Extract query from current plan step
-                query = self.state.current_plan[0].description if self.state.current_plan else "information"
-                args["query"] = query
-                self.logger.info(f"🔧 Auto-fixing missing query: '{query}'")
-                return await self._execute_tool_call_internal(tool_name, args, record_action=False)
-        
-        # Suggest multi-tool guidance for planning errors
-        if any(phrase in error_msg for phrase in ["plan", "sequence", "dependency", "complex operation"]):
-            self.logger.info(f"🔧 Planning error detected - consider using {UMS_FUNC_GET_MULTI_TOOL_GUIDANCE} for guidance")
-            # Don't auto-execute this - let the LLM decide to call it
-        
-        # Auto-fix workflow_id issues
-        if "workflow_id" in error_msg and self.state.workflow_id:
-            args["workflow_id"] = self.state.workflow_id
-            self.logger.info(f"🔧 Auto-fixing missing workflow_id")
+        # Try to fix file path issues using the diagnose_file_access_issues tool
+        if await self._attempt_file_path_auto_fix(tool_name, args, error_classification):
             return await self._execute_tool_call_internal(tool_name, args, record_action=False)
         
-        # Auto-fix file permission/path issues
-        if any(phrase in error_msg for phrase in ["permission denied", "access denied", "no such file or directory", "cannot create", "read-only"]):
-            # Try to fix file path issues using the diagnose_file_access_issues tool
-            if await self._attempt_file_path_auto_fix(tool_name, args, error_envelope):
-                return await self._execute_tool_call_internal(tool_name, args, record_action=False)
-        
-        # Auto-suggest better artifact types for user-accessible content
-        if tool_name.endswith("record_artifact") and not any(phrase in error_msg for phrase in ["invalid artifact_type", "error", "failed"]):
-            # Check if we're creating a text artifact that should be a file for user access
-            current_type = args.get("artifact_type", "").lower()
-            artifact_name = args.get("name", "").lower()
-            
-            if (current_type == "text" and 
-                any(keyword in artifact_name for keyword in ["report", "document", "analysis", "summary", "essay", "article"])):
-                
-                # Suggest using file type and add safe file path
-                args["artifact_type"] = "file"
-                if "file_path" not in args:
-                    # Generate a safe file path based on the artifact name
-                    safe_name = artifact_name.replace(" ", "_").replace(":", "_")
-                    if not safe_name.endswith('.txt'):
-                        safe_name += '.txt'
-                    args["file_path"] = self._get_safe_file_path(safe_name)
-                
-                self.logger.info(f"🔧 Auto-upgrading text artifact '{artifact_name}' to file type for user accessibility")
-                self.logger.info(f"🔧 Suggested file path: {args.get('file_path')}")
-                return await self._execute_tool_call_internal(tool_name, args, record_action=False)
-        
         return None
+    
+    async def _suggest_planning_guidance_semantically(self, tool_name: str, args: Dict, error_classification: Dict) -> Optional[Dict]:
+        """Suggest planning guidance for complex errors"""
+        
+        self.logger.info(f"🔧 Planning error detected - consider using {UMS_FUNC_GET_MULTI_TOOL_GUIDANCE} for guidance")
+        # Don't auto-execute this - let the LLM decide to call it
+        return None
+    
+    async def _is_tool_hybrid_search_semantically(self, tool_name: str) -> bool:
+        """Use LLM analysis to detect if tool is hybrid search related"""
+        
+        return await self._analyze_tool_type_with_llm(tool_name, "search_tool")
+    
+    async def _analyze_tool_type_with_llm(self, tool_name: str, tool_type: str) -> bool:
+        """Use LLM to analyze tool types with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        context_hash = hash(f"{tool_type}:{tool_name}")
+        if not hasattr(self, '_tool_analysis_cache'):
+            self._tool_analysis_cache = {}
+        
+        if context_hash in self._tool_analysis_cache:
+            return self._tool_analysis_cache[context_hash]
+        
+        # Intelligent semantic fallback instead of primitive pattern matching
+        fallback_result = await self._get_tool_analysis_intelligent_fallback(tool_name, tool_type)
+        self._tool_analysis_cache[context_hash] = fallback_result
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_tool_analysis_with_llm,
+                tool_name, tool_type, context_hash
+            )
+        
+        return fallback_result
+    
+    async def _get_tool_analysis_intelligent_fallback(self, tool_name: str, tool_type: str) -> bool:
+        """Intelligent semantic fallback for tool analysis"""
+        
+        # Use LLM semantic understanding instead of primitive hardcoded lists
+        return await self._score_tool_type_match_semantically(tool_name, tool_type)
+        
+        return False
+    
+    async def _score_tool_type_match_semantically(self, tool_name: str, tool_type: str) -> bool:
+        """Use LLM to determine if tool matches type"""
+        
+        prompt = f"""
+Does the tool "{tool_name}" match the type "{tool_type}"?
 
-    async def _attempt_file_path_auto_fix(self, tool_name: str, args: Dict, error_envelope: Dict) -> bool:
+Tool types:
+- search_tool: tools for searching, querying, finding information, retrieving data
+- artifact_tool: tools for creating, recording, writing, generating artifacts/files  
+- research_tool: tools for researching, browsing, fetching, gathering information
+
+Respond with just "yes" or "no".
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                result = response.content.strip().lower()
+                return result == "yes"
+        except Exception as e:
+            self.logger.error(f"LLM tool type analysis failed: {e}")
+            
+        return False  # Default if LLM fails
+    
+    async def _improve_tool_analysis_with_llm(self, tool_name: str, tool_type: str, context_hash: int):
+        """Use LLM to improve tool analysis"""
+        
+        tool_analysis_prompt = f"""
+Analyze this tool name and rate how well it matches the specified tool type.
+
+Tool Name: "{tool_name}"
+Tool type to check: {tool_type}
+
+Tool Types:
+- search_tool: Tools used for searching, querying, finding information, or retrieving data from memory/databases
+- artifact_tool: Tools used for creating, recording, writing, generating, or producing artifacts/files/documents/deliverables
+- research_tool: Tools used for researching, browsing, fetching, gathering information, or accessing web/APIs
+
+Rate the confidence that this tool matches the type on a scale of 0-100:
+- 0-20: Definitely not this tool type
+- 21-40: Probably not this tool type
+- 41-60: Uncertain, could be this type
+- 61-80: Likely this tool type
+- 81-100: Definitely this tool type
+
+Consider:
+1. Tool name semantic alignment with functionality
+2. Expected operations and use cases
+3. Patterns in naming that suggest tool purpose
+
+Respond with just the numerical confidence score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": tool_analysis_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    confidence_score = int(response.content.strip())
+                    if 0 <= confidence_score <= 100:
+                        # Use threshold of 70+ for high confidence tool type matching
+                        TOOL_ANALYSIS_THRESHOLD = 70
+                        matches_type = confidence_score >= TOOL_ANALYSIS_THRESHOLD
+                        # Update cache with LLM result
+                        self._tool_analysis_cache[context_hash] = matches_type
+                        self.logger.debug(f"🧠 LLM tool analysis: {tool_type} confidence={confidence_score}, matches={matches_type} (threshold={TOOL_ANALYSIS_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM tool analysis failed: {e}")
+    
+    async def _analyze_content_format_semantically(self, content: str) -> Dict[str, Any]:
+        """Analyze content format using LLM with intelligent fallback"""
+        
+        if not content or not isinstance(content, str):
+            return {"primary_format": "text", "confidence": 0.0}
+        
+        # Cache to avoid repeated LLM calls
+        content_hash = hash(content[:500])
+        if not hasattr(self, '_content_format_cache'):
+            self._content_format_cache = {}
+        
+        if content_hash in self._content_format_cache:
+            return self._content_format_cache[content_hash]
+        
+        # Intelligent fallback instead of primitive scoring
+        fallback_analysis = await self._get_content_format_intelligent_fallback(content)
+        self._content_format_cache[content_hash] = fallback_analysis
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_content_format_analysis_with_llm,
+                content, content_hash
+            )
+        
+        return fallback_analysis
+    
+    async def _get_content_format_intelligent_fallback(self, content: str) -> Dict[str, Any]:
+        """Use LLM for content format analysis"""
+        
+        format_prompt = f"""
+Analyze this content and determine its format.
+
+Content: {content[:500]}
+
+Available formats: html, json, xml, python, javascript, c_cpp, csv, markdown, text
+
+Respond with just the format name (e.g., "html", "json", "text").
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": format_prompt}],
+                model_override=None,
+                max_tokens=10,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                format_name = response.content.strip().lower()
+                valid_formats = {"html", "json", "xml", "python", "javascript", "c_cpp", "csv", "markdown", "text"}
+                if format_name in valid_formats:
+                    return {"primary_format": format_name, "confidence": 0.9}
+        except Exception as e:
+            self.logger.error(f"LLM content format analysis failed: {e}")
+            
+        return {"primary_format": "text", "confidence": 0.3}
+    
+    async def _improve_content_format_analysis_with_llm(self, content: str, content_hash: int):
+        """Use LLM to improve content format analysis"""
+        
+        format_analysis_prompt = f"""
+Analyze this content and determine its format/type. 
+
+Content sample: {content[:800]}
+
+Choose the most appropriate format:
+- html: HTML web content with tags and structure
+- json: JSON data format with key-value pairs
+- xml: XML markup with opening/closing tags
+- python: Python programming code
+- javascript: JavaScript code
+- c_cpp: C/C++ programming code
+- csv: Comma-separated values data
+- markdown: Markdown formatted text
+- text: Plain text content
+
+Consider:
+1. Syntax patterns and structure
+2. Opening/closing patterns
+3. Programming language keywords
+4. Data organization patterns
+
+Respond with just the format name and confidence (0.0-1.0) in this format: "format_name,confidence"
+For example: "html,0.9" or "text,0.3"
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": format_analysis_prompt}],
+                model_override=None,
+                max_tokens=20,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                result = response.content.strip()
+                
+                try:
+                    format_name, confidence_str = result.split(',')
+                    format_name = format_name.strip().lower()
+                    confidence = float(confidence_str.strip())
+                    
+                    valid_formats = {"html", "json", "xml", "python", "javascript", "c_cpp", "csv", "markdown", "text"}
+                    if format_name in valid_formats and 0.0 <= confidence <= 1.0:
+                        # Update cache with LLM result
+                        improved_analysis = {
+                            "primary_format": format_name,
+                            "confidence": confidence,
+                            "llm_enhanced": True
+                        }
+                        self._content_format_cache[content_hash] = improved_analysis
+                        self.logger.debug(f"🧠 LLM improved content format: {format_name} ({confidence:.1f})")
+                        
+                except (ValueError, IndexError):
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM content format analysis failed: {e}")
+    
+    def _get_format_indicators(self, content: str, primary_format: str) -> List[str]:
+        """Get the specific indicators that led to format detection"""
+        
+        indicators = []
+        indicators = self._get_format_indicators_with_llm(content, primary_format)
+        return indicators if indicators else [f"{primary_format}_detected"]
+    
+    def _get_format_indicators_with_llm(self, content: str, expected_format: str) -> List[str]:
+        """Use LLM to identify what makes content look like a specific format"""
+        
+        format_analysis_prompt = f"""
+Analyze this content and identify what specific features make it look like {expected_format} format.
+
+Content (first 300 chars): "{content[:300]}"
+Expected Format: {expected_format}
+
+List the key indicators that suggest this is {expected_format} content. Examples:
+- For HTML: specific tags, DOCTYPE, structure elements
+- For JSON: bracket patterns, key-value syntax, quotes
+- For Python: keywords, import statements, function definitions
+- For other formats: characteristic syntax patterns
+
+Respond with 2-3 specific indicators, one per line (e.g., "html_tags", "json_syntax", "python_keywords").
+"""
+
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            response = loop.run_until_complete(self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": format_analysis_prompt}],
+                model_override=None,
+                max_tokens=50,
+                temperature=0.1,
+                stream=False
+            ))
+            
+            if response and hasattr(response, 'content') and response.content:
+                indicators = [line.strip() for line in response.content.strip().split('\n') if line.strip()]
+                return indicators[:3]  # Limit to 3 indicators
+                
+        except Exception:
+            pass
+            
+        # Simple fallback based on format name
+        return [f"{expected_format}_detected"]
+        
+        # Add more indicators for other formats as needed
+        
+        return indicators
+    
+    async def _analyze_feedback_for_replan_semantically(self, feedback: str) -> bool:
+        """Analyze feedback using LLM to detect if replanning is needed"""
+        
+        if not feedback or not isinstance(feedback, str):
+            return False
+        
+        # Cache to avoid repeated LLM calls
+        feedback_hash = hash(feedback[:500])
+        if not hasattr(self, '_replan_feedback_cache'):
+            self._replan_feedback_cache = {}
+        
+        if feedback_hash in self._replan_feedback_cache:
+            return self._replan_feedback_cache[feedback_hash]
+        # No LLM result = assume no replanning needed
+        self._replan_feedback_cache[feedback_hash] = False
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_replan_analysis_with_llm,
+                feedback, feedback_hash
+            )
+        
+        return False
+    
+
+    
+    async def _improve_replan_analysis_with_llm(self, feedback: str, feedback_hash: int):
+        """Use LLM to improve replan analysis"""
+        
+        replan_analysis_prompt = f"""
+Analyze this feedback and rate how strongly it suggests the agent should replan or change approach.
+
+Feedback: "{feedback}"
+
+Rate the replanning necessity on a scale of 0-100:
+- 0-20: Feedback is positive, continue current approach
+- 21-40: Minor issues, current approach mostly fine
+- 41-60: Moderate concerns, some adjustments may be needed
+- 61-80: Significant problems, replanning strongly recommended  
+- 81-100: Critical issues, replanning absolutely necessary
+
+Consider:
+1. Severity of criticism or ineffectiveness indicated
+2. Explicit recommendations to change strategy
+3. Signs of being stuck or making poor progress
+4. Urgency of suggested approach changes
+
+Respond with just the numerical replanning necessity score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": replan_analysis_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    replan_score = int(response.content.strip())
+                    if 0 <= replan_score <= 100:
+                        # Use configurable threshold for triggering replanning
+                        needs_replan = replan_score >= LLM_REPLAN_NECESSITY_THRESHOLD
+                        # Update cache with LLM result
+                        self._replan_feedback_cache[feedback_hash] = needs_replan
+                        self.logger.debug(f"🧠 LLM replan analysis: score={replan_score}, needs_replan={needs_replan} (threshold={LLM_REPLAN_NECESSITY_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM replan analysis failed: {e}")
+
+    async def _attempt_file_path_auto_fix(self, tool_name: str, args: Dict, error_context: Dict) -> bool:
         """Attempt to fix file path/permission issues using diagnose_file_access_issues tool"""
         try:
             # Find the diagnose tool
@@ -5724,7 +9426,7 @@ class AgentMasterLoop:
             if not file_path:
                 # Try to extract path from content or other args
                 content = args.get("content", "")
-                if isinstance(content, str) and any(keyword in content.lower() for keyword in ["save to", "write to", "create file"]):
+                if isinstance(content, str) and ("save to" in content.lower() or "write to" in content.lower()):
                     # Use a safe default path for content creation
                     file_path = "/home/ubuntu/ultimate_mcp_server/storage/agent_output.txt"
                     path_arg_name = "content_path"  # We'll handle this specially
@@ -5818,41 +9520,114 @@ class AgentMasterLoop:
         return os.path.join(os.getcwd(), filename)
 
     def _is_likely_file_creation_task(self) -> bool:
-        """Detect if the current task is likely to involve creating files"""
-        # Check current plan for file creation keywords
-        if self.state.current_plan:
-            plan_text = " ".join([step.description.lower() for step in self.state.current_plan])
-            file_creation_keywords = [
-                "create file", "write file", "save file", "generate file",
-                "create report", "write report", "save report", "generate report", 
-                "create document", "write document", "save document",
-                "create html", "write html", "save html", "generate html",
-                "create code", "write code", "save code", "generate code",
-                "create artifact", "record artifact", "save artifact",
-                "export", "download", "output file", "write to disk"
-            ]
-            if any(keyword in plan_text for keyword in file_creation_keywords):
-                return True
+        """Semantically detect if the current task is likely to involve creating files"""
         
-        # Check current goal for file creation indicators
+        # Cache file creation detection
+        context_text = ""
+        if self.state.current_plan:
+            context_text += " ".join([step.description for step in self.state.current_plan])
         if self.state.goal_stack:
             current_goal = self.state.goal_stack[-1] if self.state.goal_stack else {}
-            goal_desc = str(current_goal.get("description", "")).lower()
-            goal_creation_keywords = [
-                "content", "report", "document", "file", "html", "code", 
-                "script", "analysis", "summary", "deliverable", "artifact", "creation"
-            ]
-            if any(keyword in goal_desc for keyword in goal_creation_keywords):
-                return True
+            context_text += " " + str(current_goal.get("description", ""))
+        context_text += " " + self.state.last_action_summary
         
-        # Check recent successful actions for artifact creation
-        if "record_artifact" in self.state.last_action_summary.lower():
-            return True
-            
+        context_hash = hash(context_text[:500])
+        if not hasattr(self, '_file_creation_cache'):
+            self._file_creation_cache = {}
+        
+        if context_hash in self._file_creation_cache:
+            return self._file_creation_cache[context_hash]
+        
+        # Use semantic understanding with intelligent heuristics
+        is_file_creation = self._detect_file_creation_semantically(context_text)
+        self._file_creation_cache[context_hash] = is_file_creation
+        
+        # Schedule background LLM improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_file_creation_detection_with_llm,
+                context_text, context_hash
+            )
+        
+        return is_file_creation
+    
+    def _detect_file_creation_semantically(self, context_text: str) -> bool:
+        """Use LLM analysis to detect file creation intent with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        context_hash = hash(context_text[:500])
+        if not hasattr(self, '_file_creation_detection_cache'):
+            self._file_creation_detection_cache = {}
+        
+        if context_hash in self._file_creation_detection_cache:
+            return self._file_creation_detection_cache[context_hash]
+        
+        # No LLM result = assume no file creation needed
+        self._file_creation_detection_cache[context_hash] = False
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_file_creation_detection_with_llm,
+                context_text, context_hash
+            )
+        
         return False
+    
+
+    
+    async def _improve_file_creation_detection_with_llm(self, context_text: str, context_hash: int):
+        """Use LLM to improve file creation detection"""
+        
+        detection_prompt = f"""
+Analyze this task context and rate the likelihood that it involves creating files, documents, or deliverables.
+
+Context: {context_text[:800]}
+
+Rate the file creation likelihood on a scale of 0-100:
+- 0-20: Minimal file creation, mostly reading/analysis
+- 21-40: Some output but not necessarily file-based
+- 41-60: Moderate likelihood of creating saved content
+- 61-80: High likelihood of creating downloadable deliverables
+- 81-100: Definitely involves creating files/documents for users
+
+Consider:
+1. Explicit mentions of file creation, saving, or output generation
+2. Deliverables mentioned (reports, documents, web pages, code, etc.)
+3. Goal to produce tangible outputs users can access
+4. Context suggesting content should be preserved as files
+
+Respond with just the numerical likelihood score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": detection_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    creation_likelihood = int(response.content.strip())
+                    if 0 <= creation_likelihood <= 100:
+                        is_file_creation = creation_likelihood >= LLM_FILE_CREATION_THRESHOLD
+                        # Update cache with LLM result
+                        self._file_creation_detection_cache[context_hash] = is_file_creation
+                        self.logger.debug(f"🧠 LLM file creation detection: likelihood={creation_likelihood}, is_file_creation={is_file_creation} (threshold={LLM_FILE_CREATION_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM file creation detection failed: {e}")
+    
+
 
     def _should_suggest_multi_tool_guidance(self) -> bool:
-        """Determine if the agent would benefit from multi-tool guidance"""
+        """Semantically determine if the agent would benefit from multi-tool guidance"""
+        
         # Suggest if there are consecutive errors (might be due to poor tool planning)
         if self.state.consecutive_error_count >= 2:
             return True
@@ -5861,25 +9636,17 @@ class AgentMasterLoop:
         if len(self.state.current_plan) > 4:
             return True
         
-        # Suggest if recent errors were planning-related
+        # Use semantic understanding for error analysis
         if self.state.last_error_details:
-            error_type = self.state.last_error_details.get("type", "").lower()
-            error_msg = str(self.state.last_error_details.get("error", "")).lower()
-            planning_error_indicators = [
-                "plan", "sequence", "dependency", "validation", "step", "order"
-            ]
-            if any(indicator in error_type + error_msg for indicator in planning_error_indicators):
+            error_context = f"{self.state.last_error_details.get('type', '')} {self.state.last_error_details.get('error', '')}"
+            if self._is_planning_related_error_semantically(error_context):
                 return True
         
-        # Suggest for goals that sound complex or comprehensive
+        # Use semantic understanding for goal complexity analysis
         if self.state.goal_stack:
             current_goal = self.state.goal_stack[-1] if self.state.goal_stack else {}
-            goal_desc = str(current_goal.get("description", "")).lower()
-            complex_goal_indicators = [
-                "comprehensive", "detailed", "thorough", "analysis", "complex",
-                "multi-step", "research and", "analyze and", "investigate and"
-            ]
-            if any(indicator in goal_desc for indicator in complex_goal_indicators):
+            goal_desc = str(current_goal.get("description", ""))
+            if self._is_complex_goal_semantically(goal_desc):
                 return True
         
         # Suggest if the agent is struggling with efficiency (too many turns for simple tasks)
@@ -5888,6 +9655,464 @@ class AgentMasterLoop:
         
         return False
 
+    def _is_planning_related_error_semantically(self, error_context: str) -> bool:
+        """Use LLM analysis to detect if an error is planning-related"""
+        
+        return self._analyze_error_context_with_llm(error_context, "planning_related")
+    
+    def _analyze_error_context_with_llm(self, error_context: str, analysis_type: str) -> bool:
+        """Use LLM to analyze error context with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        context_hash = hash(f"{analysis_type}:{error_context[:200]}")
+        if not hasattr(self, '_error_context_cache'):
+            self._error_context_cache = {}
+        
+        if context_hash in self._error_context_cache:
+            return self._error_context_cache[context_hash]
+        
+        # No LLM result = assume not planning-related
+        self._error_context_cache[context_hash] = False
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_error_context_analysis_with_llm,
+                error_context, analysis_type, context_hash
+            )
+        
+        return False
+    
+
+    
+    async def _improve_error_context_analysis_with_llm(self, error_context: str, analysis_type: str, context_hash: int):
+        """Use LLM to improve error context analysis"""
+        
+        if analysis_type == "planning_related":
+            analysis_prompt = f"""
+Analyze this error context and rate how strongly it relates to planning, sequencing, or coordination issues.
+
+Error Context: "{error_context}"
+
+Rate the confidence that this is planning-related on a scale of 0-100:
+- 0-20: Definitely not planning-related (technical, data, network errors)
+- 21-40: Probably not planning-related but some workflow impact
+- 41-60: Uncertain, could involve some coordination issues
+- 61-80: Likely planning-related (sequencing, dependencies, strategy)
+- 81-100: Definitely planning-related (plan validation, coordination)
+
+Consider:
+1. Plan validation or execution issues
+2. Step sequencing or dependency problems
+3. Workflow coordination or strategy failures
+4. Prerequisite or ordering problems
+
+Respond with just the numerical confidence score (0-100).
+"""
+        else:
+            return  # Unknown analysis type
+        
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": analysis_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    confidence_score = int(response.content.strip())
+                    if 0 <= confidence_score <= 100:
+                        is_planning_related = confidence_score >= LLM_ERROR_PLANNING_THRESHOLD
+                        # Update cache with LLM result
+                        self._error_context_cache[context_hash] = is_planning_related
+                        self.logger.debug(f"🧠 LLM error context analysis: {analysis_type} confidence={confidence_score}, is_planning_related={is_planning_related} (threshold={LLM_ERROR_PLANNING_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM error context analysis failed: {e}")
+    
+    def _is_complex_goal_semantically(self, goal_description: str) -> bool:
+        """Use LLM analysis to detect if a goal is complex and might benefit from guidance"""
+        
+        # Cache to avoid repeated LLM calls
+        goal_hash = hash(f"complex_goal:{goal_description[:300]}")
+        if not hasattr(self, '_complex_goal_cache'):
+            self._complex_goal_cache = {}
+        
+        if goal_hash in self._complex_goal_cache:
+            return self._complex_goal_cache[goal_hash]
+        
+        # No LLM result = assume not complex
+        self._complex_goal_cache[goal_hash] = False
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_complex_goal_analysis_with_llm,
+                goal_description, goal_hash
+            )
+        
+        return False
+    
+    async def _analyze_goal_complexity_with_llm_sync(self, goal_description: str) -> bool:
+        """Synchronous LLM-based goal complexity analysis"""
+        
+        complexity_prompt = f"""
+Rate how complex this goal is for strategic guidance needs on a scale of 0-100.
+
+Goal: "{goal_description}"
+
+Complexity indicators:
+- Multiple phases or distinct steps
+- Coordination between different types of work  
+- Research combined with creation tasks
+- Comprehensive scope or depth requirements
+- Dependencies and sequencing challenges
+
+Rate complexity (0-100):
+- 0-59: Simple to moderate, doesn't need strategic guidance
+- 60-100: Complex, would benefit from multi-tool guidance and coordination
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": complexity_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    complexity_score = int(response.content.strip())
+                    if 0 <= complexity_score <= 100:
+                        return complexity_score >= LLM_COMPLEXITY_HIGH_THRESHOLD
+                except ValueError:
+                    pass
+                    
+        except Exception:
+            pass
+            
+        return False
+    
+    async def _improve_complex_goal_analysis_with_llm(self, goal_description: str, goal_hash: int):
+        """Use LLM to improve complex goal analysis"""
+        
+        complexity_analysis_prompt = f"""
+Analyze this goal and rate its complexity level for strategic guidance needs.
+
+Goal: "{goal_description}"
+
+Rate the complexity on a scale of 0-100:
+- 0-20: Simple, single-step tasks requiring minimal coordination
+- 21-40: Straightforward tasks with clear execution path
+- 41-60: Moderate complexity requiring some planning and coordination
+- 61-80: Complex goals needing multi-tool guidance and strategic oversight
+- 81-100: Highly complex requiring extensive coordination and planning
+
+Consider:
+1. Number of distinct steps or phases required
+2. Coordination between different types of work (research + creation)
+3. Depth and comprehensiveness of scope
+4. Dependencies and sequencing requirements
+5. Benefit from strategic guidance and tool coordination
+
+Respond with just the numerical complexity score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": complexity_analysis_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    complexity_score = int(response.content.strip())
+                    if 0 <= complexity_score <= 100:
+                        # Use threshold of 60+ for considering goals complex enough for guidance
+                        COMPLEXITY_THRESHOLD = 60
+                        is_complex = complexity_score >= COMPLEXITY_THRESHOLD
+                        # Update cache with LLM result
+                        self._complex_goal_cache[goal_hash] = is_complex
+                        self.logger.debug(f"🧠 LLM complex goal analysis: score={complexity_score}, complex={is_complex} (threshold={COMPLEXITY_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM complex goal analysis failed: {e}")
+    
+    def _is_vague_plan_description_semantically(self, description: str) -> bool:
+        """Use LLM analysis to detect if a plan description is too vague/short"""
+        
+        # Cache to avoid repeated LLM calls
+        desc_hash = hash(f"vague_plan:{description}")
+        if not hasattr(self, '_vague_plan_cache'):
+            self._vague_plan_cache = {}
+        
+        if desc_hash in self._vague_plan_cache:
+            return self._vague_plan_cache[desc_hash]
+        
+        # No LLM result = assume not vague
+        self._vague_plan_cache[desc_hash] = False
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_vague_plan_analysis_with_llm,
+                description, desc_hash
+            )
+        
+        return False
+    
+    async def _analyze_plan_vagueness_with_llm_sync(self, description: str) -> bool:
+        """Synchronous LLM-based plan vagueness analysis"""
+        
+        vagueness_prompt = f"""
+Rate how vague and non-actionable this plan step is on a scale of 0-100.
+
+Plan step: "{description}"
+
+Vagueness indicators:
+- Generic actions without specifics
+- Unclear what exactly to do  
+- No clear deliverable or outcome
+- Ambiguous guidance that's hard to execute
+- Non-specific verbs without details
+
+Rate vagueness (0-100):
+- 0-59: Specific enough to execute confidently
+- 60-100: Too vague, needs clarification
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": vagueness_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    vagueness_score = int(response.content.strip())
+                    if 0 <= vagueness_score <= 100:
+                        return vagueness_score >= LLM_VAGUENESS_THRESHOLD
+                except ValueError:
+                    pass
+                    
+        except Exception:
+            pass
+            
+        return False
+    
+    async def _improve_vague_plan_analysis_with_llm(self, description: str, desc_hash: int):
+        """Use LLM to improve vague plan analysis"""
+        
+        vague_analysis_prompt = f"""
+Analyze this plan step description and rate how vague or generic it is.
+
+Plan Description: "{description}"
+
+Rate the vagueness level on a scale of 0-100:
+- 0-20: Very specific and actionable, clear guidance
+- 21-40: Mostly clear with some minor ambiguity
+- 41-60: Moderate vagueness, needs some clarification
+- 61-80: Quite vague, difficult to execute confidently
+- 81-100: Extremely vague, impossible to act on effectively
+
+Consider:
+1. Specificity and actionability of guidance provided
+2. Whether someone else could understand exactly what to do
+3. Clarity of actions and expected outcomes
+4. Level of ambiguity that would impede execution
+
+Respond with just the numerical vagueness score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": vague_analysis_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    vagueness_score = int(response.content.strip())
+                    if 0 <= vagueness_score <= 100:
+                        # Use threshold of 60+ for considering plan descriptions too vague
+                        VAGUENESS_THRESHOLD = 60
+                        is_vague = vagueness_score >= VAGUENESS_THRESHOLD
+                        # Update cache with LLM result
+                        self._vague_plan_cache[desc_hash] = is_vague
+                        self.logger.debug(f"🧠 LLM vague plan analysis: score={vagueness_score}, is_vague={is_vague} (threshold={VAGUENESS_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM vague plan analysis failed: {e}")
+    
+    def _is_tool_artifact_related_semantically(self, tool_name: str, artifact_patterns: list) -> bool:
+        """Use LLM analysis to determine if a tool is artifact-related"""
+        
+        return self._analyze_tool_type_with_llm(tool_name, "artifact_tool")
+    
+    def _is_tool_research_related_semantically(self, tool_name: str, research_patterns: list) -> bool:
+        """Use LLM analysis to determine if a tool is research-related"""
+        
+        return self._analyze_tool_type_with_llm(tool_name, "research_tool")
+    
+    def _is_research_workflow_semantically(self, goal_description: str) -> bool:
+        """Use LLM analysis to determine if a goal suggests research workflow"""
+        
+        return self._analyze_workflow_type_with_llm(goal_description, "research_workflow")
+    
+    def _suggests_artifact_work_semantically(self, step_description: str) -> bool:
+        """Use LLM analysis to determine if a plan step suggests artifact work"""
+        
+        return self._analyze_workflow_type_with_llm(step_description, "artifact_work")
+    
+    def _suggests_research_work_semantically(self, step_description: str) -> bool:
+        """Use LLM analysis to determine if a plan step suggests research work"""
+        
+        return self._analyze_workflow_type_with_llm(step_description, "research_work")
+    
+    def _analyze_workflow_type_with_llm(self, description: str, workflow_type: str) -> bool:
+        """Use LLM to analyze workflow types with intelligent fallback"""
+        
+        # Cache to avoid repeated LLM calls
+        context_hash = hash(f"{workflow_type}:{description[:300]}")
+        if not hasattr(self, '_workflow_analysis_cache'):
+            self._workflow_analysis_cache = {}
+        
+        if context_hash in self._workflow_analysis_cache:
+            return self._workflow_analysis_cache[context_hash]
+        
+        # No LLM result = assume no match
+        self._workflow_analysis_cache[context_hash] = False
+        
+        # Schedule LLM analysis for improvement
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self._start_background_task(
+                self._improve_workflow_analysis_with_llm,
+                description, workflow_type, context_hash
+            )
+        
+        return False
+    
+    async def _analyze_workflow_type_with_llm_sync(self, description: str, workflow_type: str) -> bool:
+        """Synchronous LLM-based workflow type analysis"""
+        
+        workflow_prompt = f"""
+Rate how well this description matches the "{workflow_type}" workflow type on a scale of 0-100.
+
+Description: "{description}"
+Target workflow type: {workflow_type}
+
+Workflow definitions:
+- research_workflow: Primarily researching, investigating, studying, gathering information
+- artifact_work: Creating, writing, generating, building, producing tangible outputs/deliverables  
+- research_work: Searching, finding, investigating, gathering information, browsing for data
+
+Rate match confidence (0-100):
+- 0-69: Doesn't match this workflow type
+- 70-100: Matches this workflow type well
+
+Respond with just the numerical score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": workflow_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    confidence_score = int(response.content.strip())
+                    if 0 <= confidence_score <= 100:
+                        return confidence_score >= LLM_WORKFLOW_MATCH_THRESHOLD
+                except ValueError:
+                    pass
+                    
+        except Exception:
+            pass
+            
+        return False
+    
+    async def _improve_workflow_analysis_with_llm(self, description: str, workflow_type: str, context_hash: int):
+        """Use LLM to improve workflow analysis"""
+        
+        workflow_analysis_prompt = f"""
+Analyze this description and rate how well it matches the specified workflow type.
+
+Description: "{description}"
+Workflow type to check: {workflow_type}
+
+Workflow Types:
+- research_workflow: Goals or tasks that primarily involve researching, investigating, studying, or gathering information
+- artifact_work: Steps that involve creating, writing, generating, building, or producing tangible outputs/deliverables
+- research_work: Steps that involve searching, finding, investigating, gathering information, or browsing for data
+
+Rate the confidence that this matches the workflow type on a scale of 0-100:
+- 0-20: Definitely not this workflow type
+- 21-40: Probably not this workflow type
+- 41-60: Uncertain, could be this type
+- 61-80: Likely this workflow type
+- 81-100: Definitely this workflow type
+
+Consider:
+1. Primary intent and actions described
+2. Semantic alignment with workflow type
+3. Expected work patterns and outcomes
+
+Respond with just the numerical confidence score (0-100).
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": workflow_analysis_prompt}],
+                model_override=None,
+                max_tokens=5,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                try:
+                    confidence_score = int(response.content.strip())
+                    if 0 <= confidence_score <= 100:
+                        # Use threshold of 70+ for high confidence workflow type matching
+                        WORKFLOW_ANALYSIS_THRESHOLD = 70
+                        matches_workflow = confidence_score >= WORKFLOW_ANALYSIS_THRESHOLD
+                        # Update cache with LLM result
+                        self._workflow_analysis_cache[context_hash] = matches_workflow
+                        self.logger.debug(f"🧠 LLM workflow analysis: {workflow_type} confidence={confidence_score}, matches={matches_workflow} (threshold={WORKFLOW_ANALYSIS_THRESHOLD})")
+                except ValueError:
+                    pass
+                    
+        except Exception as e:
+            self.logger.debug(f"Background LLM workflow analysis failed: {e}")
+    
     async def _execute_tool_call_internal(
         self,
         tool_name_mcp: str,
@@ -5976,7 +10201,7 @@ class AgentMasterLoop:
         current_base = self._get_base_function_name(tool_name_mcp)
         
         # Pre-execution loop detection check
-        if self._detect_infinite_loop(tool_name_mcp):
+        if await self._detect_infinite_loop(tool_name_mcp):
             self.logger.warning("🔄 PRE-EXECUTION LOOP DETECTED - Preventing tool execution")
             return await _bail(
                 _mk_envelope(
@@ -6065,56 +10290,31 @@ class AgentMasterLoop:
                     "url", "user_input", "text"
                 }
                 if memory_type not in valid_memory_types:
-                    # Apply the same mapping logic from auto-fix
-                    memory_type_mapping = {
-                        "analysis": "reasoning_step", "research": "fact", "finding": "fact", "findings": "fact",
-                        "note": "text", "notes": "text", "information": "fact", "data": "fact",
-                        "result": "fact", "results": "fact", "discovery": "insight", "learning": "insight",
-                        "observation": "observation", "thought": "reasoning_step", "idea": "insight",
-                        "concept": "fact", "detail": "fact", "details": "fact", "evidence": "fact",
-                        "source": "fact", "reference": "fact", "conclusion": "insight", "takeaway": "insight",
-                        "content": "text", "summary": "summary", "overview": "summary"
-                    }
-                    if memory_type in memory_type_mapping:
-                        final_args["memory_type"] = memory_type_mapping[memory_type]
-                        self.logger.info(f"🔧 Proactive fix: memory_type '{memory_type}' → '{final_args['memory_type']}'")
-                    else:
-                        # Use fallback logic
-                        if any(keyword in memory_type for keyword in ["research", "study", "find", "discover", "learn"]):
-                            final_args["memory_type"] = "fact"
-                        elif any(keyword in memory_type for keyword in ["think", "reason", "analyze", "consider"]):
-                            final_args["memory_type"] = "reasoning_step"
-                        elif any(keyword in memory_type for keyword in ["insight", "understand", "realize", "conclude"]):
-                            final_args["memory_type"] = "insight"
-                        else:
-                            final_args["memory_type"] = "text"
-                        self.logger.info(f"🔧 Proactive fallback fix: memory_type '{memory_type}' → '{final_args['memory_type']}'")
+                    # Use semantic understanding to classify memory type
+                    corrected_type = self._classify_memory_type_semantically(
+                        memory_type,
+                        final_args.get("content", ""),
+                        final_args.get("description", "")
+                    )
+                    if corrected_type:
+                        final_args["memory_type"] = corrected_type
+                        self.logger.info(f"🔧 Proactive semantic fix: memory_type '{memory_type}' → '{corrected_type}'")
 
             # Fix artifact_type if invalid
             if current_base == UMS_FUNC_RECORD_ARTIFACT and "artifact_type" in final_args:
                 artifact_type = final_args.get("artifact_type", "").lower()
                 valid_artifact_types = {"file", "text", "image", "table", "chart", "code", "data", "json", "url"}
                 if artifact_type not in valid_artifact_types:
-                    # Apply the same mapping logic from auto-fix
-                    type_mapping = {
-                        "report": "file", "document": "file", "article": "file", "essay": "file",
-                        "interactive": "file", "structured": "file", "html": "file", "webpage": "file",
-                        "script": "code", "program": "code", "analysis": "file", "summary": "file"
-                    }
-                    if artifact_type in type_mapping:
-                        final_args["artifact_type"] = type_mapping[artifact_type]
-                        self.logger.info(f"🔧 Proactive fix: artifact_type '{artifact_type}' → '{final_args['artifact_type']}'")
-                    else:
-                        # Use fallback logic
-                        if any(keyword in artifact_type for keyword in ["code", "script", "program"]):
-                            final_args["artifact_type"] = "code"
-                        elif any(keyword in artifact_type for keyword in ["data", "csv", "json", "xml"]):
-                            final_args["artifact_type"] = "data"
-                        elif any(keyword in artifact_type for keyword in ["html", "document", "report", "file", "quiz"]):
-                            final_args["artifact_type"] = "file"
-                        else:
-                            final_args["artifact_type"] = "text"
-                        self.logger.info(f"🔧 Proactive fallback fix: artifact_type '{artifact_type}' → '{final_args['artifact_type']}'")
+                    # Use semantic understanding to classify artifact type
+                    corrected_type = self._classify_artifact_type_semantically(
+                        artifact_type,
+                        final_args.get("name", ""),
+                        final_args.get("description", ""),
+                        final_args.get("content", "")
+                    )
+                    if corrected_type:
+                        final_args["artifact_type"] = corrected_type
+                        self.logger.info(f"🔧 Proactive semantic fix: artifact_type '{artifact_type}' → '{corrected_type}'")
 
         # Standard auto-injection logic
         if (
@@ -6197,6 +10397,50 @@ class AgentMasterLoop:
                     # Add warning to arguments for LLM context, but don't block creation
                     final_args["_duplicate_warning"] = warning_msg
                     final_args["_similar_artifacts_found"] = len(similar_artifacts)
+
+        # ───────────────────────────── intelligent memory duplication prevention ─────────────────────
+        if current_base == UMS_FUNC_STORE_MEMORY and record_action:
+            memory_content = final_args.get("content", "")
+            memory_type = final_args.get("memory_type", "")
+            memory_description = final_args.get("description", "")
+            
+            if memory_content:
+                # Check if we should store this memory using intelligent analysis
+                storage_decision = await self.memory_manager.should_store_memory(
+                    memory_content, memory_type, memory_description
+                )
+                
+                if not storage_decision["should_store"]:
+                    # Block duplicate memory storage
+                    reason = storage_decision["reason"]
+                    recommendation = storage_decision.get("recommendation", "")
+                    similar_count = storage_decision.get("similar_count", 0)
+                    
+                    self.logger.warning(f"🚫 MEMORY DUPLICATION PREVENTED: {reason}")
+                    
+                    envelope = _mk_envelope(
+                        success=False,
+                        err_type="DuplicateMemoryPrevention",
+                        err_msg=f"Memory storage blocked to prevent duplication: {reason}. {recommendation}",
+                        details={
+                            "similar_count": similar_count,
+                            "action": storage_decision.get("action", "skip_duplicate"),
+                            "recommendation": recommendation,
+                            "content_preview": memory_content[:100] + "..." if len(memory_content) > 100 else memory_content
+                        }
+                    )
+                    
+                    return await _bail(
+                        envelope,
+                        set_state_error=True,
+                        summary_prefix="Duplicate memory blocked"
+                    )
+                
+                elif storage_decision.get("action") == "store_with_note":
+                    # Enhance content with reference to similar memory
+                    similar_count = storage_decision.get("similar_count", 0)
+                    final_args["content"] = f"{memory_content}\n\n[Note: {similar_count} similar memory exists - this adds new information]"
+                    self.logger.info(f"📝 ENHANCED MEMORY: Added context note about {similar_count} similar memory")
 
         # ───────────────────── prerequisite dependency check ───────────────────────
         if planned_dependencies:
@@ -6601,7 +10845,7 @@ class AgentMasterLoop:
                     # For compute_memory_statistics, the stats are the direct payload.
                     if stats_result_envelope.get("success"):
                         # The stats_result_envelope *is* the UMS payload here.
-                        self._adapt_thresholds(stats_result_envelope)
+                        await self._adapt_thresholds(stats_result_envelope)
                         episodic_cnt = stats_result_envelope.get("by_level", {}).get(
                             MemoryLevel.EPISODIC.value, 0
                         )
@@ -6911,13 +11155,11 @@ class AgentMasterLoop:
                         if not self.state.needs_replan: # Only log if it's a change
                             self.state.needs_replan = True
                             self.logger.info(f"{log_prefix}: Setting needs_replan=True due to 'plan' reflection type.")
-                    # Case 2: Feedback content suggests a replan is needed
-                    elif "replan needed" in feedback.lower() or \
-                         "new plan required" in feedback.lower() or \
-                         "plan update suggested" in feedback.lower():
+                    # Case 2: Use semantic analysis to detect replan needs
+                    elif self._analyze_feedback_for_replan_semantically(feedback):
                         if not self.state.needs_replan: # Only log if it's a change
                             self.state.needs_replan = True
-                            self.logger.info(f"{log_prefix}: Setting needs_replan=True due to feedback content suggesting it.")
+                            self.logger.info(f"{log_prefix}: Setting needs_replan=True due to semantic feedback analysis.")
                     # Case 3: Consolidation might implicitly suggest replan if it fundamentally changes understanding
                     elif current_base_fn == UMS_FUNC_CONSOLIDATION:
                         # For now, let's not automatically set needs_replan from consolidation unless feedback explicitly states it
@@ -7372,6 +11614,26 @@ class AgentMasterLoop:
             self.state.goal_stack.append(goal_obj)
             self.state.current_goal_id = goal_id
             
+            # CRITICAL: Immediately synchronize with UMS to ensure consistency
+            try:
+                fresh_stack = await self._fetch_goal_stack_from_ums(goal_id)
+                if fresh_stack:
+                    self.state.goal_stack = fresh_stack
+                    self.logger.info(f"{log_prefix}: Successfully synchronized goal stack with UMS. Stack depth: {len(self.state.goal_stack)}")
+                    # Verify the current goal is actually in the stack
+                    current_goal_found = any(
+                        isinstance(g, dict) and g.get("goal_id") == goal_id 
+                        for g in self.state.goal_stack
+                    )
+                    if not current_goal_found:
+                        self.logger.warning(f"{log_prefix}: Current goal {goal_id} not found in fresh stack - keeping local version")
+                        self.state.goal_stack.append(goal_obj)
+                else:
+                    self.logger.warning(f"{log_prefix}: Failed to fetch fresh goal stack from UMS - using local stack")
+            except Exception as sync_err:
+                self.logger.error(f"{log_prefix}: Goal stack sync failed: {sync_err}")
+                # Keep local stack as fallback
+            
             # Force immediate persistence to avoid losing the goal ID
             await self._save_agent_state()
             
@@ -7412,26 +11674,33 @@ class AgentMasterLoop:
                 goal_desc = goal_obj.get("description", "")
                 self.logger.info(f"🎯 Goal established: '{goal_desc[:80]}...'")
                 
-                # Create a direct action plan for the goal
+                # Automatically assess completion readiness and provide specific guidance
+                completion_status = await self._check_goal_completion_readiness(goal_desc)
+                goal_type = completion_status["goal_type"]
+                criteria = completion_status["completion_criteria"]
+                
+                # Create a direct action plan based on goal type and completion criteria
                 if not self.state.current_plan or self.state.current_plan[0].description == DEFAULT_PLAN_STEP:
-                    if "research" in goal_desc.lower() or "investigate" in goal_desc.lower() or "find" in goal_desc.lower():
-                        self.state.current_plan = [
-                            PlanStep(description="Gather essential information for the goal")
-                        ]
-                    elif any(keyword in goal_desc.lower() for keyword in ["create", "write", "generate", "build", "develop", "make", "produce"]):
-                        self.state.current_plan = [
-                            PlanStep(description="Take action to fulfill the goal requirements")
-                        ]
-                    elif "analyze" in goal_desc.lower() or "study" in goal_desc.lower():
-                        self.state.current_plan = [
-                            PlanStep(description="Analyze the available information and take appropriate action")
-                        ]
+                    plan_description = f"Work on {goal_type.replace('_', ' ')} goal: '{goal_desc[:50]}...'. Target: {criteria['expected_deliverable']}"
+                    
+                    if goal_type == "analysis":
+                        plan_description = f"Analyze available information and create {criteria['expected_deliverable']} with key findings"
+                    elif goal_type == "creation":
+                        plan_description = f"Create {criteria['expected_deliverable']} as required deliverable"
+                    elif goal_type == "research":
+                        plan_description = f"Research topic and document findings in {criteria['expected_deliverable']}"
+                    elif goal_type == "planning":
+                        plan_description = f"Develop {criteria['expected_deliverable']} with structured approach"
+                    elif goal_type == "communication":
+                        plan_description = f"Prepare {criteria['expected_deliverable']} for communication needs"
                     else:
-                        self.state.current_plan = [
-                            PlanStep(description="Execute concrete action toward goal completion")
-                        ]
+                        plan_description = f"Complete goal requirements and create {criteria['expected_deliverable']}"
+                    
+                    self.state.current_plan = [
+                        PlanStep(description=plan_description)
+                    ]
                     self.state.needs_replan = False
-                    self.logger.info(f"🎯 Created direct action plan for goal")
+                    self.logger.info(f"🎯 Created completion-oriented plan for {goal_type} goal: {criteria['expected_deliverable']}")
 
             # Record a thought (best-effort)
             record_thought_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_RECORD_THOUGHT)
@@ -7848,6 +12117,17 @@ class AgentMasterLoop:
                             summary = f"{k}: {_fmt_id(summary_val) if 'id' in k else summary_val}"
                             break
                 _mark_step(SUCCESS, summary)
+                
+                # **CRITICAL FIX**: Always advance plan for vague/default steps, even on success
+                should_advance_vague_step = (
+                    current_step.description == DEFAULT_PLAN_STEP or
+                    "Execute immediate action" in current_step.description or
+                    self._is_vague_plan_description_semantically(current_step.description)
+                )
+                
+                if should_advance_vague_step:
+                    self.logger.info(f"🔄 ADVANCING PLAN: Removing vague successful step - '{current_step.description[:60]}...'")
+                
                 _pop_if_first(current_step)
 
                 # UPDATE LOOP DETECTION AND PROGRESSION TRACKING
@@ -7856,7 +12136,7 @@ class AgentMasterLoop:
                     self._update_plan_progression_stage(tool_name_mcp, True)
                     
                     # Check for infinite loop patterns
-                    if self._detect_infinite_loop(tool_name_mcp):
+                    if await self._detect_infinite_loop(tool_name_mcp):
                         self.logger.warning("🔄 INFINITE LOOP DETECTED - Forcing plan progression")
                         self.state.needs_replan = True
                         # Force progression to break the loop
@@ -7920,11 +12200,52 @@ class AgentMasterLoop:
             )
             _mark_step(FAILED, f"Failure: {err_msg}")
             
+            # **CRITICAL FIX**: Track failure count and advance plan if step fails repeatedly
+            current_step.failure_count += 1
+            
+            # **CRITICAL FIX**: Remove failed step from plan if it has failed multiple times or meets criteria
+            should_advance_plan = (
+                current_step.failure_count >= 2 or  # Failed 2+ times
+                current_step.description == DEFAULT_PLAN_STEP or  # Vague default step  
+                "Execute immediate action" in current_step.description or  # Other vague steps
+                self.state.consecutive_same_tool_count >= 2  # Same tool failing repeatedly
+            )
+            
+            if should_advance_plan:
+                self.logger.warning(f"🔄 ADVANCING PLAN: Removing failed step after {current_step.failure_count} failures - '{current_step.description[:60]}...'")
+                _pop_if_first(current_step)
+                
+                # If plan is now empty, create concrete next step instead of vague default
+                if not self.state.current_plan:
+                    current_goal_desc = ""
+                    if self.state.goal_stack and self.state.goal_stack[-1]:
+                        current_goal_desc = self.state.goal_stack[-1].get("description", "")
+                    
+                    if current_goal_desc:
+                        # Create specific next step based on goal type
+                        goal_type = self._classify_goal_type(current_goal_desc)
+                        criteria = self._get_goal_completion_criteria(goal_type, current_goal_desc)
+                        
+                        next_step = PlanStep(
+                            description=f"Create {criteria['expected_deliverable']} for {goal_type} goal",
+                            assigned_tool=self._get_ums_tool_mcp_name("record_artifact")
+                        )
+                        self.state.current_plan.append(next_step)
+                        self.logger.info(f"🎯 PLAN ADVANCEMENT: Added concrete deliverable-focused step")
+                    else:
+                        # Fallback to generic deliverable creation
+                        self.state.current_plan.append(
+                            PlanStep(
+                                description="Create concrete deliverable using available information",
+                                assigned_tool=self._get_ums_tool_mcp_name("record_artifact")
+                            )
+                        )
+            
             # UPDATE TRACKING FOR FAILED TOOLS TOO
             if tool_name_mcp:
                 self._update_plan_progression_stage(tool_name_mcp, False)
                 # Still track tool execution for loop detection even on failure
-                if self._detect_infinite_loop(tool_name_mcp):
+                if await self._detect_infinite_loop(tool_name_mcp):
                     self.logger.warning("🔄 INFINITE LOOP DETECTED in failed tool - Forcing progression")
                     self.state.needs_replan = True
                     
@@ -8147,101 +12468,261 @@ class AgentMasterLoop:
         assert action_successful is not None, "Internal error: action_successful not set!"
 
 
-    def _adapt_thresholds(self, stats: Dict[str, Any]) -> None:
+    async def _adapt_thresholds(self, stats: Dict[str, Any]) -> None:
         """
-        Heuristically nudge the reflection / consolidation thresholds so the agent
-        stays within target failure-rate and memory-mix envelopes.
+        Intelligently adjust reflection/consolidation thresholds using LLM-based semantic analysis
 
         Args:
             stats: result object returned by `ums.compute_memory_statistics`
-                Expected keys:
-                    - success: bool
-                    - total_memories: int
-                    - by_level: {MemoryLevel: int}
         Side-effects:
             - May mutate `self.state.current_consolidation_threshold`
             - May mutate `self.state.current_reflection_threshold`
         """
 
-        # ───────────────────────────────────────────────────────────── constants ──
-        TARGET_EPISODIC_UPPER = 0.30
-        TARGET_EPISODIC_LOWER = 0.10
-        CONSOLIDATION_SCALER  = 2.0               # how aggressively we react
-        FAILURE_RATE_TARGET   = 0.10
-        REFLECTION_SCALER     = 3.0
-        MIN_CALLS_FOR_RATE    = 5                 # avoid noisy early division
-        THOUGHT_MOMENTUM_BIAS = MOMENTUM_THRESHOLD_BIAS_FACTOR
-        DAMPENING             = THRESHOLD_ADAPTATION_DAMPENING
-
-        # ─────────────────────────────────────────────────── early validity check ──
+        # ─────────────────────────────────────────────── early validity check ──
         if not (stats and stats.get("success", False)):
             self.logger.warning("Cannot adapt thresholds: Invalid stats object.")
             return
 
-        # small helper to clamp & log, returns True if a change was applied
-        def _apply_delta(curr: int, delta: int, lo: int, hi: int, label: str, meta: str) -> bool:
-            if delta == 0:                    # fast exit
-                return False
-            new_val = max(lo, min(hi, curr + delta))
-            if new_val == curr:               # already at bound
-                return False
-            direction = "Lowering" if new_val < curr else "Raising"
-            self.logger.info(
-                f"{direction} {label} threshold: {curr} → {new_val} {meta}"
-            )
-            setattr(self.state, f"current_{label}_threshold", new_val)
-            return True
+        # Use LLM to analyze current performance and suggest threshold adjustments
+        threshold_analysis = await self._analyze_threshold_performance_with_llm(stats)
+        
+        if threshold_analysis:
+            # Apply LLM-suggested changes
+            changed = self._apply_llm_threshold_adjustments(threshold_analysis)
+            if not changed:
+                self.logger.debug("LLM analysis suggests no threshold adjustments needed.")
+        else:
+            # Fallback to intelligent heuristic analysis if LLM fails
+            changed = await self._adapt_thresholds_intelligent_fallback(stats)
 
-        changed = False
-        self.logger.debug("Adapting thresholds with stats: %s", stats)
-
-        # ───────────────────────────────────────────── consolidate-threshold branch ──
-        total_memories = max(int(stats.get("total_memories", 0)), 1)  # guard /0
+    async def _analyze_threshold_performance_with_llm(self, stats: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Use LLM to analyze current threshold performance and suggest adjustments"""
+        
+        # Prepare performance context for LLM analysis
+        total_memories = max(int(stats.get("total_memories", 0)), 1)
         episodic_count = int(stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0))
         episodic_ratio = episodic_count / total_memories
 
-        mid_target = (TARGET_EPISODIC_UPPER + TARGET_EPISODIC_LOWER) / 2.0
-        ratio_deviation = episodic_ratio - mid_target
-        raw_adj = -math.ceil(ratio_deviation * self.state.current_consolidation_threshold * CONSOLIDATION_SCALER)
-        damp_adj = int(raw_adj * DAMPENING) or 0  # avoid negative zero
-
-        changed |= _apply_delta(
-            curr=self.state.current_consolidation_threshold,
-            delta=damp_adj,
-            lo=MIN_CONSOLIDATION_THRESHOLD,
-            hi=MAX_CONSOLIDATION_THRESHOLD,
-            label="consolidation",
-            meta=f"(Episodic %: {episodic_ratio:.1%}, Δ: {ratio_deviation:+.1%}, raw: {raw_adj}, damp: {damp_adj})",
-        )
-
-        # ───────────────────────────────────────────── reflection-threshold branch ──
+        # Calculate failure rate from tool usage stats
         totals = [v.get("success", 0) + v.get("failure", 0) for v in self.state.tool_usage_stats.values()]
         failures = [v.get("failure", 0) for v in self.state.tool_usage_stats.values()]
         total_calls, total_failures = sum(totals), sum(failures)
+        failure_rate = (total_failures / total_calls) if total_calls >= 5 else 0.0
+        
+        performance_context = f"""
+Current System Performance:
+- Reflection Threshold: {self.state.current_reflection_threshold}
+- Consolidation Threshold: {self.state.current_consolidation_threshold}
+- Total Memories: {total_memories}
+- Episodic Memory Ratio: {episodic_ratio:.1%}
+- Tool Failure Rate: {failure_rate:.1%}
+- Consecutive Errors: {self.state.consecutive_error_count}
+- Recent Actions: {self.state.turns_since_artifact_creation}
+- Current Loop: {self.state.current_loop}
 
-        failure_rate = (total_failures / total_calls) if total_calls >= MIN_CALLS_FOR_RATE else 0.0
-        fail_dev = failure_rate - FAILURE_RATE_TARGET
-        raw_ref_adj = -math.ceil(fail_dev * self.state.current_reflection_threshold * REFLECTION_SCALER)
+Performance Goals:
+- Episodic memories should be 10-30% of total (currently {episodic_ratio:.1%})
+- Tool failure rate should be under 10% (currently {failure_rate:.1%})
+- System should be responsive but not over-reactive
+"""
 
-        is_stable = (failure_rate < FAILURE_RATE_TARGET * 0.5) and (self.state.consecutive_error_count == 0)
-        if is_stable and raw_ref_adj >= 0:
-            momentum_boost = math.ceil(raw_ref_adj * (THOUGHT_MOMENTUM_BIAS - 1.0))
-            raw_ref_adj += momentum_boost
-            self.logger.debug("Mental momentum: +%d added to reflection delta.", momentum_boost)
+        threshold_prompt = f"""
+Analyze this cognitive system's performance and suggest threshold adjustments.
 
-        damp_ref_adj = int(raw_ref_adj * DAMPENING) or 0
+{performance_context}
 
-        changed |= _apply_delta(
-            curr=self.state.current_reflection_threshold,
-            delta=damp_ref_adj,
-            lo=MIN_REFLECTION_THRESHOLD,
-            hi=MAX_REFLECTION_THRESHOLD,
-            label="reflection",
-            meta=f"(Fail rate: {failure_rate:.1%}, Δ: {fail_dev:+.1%}, raw: {raw_ref_adj}, damp: {damp_ref_adj})",
-        )
+Rate the need for adjustments on a 0-100 scale and suggest changes:
 
-        if not changed:
-            self.logger.debug("No threshold adjustments triggered.")
+reflection_adjustment_score: [0-100] (How much to adjust reflection threshold)
+- 0-20: Working well, no change needed
+- 21-40: Minor adjustment needed 
+- 41-60: Moderate adjustment needed
+- 61-80: Significant adjustment needed
+- 81-100: Major adjustment required
+
+consolidation_adjustment_score: [0-100] (How much to adjust consolidation threshold)
+- 0-20: Working well, no change needed
+- 21-40: Minor adjustment needed
+- 41-60: Moderate adjustment needed  
+- 61-80: Significant adjustment needed
+- 81-100: Major adjustment required
+
+reflection_direction: [increase/decrease/maintain] (Direction to adjust reflection threshold)
+consolidation_direction: [increase/decrease/maintain] (Direction to adjust consolidation threshold)
+
+reasoning: [Brief explanation of recommendations]
+
+Consider:
+1. High failure rates suggest need for more reflection (lower threshold)
+2. Too many episodic memories suggest need for more consolidation (lower threshold)
+3. System stability and responsiveness balance
+4. Current workload and performance trends
+
+Respond in the exact format above.
+"""
+
+        try:
+            response = await self.mcp_client.query_llm(
+                prompt_messages=[{"role": "user", "content": threshold_prompt}],
+                model_override=None,
+                max_tokens=100,
+                temperature=0.1,
+                stream=False
+            )
+            
+            if response and hasattr(response, 'content') and response.content:
+                # Parse LLM response
+                lines = response.content.strip().split('\n')
+                analysis = {}
+                
+                for line in lines:
+                    if ':' in line:
+                        key, value = line.split(':', 1)
+                        key = key.strip().lower()
+                        value = value.strip()
+                        
+                        if 'score' in key:
+                            try:
+                                analysis[key] = int(value)
+                            except ValueError:
+                                pass
+                        elif 'direction' in key:
+                            analysis[key] = value.lower()
+                        elif key == 'reasoning':
+                            analysis[key] = value
+                
+                if analysis:
+                    self.logger.debug(f"🧠 LLM threshold analysis: {analysis}")
+                    return analysis
+                    
+        except Exception as e:
+            self.logger.debug(f"LLM threshold analysis failed: {e}")
+        
+        return None
+    
+    def _apply_llm_threshold_adjustments(self, analysis: Dict[str, Any]) -> bool:
+        """Apply threshold adjustments based on LLM analysis"""
+        
+        changed = False
+        
+        # Apply reflection threshold adjustment
+        reflection_score = analysis.get("reflection_adjustment_score", 0)
+        reflection_direction = analysis.get("reflection_direction", "maintain")
+        
+        if reflection_score >= 40 and reflection_direction != "maintain":
+            # Calculate adjustment magnitude based on score
+            if reflection_score >= 80:
+                magnitude = 5  # Major adjustment
+            elif reflection_score >= 60:
+                magnitude = 3  # Significant adjustment
+            else:
+                magnitude = 2  # Moderate adjustment
+            
+            if reflection_direction == "decrease":
+                magnitude = -magnitude
+            
+            new_reflection = max(MIN_REFLECTION_THRESHOLD, 
+                               min(MAX_REFLECTION_THRESHOLD, 
+                                   self.state.current_reflection_threshold + magnitude))
+            
+            if new_reflection != self.state.current_reflection_threshold:
+                direction = "Lowering" if new_reflection < self.state.current_reflection_threshold else "Raising"
+                self.logger.info(f"🧠 LLM-guided {direction} reflection threshold: "
+                               f"{self.state.current_reflection_threshold} → {new_reflection} "
+                               f"(score={reflection_score}, reasoning={analysis.get('reasoning', 'N/A')})")
+                self.state.current_reflection_threshold = new_reflection
+                changed = True
+        
+        # Apply consolidation threshold adjustment
+        consolidation_score = analysis.get("consolidation_adjustment_score", 0)
+        consolidation_direction = analysis.get("consolidation_direction", "maintain")
+        
+        if consolidation_score >= 40 and consolidation_direction != "maintain":
+            # Calculate adjustment magnitude based on score
+            if consolidation_score >= 80:
+                magnitude = 5  # Major adjustment
+            elif consolidation_score >= 60:
+                magnitude = 3  # Significant adjustment
+            else:
+                magnitude = 2  # Moderate adjustment
+            
+            if consolidation_direction == "decrease":
+                magnitude = -magnitude
+            
+            new_consolidation = max(MIN_CONSOLIDATION_THRESHOLD,
+                                  min(MAX_CONSOLIDATION_THRESHOLD,
+                                      self.state.current_consolidation_threshold + magnitude))
+            
+            if new_consolidation != self.state.current_consolidation_threshold:
+                direction = "Lowering" if new_consolidation < self.state.current_consolidation_threshold else "Raising"
+                self.logger.info(f"🧠 LLM-guided {direction} consolidation threshold: "
+                               f"{self.state.current_consolidation_threshold} → {new_consolidation} "
+                               f"(score={consolidation_score})")
+                self.state.current_consolidation_threshold = new_consolidation
+                changed = True
+        
+        return changed
+    
+    async def _adapt_thresholds_intelligent_fallback(self, stats: Dict[str, Any]) -> bool:
+        """Intelligent fallback using semantic understanding"""
+        
+        changed = False
+        
+        # Analyze memory distribution with semantic understanding
+        total_memories = max(int(stats.get("total_memories", 0)), 1)
+        episodic_count = int(stats.get("by_level", {}).get(MemoryLevel.EPISODIC.value, 0))
+        episodic_ratio = episodic_count / total_memories
+        
+        # Semantic assessment of memory distribution health
+        if episodic_ratio > 0.35:  # Too many episodic memories
+            # Need more consolidation
+            adjustment = min(3, int((episodic_ratio - 0.20) * 10))  # Semantic scaling
+            new_consolidation = max(MIN_CONSOLIDATION_THRESHOLD, 
+                                  self.state.current_consolidation_threshold - adjustment)
+            if new_consolidation != self.state.current_consolidation_threshold:
+                self.logger.info(f"📊 Semantic analysis: Too many episodic memories ({episodic_ratio:.1%}) - "
+                               f"lowering consolidation threshold: {self.state.current_consolidation_threshold} → {new_consolidation}")
+                self.state.current_consolidation_threshold = new_consolidation
+                changed = True
+        
+        elif episodic_ratio < 0.05:  # Too few episodic memories
+            # Reduce consolidation frequency
+            adjustment = min(3, int((0.15 - episodic_ratio) * 10))  # Semantic scaling
+            new_consolidation = min(MAX_CONSOLIDATION_THRESHOLD,
+                                  self.state.current_consolidation_threshold + adjustment)
+            if new_consolidation != self.state.current_consolidation_threshold:
+                self.logger.info(f"📊 Semantic analysis: Too few episodic memories ({episodic_ratio:.1%}) - "
+                               f"raising consolidation threshold: {self.state.current_consolidation_threshold} → {new_consolidation}")
+                self.state.current_consolidation_threshold = new_consolidation
+                changed = True
+        
+        # Analyze error patterns with semantic understanding
+        if self.state.consecutive_error_count >= 2:
+            # System appears to need more reflection
+            adjustment = min(3, self.state.consecutive_error_count)
+            new_reflection = max(MIN_REFLECTION_THRESHOLD,
+                               self.state.current_reflection_threshold - adjustment)
+            if new_reflection != self.state.current_reflection_threshold:
+                self.logger.info(f"🚨 Semantic analysis: Error pattern detected ({self.state.consecutive_error_count} consecutive) - "
+                               f"lowering reflection threshold: {self.state.current_reflection_threshold} → {new_reflection}")
+                self.state.current_reflection_threshold = new_reflection
+                changed = True
+        
+        # Assess productivity patterns
+        elif (self.state.turns_since_artifact_creation == 0 and 
+              self.state.consecutive_error_count == 0 and
+              self.state.current_loop > 5):
+            # System appears to be working well - can reduce reflection frequency
+            new_reflection = min(MAX_REFLECTION_THRESHOLD,
+                               self.state.current_reflection_threshold + 1)
+            if new_reflection != self.state.current_reflection_threshold:
+                self.logger.info(f"✅ Semantic analysis: System performing well - "
+                               f"raising reflection threshold: {self.state.current_reflection_threshold} → {new_reflection}")
+                self.state.current_reflection_threshold = new_reflection
+                changed = True
+        
+        return changed
 
     async def _trigger_promotion_checks(self) -> None:
         """
@@ -8442,13 +12923,24 @@ class AgentMasterLoop:
         cache_duration = 30  # Default 30 seconds
         
         if self.state.goal_stack and self.state.goal_stack[-1]:
-            goal_desc = self.state.goal_stack[-1].get("description", "").lower()
-            research_keywords = ["research", "search", "investigate", "study", "gather", "explore", "articles"]
-            is_research_workflow = any(keyword in goal_desc for keyword in research_keywords)
+            goal_desc = self.state.goal_stack[-1].get("description", "")
+            is_research_workflow = self._is_research_workflow_semantically(goal_desc)
         
-        # Extend cache duration for research workflows and focus mode
-        if is_research_workflow or self.state.artifact_focus_mode:
-            cache_duration = 120  # 2 minutes for research workflows
+        # **CRITICAL FIX**: Disable caching when storing memories or doing critical actions to prevent infinite loops
+        recent_critical_actions = (
+            self.state.last_action_summary and 
+            any(action in self.state.last_action_summary for action in [
+                "store_memory", "memory_id:", "record_artifact", "artifact_id:",
+                "search_semantic", "hybrid_search", "query_memories"
+            ])
+        )
+        
+        # **CRITICAL FIX**: Force fresh context during active work to prevent infinite loops
+        if recent_critical_actions or self.state.current_loop <= 3:
+            cache_duration = 0  # NO CACHE during critical actions or early loops
+            self.logger.info("🚫 CACHE DISABLED: Recent critical actions detected - forcing fresh context")
+        elif is_research_workflow or self.state.artifact_focus_mode:
+            cache_duration = 60  # Reduced from 120 to 60 seconds for research workflows
             
         # For research workflows, be less strict about plan hash matching
         plan_hash_matches = current_plan_hash == self.state.context_cache_plan_hash
@@ -8457,7 +12949,7 @@ class AgentMasterLoop:
             if self.state.last_context_cache and len(self.state.current_plan) > 0:
                 # If first step description is similar, consider it a match
                 current_step = self.state.current_plan[0].description.lower()
-                if any(keyword in current_step for keyword in ["search", "research", "write", "create"]):
+                if ("search" in current_step or "research" in current_step or "create" in current_step):
                     plan_hash_matches = True  # Allow cache reuse for research steps
         
         if (self.state.last_context_cache and 
@@ -8620,9 +13112,8 @@ class AgentMasterLoop:
         # Use research-optimized context for research workflows in mid-execution
         is_research_workflow = False
         if self.state.goal_stack and self.state.goal_stack[-1]:
-            goal_desc = self.state.goal_stack[-1].get("description", "").lower()
-            research_keywords = ["research", "search", "investigate", "study", "gather", "explore", "articles"]
-            is_research_workflow = any(keyword in goal_desc for keyword in research_keywords)
+            goal_desc = self.state.goal_stack[-1].get("description", "")
+            is_research_workflow = self._is_research_workflow_semantically(goal_desc)
         
         if (is_research_workflow and 
             self.state.current_loop > 3 and  # After initial setup
@@ -9517,8 +14008,50 @@ class AgentMasterLoop:
 
         # Simple envelopes for "non-action" decisions
         if decision_type in {"complete", "complete_with_artifact"}:
-            tool_call_envelope = _construct_envelope(True, data={"message": "LLM signaled overall completion."})
-            self.logger.info("AML EXEC_DECISION: LLM signaled '%s'.", decision_type)
+            completion_summary = llm_decision.get("summary", "Goal completed")
+            tool_call_envelope = _construct_envelope(True, data={"message": f"LLM signaled overall completion: {completion_summary}"})
+            
+            # CRITICAL: Trigger actual goal completion when LLM signals completion
+            self.state.goal_achieved_flag = True
+            self.state.last_action_summary = f"Goal Achieved: {completion_summary}"
+            
+            # Update current goal status to completed
+            if self.state.current_goal_id:
+                try:
+                    update_goal_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_GOAL_STATUS)
+                    if self._find_tool_server(update_goal_mcp):
+                        await self._execute_tool_call_internal(
+                            update_goal_mcp,
+                            {
+                                "goal_id": self.state.current_goal_id,
+                                "status": GoalStatus.COMPLETED.value,
+                                "completion_message": completion_summary
+                            },
+                            record_action=False
+                        )
+                        self.logger.info(f"✅ Updated goal {self.state.current_goal_id} status to completed: {completion_summary}")
+                except Exception as e:
+                    self.logger.error(f"Failed to update goal status on completion: {e}")
+            
+            # Update workflow status if this is the root goal
+            if self.state.workflow_id and len(self.state.goal_stack) <= 1:
+                try:
+                    update_wf_mcp = self._get_ums_tool_mcp_name(UMS_FUNC_UPDATE_WORKFLOW_STATUS)
+                    if self._find_tool_server(update_wf_mcp):
+                        await self._execute_tool_call_internal(
+                            update_wf_mcp,
+                            {
+                                "workflow_id": self.state.workflow_id,
+                                "status": WorkflowStatus.COMPLETED.value,
+                                "completion_message": completion_summary
+                            },
+                            record_action=False
+                        )
+                        self.logger.info(f"✅ Updated workflow {self.state.workflow_id} status to completed")
+                except Exception as e:
+                    self.logger.error(f"Failed to update workflow status on completion: {e}")
+            
+            self.logger.info("🎉 AML EXEC_DECISION: LLM signaled '%s' - Goal achieved: %s", decision_type, completion_summary)
         elif decision_type == "plan_update":
             tool_call_envelope = _construct_envelope(True, data={"message": "LLM textual plan received for processing."})
             self.logger.info("AML EXEC_DECISION: LLM provided textual plan update.")
