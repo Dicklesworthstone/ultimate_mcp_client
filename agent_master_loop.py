@@ -902,36 +902,42 @@ reason: [brief explanation]
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            memory_similarity_schema = {
+                "type": "object",
+                "properties": {
+                    "similarity_score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Semantic similarity score from 0-100"
+                    },
+                    "decision": {
+                        "type": "string",
+                        "enum": ["store_new", "store_with_note", "skip_similar", "skip_duplicate"],
+                        "description": "Decision on how to handle the memory"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation for the decision"
+                    }
+                },
+                "required": ["similarity_score", "decision", "reason"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": comparison_prompt}],
-                model_override=None,
+                response_schema=memory_similarity_schema,
+                schema_name="memory_similarity_analysis",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=50,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                # Parse LLM response
-                lines = response.content.strip().split('\n')
-                similarity_score = 0
-                decision = "store_new"
-                reason = "LLM analysis completed"
-                
-                for line in lines:
-                    if ':' in line:
-                        key, value = line.split(':', 1)
-                        key = key.strip().lower()
-                        value = value.strip()
-                        
-                        if key == "similarity_score":
-                            try:
-                                similarity_score = int(value)
-                            except ValueError:
-                                pass
-                        elif key == "decision":
-                            decision = value
-                        elif key == "reason":
-                            reason = value
+            if response:
+                similarity_score = response.get("similarity_score", 0)
+                decision = response.get("decision", "store_new")
+                reason = response.get("reason", "LLM analysis completed")
                 
                 # Convert LLM decision to memory analysis format
                 should_store = decision in ["store_new", "store_with_note"]
@@ -948,8 +954,6 @@ reason: [brief explanation]
             self.logger.debug(f"LLM memory similarity analysis failed: {e}")
         
         return None
-    
-
     
     async def _are_contents_semantically_identical(self, content1: str, content2: str) -> bool:
         """Use LLM to determine if contents are semantically identical"""
@@ -1003,22 +1007,34 @@ Respond with just the numerical score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": similarity_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="semantic_similarity_scoring",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    similarity_score = int(response.content.strip())
-                    if 0 <= similarity_score <= 100:
-                        # Convert to 0-1 scale for compatibility
-                        return similarity_score / 100.0
-                except ValueError:
-                    pass
+            if response:
+                similarity_score = response.get("score", 0)
+                if 0 <= similarity_score <= 100:
+                    # Convert to 0-1 scale for compatibility
+                    return similarity_score / 100.0
                     
         except Exception as e:
             self.logger.debug(f"LLM semantic similarity failed: {e}")
@@ -1068,21 +1084,33 @@ Respond with just the numerical score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Semantic similarity score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": similarity_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="semantic_similarity_scoring",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    score = int(response.content.strip())
-                    if 0 <= score <= 100:
-                        return score
-                except ValueError:
-                    pass
+            if response:
+                score = response.get("score", 0)
+                if 0 <= score <= 100:
+                    return score
                     
         except Exception as e:
             self.logger.debug(f"LLM semantic similarity scoring failed: {e}")
@@ -1216,21 +1244,33 @@ Respond with just the numerical score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Consolidation necessity score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": consolidation_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="consolidation_decision",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    consolidation_score = int(response.content.strip())
-                    if 0 <= consolidation_score <= 100:
-                        return consolidation_score >= LLM_SIMILARITY_CONSOLIDATION_THRESHOLD
-                except ValueError:
-                    pass
+            if response:
+                consolidation_score = response.get("score", 0)
+                if 0 <= consolidation_score <= 100:
+                    return consolidation_score >= LLM_SIMILARITY_CONSOLIDATION_THRESHOLD
                     
         except Exception as e:
             self.logger.debug(f"LLM consolidation decision failed: {e}")
@@ -1283,25 +1323,37 @@ Respond with just the numbers separated by commas (e.g., "1,3,4").
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            unique_content_schema = {
+                "type": "object",
+                "properties": {
+                    "unique_items": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "description": "List of item numbers (1-based) that contain unique information"
+                    }
+                },
+                "required": ["unique_items"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": unique_analysis_prompt}],
-                model_override=None,
+                response_schema=unique_content_schema,
+                schema_name="unique_content_analysis",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=20,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                # Parse unique item numbers
+            if response:
                 unique_numbers = []
-                numbers_text = response.content.strip()
-                for num_str in numbers_text.split(','):
-                    try:
-                        num = int(num_str.strip())
-                        if 1 <= num <= len(content_list):
-                            unique_numbers.append(num - 1)  # Convert to 0-based index
-                    except ValueError:
-                        continue
+                unique_items = response.get("unique_items", [])
+                for num in unique_items:
+                    if isinstance(num, int) and 1 <= num <= len(content_list):
+                        unique_numbers.append(num - 1)  # Convert to 0-based index
                 
                 # Return unique content items
                 if unique_numbers:
@@ -1556,36 +1608,41 @@ recommendation: [brief suggestion for improvement]
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            progress_assessment_schema = {
+                "type": "object",
+                "properties": {
+                    "reasonableness_score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Progress reasonableness score from 0-100"
+                    },
+                    "primary_concern": {
+                        "type": "string",
+                        "description": "Main issue if score < 51, or 'none' if reasonable"
+                    },
+                    "recommendation": {
+                        "type": "string",
+                        "description": "Brief suggestion for improvement"
+                    }
+                },
+                "required": ["reasonableness_score", "primary_concern", "recommendation"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": assessment_prompt}],
-                model_override=None,
+                response_schema=progress_assessment_schema,
+                schema_name="progress_assessment",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=100,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                # Parse LLM response
-                lines = response.content.strip().split('\n')
-                reasonableness_score = 60  # Default reasonable
-                primary_concern = "none"
-                recommendation = "continue current approach"
-                
-                for line in lines:
-                    if ':' in line:
-                        key, value = line.split(':', 1)
-                        key = key.strip().lower()
-                        value = value.strip()
-                        
-                        if key == "reasonableness_score":
-                            try:
-                                reasonableness_score = int(value)
-                            except ValueError:
-                                pass
-                        elif key == "primary_concern":
-                            primary_concern = value
-                        elif key == "recommendation":
-                            recommendation = value
+            if response:
+                reasonableness_score = response.get("reasonableness_score", 60)
+                primary_concern = response.get("primary_concern", "none")
+                recommendation = response.get("recommendation", "continue current approach")
                 
                 is_reasonable = reasonableness_score >= LLM_PROGRESS_REASONABLENESS_THRESHOLD
                 
@@ -6105,21 +6162,33 @@ Respond with just the numerical complexity score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Task complexity score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": complexity_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="complexity_scoring",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    complexity_score = int(response.content.strip())
-                    if 0 <= complexity_score <= 100:
-                        return complexity_score
-                except ValueError:
-                    pass
+            if response:
+                complexity_score = response.get("score", 50)
+                if 0 <= complexity_score <= 100:
+                    return complexity_score
                     
         except Exception:
             pass
@@ -6156,23 +6225,35 @@ Respond with just the numerical complexity score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Task complexity score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": complexity_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="complexity_scoring",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    complexity_score = int(response.content.strip())
-                    if 0 <= complexity_score <= 100:
-                        self._complexity_score_cache[goal_hash] = complexity_score
-                        self.logger.debug(f"🧠 LLM complexity score: {complexity_score}/100")
-                except ValueError:
-                    pass
-                    
+            if response:
+                complexity_score = response.get("score", 50)
+                if 0 <= complexity_score <= 100:
+                    self._complexity_score_cache[goal_hash] = complexity_score
+                    self.logger.debug(f"🧠 LLM complexity score: {complexity_score}/100")
+
         except Exception as e:
             self.logger.debug(f"Background LLM complexity scoring failed: {e}")
     
@@ -6231,22 +6312,34 @@ Respond with just the numerical intensity score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Research intensity score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": research_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="research_intensity_scoring",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    intensity_score = int(response.content.strip())
-                    if 0 <= intensity_score <= 100:
-                        self._research_intensity_cache[goal_hash] = intensity_score
-                        self.logger.debug(f"🧠 LLM research intensity: {intensity_score}/100")
-                except ValueError:
-                    pass
+            if response:
+                intensity_score = response.get("score", 50)
+                if 0 <= intensity_score <= 100:
+                    self._research_intensity_cache[goal_hash] = intensity_score
+                    self.logger.debug(f"🧠 LLM research intensity: {intensity_score}/100")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM research intensity assessment failed: {e}")
@@ -6300,22 +6393,34 @@ Respond with just the numerical creation focus score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Creation focus score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": creation_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="creation_focus_scoring",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    focus_score = int(response.content.strip())
-                    if 0 <= focus_score <= 100:
-                        self._creation_focus_cache[goal_hash] = focus_score
-                        self.logger.debug(f"🧠 LLM creation focus: {focus_score}/100")
-                except ValueError:
-                    pass
+            if response:
+                focus_score = response.get("score", 50)
+                if 0 <= focus_score <= 100:
+                    self._creation_focus_cache[goal_hash] = focus_score
+                    self.logger.debug(f"🧠 LLM creation focus: {focus_score}/100")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM creation focus assessment failed: {e}")
@@ -6377,43 +6482,76 @@ general_artifact: [0-100]
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            deliverable_type_schema = {
+                "type": "object",
+                "properties": {
+                    "report": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Likelihood of producing analytical reports or research summaries"
+                    },
+                    "html_file": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Likelihood of producing web pages or HTML documents"
+                    },
+                    "interactive_quiz": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Likelihood of producing quizzes, tests, or assessments"
+                    },
+                    "code_file": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Likelihood of producing programming code or scripts"
+                    },
+                    "document": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Likelihood of producing general text documents or papers"
+                    },
+                    "general_artifact": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Likelihood of producing other types of deliverables"
+                    }
+                },
+                "required": ["report", "html_file", "interactive_quiz", "code_file", "document", "general_artifact"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": deliverable_prompt}],
-                model_override=None,
+                response_schema=deliverable_type_schema,
+                schema_name="deliverable_type_prediction",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=20,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    # Parse confidence scores for each deliverable type
-                    lines = response.content.strip().split('\n')
-                    scores = {}
-                    for line in lines:
-                        if ':' in line:
-                            type_name, score_str = line.split(':', 1)
-                            type_name = type_name.strip().lower()
-                            score = int(score_str.strip())
-                            if 0 <= score <= 100:
-                                scores[type_name] = score
+            if response:
+                # Find the highest confidence type
+                scores = {k: v for k, v in response.items() if isinstance(v, int) and 0 <= v <= 100}
+                
+                if scores:
+                    best_type = max(scores, key=scores.get)
+                    best_score = scores[best_type]
                     
-                    if scores:
-                        # Find the highest confidence type
-                        best_type = max(scores, key=scores.get)
-                        best_score = scores[best_type]
-                        
-                        # Only use if confidence is reasonable (50+)
-                        if best_score >= 50:
-                            # Update cache with LLM result
-                            self._deliverable_type_cache[goal_hash] = best_type
-                            self.logger.debug(f"🧠 LLM deliverable type: {best_type} (confidence={best_score}, scores={scores})")
-                        else:
-                            # Fall back to general_artifact if no high confidence
-                            self._deliverable_type_cache[goal_hash] = "general_artifact"
-                            self.logger.debug(f"🧠 LLM deliverable type: general_artifact (low confidence, max={best_score})")
-                except (ValueError, IndexError):
-                    pass
+                    # Only use if confidence is reasonable (50+)
+                    if best_score >= 50:
+                        # Update cache with LLM result
+                        self._deliverable_type_cache[goal_hash] = best_type
+                        self.logger.debug(f"🧠 LLM deliverable type: {best_type} (confidence={best_score}, scores={scores})")
+                    else:
+                        # Fall back to general_artifact if no high confidence
+                        self._deliverable_type_cache[goal_hash] = "general_artifact"
+                        self.logger.debug(f"🧠 LLM deliverable type: general_artifact (low confidence, max={best_score})")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM deliverable type prediction failed: {e}")
@@ -6466,25 +6604,37 @@ Respond with just the numerical score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Multi-part task score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": multi_part_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="multi_part_analysis",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    score = int(response.content.strip())
-                    if 0 <= score <= 100:
-                        # Use threshold of 60+ for considering task multi-part
-                        MULTI_PART_THRESHOLD = 60
-                        is_multi_part = score >= MULTI_PART_THRESHOLD
-                        self.logger.debug(f"🧠 LLM multi-part analysis: score={score}, is_multi_part={is_multi_part}")
-                        return is_multi_part
-                except ValueError:
-                    pass
+            if response:
+                score = response.get("score", 0)
+                if 0 <= score <= 100:
+                    # Use threshold of 60+ for considering task multi-part
+                    MULTI_PART_THRESHOLD = 60
+                    is_multi_part = score >= MULTI_PART_THRESHOLD
+                    self.logger.debug(f"🧠 LLM multi-part analysis: score={score}, is_multi_part={is_multi_part}")
+                    return is_multi_part
                     
         except Exception as e:
             self.logger.debug(f"LLM multi-part analysis failed: {e}")
@@ -6542,25 +6692,37 @@ Respond with just the numerical score (0-100).
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            simple_score_schema = {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "External integration needs score from 0-100"
+                    }
+                },
+                "required": ["score"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": integration_prompt}],
-                model_override=None,
+                response_schema=simple_score_schema,
+                schema_name="integration_needs_analysis",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=5,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    score = int(response.content.strip())
-                    if 0 <= score <= 100:
-                        # Use threshold of 60+ for considering integration needed
-                        INTEGRATION_THRESHOLD = 60
-                        needs_integration = score >= INTEGRATION_THRESHOLD
-                        self.logger.debug(f"🧠 LLM integration analysis: score={score}, needs_integration={needs_integration}")
-                        return needs_integration
-                except ValueError:
-                    pass
+            if response:
+                score = response.get("score", 0)
+                if 0 <= score <= 100:
+                    # Use threshold of 60+ for considering integration needed
+                    INTEGRATION_THRESHOLD = 60
+                    needs_integration = score >= INTEGRATION_THRESHOLD
+                    self.logger.debug(f"🧠 LLM integration analysis: score={score}, needs_integration={needs_integration}")
+                    return needs_integration
                     
         except Exception as e:
             self.logger.debug(f"LLM integration analysis failed: {e}")
@@ -6583,7 +6745,8 @@ Respond with just the numerical score (0-100).
             return "error_recovery"
         
         # Use LLM-based action phase analysis instead of primitive keyword matching
-        return await self._analyze_action_phase_with_llm_fallback(action_lower)
+        # Since this is a sync function, use a fallback approach
+        return "general_work"  # Default fallback for now
     
     async def _analyze_action_phase_with_llm_fallback(self, action_description: str) -> str:
         """Use LLM to analyze action phase instead of primitive keyword matching"""
@@ -6632,19 +6795,31 @@ Respond with just the phase name that scored highest.
 """
 
         try:
-            response = await self.mcp_client.query_llm(
+            phase_classification_schema = {
+                "type": "object",
+                "properties": {
+                    "phase": {
+                        "type": "string",
+                        "enum": ["research", "creation", "processing", "analysis", "general_work"],
+                        "description": "Current phase of work based on action analysis"
+                    }
+                },
+                "required": ["phase"],
+                "additionalProperties": False
+            }
+            
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": phase_prompt}],
-                model_override=None,
+                response_schema=phase_classification_schema,
+                schema_name="action_phase_analysis",
+                use_cheap_model=True,  # Use cheap/fast model
                 max_tokens=10,
-                temperature=0.1,
-                stream=False
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                phase = response.content.strip().lower()
-                valid_phases = {"research", "creation", "processing", "analysis", "general_work"}
-                if phase in valid_phases:
-                    return phase
+            if response:
+                phase = response.get("phase", "general_work")
+                return phase
                     
         except Exception as e:
             self.logger.debug(f"LLM action phase analysis failed: {e}")
@@ -6683,29 +6858,39 @@ For each category scoring 40+ points, include it in the response.
 Respond with only the category names that score 40+ (e.g., "information_gathering,content_creation").
 """
 
+        categorization_schema = {
+            "type": "object",
+            "properties": {
+                "categories": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["information_gathering", "knowledge_storage", "content_creation", 
+                                "analysis_thinking", "data_processing", "collaboration"]
+                    },
+                    "description": "List of activity categories that score 40+ points"
+                },
+                "explanation": {
+                    "type": "string",
+                    "description": "Brief explanation of the categorization"
+                }
+            },
+            "required": ["categories"],
+            "additionalProperties": False
+        }
+
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": categorization_prompt}],
-                model_override=None,
-                max_tokens=50,
-                temperature=0.1,
-                stream=False
+                response_schema=categorization_schema,
+                schema_name="activity_categorization",
+                use_cheap_model=True,
+                max_tokens=100,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                # Parse comma-separated categories
-                categories_text = response.content.strip()
-                valid_categories = {
-                    "information_gathering", "knowledge_storage", "content_creation", 
-                    "analysis_thinking", "data_processing", "collaboration"
-                }
-                
-                categories = []
-                for category in categories_text.split(','):
-                    category = category.strip().lower()
-                    if category in valid_categories:
-                        categories.append(category)
-                
+            if response:
+                categories = response.get("categories", [])
                 if categories:
                     return categories
                     
@@ -6833,19 +7018,40 @@ Focus on:
 
 Provide 2-3 specific, actionable suggestions focusing on tool names and approach.
 """
+        suggestion_schema = {
+            "type": "object",
+            "properties": {
+                "suggestions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 3,
+                    "description": "2-3 specific, actionable tool suggestions"
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation of why these tools are recommended"
+                }
+            },
+            "required": ["suggestions"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": suggestion_prompt}],
-                model_override=None,
-                max_tokens=300,
-                temperature=0.2,
-                stream=False
+                response_schema=suggestion_schema,
+                schema_name="tool_suggestion_improvement",
+                use_cheap_model=True,
+                max_tokens=250,
+                temperature=0.2
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                self.logger.debug(f"🧠 LLM suggested improved tools: {response.content[:100]}...")
-                # Could be used to improve future suggestions via caching/learning
+            if response:
+                suggestions = response.get("suggestions", [])
+                if suggestions:
+                    self.logger.debug(f"🧠 LLM suggested improved tools: {suggestions}")
+                    # Could be used to improve future suggestions via caching/learning
                 
         except Exception as e:
             self.logger.debug(f"Background LLM tool suggestion improvement failed: {e}")
@@ -7044,20 +7250,32 @@ Categories:
 
 Respond with ONLY the category name (no explanation).
 """
+        classification_schema = {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["creation", "analysis", "planning", "communication", "evaluation", "problem_solving"],
+                    "description": "Primary goal category based on the nature of work"
+                }
+            },
+            "required": ["category"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": classification_prompt}],
-                model_override=None,
-                max_tokens=10,
-                temperature=0.1,
-                stream=False
+                response_schema=classification_schema,
+                schema_name="goal_type_classification",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                classification = response.content.strip().lower()
-                valid_categories = {"creation", "analysis", "planning", "communication", "evaluation", "problem_solving"}
-                if classification in valid_categories:
+            if response:
+                classification = response.get("category")
+                if classification:
                     return classification
                     
         except Exception:
@@ -7096,46 +7314,57 @@ evaluation: [0-100]
 problem_solving: [0-100]
 """
 
+        scoring_schema = {
+            "type": "object",
+            "properties": {
+                "creation": {"type": "integer", "minimum": 0, "maximum": 100},
+                "analysis": {"type": "integer", "minimum": 0, "maximum": 100},
+                "planning": {"type": "integer", "minimum": 0, "maximum": 100},
+                "communication": {"type": "integer", "minimum": 0, "maximum": 100},
+                "evaluation": {"type": "integer", "minimum": 0, "maximum": 100},
+                "problem_solving": {"type": "integer", "minimum": 0, "maximum": 100}
+            },
+            "required": ["creation", "analysis", "planning", "communication", "evaluation", "problem_solving"],
+            "additionalProperties": False
+        }
+
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": classification_prompt}],
-                model_override=None,
-                max_tokens=15,
-                temperature=0.1,
-                stream=False
+                response_schema=scoring_schema,
+                schema_name="goal_classification_scoring",
+                use_cheap_model=True,
+                max_tokens=50,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    # Parse confidence scores for each goal category
-                    lines = response.content.strip().split('\n')
-                    scores = {}
-                    for line in lines:
-                        if ':' in line:
-                            category, score_str = line.split(':', 1)
-                            category = category.strip().lower()
-                            score = int(score_str.strip())
-                            if 0 <= score <= 100:
-                                scores[category] = score
+            if response:
+                scores = {
+                    "creation": response.get("creation", 0),
+                    "analysis": response.get("analysis", 0),
+                    "planning": response.get("planning", 0),
+                    "communication": response.get("communication", 0),
+                    "evaluation": response.get("evaluation", 0),
+                    "problem_solving": response.get("problem_solving", 0)
+                }
+                
+                if scores:
+                    # Find the highest confidence category
+                    best_category = max(scores, key=scores.get)
+                    best_score = scores[best_category]
                     
-                    if scores:
-                        # Find the highest confidence category
-                        best_category = max(scores, key=scores.get)
-                        best_score = scores[best_category]
-                        
-                        # Use threshold of 40+ for considering a valid classification
-                        GOAL_CLASSIFICATION_THRESHOLD = 40
-                        if best_score >= GOAL_CLASSIFICATION_THRESHOLD:
-                            # Update cache with LLM result
-                            self._goal_classify_cache[goal_hash] = best_category
-                            self.logger.debug(f"🎯 LLM goal classification: {best_category} (confidence={best_score}, scores={scores})")
-                        else:
-                            # Fall back to general_task if no high confidence
-                            self._goal_classify_cache[goal_hash] = "general_task"
-                            self.logger.debug(f"🎯 LLM goal classification: general_task (low confidence, max={best_score})")
-                except (ValueError, IndexError):
-                    pass
-                    
+                    # Use threshold of 40+ for considering a valid classification
+                    GOAL_CLASSIFICATION_THRESHOLD = 40
+                    if best_score >= GOAL_CLASSIFICATION_THRESHOLD:
+                        # Update cache with LLM result
+                        self._goal_classify_cache[goal_hash] = best_category
+                        self.logger.debug(f"🎯 LLM goal classification: {best_category} (confidence={best_score}, scores={scores})")
+                    else:
+                        # Fall back to general_task if no high confidence
+                        self._goal_classify_cache[goal_hash] = "general_task"
+                        self.logger.debug(f"🎯 LLM goal classification: general_task (low confidence, max={best_score})")
+        except (ValueError, IndexError):
+            pass
         except Exception as e:
             self.logger.debug(f"Background LLM goal classification failed: {e}")
     
@@ -7163,20 +7392,33 @@ Goal to classify: "{goal_description}"
 Respond with ONLY the category name (no explanation). If the goal involves multiple aspects, choose the PRIMARY focus.
 """
 
+        async_classification_schema = {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["creation", "analysis", "planning", "communication", "evaluation", "problem_solving"],
+                    "description": "Primary goal category"
+                }
+            },
+            "required": ["category"],
+            "additionalProperties": False
+        }
+
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": classification_prompt}],
-                model_override=None,
-                max_tokens=15,
-                temperature=0.1,
-                stream=False
+                response_schema=async_classification_schema,
+                schema_name="async_goal_classification",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                classification = response.content.strip().lower()
+            if response:
+                classification = response.get("category")
                 
-                valid_categories = {"creation", "analysis", "planning", "communication", "evaluation", "problem_solving"}
-                if classification in valid_categories:
+                if classification:
                     # Update cache with LLM result
                     if not hasattr(self, '_goal_classification_cache'):
                         self._goal_classification_cache = {}
@@ -7330,18 +7572,63 @@ FORCE_COMPLETION: [0-100]
 HAS_DELIVERABLE: [yes/no]
 REASON: [brief explanation]
 """
+        completion_analysis_schema = {
+            "type": "object",
+            "properties": {
+                "completion_readiness": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Score 0-100 for goal completion readiness"
+                },
+                "force_completion": {
+                    "type": "integer", 
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Score 0-100 for whether completion should be forced"
+                },
+                "has_deliverable": {
+                    "type": "boolean",
+                    "description": "Whether deliverable exists"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation of the analysis"
+                }
+            },
+            "required": ["completion_readiness", "force_completion", "has_deliverable", "reason"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": completion_prompt}],
-                model_override=None,
-                max_tokens=100,
-                temperature=0.1,
-                stream=False
+                response_schema=completion_analysis_schema,
+                schema_name="goal_completion_analysis",
+                use_cheap_model=True,
+                max_tokens=150,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                return await self._parse_completion_analysis(response.content, goal_type)
+            if response:
+                completion_readiness = response.get("completion_readiness", 0)
+                force_completion = response.get("force_completion", 0)
+                has_deliverable = response.get("has_deliverable", False)
+                reason = response.get("reason", "Structured analysis completed")
+                
+                ready_for_completion = completion_readiness >= 70 or force_completion >= 70
+                force_needed = force_completion >= 70
+                
+                return {
+                    "goal_type": goal_type,
+                    "ready_for_completion": ready_for_completion,
+                    "force_completion": force_needed,
+                    "has_deliverable": has_deliverable,
+                    "completion_readiness_score": completion_readiness,
+                    "force_completion_score": force_completion,
+                    "completion_message": f"Goal completion analysis: readiness={completion_readiness}%, force={force_completion}%, deliverable={has_deliverable}",
+                    "reason": reason
+                }
                 
         except Exception as e:
             self.logger.debug(f"LLM goal completion analysis failed: {e}")
@@ -7401,25 +7688,50 @@ Extract these values:
 Provide response as a JSON object:
 {{"completion_readiness": 0, "force_completion": 0, "has_deliverable": false, "reason": "explanation"}}
 """
+        parsing_schema = {
+            "type": "object",
+            "properties": {
+                "completion_readiness": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Score 0-100 for goal completion readiness"
+                },
+                "force_completion": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Score 0-100 for whether completion should be forced"
+                },
+                "has_deliverable": {
+                    "type": "boolean",
+                    "description": "Boolean for whether deliverable exists"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation text"
+                }
+            },
+            "required": ["completion_readiness", "force_completion", "has_deliverable", "reason"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": parsing_prompt}],
-                model_override=None,
-                max_tokens=100,
-                temperature=0.1,
-                stream=False
+                response_schema=parsing_schema,
+                schema_name="completion_response_parsing",
+                use_cheap_model=True,
+                max_tokens=150,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                import json
-                parsed_json = json.loads(response.content.strip())
-                
+            if response:
                 return {
-                    "completion_readiness": parsed_json.get("completion_readiness", 0),
-                    "force_completion": parsed_json.get("force_completion", 0), 
-                    "has_deliverable": parsed_json.get("has_deliverable", False),
-                    "reason": parsed_json.get("reason", "LLM extraction completed")
+                    "completion_readiness": response.get("completion_readiness", 0),
+                    "force_completion": response.get("force_completion", 0), 
+                    "has_deliverable": response.get("has_deliverable", False),
+                    "reason": response.get("reason", "Structured extraction completed")
                 }
                 
         except Exception as e:
@@ -7475,20 +7787,34 @@ Rate 0-100 how much substantial progress has occurred:
 
 Respond with just the numerical score (0-100).
 """
+        progress_schema = {
+            "type": "object",
+            "properties": {
+                "progress_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Progress score from 0-100"
+                }
+            },
+            "required": ["progress_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": progress_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=progress_schema,
+                schema_name="progress_scoring",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                progress_score = int(response.content.strip())
+            if response:
+                progress_score = response.get("progress_score", 0)
                 return progress_score >= 60
-                
+
         except Exception as e:
             self.logger.debug(f"LLM progress analysis failed: {e}")
         
@@ -7647,28 +7973,40 @@ Consider:
 Respond with 1-3 tool base names (like "search", "store_memory", "record_artifact") separated by commas, in logical order.
 Focus on concrete progress toward the goal.
 """
+        tool_suggestion_schema = {
+            "type": "object",
+            "properties": {
+                "suggested_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of 1-3 base tool names for progress",
+                    "maxItems": 3
+                }
+            },
+            "required": ["suggested_tools"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": suggestion_prompt}],
-                model_override=None,
-                max_tokens=50,
-                temperature=0.2,
-                stream=False
+                response_schema=tool_suggestion_schema,
+                schema_name="tool_suggestion_analysis",
+                use_cheap_model=True,
+                max_tokens=80,
+                temperature=0.2
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                # Parse tool suggestions
+            if response:
                 suggested_tools = []
-                tools_text = response.content.strip()
+                tool_list = response.get("suggested_tools", [])
                 
-                # Extract tool names from response
-                tool_names = [name.strip() for name in tools_text.split(',')]
-                for tool_name in tool_names[:3]:  # Max 3 tools
-                    # Convert to MCP names
-                    mcp_tool_name = self._convert_base_to_mcp_tool_name(tool_name)
-                    if mcp_tool_name:
-                        suggested_tools.append(mcp_tool_name)
+                for tool_name in tool_list[:3]:  # Max 3 tools
+                    if isinstance(tool_name, str):
+                        # Convert to MCP names
+                        mcp_tool_name = self._convert_base_to_mcp_tool_name(tool_name.strip())
+                        if mcp_tool_name:
+                            suggested_tools.append(mcp_tool_name)
                 
                 if suggested_tools:
                     # Update cache with LLM result
@@ -7833,18 +8171,32 @@ Rate on a scale of 0-100:
 
 Respond with just the numerical score (0-100).
 """
+        state_analysis_schema = {
+            "type": "object",
+            "properties": {
+                "activity_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Score 0-100 for activity occurrence"
+                }
+            },
+            "required": ["activity_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": analysis_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=state_analysis_schema,
+                schema_name="progress_state_analysis",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                progress_score = int(response.content.strip())
+            if response:
+                progress_score = response.get("activity_score", 0)
                 if 0 <= progress_score <= 100:
                     return progress_score >= 50  # Threshold for activity occurrence
         except Exception as e:
@@ -7898,19 +8250,32 @@ Available types:
 
 Respond with just the best type name (e.g., "fact", "insight", "reasoning_step").
 """
+        memory_classification_schema = {
+            "type": "object",
+            "properties": {
+                "memory_type": {
+                    "type": "string",
+                    "enum": ["fact", "insight", "reasoning_step", "observation", "procedure", "summary", "text"],
+                    "description": "Best memory type classification"
+                }
+            },
+            "required": ["memory_type"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": scoring_prompt}],
-                model_override=None,
-                max_tokens=10,
-                temperature=0.1,
-                stream=False
+                response_schema=memory_classification_schema,
+                schema_name="memory_type_classification",
+                use_cheap_model=True,
+                max_tokens=30,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                llm_type = response.content.strip().lower()
-                if llm_type in valid_types:
+            if response:
+                llm_type = response.get("memory_type")
+                if llm_type:
                     return llm_type
         except Exception as e:
             self.logger.error(f"LLM memory type classification failed: {e}")
@@ -7938,24 +8303,44 @@ Consider:
 
 Respond with just the type name (e.g., "fact", "insight", "reasoning_step").
 """
+        memory_improvement_schema = {
+            "type": "object",
+            "properties": {
+                "memory_type": {
+                    "type": "string",
+                    "enum": ["fact", "insight", "reasoning_step", "observation", "procedure", "summary", "text"],
+                    "description": "Improved memory type classification"
+                },
+                "confidence": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Confidence in classification"
+                }
+            },
+            "required": ["memory_type"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": memory_classification_prompt}],
-                model_override=None,
-                max_tokens=20,
-                temperature=0.1,
-                stream=False
+                response_schema=memory_improvement_schema,
+                schema_name="memory_type_improvement",
+                use_cheap_model=True,
+                max_tokens=50,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                llm_classification = response.content.strip().lower()
+            if response:
+                llm_classification = response.get("memory_type")
                 
                 # Validate LLM response
-                if llm_classification in valid_types:
+                if llm_classification:
                     # Update cache with LLM result
                     self._memory_type_heuristic_cache[context_hash] = llm_classification
-                    self.logger.debug(f"🧠 LLM improved memory classification: '{memory_type}' → '{llm_classification}'")
+                    confidence = response.get("confidence", 75)
+                    self.logger.debug(f"🧠 LLM improved memory classification: '{memory_type}' → '{llm_classification}' (confidence: {confidence}%)")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM memory classification failed: {e}")
@@ -7980,21 +8365,34 @@ Consider:
 
 Respond with just the type name (e.g., "fact", "insight", "reasoning_step").
 """
+        memory_classification_schema = {
+            "type": "object",
+            "properties": {
+                "memory_type": {
+                    "type": "string",
+                    "enum": ["fact", "insight", "reasoning_step", "observation", "procedure", "summary", "text"],
+                    "description": "Classified memory type"
+                }
+            },
+            "required": ["memory_type"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": classification_prompt}],
-                model_override=None,
-                max_tokens=20,
-                temperature=0.1,
-                stream=False
+                response_schema=memory_classification_schema,
+                schema_name="memory_classification",
+                use_cheap_model=True,
+                max_tokens=30,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                llm_classification = response.content.strip().lower()
+            if response:
+                llm_classification = response.get("memory_type")
                 
                 # Validate LLM response
-                if llm_classification in valid_types:
+                if llm_classification:
                     # Update cache with LLM result
                     if not hasattr(self, '_memory_type_cache'):
                         self._memory_type_cache = {}
@@ -8100,25 +8498,36 @@ Available types:
 
 Respond with just the best type name (e.g., "file", "code", "data").
 """
+        error_category_schema = {
+            "type": "object",
+            "properties": {
+                "matches": {
+                    "type": "boolean",
+                    "description": "Whether the error matches the specified category"
+                }
+            },
+            "required": ["matches"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": scoring_prompt}],
-                model_override=None,
-                max_tokens=10,
-                temperature=0.1,
-                stream=False
+                response_schema=error_category_schema,
+                schema_name="error_category_classification",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                llm_type = response.content.strip().lower()
-                if llm_type in valid_types:
-                    return llm_type
+            if response:
+                return response.get("matches", False)
         except Exception as e:
-            self.logger.error(f"LLM artifact type classification failed: {e}")
+            self.logger.error(f"LLM error category classification failed: {e}")
             
-        return "text"  # Default if LLM fails
-    
+        return False  # Default if LLM fails
+            
+
     async def _improve_artifact_type_classification_with_llm(self, artifact_type: str, name: str, description: str, content: str, context_hash: int, valid_types: dict):
         """Use LLM to improve artifact type classification"""
         
@@ -8141,25 +8550,37 @@ Consider:
 
 Respond with just the type name (e.g., "file", "code", "data").
 """
+        artifact_classification_schema = {
+            "type": "object",
+            "properties": {
+                "artifact_type": {
+                    "type": "string",
+                    "enum": ["file", "text", "code", "data", "image", "chart", "table", "json", "url"],
+                    "description": "Classified artifact type"
+                }
+            },
+            "required": ["artifact_type"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": artifact_classification_prompt}],
-                model_override=None,
-                max_tokens=20,
-                temperature=0.1,
-                stream=False
+                response_schema=artifact_classification_schema,
+                schema_name="artifact_classification",
+                use_cheap_model=True,
+                max_tokens=30,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                llm_classification = response.content.strip().lower()
+            if response:
+                llm_classification = response.get("artifact_type")
                 
                 # Validate LLM response
-                if llm_classification in valid_types:
+                if llm_classification:
                     # Update cache with LLM result
                     self._artifact_type_heuristic_cache[context_hash] = llm_classification
                     self.logger.debug(f"🧠 LLM improved artifact classification: '{artifact_type}' → '{llm_classification}'")
-                    
         except Exception as e:
             self.logger.debug(f"Background LLM artifact classification failed: {e}")
     
@@ -8184,21 +8605,34 @@ Consider:
 
 Respond with just the type name (e.g., "file", "code", "data").
 """
+        background_artifact_schema = {
+            "type": "object",
+            "properties": {
+                "artifact_type": {
+                    "type": "string",
+                    "enum": ["file", "text", "code", "data", "image", "chart", "table", "json", "url"],
+                    "description": "Background classified artifact type"
+                }
+            },
+            "required": ["artifact_type"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": classification_prompt}],
-                model_override=None,
-                max_tokens=20,
-                temperature=0.1,
-                stream=False
+                response_schema=background_artifact_schema,
+                schema_name="background_artifact_classification",
+                use_cheap_model=True,
+                max_tokens=30,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                llm_classification = response.content.strip().lower()
+            if response:
+                llm_classification = response.get("artifact_type")
                 
                 # Validate LLM response
-                if llm_classification in valid_types:
+                if llm_classification:
                     # Update cache with LLM result
                     if not hasattr(self, '_artifact_type_cache'):
                         self._artifact_type_cache = {}
@@ -8411,28 +8845,39 @@ Consider:
 
 Respond with just the numerical score (0-100).
 """
+        similarity_analysis_schema = {
+            "type": "object",
+            "properties": {
+                "similarity_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Similarity score 0-100"
+                }
+            },
+            "required": ["similarity_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": similarity_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=similarity_analysis_schema,
+                schema_name="similarity_analysis",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    similarity_score = int(response.content.strip())
-                    if 0 <= similarity_score <= 100:
-                        # Use threshold of 65+ for considering items similar/duplicate
-                        SIMILARITY_THRESHOLD = 65
-                        is_similar = similarity_score >= SIMILARITY_THRESHOLD
-                        # Update cache with LLM result
-                        self._similarity_cache[content_hash] = is_similar
-                        self.logger.debug(f"🧠 LLM similarity analysis: score={similarity_score}, similar={is_similar} (threshold={SIMILARITY_THRESHOLD})")
-                except ValueError:
-                    pass
+            if response:
+                similarity_score = response.get("similarity_score", 0)
+                if 0 <= similarity_score <= 100:
+                    # Use threshold of 65+ for considering items similar/duplicate
+                    SIMILARITY_THRESHOLD = 65
+                    is_similar = similarity_score >= SIMILARITY_THRESHOLD
+                    # Update cache with LLM result
+                    self._similarity_cache[content_hash] = is_similar
+                    self.logger.debug(f"🧠 LLM similarity analysis: score={similarity_score}, similar={is_similar} (threshold={SIMILARITY_THRESHOLD})")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM similarity analysis failed: {e}")
@@ -8873,19 +9318,30 @@ Categories:
 
 Respond with just "yes" or "no".
 """
+        error_classification_schema = {
+            "type": "object",
+            "properties": {
+                "matches_category": {
+                    "type": "boolean",
+                    "description": "Whether error matches specified category"
+                }
+            },
+            "required": ["matches_category"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": scoring_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=error_classification_schema,
+                schema_name="error_classification",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                result = response.content.strip().lower()
-                return result == "yes"
+            if response:
+                return response.get("matches_category", False)
         except Exception as e:
             self.logger.error(f"LLM error category classification failed: {e}")
             
@@ -8923,28 +9379,39 @@ Consider:
 
 Respond with just the numerical confidence score (0-100).
 """
+        error_classification_improvement_schema = {
+            "type": "object",
+            "properties": {
+                "confidence_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Confidence score 0-100 for error category match"
+                }
+            },
+            "required": ["confidence_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": error_classification_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=error_classification_improvement_schema,
+                schema_name="error_classification_improvement",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    confidence_score = int(response.content.strip())
-                    if 0 <= confidence_score <= 100:
-                        # Use threshold of 70+ for high confidence error classification  
-                        ERROR_CLASSIFICATION_THRESHOLD = 70
-                        matches_category = confidence_score >= ERROR_CLASSIFICATION_THRESHOLD
-                        # Update cache with LLM result
-                        self._error_classification_cache[context_hash] = matches_category
-                        self.logger.debug(f"🧠 LLM error classification: {error_category} confidence={confidence_score}, matches={matches_category} (threshold={ERROR_CLASSIFICATION_THRESHOLD})")
-                except ValueError:
-                    pass
+            if response:
+                confidence_score = response.get("confidence_score", 0)
+                if 0 <= confidence_score <= 100:
+                    # Use threshold of 70+ for high confidence error classification  
+                    ERROR_CLASSIFICATION_THRESHOLD = 70
+                    matches_category = confidence_score >= ERROR_CLASSIFICATION_THRESHOLD
+                    # Update cache with LLM result
+                    self._error_classification_cache[context_hash] = matches_category
+                    self.logger.debug(f"🧠 LLM error classification: {error_category} confidence={confidence_score}, matches={matches_category} (threshold={ERROR_CLASSIFICATION_THRESHOLD})")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM error classification failed: {e}")
@@ -9084,19 +9551,30 @@ Tool types:
 
 Respond with just "yes" or "no".
 """
+        tool_type_schema = {
+            "type": "object",
+            "properties": {
+                "matches_type": {
+                    "type": "boolean",
+                    "description": "Whether the tool matches the specified type"
+                }
+            },
+            "required": ["matches_type"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=tool_type_schema,
+                schema_name="tool_type_analysis",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                result = response.content.strip().lower()
-                return result == "yes"
+            if response:
+                return response.get("matches_type", False)
         except Exception as e:
             self.logger.error(f"LLM tool type analysis failed: {e}")
             
@@ -9130,28 +9608,39 @@ Consider:
 
 Respond with just the numerical confidence score (0-100).
 """
+        tool_analysis_improvement_schema = {
+            "type": "object",
+            "properties": {
+                "confidence_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Confidence score 0-100 for tool type match"
+                }
+            },
+            "required": ["confidence_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": tool_analysis_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=tool_analysis_improvement_schema,
+                schema_name="tool_analysis_improvement",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    confidence_score = int(response.content.strip())
-                    if 0 <= confidence_score <= 100:
-                        # Use threshold of 70+ for high confidence tool type matching
-                        TOOL_ANALYSIS_THRESHOLD = 70
-                        matches_type = confidence_score >= TOOL_ANALYSIS_THRESHOLD
-                        # Update cache with LLM result
-                        self._tool_analysis_cache[context_hash] = matches_type
-                        self.logger.debug(f"🧠 LLM tool analysis: {tool_type} confidence={confidence_score}, matches={matches_type} (threshold={TOOL_ANALYSIS_THRESHOLD})")
-                except ValueError:
-                    pass
+            if response:
+                confidence_score = response.get("confidence_score", 0)
+                if 0 <= confidence_score <= 100:
+                    # Use threshold of 70+ for high confidence tool type matching
+                    TOOL_ANALYSIS_THRESHOLD = 70
+                    matches_type = confidence_score >= TOOL_ANALYSIS_THRESHOLD
+                    # Update cache with LLM result
+                    self._tool_analysis_cache[context_hash] = matches_type
+                    self.logger.debug(f"🧠 LLM tool analysis: {tool_type} confidence={confidence_score}, matches={matches_type} (threshold={TOOL_ANALYSIS_THRESHOLD})")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM tool analysis failed: {e}")
@@ -9195,21 +9684,39 @@ Available formats: html, json, xml, python, javascript, c_cpp, csv, markdown, te
 
 Respond with just the format name (e.g., "html", "json", "text").
 """
+        content_format_schema = {
+            "type": "object",
+            "properties": {
+                "format_name": {
+                    "type": "string",
+                    "enum": ["html", "json", "xml", "python", "javascript", "c_cpp", "csv", "markdown", "text"],
+                    "description": "Detected content format"
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Confidence in format detection"
+                }
+            },
+            "required": ["format_name"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": format_prompt}],
-                model_override=None,
-                max_tokens=10,
-                temperature=0.1,
-                stream=False
+                response_schema=content_format_schema,
+                schema_name="content_format_analysis",
+                use_cheap_model=True,
+                max_tokens=30,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                format_name = response.content.strip().lower()
-                valid_formats = {"html", "json", "xml", "python", "javascript", "c_cpp", "csv", "markdown", "text"}
-                if format_name in valid_formats:
-                    return {"primary_format": format_name, "confidence": 0.9}
+            if response:
+                format_name = response.get("format_name", "text")
+                confidence = response.get("confidence", 0.9)
+                return {"primary_format": format_name, "confidence": confidence}
         except Exception as e:
             self.logger.error(f"LLM content format analysis failed: {e}")
             
@@ -9243,37 +9750,47 @@ Consider:
 Respond with just the format name and confidence (0.0-1.0) in this format: "format_name,confidence"
 For example: "html,0.9" or "text,0.3"
 """
+        content_format_improvement_schema = {
+            "type": "object",
+            "properties": {
+                "format_name": {
+                    "type": "string",
+                    "enum": ["html", "json", "xml", "python", "javascript", "c_cpp", "csv", "markdown", "text"],
+                    "description": "Detected content format"
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Confidence in format detection"
+                }
+            },
+            "required": ["format_name", "confidence"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": format_analysis_prompt}],
-                model_override=None,
-                max_tokens=20,
-                temperature=0.1,
-                stream=False
+                response_schema=content_format_improvement_schema,
+                schema_name="content_format_improvement",
+                use_cheap_model=True,
+                max_tokens=50,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                result = response.content.strip()
+            if response:
+                format_name = response.get("format_name", "text")
+                confidence = response.get("confidence", 0.5)
                 
-                try:
-                    format_name, confidence_str = result.split(',')
-                    format_name = format_name.strip().lower()
-                    confidence = float(confidence_str.strip())
-                    
-                    valid_formats = {"html", "json", "xml", "python", "javascript", "c_cpp", "csv", "markdown", "text"}
-                    if format_name in valid_formats and 0.0 <= confidence <= 1.0:
-                        # Update cache with LLM result
-                        improved_analysis = {
-                            "primary_format": format_name,
-                            "confidence": confidence,
-                            "llm_enhanced": True
-                        }
-                        self._content_format_cache[content_hash] = improved_analysis
-                        self.logger.debug(f"🧠 LLM improved content format: {format_name} ({confidence:.1f})")
-                        
-                except (ValueError, IndexError):
-                    pass
+                # Update cache with LLM result
+                improved_analysis = {
+                    "primary_format": format_name,
+                    "confidence": confidence,
+                    "llm_enhanced": True
+                }
+                self._content_format_cache[content_hash] = improved_analysis
+                self.logger.debug(f"🧠 LLM improved content format: {format_name} ({confidence:.1f})")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM content format analysis failed: {e}")
@@ -9302,20 +9819,34 @@ List the key indicators that suggest this is {expected_format} content. Examples
 
 Respond with 2-3 specific indicators, one per line (e.g., "html_tags", "json_syntax", "python_keywords").
 """
+        format_indicators_schema = {
+            "type": "object",
+            "properties": {
+                "indicators": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 3,
+                    "description": "List of 2-3 specific format indicators"
+                }
+            },
+            "required": ["indicators"],
+            "additionalProperties": False
+        }
 
         try:
             import asyncio
             loop = asyncio.get_event_loop()
-            response = loop.run_until_complete(self.mcp_client.query_llm(
+            response = loop.run_until_complete(self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": format_analysis_prompt}],
-                model_override=None,
-                max_tokens=50,
-                temperature=0.1,
-                stream=False
+                response_schema=format_indicators_schema,
+                schema_name="format_indicators",
+                use_cheap_model=True,
+                max_tokens=80,
+                temperature=0.1
             ))
             
-            if response and hasattr(response, 'content') and response.content:
-                indicators = [line.strip() for line in response.content.strip().split('\n') if line.strip()]
+            if response:
+                indicators = response.get("indicators", [])
                 return indicators[:3]  # Limit to 3 indicators
                 
         except Exception:
@@ -9378,27 +9909,38 @@ Consider:
 
 Respond with just the numerical replanning necessity score (0-100).
 """
+        replan_analysis_schema = {
+            "type": "object",
+            "properties": {
+                "replan_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Replanning necessity score 0-100"
+                }
+            },
+            "required": ["replan_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": replan_analysis_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=replan_analysis_schema,
+                schema_name="replan_analysis",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    replan_score = int(response.content.strip())
-                    if 0 <= replan_score <= 100:
-                        # Use configurable threshold for triggering replanning
-                        needs_replan = replan_score >= LLM_REPLAN_NECESSITY_THRESHOLD
-                        # Update cache with LLM result
-                        self._replan_feedback_cache[feedback_hash] = needs_replan
-                        self.logger.debug(f"🧠 LLM replan analysis: score={replan_score}, needs_replan={needs_replan} (threshold={LLM_REPLAN_NECESSITY_THRESHOLD})")
-                except ValueError:
-                    pass
+            if response:
+                replan_score = response.get("replan_score", 0)
+                if 0 <= replan_score <= 100:
+                    # Use configurable threshold for triggering replanning
+                    needs_replan = replan_score >= LLM_REPLAN_NECESSITY_THRESHOLD
+                    # Update cache with LLM result
+                    self._replan_feedback_cache[feedback_hash] = needs_replan
+                    self.logger.debug(f"🧠 LLM replan analysis: score={replan_score}, needs_replan={needs_replan} (threshold={LLM_REPLAN_NECESSITY_THRESHOLD})")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM replan analysis failed: {e}")
@@ -9599,26 +10141,37 @@ Consider:
 
 Respond with just the numerical likelihood score (0-100).
 """
+        file_creation_schema = {
+            "type": "object",
+            "properties": {
+                "creation_likelihood": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "File creation likelihood score 0-100"
+                }
+            },
+            "required": ["creation_likelihood"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": detection_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=file_creation_schema,
+                schema_name="file_creation_detection",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    creation_likelihood = int(response.content.strip())
-                    if 0 <= creation_likelihood <= 100:
-                        is_file_creation = creation_likelihood >= LLM_FILE_CREATION_THRESHOLD
-                        # Update cache with LLM result
-                        self._file_creation_detection_cache[context_hash] = is_file_creation
-                        self.logger.debug(f"🧠 LLM file creation detection: likelihood={creation_likelihood}, is_file_creation={is_file_creation} (threshold={LLM_FILE_CREATION_THRESHOLD})")
-                except ValueError:
-                    pass
+            if response:
+                creation_likelihood = response.get("creation_likelihood", 0)
+                if 0 <= creation_likelihood <= 100:
+                    is_file_creation = creation_likelihood >= LLM_FILE_CREATION_THRESHOLD
+                    # Update cache with LLM result
+                    self._file_creation_detection_cache[context_hash] = is_file_creation
+                    self.logger.debug(f"🧠 LLM file creation detection: likelihood={creation_likelihood}, is_file_creation={is_file_creation} (threshold={LLM_FILE_CREATION_THRESHOLD})")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM file creation detection failed: {e}")
@@ -9711,27 +10264,38 @@ Respond with just the numerical confidence score (0-100).
 """
         else:
             return  # Unknown analysis type
-        
+        error_context_schema = {
+            "type": "object",
+            "properties": {
+                "confidence_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Confidence score 0-100 for error context analysis"
+                }
+            },
+            "required": ["confidence_score"],
+            "additionalProperties": False
+        }
+
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": analysis_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=error_context_schema,
+                schema_name="error_context_analysis",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    confidence_score = int(response.content.strip())
-                    if 0 <= confidence_score <= 100:
-                        is_planning_related = confidence_score >= LLM_ERROR_PLANNING_THRESHOLD
-                        # Update cache with LLM result
-                        self._error_context_cache[context_hash] = is_planning_related
-                        self.logger.debug(f"🧠 LLM error context analysis: {analysis_type} confidence={confidence_score}, is_planning_related={is_planning_related} (threshold={LLM_ERROR_PLANNING_THRESHOLD})")
-                except ValueError:
-                    pass
-                    
+            if response:
+                confidence_score = response.get("confidence_score", 0)
+                if 0 <= confidence_score <= 100:
+                    is_planning_related = confidence_score >= LLM_ERROR_PLANNING_THRESHOLD
+                    # Update cache with LLM result
+                    self._error_context_cache[context_hash] = is_planning_related
+                    self.logger.debug(f"🧠 LLM error context analysis: {analysis_type} confidence={confidence_score}, is_planning_related={is_planning_related} (threshold={LLM_ERROR_PLANNING_THRESHOLD})")
+
         except Exception as e:
             self.logger.debug(f"Background LLM error context analysis failed: {e}")
     
@@ -9779,23 +10343,34 @@ Rate complexity (0-100):
 
 Respond with just the numerical score (0-100).
 """
+        goal_complexity_schema = {
+            "type": "object",
+            "properties": {
+                "complexity_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Goal complexity score 0-100"
+                }
+            },
+            "required": ["complexity_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": complexity_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=goal_complexity_schema,
+                schema_name="goal_complexity_analysis",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    complexity_score = int(response.content.strip())
-                    if 0 <= complexity_score <= 100:
-                        return complexity_score >= LLM_COMPLEXITY_HIGH_THRESHOLD
-                except ValueError:
-                    pass
+            if response:
+                complexity_score = response.get("complexity_score", 0)
+                if 0 <= complexity_score <= 100:
+                    return complexity_score >= LLM_COMPLEXITY_HIGH_THRESHOLD
                     
         except Exception:
             pass
@@ -9826,29 +10401,39 @@ Consider:
 
 Respond with just the numerical complexity score (0-100).
 """
+        complex_goal_improvement_schema = {
+            "type": "object",
+            "properties": {
+                "complexity_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Goal complexity score 0-100"
+                }
+            },
+            "required": ["complexity_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": complexity_analysis_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=complex_goal_improvement_schema,
+                schema_name="complex_goal_improvement",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    complexity_score = int(response.content.strip())
-                    if 0 <= complexity_score <= 100:
-                        # Use threshold of 60+ for considering goals complex enough for guidance
-                        COMPLEXITY_THRESHOLD = 60
-                        is_complex = complexity_score >= COMPLEXITY_THRESHOLD
-                        # Update cache with LLM result
-                        self._complex_goal_cache[goal_hash] = is_complex
-                        self.logger.debug(f"🧠 LLM complex goal analysis: score={complexity_score}, complex={is_complex} (threshold={COMPLEXITY_THRESHOLD})")
-                except ValueError:
-                    pass
-                    
+            if response:
+                complexity_score = response.get("complexity_score", 0)
+                if 0 <= complexity_score <= 100:
+                    # Use threshold of 60+ for considering goals complex enough for guidance
+                    COMPLEXITY_THRESHOLD = 60
+                    is_complex = complexity_score >= COMPLEXITY_THRESHOLD
+                    # Update cache with LLM result
+                    self._complex_goal_cache[goal_hash] = is_complex
+                    self.logger.debug(f"🧠 LLM complex goal analysis: score={complexity_score}, complex={is_complex} (threshold={COMPLEXITY_THRESHOLD})")
         except Exception as e:
             self.logger.debug(f"Background LLM complex goal analysis failed: {e}")
     
@@ -9896,23 +10481,34 @@ Rate vagueness (0-100):
 
 Respond with just the numerical score (0-100).
 """
+        vague_plan_schema = {
+            "type": "object",
+            "properties": {
+                "vagueness_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Plan vagueness score 0-100"
+                }
+            },
+            "required": ["vagueness_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": vagueness_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=vague_plan_schema,
+                schema_name="vague_plan_analysis",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    vagueness_score = int(response.content.strip())
-                    if 0 <= vagueness_score <= 100:
-                        return vagueness_score >= LLM_VAGUENESS_THRESHOLD
-                except ValueError:
-                    pass
+            if response:
+                vagueness_score = response.get("vagueness_score", 0)
+                if 0 <= vagueness_score <= 100:
+                    return vagueness_score >= LLM_VAGUENESS_THRESHOLD
                     
         except Exception:
             pass
@@ -9942,29 +10538,39 @@ Consider:
 
 Respond with just the numerical vagueness score (0-100).
 """
+        vague_plan_improvement_schema = {
+            "type": "object",
+            "properties": {
+                "vagueness_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Plan vagueness score 0-100"
+                }
+            },
+            "required": ["vagueness_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": vague_analysis_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=vague_plan_improvement_schema,
+                schema_name="vague_plan_improvement",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    vagueness_score = int(response.content.strip())
-                    if 0 <= vagueness_score <= 100:
-                        # Use threshold of 60+ for considering plan descriptions too vague
-                        VAGUENESS_THRESHOLD = 60
-                        is_vague = vagueness_score >= VAGUENESS_THRESHOLD
-                        # Update cache with LLM result
-                        self._vague_plan_cache[desc_hash] = is_vague
-                        self.logger.debug(f"🧠 LLM vague plan analysis: score={vagueness_score}, is_vague={is_vague} (threshold={VAGUENESS_THRESHOLD})")
-                except ValueError:
-                    pass
-                    
+            if response:
+                vagueness_score = response.get("vagueness_score", 0)
+                if 0 <= vagueness_score <= 100:
+                    # Use threshold of 60+ for considering plan descriptions too vague
+                    VAGUENESS_THRESHOLD = 60
+                    is_vague = vagueness_score >= VAGUENESS_THRESHOLD
+                    # Update cache with LLM result
+                    self._vague_plan_cache[desc_hash] = is_vague
+                    self.logger.debug(f"🧠 LLM vague plan analysis: score={vagueness_score}, is_vague={is_vague} (threshold={VAGUENESS_THRESHOLD})")
         except Exception as e:
             self.logger.debug(f"Background LLM vague plan analysis failed: {e}")
     
@@ -10036,23 +10642,34 @@ Rate match confidence (0-100):
 
 Respond with just the numerical score (0-100).
 """
+        workflow_type_sync_schema = {
+            "type": "object",
+            "properties": {
+                "confidence_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Workflow type match confidence 0-100"
+                }
+            },
+            "required": ["confidence_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": workflow_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=workflow_type_sync_schema,
+                schema_name="workflow_type_sync",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    confidence_score = int(response.content.strip())
-                    if 0 <= confidence_score <= 100:
-                        return confidence_score >= LLM_WORKFLOW_MATCH_THRESHOLD
-                except ValueError:
-                    pass
+            if response:
+                confidence_score = response.get("confidence_score", 0)
+                if 0 <= confidence_score <= 100:
+                    return confidence_score >= LLM_WORKFLOW_MATCH_THRESHOLD
                     
         except Exception:
             pass
@@ -10087,28 +10704,39 @@ Consider:
 
 Respond with just the numerical confidence score (0-100).
 """
+        workflow_analysis_improvement_schema = {
+            "type": "object",
+            "properties": {
+                "confidence_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Workflow analysis confidence score 0-100"
+                }
+            },
+            "required": ["confidence_score"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": workflow_analysis_prompt}],
-                model_override=None,
-                max_tokens=5,
-                temperature=0.1,
-                stream=False
+                response_schema=workflow_analysis_improvement_schema,
+                schema_name="workflow_analysis_improvement",
+                use_cheap_model=True,
+                max_tokens=20,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                try:
-                    confidence_score = int(response.content.strip())
-                    if 0 <= confidence_score <= 100:
-                        # Use threshold of 70+ for high confidence workflow type matching
-                        WORKFLOW_ANALYSIS_THRESHOLD = 70
-                        matches_workflow = confidence_score >= WORKFLOW_ANALYSIS_THRESHOLD
-                        # Update cache with LLM result
-                        self._workflow_analysis_cache[context_hash] = matches_workflow
-                        self.logger.debug(f"🧠 LLM workflow analysis: {workflow_type} confidence={confidence_score}, matches={matches_workflow} (threshold={WORKFLOW_ANALYSIS_THRESHOLD})")
-                except ValueError:
-                    pass
+            if response:
+                confidence_score = response.get("confidence_score", 0)
+                if 0 <= confidence_score <= 100:
+                    # Use threshold of 70+ for high confidence workflow type matching
+                    WORKFLOW_ANALYSIS_THRESHOLD = 70
+                    matches_workflow = confidence_score >= WORKFLOW_ANALYSIS_THRESHOLD
+                    # Update cache with LLM result
+                    self._workflow_analysis_cache[context_hash] = matches_workflow
+                    self.logger.debug(f"🧠 LLM workflow analysis: {workflow_type} confidence={confidence_score}, matches={matches_workflow} (threshold={WORKFLOW_ANALYSIS_THRESHOLD})")
                     
         except Exception as e:
             self.logger.debug(f"Background LLM workflow analysis failed: {e}")
@@ -12561,40 +13189,61 @@ Consider:
 
 Respond in the exact format above.
 """
+        threshold_analysis_schema = {
+            "type": "object",
+            "properties": {
+                "reflection_adjustment_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Reflection threshold adjustment score 0-100"
+                },
+                "reflection_direction": {
+                    "type": "string",
+                    "enum": ["increase", "decrease", "maintain"],
+                    "description": "Direction to adjust reflection threshold"
+                },
+                "consolidation_adjustment_score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Consolidation threshold adjustment score 0-100"
+                },
+                "consolidation_direction": {
+                    "type": "string",
+                    "enum": ["increase", "decrease", "maintain"],
+                    "description": "Direction to adjust consolidation threshold"
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief reasoning for threshold adjustments"
+                }
+            },
+            "required": ["reflection_adjustment_score", "reflection_direction", "consolidation_adjustment_score", "consolidation_direction"],
+            "additionalProperties": False
+        }
 
         try:
-            response = await self.mcp_client.query_llm(
+            response = await self.mcp_client.query_llm_structured(
                 prompt_messages=[{"role": "user", "content": threshold_prompt}],
-                model_override=None,
-                max_tokens=100,
-                temperature=0.1,
-                stream=False
+                response_schema=threshold_analysis_schema,
+                schema_name="threshold_analysis",
+                use_cheap_model=True,
+                max_tokens=150,
+                temperature=0.1
             )
             
-            if response and hasattr(response, 'content') and response.content:
-                # Parse LLM response
-                lines = response.content.strip().split('\n')
+            if response:
+                # Convert to expected format for compatibility
                 analysis = {}
+                analysis["reflection_adjustment_score"] = response.get("reflection_adjustment_score", 0)
+                analysis["reflection_direction"] = response.get("reflection_direction", "maintain")
+                analysis["consolidation_adjustment_score"] = response.get("consolidation_adjustment_score", 0)
+                analysis["consolidation_direction"] = response.get("consolidation_direction", "maintain")
+                analysis["reasoning"] = response.get("reasoning", "")
                 
-                for line in lines:
-                    if ':' in line:
-                        key, value = line.split(':', 1)
-                        key = key.strip().lower()
-                        value = value.strip()
-                        
-                        if 'score' in key:
-                            try:
-                                analysis[key] = int(value)
-                            except ValueError:
-                                pass
-                        elif 'direction' in key:
-                            analysis[key] = value.lower()
-                        elif key == 'reasoning':
-                            analysis[key] = value
-                
-                if analysis:
-                    self.logger.debug(f"🧠 LLM threshold analysis: {analysis}")
-                    return analysis
+                self.logger.debug(f"🧠 LLM threshold analysis: {analysis}")
+                return analysis
                     
         except Exception as e:
             self.logger.debug(f"LLM threshold analysis failed: {e}")
