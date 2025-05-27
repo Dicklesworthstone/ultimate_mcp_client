@@ -7727,32 +7727,17 @@ class MCPClient:
             #    - On successful parsing of non-dict JSON (e.g. string from summarize_text): {"success": True, "_raw_non_dict_data": "string_content"}
             #    - On parsing failure: {"success": False, "error": "parse error msg", "error_type": "ParseErrorType", ...}
             
-            # ===== DETAILED RESPONSE LOGGING =====
+            # ===== STREAMLINED RESPONSE LOGGING =====
             import json as json_lib
-
             from rich.console import Console
             from rich.panel import Panel
             from rich.syntax import Syntax
             
             debug_console = Console()
             
-            # Log the raw MCP response
-            try:
-                raw_content_str = str(raw_call_tool_result_obj.content) if raw_call_tool_result_obj.content is not None else "None"
-                debug_console.print(Panel(
-                    f"[bold cyan]RAW MCP RESPONSE for {tool_name_mcp}:[/]\n"
-                    f"isError: {raw_call_tool_result_obj.isError}\n"
-                    f"Content Type: {type(raw_call_tool_result_obj.content)}\n"
-                    f"Content: {raw_content_str[:1000]}{'...' if len(raw_content_str) > 1000 else ''}",
-                    title="🔍 Raw MCP Response",
-                    border_style="blue"
-                ))
-            except Exception as e:
-                self.logger.warning(f"Failed to log raw MCP response: {e}")
-            
             parsed_dict_from_robust_parse = robust_parse_mcp_tool_content(raw_call_tool_result_obj.content)
             
-            # Log the result of robust parsing
+            # Only log the parsed result (since raw and final are nearly identical)
             try:
                 if isinstance(parsed_dict_from_robust_parse, dict):
                     parsed_json = json_lib.dumps(parsed_dict_from_robust_parse, indent=2, default=str)
@@ -7762,13 +7747,13 @@ class MCPClient:
                 
                 debug_console.print(Panel(
                     syntax,
-                    title="🧩 Robust Parse Result",
+                    title="🧩 Tool Result",
                     border_style="green"
                 ))
             except Exception as e:
                 debug_console.print(Panel(
-                    f"Failed to format parsed result: {e}\nRaw: {parsed_dict_from_robust_parse}",
-                    title="🧩 Robust Parse Result (Raw)",
+                    f"Failed to format result: {e}\nRaw: {parsed_dict_from_robust_parse}",
+                    title="🧩 Tool Result (Raw)",
                     border_style="yellow"
                 ))
             
@@ -7840,30 +7825,19 @@ class MCPClient:
                     f"MCPC._exec_tool_and_parse_FOR_AGENT: CRITICAL - robust_parse_mcp_tool_content returned None for tool '{tool_name_mcp}'. Raw CallToolResult content was: {str(raw_call_tool_result_obj.content)[:200]}"
                 )
 
-            # ===== LOG FINAL ENVELOPE =====
+            # ===== LOG PROCESSING SUMMARY =====
             try:
-                final_envelope_json = json_lib.dumps(standard_agent_envelope, indent=2, default=str)
-                final_syntax = Syntax(final_envelope_json, "json", theme="monokai", line_numbers=True)
+                # Just log a concise summary since we already showed the tool result above
                 debug_console.print(Panel(
-                    final_syntax,
-                    title="📦 Final Agent Envelope",
-                    border_style="magenta"
-                ))
-                
-                # Also log a summary of the transformation
-                debug_console.print(Panel(
-                    f"[bold]TRANSFORMATION SUMMARY:[/]\n"
-                    f"Tool: {tool_name_mcp}\n"
-                    f"MCP isError: {raw_call_tool_result_obj.isError}\n"
-                    f"Parsed Success: {parsed_dict_from_robust_parse.get('success', 'N/A') if isinstance(parsed_dict_from_robust_parse, dict) else 'N/A'}\n"
-                    f"Final Success: {standard_agent_envelope.get('success', 'N/A')}\n"
-                    f"Has Data Field: {'data' in standard_agent_envelope}\n"
-                    f"Data Type: {type(standard_agent_envelope.get('data', None))}\n",
+                    f"[bold]Tool:[/] {tool_name_mcp}\n"
+                    f"[bold]Success:[/] {standard_agent_envelope.get('success', 'N/A')}\n"
+                    f"[bold]Error:[/] {standard_agent_envelope.get('error_message', 'None')}\n"
+                    f"[bold]Data Type:[/] {type(standard_agent_envelope.get('data', None)).__name__}",
                     title="📊 Processing Summary",
                     border_style="cyan"
                 ))
             except Exception as e:
-                self.logger.warning(f"Failed to log final envelope: {e}")
+                self.logger.warning(f"Failed to log processing summary: {e}")
 
             return standard_agent_envelope
 

@@ -1007,7 +1007,14 @@ class AgentState:
     successful_patterns: Dict[str, List[List[str]]] = field(default_factory=dict)  # goal_type -> list of tool_sequences  
     pattern_success_count: Dict[str, int] = field(default_factory=dict)  # pattern_hash -> success_count
     last_workflow_tools: List[str] = field(default_factory=list)  # Track tools used in current workflow
-    # Note: Automatic goal decomposition has been completely DISABLED to prevent infinite recursion loops
+    
+    # NEW: Loop detection and plan progression tracking
+    recent_tool_sequence: List[str] = field(default_factory=list)  # Last 5 tools executed
+    consecutive_same_tool_count: int = 0  # Count of same tool executed consecutively
+    last_tool_executed: Optional[str] = None  # Last tool name executed
+    plan_progression_stage: str = "initial"  # Track: initial, research, analysis, creation, completion
+    turns_since_artifact_creation: int = 0  # Count turns since last artifact was created
+    search_attempts_count: int = 0  # Count search attempts to prevent endless searching
 
 # =====================================================================
 # Agent Master Loop
@@ -1623,7 +1630,7 @@ class AgentMasterLoop:
             current_step_desc = self.state.current_plan[0].description.lower()
             artifact_keywords = [
                 "write", "create", "generate", "build", "develop", "code", "report", 
-                "quiz", "html", "file", "document", "artifact", "deliverable", "output"
+                "content", "file", "document", "artifact", "deliverable", "output"
             ]
             research_keywords = [
                 "search", "research", "find", "investigate", "gather", "explore",
@@ -1878,16 +1885,20 @@ class AgentMasterLoop:
                 "2. **IMMEDIATE ACTION**: Choose and execute the most logical tool RIGHT NOW",
                 "3. **TOOL EXECUTION**: Call tools with appropriate arguments - don't overthink",
                 "",
-                "🚀 **TOOL USAGE PRIORITIES** (Execute immediately when applicable):",
-                f"• **Search/Research**: Use `{UMS_FUNC_HYBRID_SEARCH}` immediately - don't plan to search, just search",
-                f"• **Create Deliverables**: Use `{UMS_FUNC_RECORD_ARTIFACT}` as soon as you have content - don't perfect it first",
-                f"  (Valid artifact_type values: 'text', 'file', 'code', 'data', 'json', 'image', 'table', 'chart', 'url')",
-                f"• **Store Insights**: Use `{UMS_FUNC_STORE_MEMORY}` for important facts you discover",
+                "🚀 **TOOL USAGE PRIORITIES** (DELIVERABLE-FIRST APPROACH):",
+                f"• **CREATE FIRST**: Use `{UMS_FUNC_RECORD_ARTIFACT}` IMMEDIATELY if you can create any deliverable",
+                f"  - Don't wait for 'perfect' information - create with what you have!",
+                f"  - Valid artifact_type values: 'text', 'file', 'code', 'data', 'json', 'image', 'table', 'chart', 'url'",
+                f"  - For creation tasks: Produce the requested deliverable",
+                f"  - For reports: Create comprehensive analysis with available knowledge",
+                f"• **LIMITED SEARCH**: Use `{UMS_FUNC_HYBRID_SEARCH}` ONLY if absolutely essential (MAX 2 searches)",
+                f"  - Search for SPECIFIC missing pieces, not general research",
+                f"  - After ANY search, IMMEDIATELY create the deliverable",
+                f"• **NO ENDLESS RESEARCH**: If you've searched twice, STOP and CREATE the deliverable",
+                f"• **Store Key Facts**: Use `{UMS_FUNC_STORE_MEMORY}` for critical findings only",
                 f"• **Brief Thoughts**: Use `{UMS_FUNC_RECORD_THOUGHT}` for quick insights (not lengthy analysis)",
-                f"• **Multi-Tool Execution**: Chain related actions (search → analyze → create) in single turns when possible",
-                f"• **Smart Chaining**: Combine related tools in single turns: search→store_memory→record_artifact",
-                f"• **Batch Operations**: When creating multiple items, use multiple tool calls in one turn",
-                f"• **Multi-Tool Planning**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` when planning complex tool sequences or need guidance on tool combinations",
+                f"• **Multi-Tool Execution**: Preferred pattern: search → create (NOT search → search → search)",
+                f"• **Multi-Tool Planning**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for complex operations only",
                 "",
                             "📁 **FILE STORAGE BEST PRACTICES** (CRITICAL for file creation):",
             "• **Safe Locations**: Always use writable directories like:",
@@ -1917,15 +1928,19 @@ class AgentMasterLoop:
                 "• Don't overthink - if you need info, search for it; if you have content, create the artifact",
                 "• Don't write thoughts about what you 'should do' - just do it",
                 "",
-                "✅ **DECISION LOGIC:**",
+                "✅ **DECISION LOGIC** (DELIVERABLE-FIRST):",
                 f"    *   **NO WORKFLOW**: Call `{UMS_FUNC_CREATE_WORKFLOW}` with the task description",
                 f"    *   **NO GOAL SET**: Call `{UMS_FUNC_CREATE_GOAL}` to establish the root goal",
-                f"    *   **NEED INFORMATION**: Call search tools (`{UMS_FUNC_HYBRID_SEARCH}`) immediately",
-                f"    *   **HAVE CONTENT**: Call `{UMS_FUNC_RECORD_ARTIFACT}` to create the deliverable",
+                f"    *   **CAN CREATE NOW**: Call `{UMS_FUNC_RECORD_ARTIFACT}` immediately (don't wait for more info)",
+                f"    *   **CREATION GOAL**: Take immediate action to produce the requested deliverable",
+                f"    *   **ANALYSIS GOAL**: Create comprehensive analysis immediately with available info",
+                f"    *   **TECHNICAL GOAL**: Create the requested technical solution immediately",
+                f"    *   **MISSING CRITICAL INFO**: Call `{UMS_FUNC_HYBRID_SEARCH}` ONCE, then create deliverable",
+                f"    *   **ALREADY SEARCHED**: Call `{UMS_FUNC_RECORD_ARTIFACT}` (NO MORE SEARCHING)",
                 f"    *   **GOAL COMPLETE**: Call `{UMS_FUNC_UPDATE_GOAL_STATUS}` then signal completion",
                 f"    *   **ERROR/REPLAN**: Call `{llm_seen_agent_update_plan_name_for_instr}` with corrected plan",
                 f"    *   **COMPLEX OPERATION**: Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for multi-tool planning guidance",
-                "    *   **IN DOUBT**: Pick the action that creates tangible progress toward the goal",
+                "    *   **IN DOUBT**: CREATE the deliverable with available information (don't search more)",
                 "",
                 "🏁 **OUTPUT**: Respond with ONLY a valid JSON tool call or 'Goal Achieved...' text",
             ]
@@ -1962,6 +1977,7 @@ class AgentMasterLoop:
                 f"*   `CognitiveStateError`: Error saving or loading agent's cognitive state. This is serious. Attempt to record key information as memories and then try to re-establish state or simplify the current task.",
                 f"*   `InternalStateSetupError`: Critical internal error during agent/workflow setup. Analyze error. May require `{llm_seen_agent_update_plan_name_for_instr}` to fix plan or re-initiate a step.",
                 f"*   `FilePermissionError` / `FileAccessError`: Use safe file paths (e.g., `/home/ubuntu/ultimate_mcp_server/storage/`). Call `{UMS_FUNC_DIAGNOSE_FILE_ACCESS}` tool for path diagnosis and alternatives. Avoid system directories.",
+                f"*   `InfiniteLoopDetected` / `InfiniteLoopDetectedOnFailure`: Agent is stuck repeating the same tool without progress. CRITICAL: You MUST break the pattern by: (1) Creating a deliverable immediately with `{UMS_FUNC_RECORD_ARTIFACT}`, (2) Using a completely different tool/approach, or (3) Simplifying the goal. DO NOT repeat the same action that caused the loop.",
                 f"*   `UnknownError` / `UnexpectedExecutionError` / `AgentError` / `MCPClientError` / `LLMError` / `LLMOutputError`: Analyze error message carefully. Simplify step, use different approach, or record_thought if stuck. If related to agent state, try to save essential info and restart a simpler sub-task.",
             ]
         )
@@ -2007,6 +2023,28 @@ class AgentMasterLoop:
             ]
 
         if self.state.last_error_details:
+            # Add special context for infinite loop detection
+            if self.state.last_error_details.get("type") in ["InfiniteLoopDetected", "InfiniteLoopDetectedOnFailure"]:
+                loop_info = self.state.last_error_details.get("loop_info", {})
+                user_prompt_blocks += [
+                    "🔄 **INFINITE LOOP DETECTED - CRITICAL INTERVENTION REQUIRED**:",
+                    f"The agent has been executing the same tool '{self.state.last_error_details.get('tool')}' repeatedly without making progress.",
+                    "",
+                    "**Loop Detection Metrics:**",
+                    f"• Consecutive same tool executions: {loop_info.get('consecutive_same_tool', 0)}",
+                    f"• Search attempts without artifacts: {loop_info.get('search_attempts', 0)}",
+                    f"• Current progression stage: {loop_info.get('progression_stage', 'unknown')}",
+                    f"• Turns since last artifact creation: {loop_info.get('turns_since_artifact', 0)}",
+                    "",
+                    "**REQUIRED ACTION - Choose ONE of these approaches:**",
+                    f"1. **FORCE PROGRESSION**: Create a deliverable NOW using `{UMS_FUNC_RECORD_ARTIFACT}` with whatever information you have",
+                    f"2. **CHANGE APPROACH**: Use a completely different tool or method than '{self.state.last_error_details.get('tool')}'",
+                    f"3. **SIMPLIFY GOAL**: Break down the current goal into smaller, achievable steps using `{UMS_FUNC_CREATE_GOAL}`",
+                    "",
+                    "**DO NOT repeat the same search/analysis patterns. Take CONCRETE ACTION to create progress.**",
+                    "",
+                ]
+            
             user_prompt_blocks += [
                 "**CRITICAL: Address Last Error Details (refer to Recovery Strategies in System Prompt)**:",
                 "```json",
@@ -2039,6 +2077,11 @@ class AgentMasterLoop:
         user_prompt_blocks.append(f"Current Goal Reminder: {current_goal_desc_for_reminder}")
         user_prompt_blocks.append("")
 
+        # Add CRITICAL infinite loop prevention warnings based on current state
+        loop_warnings = self._generate_loop_prevention_warnings(current_goal_desc_for_reminder)
+        if loop_warnings:
+            user_prompt_blocks.append(loop_warnings)
+
         # Add proactive tool suggestions (enhanced for research workflows)
         tool_suggestions = self._suggest_next_tools(
             current_goal_desc_for_reminder, 
@@ -2048,11 +2091,10 @@ class AgentMasterLoop:
         if tool_suggestions:
             user_prompt_blocks.append(tool_suggestions)
         
-        # Add research workflow-specific multi-tool suggestions
-        if any(keyword in current_goal_desc_for_reminder.lower() for keyword in ["research", "search", "investigate", "study"]):
-            research_suggestions = self._suggest_research_tool_patterns(current_goal_desc_for_reminder, self.state.last_action_summary)
-            if research_suggestions:
-                user_prompt_blocks.append(research_suggestions)
+        # Add workflow-specific multi-tool suggestions
+        efficient_suggestions = self._suggest_efficient_tool_patterns(current_goal_desc_for_reminder, self.state.last_action_summary)
+        if efficient_suggestions:
+            user_prompt_blocks.append(efficient_suggestions)
 
         # ---------- 7. Final instruction branch logic (plus hard constraint) --------
         instruction_append = " Remember: output MUST be either a single JSON object for a tool call or the 'Goal Achieved…' sentence - no markdown, no additional keys."  # [ADDED]
@@ -4697,172 +4739,6 @@ class AgentMasterLoop:
                 exc_info=False,
             )
 
-
-    def _score_goal_complexity(self, goal_description: str) -> int:
-        """
-        Score goal complexity on a scale from 0-100 based on the number of discrete, 
-        complex actions or tool usages it would require.
-        
-        Returns:
-            int: Complexity score from 0-100 where:
-            - 0-30: Simple, single-step tasks
-            - 31-60: Moderate tasks requiring 2-3 tools
-            - 61-85: Complex tasks requiring multiple steps/tools
-            - 86-100: Very complex tasks requiring decomposition
-        """
-        if not goal_description:
-            return 0
-        
-        goal_lower = goal_description.lower()
-        complexity_score = 0
-        
-        # Base complexity from length (longer descriptions often indicate complexity)
-        if len(goal_description) > 200:
-            complexity_score += 25
-        elif len(goal_description) > 100:
-            complexity_score += 15
-        elif len(goal_description) > 50:
-            complexity_score += 5
-        
-        # Count action words (each suggests a discrete step)
-        action_words = [
-            "research", "analyze", "create", "build", "develop", "write", "generate",
-            "investigate", "examine", "study", "design", "implement", "plan", "execute",
-            "compare", "contrast", "evaluate", "summarize", "document", "report",
-            "test", "validate", "verify", "review", "compile", "organize", "format"
-        ]
-        action_count = sum(1 for word in action_words if word in goal_lower)
-        complexity_score += action_count * 8  # Each action adds complexity
-        
-        # Multiple deliverables/outputs increase complexity
-        deliverable_indicators = [
-            "and then", "also create", "additionally", "furthermore", "plus",
-            "as well as", "both", "multiple", "several", "various", "different types"
-        ]
-        deliverable_count = sum(1 for indicator in deliverable_indicators if indicator in goal_lower)
-        complexity_score += deliverable_count * 15
-        
-        # Technical complexity indicators
-        technical_indicators = [
-            "html", "css", "javascript", "code", "program", "script", "interactive",
-            "api", "database", "algorithm", "optimization", "integration", "framework"
-        ]
-        technical_count = sum(1 for indicator in technical_indicators if indicator in goal_lower)
-        complexity_score += technical_count * 10
-        
-        # Research depth indicators
-        research_indicators = [
-            "comprehensive", "detailed", "thorough", "extensive", "complete",
-            "in-depth", "systematic", "scholarly", "academic", "citations"
-        ]
-        research_depth = sum(1 for indicator in research_indicators if indicator in goal_lower)
-        complexity_score += research_depth * 8
-        
-        # Multi-step process indicators
-        process_indicators = [
-            "first", "then", "next", "finally", "step", "phase", "stage",
-            "process", "workflow", "pipeline", "sequence"
-        ]
-        process_count = sum(1 for indicator in process_indicators if indicator in goal_lower)
-        complexity_score += process_count * 6
-        
-        # Complex conjunction patterns (indicate multiple requirements)
-        conjunction_patterns = [
-            " and ", " or ", " while ", " during ", " after ", " before ",
-            " including ", " with ", " using ", " through ", " via "
-        ]
-        conjunction_count = sum(1 for pattern in conjunction_patterns if pattern in goal_lower)
-        complexity_score += conjunction_count * 4
-        
-        # Specific high-complexity scenarios
-        if "quiz" in goal_lower and ("html" in goal_lower or "interactive" in goal_lower):
-            complexity_score += 20  # Interactive quiz creation is complex
-        
-        if "report" in goal_lower and ("research" in goal_lower or "sources" in goal_lower):
-            complexity_score += 15  # Research reports require multiple steps
-        
-        if "analyze" in goal_lower and "create" in goal_lower:
-            complexity_score += 15  # Analysis + creation requires multiple phases
-        
-        # Cap at 100
-        complexity_score = min(100, complexity_score)
-        
-        return complexity_score
-
-    async def _decompose_large_goal(self, goal_description: str, workflow_id: str) -> List[Dict[str, str]]:
-        """
-        Decompose a large/complex goal into smaller, actionable sub-goals.
-        
-        Returns list of sub-goal dictionaries with 'title' and 'description' keys.
-        """
-        # Keywords that indicate a goal might need decomposition
-        decomposition_indicators = [
-            "research and", "analyze and", "create a comprehensive", "develop a complete",
-            "build a", "design and implement", "investigate and report", "study and document",
-            "compare and contrast", "evaluate and recommend", "plan and execute"
-        ]
-        
-        goal_lower = goal_description.lower()
-        needs_decomposition = any(indicator in goal_lower for indicator in decomposition_indicators)
-        
-        if not needs_decomposition or len(goal_description) < 100:
-            return []  # Goal is simple enough
-        
-        # Improved decomposition patterns with short, atomic descriptions
-        sub_goals = []
-        
-        # Extract key topic/subject from goal for more specific sub-goals
-        topic_keywords = []
-        for word in goal_description.split():
-            if len(word) > 3 and word.lower() not in ['research', 'create', 'write', 'analyze', 'build', 'develop']:
-                topic_keywords.append(word)
-        
-        main_topic = " ".join(topic_keywords[:3]) if topic_keywords else "the subject"
-        
-        if "research" in goal_lower and ("report" in goal_lower or "write" in goal_lower):
-            sub_goals = [
-                {"title": "Web Research", "description": f"Search web for key information about {main_topic[:40]}"},
-                {"title": "Report Writing", "description": "Create comprehensive written report from findings"}
-            ]
-        elif ("quiz" in goal_lower or "questions" in goal_lower) and "html" in goal_lower:
-            sub_goals = [
-                {"title": "Content Research", "description": f"Research {main_topic[:40]} content for quiz questions"},
-                {"title": "Interactive Quiz", "description": "Create HTML quiz with JavaScript functionality"}
-            ]
-        elif "research" in goal_lower and "quiz" in goal_lower:
-            sub_goals = [
-                {"title": "Research Task", "description": f"Research {main_topic[:40]} and gather key information"},
-                {"title": "Quiz Creation", "description": "Design and create quiz based on research findings"}
-            ]
-        elif "analyze" in goal_lower and "create" in goal_lower:
-            sub_goals = [
-                {"title": "Analysis Task", "description": f"Analyze available information about {main_topic[:40]}"},
-                {"title": "Content Creation", "description": "Create deliverable based on analysis results"}
-            ]
-        elif len(goal_description) > 200 and ("then" in goal_lower or "and" in goal_lower):
-            # Multi-part goals - split into major components
-            if "html" in goal_lower or "interactive" in goal_lower:
-                sub_goals = [
-                    {"title": "Research Phase", "description": f"Gather information about {main_topic[:40]}"},
-                    {"title": "Interactive Development", "description": "Build HTML/JavaScript interactive component"}
-                ]
-            else:
-                sub_goals = [
-                    {"title": "Information Gathering", "description": f"Research and collect data about {main_topic[:40]}"},
-                    {"title": "Deliverable Creation", "description": "Create final output from gathered information"}
-                ]
-        else:
-            # Generic decomposition with very short descriptions to avoid re-decomposition
-            action_words = [word for word in goal_description.split() if word.lower() in ["research", "create", "build", "analyze", "write", "develop"]]
-            main_action = action_words[0] if action_words else "complete"
-            sub_goals = [
-                {"title": "Preparation", "description": f"Gather information needed to {main_action.lower()}"},
-                {"title": "Execution", "description": f"Execute the main {main_action.lower()} task"}
-            ]
-        
-        self.logger.info(f"🎯 Decomposed large goal into {len(sub_goals)} sub-goals")
-        return sub_goals
-            
     def _get_adaptive_context_limits(self) -> Dict[str, int]:
         """Adjust context limits based on task complexity and history"""
         base_limits = {
@@ -4901,114 +4777,150 @@ class AgentMasterLoop:
         return base_limits
 
     def _suggest_next_tools(self, current_goal: str, last_action: str, plan_length: int) -> str:
-        """Suggest the most logical next tools based on context"""
+        """Suggest the most logical next tools based on GENERIC action-oriented principles"""
         suggestions = []
         
-        # Fresh start suggestions
+        # GENERIC ACTION-FIRST PRINCIPLES: Always prioritize concrete action over endless information gathering
+        goal_lower = current_goal.lower()
+        
+        # Fresh start suggestions - BIAS TOWARD ACTION
         if not last_action or "initialized" in last_action.lower() or "loop initialized" in last_action.lower():
-            if any(word in current_goal.lower() for word in ["create", "build", "develop", "generate"]):
-                suggestions.append(f"🔍 Start with {UMS_FUNC_HYBRID_SEARCH} to research requirements")
-                suggestions.append(f"📝 Use {UMS_FUNC_STORE_MEMORY} to organize findings")  
-                suggestions.append(f"🔍 Check for existing similar artifacts with {UMS_FUNC_QUERY_MEMORIES}")
-                suggestions.append(f"🎯 Create deliverable with {UMS_FUNC_RECORD_ARTIFACT}")
-            elif any(word in current_goal.lower() for word in ["analyze", "report", "summary", "research"]):
-                suggestions.append(f"🔍 Begin with {UMS_FUNC_HYBRID_SEARCH} to gather information")
-                suggestions.append(f"📊 Use {UMS_FUNC_STORE_MEMORY} to organize findings")
-                suggestions.append(f"📄 Create deliverable with {UMS_FUNC_RECORD_ARTIFACT}")
-            elif any(word in current_goal.lower() for word in ["write", "document", "explain"]):
-                suggestions.append(f"🔍 Research with {UMS_FUNC_HYBRID_SEARCH} for background")
-                suggestions.append(f"🎯 Create content with {UMS_FUNC_RECORD_ARTIFACT}")
-        
-        # Post-search suggestions  
-        elif any(search_tool in last_action for search_tool in [UMS_FUNC_HYBRID_SEARCH, "search", "research"]):
-            suggestions.append(f"📝 Store key findings with {UMS_FUNC_STORE_MEMORY}")
-            if any(word in current_goal.lower() for word in ["quiz", "report", "document", "file"]):
-                suggestions.append(f"🎯 Create the deliverable with {UMS_FUNC_RECORD_ARTIFACT}")
-        
-        # Post-storage suggestions
-        elif UMS_FUNC_STORE_MEMORY in last_action or "stored" in last_action.lower():
-            suggestions.append(f"🎯 Ready to create deliverable with {UMS_FUNC_RECORD_ARTIFACT}")
-        
-        # Efficiency suggestions for long plans
-        if plan_length > 5:
-            suggestions.insert(0, "⚡ **TIP**: Consider combining related actions in single turns for efficiency")
-            suggestions.append(f"🔧 Get multi-tool guidance with {UMS_FUNC_GET_MULTI_TOOL_GUIDANCE} for complex operations")
-        
-        # Multi-tool guidance for complex scenarios
-        if any(keyword in current_goal.lower() for keyword in ["complex", "comprehensive", "detailed", "thorough", "analysis"]):
-            suggestions.append(f"🔧 Use {UMS_FUNC_GET_MULTI_TOOL_GUIDANCE} for planning complex tool sequences")
-        
-        # Focus mode suggestions (supplement, don't override)
-        if getattr(self.state, 'artifact_focus_mode', False):
-            # Check if we already have artifacts created and might need to progress to next part
-            if "artifact" in last_action.lower() or "record" in last_action.lower():
-                # If we just created an artifact, suggest checking for additional requirements
-                suggestions.insert(0, f"🎯 **FOCUS MODE**: Check if task requires additional deliverables or components")
-                suggestions.append(f"💡 Use {UMS_FUNC_GET_GOAL_DETAILS} to verify if all requirements are met")
-                suggestions.append(f"🔍 Consider checking existing artifacts to avoid duplication")
+            if any(word in goal_lower for word in ["create", "build", "develop", "generate", "write", "make", "produce"]):
+                suggestions.append(f"🎯 **TAKE ACTION IMMEDIATELY**: Execute the requested action with available knowledge")
+                suggestions.append(f"💡 Don't wait for 'perfect' information - act with what you have!")
+            elif any(word in goal_lower for word in ["research", "investigate", "study", "find", "explore"]):
+                suggestions.append(f"🔍 **LIMITED SEARCH**: Use {UMS_FUNC_HYBRID_SEARCH} for ONE focused search")
+                suggestions.append(f"🎯 **THEN ACT**: Take concrete action immediately after search")
             else:
-                suggestions.insert(0, f"🎯 **FOCUS MODE**: Continue with productive work using {UMS_FUNC_RECORD_ARTIFACT}")
+                suggestions.append(f"🎯 **ACTION-FIRST**: Take concrete action toward the goal")
+                suggestions.append(f"🔍 If truly missing critical info, ONE search with {UMS_FUNC_HYBRID_SEARCH}")
+        
+        # Post-search suggestions - FORCE ACTION
+        elif any(search_tool in last_action for search_tool in [UMS_FUNC_HYBRID_SEARCH, "search", "research"]):
+            suggestions.append(f"🚨 **STOP SEARCHING**: Take concrete action based on information gathered")
+            suggestions.append(f"⚠️ NO MORE RESEARCH - you have enough information!")
+            suggestions.append(f"💡 Act with current knowledge, don't perfect it")
+        
+        # Post-storage suggestions - IMMEDIATE ACTION
+        elif UMS_FUNC_STORE_MEMORY in last_action or "stored" in last_action.lower():
+            suggestions.append(f"🚨 **IMMEDIATE ACTION**: Use stored information to take concrete action")
+            suggestions.append(f"⚠️ Don't store more - ACT on what you have!")
+        
+        # Warn about inefficient patterns
+        if plan_length > 4:
+            suggestions.insert(0, "🚨 **EFFICIENCY WARNING**: Plan is too long - take concrete action immediately!")
+        
+        # Detect and warn about research loops
+        if self.state.search_attempts_count >= 1:
+            suggestions.insert(0, f"🚨 **LOOP WARNING**: {self.state.search_attempts_count} searches done - TAKE ACTION NOW!")
+        
+        # Focus mode - be even more aggressive about action
+        if getattr(self.state, 'artifact_focus_mode', False):
+            suggestions.insert(0, f"🎯 **FOCUS MODE**: Take concrete action to maintain productivity")
+        
+        # Special warning for turns without concrete action
+        if self.state.turns_since_artifact_creation >= 3:
+            suggestions.insert(0, f"⚠️ **{self.state.turns_since_artifact_creation} TURNS WITHOUT ACTION**: Take concrete action NOW!")
         
         if suggestions:
-            suggestion_text = "\n".join(f"  • {s}" for s in suggestions[:3])  # Limit to 3 suggestions
-            return f"\n\n**💡 SUGGESTED NEXT ACTIONS**:\n{suggestion_text}\n"
+            suggestion_text = "\n".join(f"  • {s}" for s in suggestions[:4])  # Show more warnings
+            return f"\n\n**💡 ACTION-FIRST SUGGESTIONS**:\n{suggestion_text}\n"
         
-    def _suggest_research_tool_patterns(self, current_goal: str, last_action: str) -> str:
-        """Suggest efficient multi-tool patterns specifically for research workflows"""
+    def _suggest_efficient_tool_patterns(self, current_goal: str, last_action: str) -> str:
+        """Suggest efficient multi-tool patterns for any workflow type"""
         suggestions = []
         
         goal_lower = current_goal.lower()
         action_lower = last_action.lower()
         
-        # Determine research phase
+        # Determine workflow phase generically
         if ("initialized" in action_lower or "started" in action_lower or 
-            not any(tool in action_lower for tool in ["search", "web", "browser", "store"])):
-            # Beginning of research
-            suggestions.append("**🔬 RESEARCH WORKFLOW - EFFICIENT PATTERNS:**")
-            suggestions.append(f"• **Quick Start**: Use `{UMS_FUNC_HYBRID_SEARCH}` immediately to gather background knowledge")
-            suggestions.append(f"• **Multi-Search Pattern**: Chain web searches with `{UMS_FUNC_STORE_MEMORY}` to build knowledge base")
-            suggestions.append(f"• **Research & Write**: Follow pattern: search → store_memory → search more → create artifact")
+            not any(tool in action_lower for tool in ["search", "store", "record"])):
+            # Beginning of workflow
+            suggestions.append("**🚀 WORKFLOW START - EFFICIENT PATTERNS:**")
+            suggestions.append(f"• **Information Gathering**: Use `{UMS_FUNC_HYBRID_SEARCH}` if information is needed")
+            suggestions.append(f"• **Knowledge Storage**: Use `{UMS_FUNC_STORE_MEMORY}` to save important findings")
+            suggestions.append(f"• **Action Pattern**: Follow: gather → store → act")
             
         elif any(search_term in action_lower for search_term in ["search", "web", "browser"]):
-            # In research phase
-            suggestions.append("**🔍 RESEARCH IN PROGRESS - NEXT PATTERNS:**")
-            suggestions.append(f"• **Store & Continue**: Use `{UMS_FUNC_STORE_MEMORY}` to save findings, then search for more details")
-            suggestions.append(f"• **Deep Dive**: Use `{UMS_FUNC_HYBRID_SEARCH}` for internal knowledge + web tools for current info")
-            suggestions.append(f"• **Ready to Write**: If sufficient research gathered, use `{UMS_FUNC_RECORD_ARTIFACT}` to create report")
+            # In information gathering phase
+            suggestions.append("**🔍 INFORMATION GATHERING - NEXT PATTERNS:**")
+            suggestions.append(f"• **Store Findings**: Use `{UMS_FUNC_STORE_MEMORY}` to save what you found")
+            suggestions.append(f"• **Take Action**: Use gathered information to take concrete action")
+            suggestions.append(f"• **Avoid Over-Research**: Don't search more unless absolutely necessary")
             
         elif "store" in action_lower or "memory" in action_lower:
             # Knowledge storage phase
-            suggestions.append("**📚 KNOWLEDGE BUILDING - NEXT PATTERNS:**")
-            suggestions.append(f"• **More Research**: Continue with web searches if more info needed")
-            suggestions.append(f"• **Start Writing**: Use `{UMS_FUNC_RECORD_ARTIFACT}` to create comprehensive report")
-            suggestions.append(f"• **Multi-Source**: Combine `{UMS_FUNC_HYBRID_SEARCH}` + web tools for complete coverage")
+            suggestions.append("**📚 KNOWLEDGE STORED - NEXT PATTERNS:**")
+            suggestions.append(f"• **Take Action**: Use stored knowledge to take concrete action toward goal")
+            suggestions.append(f"• **More Info Only If**: Search more only if critical information is missing")
+            suggestions.append(f"• **Multi-Tool**: Combine tools efficiently for complex operations")
             
-        elif "record" in action_lower or "artifact" in action_lower or "write" in action_lower:
-            # Creation phase - check for multi-part tasks and duplicates
+        elif "record" in action_lower or "artifact" in action_lower:
+            # Action completion phase
             if any(keyword in goal_lower for keyword in ["and", "then", "also", "plus", "both", "multiple"]):
                 # Potential multi-part task detected
                 suggestions.append("**📋 MULTI-PART TASK DETECTED:**")
-                suggestions.append(f"• **Check Requirements**: Use `{UMS_FUNC_GET_GOAL_DETAILS}` to verify all deliverables needed")
-                suggestions.append(f"• **Check Existing**: Query existing artifacts to avoid duplicates")
-                suggestions.append(f"• **Create Missing**: Use `{UMS_FUNC_RECORD_ARTIFACT}` for any missing deliverables")
-                suggestions.append(f"• **Examples**: Multi-part tasks might include report + code, analysis + visualization, etc.")
+                suggestions.append(f"• **Check Requirements**: Use `{UMS_FUNC_GET_GOAL_DETAILS}` to verify all parts needed")
+                suggestions.append(f"• **Check Progress**: Query existing work to avoid duplicates")
+                suggestions.append(f"• **Complete Missing**: Address any remaining requirements")
             else:
-                suggestions.append("**📄 CREATION COMPLETE - FINALIZATION:**")
-                suggestions.append(f"• **Duplicate Check**: Verify no similar artifacts already exist in this workflow")
-                suggestions.append(f"• **Goal Verification**: Use `{UMS_FUNC_GET_GOAL_DETAILS}` to check if all requirements met")
-                suggestions.append(f"• **Quality Review**: Ensure deliverable meets specified requirements")
+                suggestions.append("**✅ ACTION TAKEN - FINALIZATION:**")
+                suggestions.append(f"• **Verify Completion**: Use `{UMS_FUNC_GET_GOAL_DETAILS}` to check if goal is met")
+                suggestions.append(f"• **Quality Check**: Ensure action meets specified requirements")
+                suggestions.append(f"• **Goal Status**: Update goal status if work is complete")
         
-        # Add efficiency tips for research workflows
+        # Add generic efficiency tips
         if suggestions:
             suggestions.append("")
-            suggestions.append("**⚡ RESEARCH EFFICIENCY TIPS:**")
-            suggestions.append("• Execute multiple related tools in single turns (search→store→search)")
-            suggestions.append("• Use specific, focused search queries rather than broad ones")
-            suggestions.append("• Save intermediate findings to avoid losing research progress")
-            suggestions.append(f"• Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for complex research operations")
+            suggestions.append("**⚡ GENERAL EFFICIENCY TIPS:**")
+            suggestions.append("• Execute multiple related tools in single turns when possible")
+            suggestions.append("• Be specific and focused rather than broad in tool usage")
+            suggestions.append("• Save important findings to avoid losing progress")
+            suggestions.append(f"• Use `{UMS_FUNC_GET_MULTI_TOOL_GUIDANCE}` for complex operations")
         
         if suggestions:
             return "\n".join(suggestions) + "\n"
+        
+        return ""
+
+    def _generate_loop_prevention_warnings(self, current_goal_desc: str) -> str:
+        """Generate critical warnings to prevent infinite loops based on current agent state"""
+        warnings = []
+        
+        # Critical search loop warnings
+        if self.state.search_attempts_count >= 2:
+            warnings.append("🚨 **CRITICAL LOOP ALERT**: You have already searched 2+ times!")
+            warnings.append("🚨 **STOP SEARCHING**: Take concrete action based on information gathered")
+            warnings.append("🚨 **NO MORE RESEARCH**: Act with information you have")
+        elif self.state.search_attempts_count >= 1:
+            warnings.append("⚠️ **SEARCH WARNING**: 1 search completed - next action MUST be concrete action")
+            warnings.append("⚠️ **NO MORE RESEARCH**: Act on gathered information immediately")
+        
+        # Consecutive tool warnings
+        if self.state.consecutive_same_tool_count >= 2:
+            last_tool = self.state.last_tool_executed or "unknown"
+            warnings.append(f"🚨 **INFINITE LOOP DETECTED**: Tool '{last_tool}' used {self.state.consecutive_same_tool_count} times consecutively")
+            warnings.append("🚨 **BREAK THE PATTERN**: Use a different approach or tool")
+        
+        # Turns without concrete action warnings
+        if self.state.turns_since_artifact_creation >= 5:
+            warnings.append(f"🚨 **{self.state.turns_since_artifact_creation} TURNS WITHOUT CONCRETE ACTION**: This is wasteful!")
+            warnings.append("🚨 **IMMEDIATE ACTION**: Take concrete action toward the goal NOW")
+        elif self.state.turns_since_artifact_creation >= 3:
+            warnings.append(f"⚠️ **{self.state.turns_since_artifact_creation} turns without concrete action**: Act soon")
+        
+        # Generic action guidance (no task-specific hardcoding)
+        if warnings and current_goal_desc:
+            warnings.append("💡 **SOLUTION**: Take concrete action using the information and tools available")
+        
+        # Plan progression warnings
+        if self.state.plan_progression_stage == "research" and self.state.current_loop >= 6:
+            warnings.append("🚨 **STUCK IN RESEARCH STAGE**: Move to concrete action immediately")
+        
+        if warnings:
+            warning_text = "\n".join(f"  {w}" for w in warnings)
+            return f"\n\n**🚨 INFINITE LOOP PREVENTION ALERTS**:\n{warning_text}\n"
         
         return ""
 
@@ -5016,33 +4928,30 @@ class AgentMasterLoop:
         """Classify goal into a pattern category for learning"""
         goal_lower = goal_description.lower()
         
-        # Content creation patterns
-        if any(word in goal_lower for word in ["create", "generate", "build", "develop", "write", "produce"]):
-            if any(word in goal_lower for word in ["code", "program", "script", "software", "app"]):
-                return "code_creation"
-            elif any(word in goal_lower for word in ["report", "document", "analysis", "summary"]):
-                return "document_creation"
-            elif any(word in goal_lower for word in ["test", "quiz", "questions", "assessment"]):
-                return "assessment_creation"
-            else:
-                return "content_creation"
+        # Generic creation patterns (no task-specific hardcoding)
+        if any(word in goal_lower for word in ["create", "generate", "build", "develop", "write", "produce", "make"]):
+            return "creation"
         
-        # Analysis patterns
-        elif any(word in goal_lower for word in ["analyze", "research", "investigate", "study", "examine"]):
-            if any(word in goal_lower for word in ["data", "statistics", "metrics", "numbers"]):
-                return "data_analysis"
-            else:
-                return "research_analysis"
+        # Generic analysis patterns
+        elif any(word in goal_lower for word in ["analyze", "research", "investigate", "study", "examine", "explore"]):
+            return "analysis"
         
-        # Planning patterns
-        elif any(word in goal_lower for word in ["plan", "strategy", "roadmap", "proposal", "design"]):
+        # Generic planning patterns
+        elif any(word in goal_lower for word in ["plan", "strategy", "roadmap", "proposal", "design", "organize"]):
             return "planning"
         
-        # Generic patterns based on action verbs
-        elif any(word in goal_lower for word in ["explain", "describe", "summarize"]):
-            return "explanation"
-        elif any(word in goal_lower for word in ["compare", "contrast", "evaluate"]):
-            return "comparison"
+        # Generic communication patterns
+        elif any(word in goal_lower for word in ["explain", "describe", "summarize", "present", "communicate"]):
+            return "communication"
+        
+        # Generic evaluation patterns
+        elif any(word in goal_lower for word in ["compare", "contrast", "evaluate", "assess", "review"]):
+            return "evaluation"
+        
+        # Generic problem-solving patterns
+        elif any(word in goal_lower for word in ["solve", "fix", "debug", "troubleshoot", "optimize"]):
+            return "problem_solving"
+        
         else:
             return "general_task"
 
@@ -5194,6 +5103,259 @@ class AgentMasterLoop:
         
         # Consider similar if >60% of key terms match
         return similarity_ratio > 0.6
+
+    def _detect_infinite_loop(self, tool_name: str) -> bool:
+        """Detect if the agent is stuck in an infinite loop with the same tool"""
+        base_tool = self._get_base_function_name(tool_name)
+        
+        # Update loop detection state
+        if self.state.last_tool_executed == tool_name:
+            self.state.consecutive_same_tool_count += 1
+        else:
+            self.state.consecutive_same_tool_count = 1
+            self.state.last_tool_executed = tool_name
+        
+        # Update recent tool sequence (keep last 5)
+        self.state.recent_tool_sequence.append(base_tool)
+        if len(self.state.recent_tool_sequence) > 5:
+            self.state.recent_tool_sequence = self.state.recent_tool_sequence[-5:]
+        
+        # Count search attempts for search tools
+        search_tools = {"hybrid_search_memories", "search_semantic_memories", "web_search", "smart_browser"}
+        if base_tool in search_tools:
+            self.state.search_attempts_count += 1
+        
+        # Detect various loop patterns
+        
+        # 1. Same tool executed 3+ times consecutively
+        if self.state.consecutive_same_tool_count >= 3:
+            self.logger.warning(f"🔄 LOOP DETECTED: Same tool '{tool_name}' executed {self.state.consecutive_same_tool_count} times consecutively")
+            return True
+        
+        # 2. Repetitive pattern in recent sequence (e.g., A-B-A-B-A)
+        if len(self.state.recent_tool_sequence) >= 4:
+            recent = self.state.recent_tool_sequence[-4:]
+            if len(set(recent)) <= 2 and recent[0] == recent[2]:  # A-B-A-B pattern
+                self.logger.warning(f"🔄 LOOP DETECTED: Repetitive pattern {recent} in recent tool sequence")
+                return True
+        
+        # 3. Excessive search attempts without progress (5+ searches without creating artifacts)
+        if (self.state.search_attempts_count >= 5 and 
+            self.state.turns_since_artifact_creation > 8):
+            self.logger.warning(f"🔄 LOOP DETECTED: {self.state.search_attempts_count} search attempts without artifact creation")
+            return True
+        
+        # 4. Check if we've been in the same progression stage too long
+        if (self.state.plan_progression_stage == "research" and 
+            self.state.turns_since_artifact_creation > 10):
+            self.logger.warning(f"🔄 LOOP DETECTED: Stuck in '{self.state.plan_progression_stage}' stage for {self.state.turns_since_artifact_creation} turns")
+            return True
+        
+        return False
+
+    def _update_plan_progression_stage(self, tool_name: str, success: bool) -> None:
+        """Update the plan progression stage based on tool usage"""
+        if not success:
+            return
+            
+        base_tool = self._get_base_function_name(tool_name)
+        
+        # Update turns since artifact creation
+        if base_tool == "record_artifact":
+            self.state.turns_since_artifact_creation = 0
+            self.state.search_attempts_count = 0  # Reset search count after artifact creation
+            self.state.plan_progression_stage = "creation"
+        else:
+            self.state.turns_since_artifact_creation += 1
+        
+        # Determine current stage based on tool usage
+        search_tools = {"hybrid_search_memories", "search_semantic_memories", "web_search", "smart_browser"}
+        analysis_tools = {"store_memory", "create_memory_link", "record_thought"}
+        creation_tools = {"record_artifact", "write_file", "create_file"}
+        
+        if base_tool in search_tools and self.state.plan_progression_stage in ["initial", "research"]:
+            self.state.plan_progression_stage = "research"
+        elif base_tool in analysis_tools and self.state.plan_progression_stage in ["research", "analysis"]:
+            self.state.plan_progression_stage = "analysis"  
+        elif base_tool in creation_tools:
+            self.state.plan_progression_stage = "creation"
+        elif base_tool in {"update_goal_status", "update_workflow_status"}:
+            self.state.plan_progression_stage = "completion"
+
+    def _generate_progression_aware_plan(self, current_goal_desc: str) -> List[PlanStep]:
+        """Generate a plan that moves toward completion based on current progression stage"""
+        
+        # Check if we should force progression to prevent infinite loops
+        if self._should_force_progression_to_creation():
+            self.logger.warning("🚨 INFINITE LOOP PREVENTION: Forcing progression to deliverable creation")
+            return self._get_forced_progression_plan(current_goal_desc)
+        
+        # Analyze what stage we should be in based on goal and current state
+        goal_lower = current_goal_desc.lower()
+        
+        # Determine if we need to move to the next stage
+        force_progression = (
+            self.state.turns_since_artifact_creation > 8 or
+            self.state.search_attempts_count >= 4 or
+            self.state.consecutive_same_tool_count >= 2
+        )
+        
+        plan_steps = []
+        
+        if self.state.plan_progression_stage == "initial":
+            # ACTION-FIRST APPROACH: Bias toward concrete action over endless information gathering
+            if any(keyword in goal_lower for keyword in ["create", "write", "generate", "make", "build", "develop", "produce"]):
+                plan_steps.append(PlanStep(
+                    description="Take immediate action to fulfill the goal using available knowledge"
+                ))
+            elif any(keyword in goal_lower for keyword in ["research", "find", "search", "investigate", "study", "analyze"]):
+                # Only allow research if explicitly requested AND with limits
+                plan_steps.append(PlanStep(
+                    description="Conduct ONE focused search for the most critical information needed",
+                    assigned_tool=self._get_ums_tool_mcp_name("hybrid_search_memories")
+                ))
+                plan_steps.append(PlanStep(
+                    description="Take concrete action based on findings (NO MORE SEARCHING)"
+                ))
+            else:
+                plan_steps.append(PlanStep(
+                    description="Take concrete action toward the goal using available information"
+                ))
+                
+        elif self.state.plan_progression_stage == "research":
+            if force_progression or self.state.search_attempts_count >= 2:  # Reduced from 3 to 2
+                # Force move to action phase
+                self.logger.info("🎯 PROGRESSION: Forcing move from research to action phase")
+                plan_steps.append(PlanStep(
+                    description="Take concrete action based on gathered information"
+                ))
+            else:
+                # ONE more search ONLY, then MUST act
+                plan_steps.append(PlanStep(
+                    description="Final search for any missing critical information (LAST SEARCH)",
+                    assigned_tool=self._get_ums_tool_mcp_name("hybrid_search_memories")
+                ))
+                plan_steps.append(PlanStep(
+                    description="Take concrete action immediately after this search"
+                ))
+                
+        elif self.state.plan_progression_stage == "analysis":
+            # Move to action
+            plan_steps.append(PlanStep(
+                description="Take concrete action based on analysis"
+            ))
+            
+        elif self.state.plan_progression_stage == "creation":
+            # Check if goal is complete or if more actions needed
+            if "and" in goal_lower or "multiple" in goal_lower:
+                plan_steps.append(PlanStep(
+                    description="Check if all required actions have been completed",
+                    assigned_tool=self._get_ums_tool_mcp_name("get_goal_details")
+                ))
+            else:
+                plan_steps.append(PlanStep(
+                    description="Verify goal completion and update goal status",
+                    assigned_tool=self._get_ums_tool_mcp_name("update_goal_status")
+                ))
+        
+        return plan_steps if plan_steps else [PlanStep(description="Create the primary deliverable for this goal")]
+
+    def _generate_concrete_action_plan(self, goal_description: str) -> List[PlanStep]:
+        """
+        Generate concrete, action-oriented plans that prevent infinite loops through GENERIC principles:
+        
+        1. BIAS TOWARD ACTION over endless information gathering
+        2. CONCRETE STEPS with clear success criteria  
+        3. LIMITED RESEARCH with forced progression to action
+        4. MEASURABLE OUTCOMES that can be evaluated
+        """
+        goal_lower = goal_description.lower()
+        
+        # GENERIC ACTION-FIRST PLANNING PRINCIPLES:
+        
+        # If goal explicitly requires research/investigation, allow ONE focused search then ACT
+        if any(keyword in goal_lower for keyword in ["research", "investigate", "study", "find", "explore", "analyze"]):
+            return [
+                PlanStep(
+                    description="Gather essential information for the task (ONE focused search)",
+                    assigned_tool=self._get_ums_tool_mcp_name(UMS_FUNC_HYBRID_SEARCH),
+                    status="planned"
+                ),
+                PlanStep(
+                    description="Take concrete action based on gathered information",
+                    status="planned"
+                )
+            ]
+        
+        # If goal is action-oriented, proceed directly to action
+        elif any(keyword in goal_lower for keyword in ["create", "write", "build", "develop", "generate", "make", "produce"]):
+            return [
+                PlanStep(
+                    description=f"Execute the requested action: {goal_description[:120]}",
+                    status="planned"
+                )
+            ]
+        
+        # Default: favor immediate action with available information
+        else:
+            return [
+                PlanStep(
+                    description="Take immediate concrete action toward the goal using available information",
+                    status="planned"
+                ),
+                PlanStep(
+                    description="Evaluate results and determine if goal is complete",
+                    status="planned"
+                )
+            ]
+
+    def _should_force_progression_to_creation(self) -> bool:
+        """
+        Determine if agent should be forced to stop researching and start creating deliverables.
+        
+        This is a key infinite loop prevention mechanism.
+        """
+        # Force progression after 2 search attempts (reduced from 3)
+        if self.state.search_attempts_count >= 2:
+            self.logger.warning("🚨 FORCING PROGRESSION: 2+ search attempts detected")
+            return True
+        
+        # Force progression after 5 turns without artifact creation (reduced from 6)
+        if self.state.turns_since_artifact_creation >= 5:
+            self.logger.warning("🚨 FORCING PROGRESSION: 5+ turns without creating artifacts")
+            return True
+        
+        # Force progression if stuck in research stage too long
+        if (self.state.plan_progression_stage == "research" and 
+            self.state.current_loop >= 6):  # Reduced from 8
+            self.logger.warning("🚨 FORCING PROGRESSION: Stuck in research stage too long")
+            return True
+        
+        # Force progression if same tool used 2+ times consecutively (reduced from 3)
+        if self.state.consecutive_same_tool_count >= 2:
+            self.logger.warning("🚨 FORCING PROGRESSION: Same tool repeated 2+ times")
+            return True
+        
+        return False
+
+    def _get_forced_progression_plan(self, current_goal_desc: str) -> List[PlanStep]:
+        """
+        Generate a plan that FORCES progression to concrete action.
+        Used when infinite loop prevention triggers.
+        """
+        # Generic action-oriented forced progression (no task-specific hardcoding)
+        action_desc = f"Take immediate concrete action toward the goal using available information"
+        
+        return [
+            PlanStep(
+                description=f"FORCED PROGRESSION: {action_desc}",
+                status="planned"
+            ),
+            PlanStep(
+                description="Evaluate action results and determine if goal requirements are met",
+                status="planned"
+            )
+        ]
 
     async def _attempt_auto_fix(self, tool_name: str, args: Dict, error_envelope: Dict) -> Optional[Dict]:
         """Attempt automatic fixes for common errors"""
@@ -5391,11 +5553,9 @@ class AgentMasterLoop:
                 "study": "file",
                 "research": "file",
                 
-                # Interactive content
-                "quiz": "file",
-                "test": "file",
-                "exam": "file",
-                "assessment": "file",
+                # Interactive and structured content
+                "interactive": "file",
+                "structured": "file",
                 "questionnaire": "file",
                 "survey": "file",
                 "form": "file",
@@ -5483,7 +5643,7 @@ class AgentMasterLoop:
                     args["artifact_type"] = "chart"
                 elif any(keyword in current_type for keyword in ["url", "link", "website", "web"]):
                     args["artifact_type"] = "url"
-                elif any(keyword in current_type for keyword in ["html", "document", "report", "file", "quiz", "test"]):
+                elif any(keyword in current_type for keyword in ["html", "document", "report", "file", "structured", "interactive"]):
                     args["artifact_type"] = "file"
                 else:
                     args["artifact_type"] = "text"  # Safe default
@@ -5679,8 +5839,8 @@ class AgentMasterLoop:
             current_goal = self.state.goal_stack[-1] if self.state.goal_stack else {}
             goal_desc = str(current_goal.get("description", "")).lower()
             goal_creation_keywords = [
-                "quiz", "report", "document", "file", "html", "code", 
-                "script", "analysis", "summary", "deliverable", "artifact"
+                "content", "report", "document", "file", "html", "code", 
+                "script", "analysis", "summary", "deliverable", "artifact", "creation"
             ]
             if any(keyword in goal_desc for keyword in goal_creation_keywords):
                 return True
@@ -5814,9 +5974,23 @@ class AgentMasterLoop:
 
 
         current_base = self._get_base_function_name(tool_name_mcp)
-        _force_print(
-            f"AML_EXEC_TOOL_INTERNAL: start tool='{tool_name_mcp}' "
-            f"base='{current_base}' args={str(arguments)[:200]}…"
+        
+        # Pre-execution loop detection check
+        if self._detect_infinite_loop(tool_name_mcp):
+            self.logger.warning("🔄 PRE-EXECUTION LOOP DETECTED - Preventing tool execution")
+            return await _bail(
+                _mk_envelope(
+                    err_type="InfiniteLoopDetected",
+                    err_msg=f"Prevented execution of '{tool_name_mcp}' - infinite loop detected"
+                ),
+                set_state_error=True,
+                mark_replan=True,
+                summary_prefix="Loop Prevented"
+            )
+        
+        self.logger.info(
+            f"🔧 EXECUTING TOOL: {tool_name_mcp} | Base: {current_base} | "
+            f"Args: {str(arguments)[:150]}{'...' if len(str(arguments)) > 150 else ''}"
         )
 
         envelope: Dict[str, Any] = _mk_envelope(
@@ -5924,7 +6098,7 @@ class AgentMasterLoop:
                     # Apply the same mapping logic from auto-fix
                     type_mapping = {
                         "report": "file", "document": "file", "article": "file", "essay": "file",
-                        "quiz": "file", "test": "file", "html": "file", "webpage": "file",
+                        "interactive": "file", "structured": "file", "html": "file", "webpage": "file",
                         "script": "code", "program": "code", "analysis": "file", "summary": "file"
                     }
                     if artifact_type in type_mapping:
@@ -6306,8 +6480,32 @@ class AgentMasterLoop:
                 msg += f" (Code: {envelope['status_code']})"
             self.state.last_action_summary = f"{tool_name_mcp} -> {msg}"
 
-        _force_print(
-            f"AML_EXEC_TOOL_INTERNAL: last_action_summary='{self.state.last_action_summary}'"
+        execution_time_ms = (time.time() - start_ts) * 1000
+        
+        # Extract meaningful result snippet for debugging
+        result_preview = "No result"
+        if envelope.get("success"):
+            data = envelope.get("data", {})
+            if isinstance(data, dict):
+                # Show key identifiers or messages
+                for key in ["memory_id", "artifact_id", "goal_id", "action_id", "thought_id", "message", "summary"]:
+                    if data.get(key):
+                        result_preview = f"{key}: {str(data[key])[:100]}"
+                        break
+                else:
+                    # Show truncated data if no key identifiers
+                    result_preview = str(data)[:100] + "..." if len(str(data)) > 100 else str(data)
+            else:
+                result_preview = str(data)[:100] + "..." if len(str(data)) > 100 else str(data)
+        else:
+            error_msg = envelope.get("error_message", envelope.get("error", "Unknown error"))
+            result_preview = f"Error: {str(error_msg)[:100]}"
+        
+        success_indicator = "✅" if envelope.get("success") else "❌"
+        self.logger.info(
+            f"{success_indicator} TOOL COMPLETED: {tool_name_mcp} | "
+            f"Time: {execution_time_ms:.1f}ms | "
+            f"Result: {result_preview}"
         )
 
         # ────────────────────────── record action completion ───────────────────────
@@ -7211,30 +7409,26 @@ class AgentMasterLoop:
                 self.state.consecutive_error_count = 0
                 self.logger.info(f"{log_prefix}: Goal {_fmt_id(goal_id)} successfully established, error state cleared")
 
-                # AUTOMATIC GOAL DECOMPOSITION **COMPLETELY DISABLED**
-                # This was causing infinite recursive goal creation loops.
-                # The agent should work directly on goals without creating sub-goals.
-                
                 goal_desc = goal_obj.get("description", "")
-                self.logger.info(f"🎯 Goal established: '{goal_desc[:80]}...' - AUTO-DECOMPOSITION DISABLED")
+                self.logger.info(f"🎯 Goal established: '{goal_desc[:80]}...'")
                 
                 # Create a direct action plan for the goal
                 if not self.state.current_plan or self.state.current_plan[0].description == DEFAULT_PLAN_STEP:
-                    if "research" in goal_desc.lower():
+                    if "research" in goal_desc.lower() or "investigate" in goal_desc.lower() or "find" in goal_desc.lower():
                         self.state.current_plan = [
-                            PlanStep(description="Search the web for relevant information")
+                            PlanStep(description="Gather essential information for the goal")
                         ]
-                    elif "create" in goal_desc.lower() or "write" in goal_desc.lower():
+                    elif any(keyword in goal_desc.lower() for keyword in ["create", "write", "generate", "build", "develop", "make", "produce"]):
                         self.state.current_plan = [
-                            PlanStep(description="Create the requested content or artifact")
+                            PlanStep(description="Take action to fulfill the goal requirements")
                         ]
-                    elif "analyze" in goal_desc.lower():
+                    elif "analyze" in goal_desc.lower() or "study" in goal_desc.lower():
                         self.state.current_plan = [
-                            PlanStep(description="Analyze the available information")
+                            PlanStep(description="Analyze the available information and take appropriate action")
                         ]
                     else:
                         self.state.current_plan = [
-                            PlanStep(description="Execute the first step toward goal completion")
+                            PlanStep(description="Execute concrete action toward goal completion")
                         ]
                     self.state.needs_replan = False
                     self.logger.info(f"🎯 Created direct action plan for goal")
@@ -7656,33 +7850,58 @@ class AgentMasterLoop:
                 _mark_step(SUCCESS, summary)
                 _pop_if_first(current_step)
 
+                # UPDATE LOOP DETECTION AND PROGRESSION TRACKING
+                if tool_name_mcp:
+                    # Update progression stage tracking
+                    self._update_plan_progression_stage(tool_name_mcp, True)
+                    
+                    # Check for infinite loop patterns
+                    if self._detect_infinite_loop(tool_name_mcp):
+                        self.logger.warning("🔄 INFINITE LOOP DETECTED - Forcing plan progression")
+                        self.state.needs_replan = True
+                        # Force progression to break the loop
+                        current_goal_desc = ""
+                        if self.state.goal_stack and self.state.goal_stack[-1]:
+                            current_goal_desc = self.state.goal_stack[-1].get("description", "")
+                        
+                        # Generate progression-aware plan to break the loop
+                        new_plan_steps = self._generate_progression_aware_plan(current_goal_desc)
+                        self.state.current_plan.extend(new_plan_steps)
+                        
+                        # Set specific error details to trigger appropriate LLM response
+                        self.state.last_error_details = {
+                            "type": "InfiniteLoopDetected",
+                            "tool": tool_name_mcp,
+                            "error": f"Agent stuck in infinite loop executing '{tool_name_mcp}' repeatedly",
+                            "recommendation": "Force progression to next stage or create deliverables",
+                            "loop_info": {
+                                "consecutive_same_tool": self.state.consecutive_same_tool_count,
+                                "search_attempts": self.state.search_attempts_count,
+                                "progression_stage": self.state.plan_progression_stage,
+                                "turns_since_artifact": self.state.turns_since_artifact_creation
+                            }
+                        }
+                        return False, "tool-exec-loop-detected"
+
                 if not self.state.current_plan:
-                    # Try smart chaining first
+                    # Use DELIVERABLE-FIRST planning approach
                     current_goal_desc = ""
                     if self.state.goal_stack and self.state.goal_stack[-1]:
                         current_goal_desc = self.state.goal_stack[-1].get("description", "")
                     
-                    suggested_tools = self._suggest_tool_chain(current_goal_desc, self.state.last_action_summary)
-                    if suggested_tools and len(suggested_tools) > 0:
+                    # Generate concrete action plan biased toward deliverable creation
+                    if current_goal_desc:
+                        new_plan_steps = self._generate_concrete_action_plan(current_goal_desc)
+                        self.state.current_plan.extend(new_plan_steps)
+                        self.logger.info(f"🎯 DELIVERABLE-FIRST: Generated {len(new_plan_steps)} concrete action steps")
+                    else:
+                        # Even without goal description, default to creating something
                         self.state.current_plan.append(
                             PlanStep(
-                                description=f"Continue with {suggested_tools[0].split('_')[-1]} tool",
-                                assigned_tool=self._get_ums_tool_mcp_name(suggested_tools[0])
+                                description="Create deliverable for current goal using available information",
+                                assigned_tool=self._get_ums_tool_mcp_name("record_artifact")
                             )
                         )
-                        self.logger.info(f"Smart chaining suggested next tool: {suggested_tools[0]}")
-                    else:
-                        # Check for multi-part tasks before declaring completion
-                        if (current_goal_desc and 
-                            any(keyword in current_goal_desc.lower() for keyword in ["and", "then", "also", "both", "multiple", "plus"]) and
-                            "artifact" in self.state.last_action_summary.lower()):
-                            self.state.current_plan.append(
-                                PlanStep(description=f"Check if all deliverables from multi-part task are complete using {UMS_FUNC_GET_GOAL_DETAILS}")
-                            )
-                        else:
-                            self.state.current_plan.append(
-                                PlanStep(description="Plan finished. Check for duplicate artifacts and decide if workflow goal met.")
-                            )
 
                 # Clear error only if same tool now succeeded
                 if (
@@ -7700,6 +7919,30 @@ class AgentMasterLoop:
                 else "Unknown tool failure."
             )
             _mark_step(FAILED, f"Failure: {err_msg}")
+            
+            # UPDATE TRACKING FOR FAILED TOOLS TOO
+            if tool_name_mcp:
+                self._update_plan_progression_stage(tool_name_mcp, False)
+                # Still track tool execution for loop detection even on failure
+                if self._detect_infinite_loop(tool_name_mcp):
+                    self.logger.warning("🔄 INFINITE LOOP DETECTED in failed tool - Forcing progression")
+                    self.state.needs_replan = True
+                    
+                    # Set specific error details about the loop
+                    self.state.last_error_details = {
+                        "type": "InfiniteLoopDetectedOnFailure",
+                        "tool": tool_name_mcp,
+                        "error": f"Agent stuck in infinite loop with failing tool '{tool_name_mcp}'",
+                        "recommendation": "Force progression to different approach",
+                        "loop_info": {
+                            "consecutive_same_tool": self.state.consecutive_same_tool_count,
+                            "search_attempts": self.state.search_attempts_count,
+                            "progression_stage": self.state.plan_progression_stage,
+                            "turns_since_artifact": self.state.turns_since_artifact_creation
+                        },
+                        "original_error": err_msg
+                    }
+                    return False, "tool-exec-fail-loop-detected"
             
             # Try state recovery before replanning for tool failure
             recovery_successful = await self.state_validator.validate_and_recover_state("tool_execution_failure")
