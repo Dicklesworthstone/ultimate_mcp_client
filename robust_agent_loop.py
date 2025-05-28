@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import statistics
 import textwrap
@@ -245,17 +246,32 @@ class MemoryGraphManager:
     # Public high‑level operations
     #############################################################
 
-    async def auto_link(self, src_id: str, tgt_id: str, context_snip: str = "") -> None:
-        """Infer `LinkType` & strength, then write to `memory_links`.
-
-        The heuristic:
-        * If either text snippet contains negation referring to the other, → `CONTRADICTS`.
-        * If we see causal cue words ("therefore", "because", "so that"…) → `CAUSAL`.
-        * Matching tags or high embedding cosine (> 0·8) → `RELATED`.
-        Otherwise we fall back to `RELATED`.
+    async def auto_link(
+        self,
+        src_id: str,
+        tgt_id: str,
+        context_snip: str = "",
+        *,                           # <- forces keyword for the override
+        kind_hint: LinkKind | None = None,
+    ) -> None:
         """
-        link_type = LinkKind(await self._infer_link_type(src_id, tgt_id, context_snip)).value
-        # use the official UMS API so downstream triggers fire
+        Create (or upsert) a semantic link between two memories.
+
+        Parameters
+        ----------
+        src_id, tgt_id : str
+            Memory IDs.
+        context_snip   : str
+            Short free-text description stored in `description`.
+        kind_hint      : LinkKind | None, optional
+            If provided we *trust* the caller's classification instead of running
+            the `_infer_link_type` heuristic.  Keeps the cheap-LLM budget down when
+            the semantics are already known (e.g. reasoning-trace construction).
+        """
+        link_type = (kind_hint or LinkKind(
+            await self._infer_link_type(src_id, tgt_id, context_snip)
+        )).value
+
         await self.mcp._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:create_memory_link",
@@ -266,6 +282,8 @@ class MemoryGraphManager:
                 "link_type": link_type,
                 "strength": 1.0,
                 "description": context_snip[:180],
+                "extra_json": json.dumps({"loop": self.state.loop_count,
+                                          "phase": self.state.phase.value})[:300],
             },
         )
 
@@ -331,8 +349,30 @@ class MemoryGraphManager:
         """
         # Rule 1: explicit contradicts links ---------------------------------
         rows = self._exec("SELECT source_memory_id, target_memory_id FROM memory_links WHERE link_type = 'CONTRADICTS'")
-        result: Set[Tuple[str, str]] = {(r["source_memory_id"], r["target_memory_id"]) for r in rows}
-
+        result: Set[Tuple[str, str]] = set()
+        
+        # ⇢ NEW: filter out resolved contradictions
+        for r in rows:
+            src, tgt = r["source_memory_id"], r["target_memory_id"]
+            # Check if this contradiction has been marked as resolved
+            try:
+                link_meta_res = self.mcp._execute_tool_and_parse_for_agent(
+                    "UMS_Server",
+                    "ums:get_memory_link_metadata", 
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "source_memory_id": src,
+                        "target_memory_id": tgt,
+                        "link_type": "CONTRADICTS",
+                    }
+                )
+                metadata = link_meta_res.get("data", {}).get("metadata", {})
+                if "resolved_at" not in metadata:
+                    result.add((src, tgt))
+            except Exception:
+                # If we can't check metadata, include it (fail-safe)
+                result.add((src, tgt))
+        
         # Rule 2: naive negation check on recent memories ---------------------
         recent = self._exec(
             """SELECT memory_id, content FROM memories
@@ -351,6 +391,21 @@ class MemoryGraphManager:
                     result.add((row_i["memory_id"], row_j["memory_id"]))
                 if (" not " in text_j or " no " in text_j) and row_i["content"][:40].lower() in text_j:
                     result.add((row_j["memory_id"], row_i["memory_id"]))
+         
+         # Rule 3: Soft negative feedback loops (A→B→…→A via CAUSAL edges) ----
+        g = nx.DiGraph()
+        causal_rows = self._exec(
+            "SELECT source_memory_id, target_memory_id FROM memory_links "
+            "WHERE link_type = 'CAUSAL'"
+        )
+        g.add_edges_from((r["source_memory_id"], r["target_memory_id"]) for r in causal_rows)
+        try:
+            for cycle in nx.simple_cycles(g):
+                if len(cycle) > 1:
+                    result.add((cycle[0], cycle[-1]))
+        except nx.NetworkXError:
+            pass  # ignore if graph is empty or malformed
+        
         return list(result)
 
     async def consolidate_cluster(self, min_size: int = 6) -> None:
@@ -381,6 +436,15 @@ class MemoryGraphManager:
                 mtype="SUMMARY",
                 description=f"Consolidated summary of {len(neigh_ids)} related memories around {hub_id}",
             )
+            # average importance inheritance
+            if neigh_ids:
+                imp_rows = self._exec(
+                    f"SELECT importance FROM memories WHERE memory_id IN ({','.join('?' * len(neigh_ids))})",
+                    neigh_ids,
+                )
+                if imp_rows:
+                    avg_importance = statistics.mean(r["importance"] for r in imp_rows)
+                    self._exec("UPDATE memories SET importance=? WHERE memory_id=?", [avg_importance, new_id])
             # create GENERALIZES link hub -> summary -----------------------------
             self._exec(
                 """INSERT OR IGNORE INTO memory_links
@@ -423,7 +487,7 @@ class MemoryGraphManager:
         )
         for r in recent:
             mid = r["memory_id"]
-            nodes[mid] = {"type": r["memory_type"], "snippet": r["content"][:200]}
+            nodes[mid] = {"id": mid, "type": r["memory_type"], "snippet": r["content"][:200], "tags": list(self._get_tags_for_memory(mid))}
             links = self._exec("SELECT target_memory_id, link_type FROM memory_links WHERE source_memory_id = ?", [mid])
             for lk in links:
                 tgt = lk["target_memory_id"]
@@ -431,7 +495,7 @@ class MemoryGraphManager:
                 if tgt not in nodes:
                     tgt_row = self._exec("SELECT content, memory_type FROM memories WHERE memory_id = ? LIMIT 1", [tgt])
                     if tgt_row:
-                        nodes[tgt] = {"type": tgt_row[0]["memory_type"], "snippet": tgt_row[0]["content"][:200]}
+                        nodes[tgt] = {"id": tgt, "type": tgt_row[0]["memory_type"], "snippet": tgt_row[0]["content"][:200], "tags": list(self._get_tags_for_memory(tgt))}
         return {"nodes": nodes, "edges": edges}
 
     #############################################################
@@ -440,6 +504,22 @@ class MemoryGraphManager:
 
     async def _infer_link_type(self, src_id: str, tgt_id: str, context: str) -> str:
         """Fast heuristic and cheap‑LLM back‑off for deciding link type."""
+        
+        # ------------------------------------------------------------------
+        # 0) **CACHE SHORT-CIRCUIT** – if both memories already carry a
+        #    reciprocal cached type we trust that and return it instantly.
+        # ------------------------------------------------------------------
+        try:
+            meta_src = self._get_metadata(src_id).get("link_type_cache", {})
+            if tgt_id in meta_src:
+                return meta_src[tgt_id]
+            meta_tgt = self._get_metadata(tgt_id).get("link_type_cache", {})
+            if src_id in meta_tgt:
+                return meta_tgt[src_id]
+        except Exception:
+            # Any metadata hiccup → fall back to normal path
+            pass
+
         # 1. Heuristic quick rules -------------------------------------------
         ctx_lower = context.lower()
         causal_cues = ("because", "therefore", "so that", "as a result", "leads to")
@@ -451,10 +531,9 @@ class MemoryGraphManager:
         src_vec = self._get_cached_embedding(src_id)
         tgt_vec = self._get_cached_embedding(tgt_id)
         if src_vec is not None and tgt_vec is not None:
-            sim = asyncio.run_coroutine_threadsafe(
-                self.ums.vector_similarity(src_vec, tgt_vec),
-                asyncio.get_event_loop(),
-            ).result()
+            # direct await keeps us on the same event-loop and avoids the rare
+            # dead-lock risk of run_coroutine_threadsafe.
+            sim = await self.ums.vector_similarity(src_vec, tgt_vec)
             if sim is not None and sim >= 0.80:
                 return "RELATED"
 
@@ -478,9 +557,18 @@ class MemoryGraphManager:
         try:
             resp = await self.mcp.fast_llm_call(prompt, schema)  # assumes such helper; else fallback
             t = resp.get("link_type", "RELATED").upper()
-            return t if t in {"RELATED", "CAUSAL", "SEQUENTIAL", "CONTRADICTS", "SUPPORTS", "GENERALIZES", "SPECIALIZES"} else "RELATED"
+            inferred = t if t in {"RELATED", "CAUSAL", "SEQUENTIAL", "CONTRADICTS", "SUPPORTS", "GENERALIZES", "SPECIALIZES"} else "RELATED"
         except Exception:
-            return "RELATED"
+            inferred = "RELATED"
+
+        # ------------------------------------------------------------------
+        # 5)  **CACHE RESULT** for both memories so future calls are O(1)
+        # ------------------------------------------------------------------
+        try:
+            self._update_link_type_cache(src_id, tgt_id, inferred)
+        except Exception:
+            pass
+        return inferred
 
     # ------------------------ misc small helpers ---------------------------
 
@@ -574,6 +662,61 @@ class MemoryGraphManager:
             """,
             [half_life_days],
         )
+
+    # ----------------------- metadata helpers -----------------------------
+
+    def _get_metadata(self, memory_id: str) -> Dict[str, Any]:
+        """Fetch metadata JSON for *memory_id* (empty dict if none)."""
+        try:
+            res = self.mcp._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:get_memory_metadata",
+                {"workflow_id": self.state.workflow_id,
+                 "memory_id": memory_id},
+            )
+            return res["data"].get("metadata", {}) or {}
+        except Exception:
+            return {}
+
+    def _update_link_type_cache(self, src_id: str, tgt_id: str, link_type: str) -> None:
+        """Persist reciprocal cache entries `src→tgt` and `tgt→src`."""
+        for a, b in ((src_id, tgt_id), (tgt_id, src_id)):
+            meta = self._get_metadata(a)
+            cache = meta.get("link_type_cache", {})
+            cache[b] = link_type
+            meta["link_type_cache"] = cache
+            try:
+                self.mcp._execute_tool_and_parse_for_agent(
+                    "UMS_Server",
+                    "ums:update_memory_metadata",
+                    {"workflow_id": self.state.workflow_id,
+                     "memory_id": a,
+                     "metadata": meta},
+                )
+            except Exception:
+                continue
+
+    # --- tiny convenience -----------------------------------------------
+    async def mark_contradiction_resolved(self, mem_a: str, mem_b: str) -> None:
+        """
+        Tag the CONTRADICTS edge A↔B as resolved so Metacognition skips it later.
+        """
+        meta_flag = {"resolved_at": int(time.time())}
+        for a, b in ((mem_a, mem_b), (mem_b, mem_a)):
+            try:
+                self.mcp._execute_tool_and_parse_for_agent(
+                    "UMS_Server", 
+                    "ums:update_memory_link_metadata",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "source_memory_id": a,
+                        "target_memory_id": b,
+                        "link_type": "CONTRADICTS",
+                        "metadata": meta_flag,
+                    },
+                )
+            except Exception:
+                pass
 
 
 ###############################################################################
@@ -986,6 +1129,11 @@ class MetacognitionEngine:
         self.mem_graph = mem_graph
         self.llm = llm_orch
         self.async_queue = async_queue
+        self.planner: Optional["ProceduralAgenda"] = None  # Set later by AML
+
+    def set_planner(self, planner: "ProceduralAgenda") -> None:
+        """Link the planner for contradiction escalation to BLOCKER goals."""
+        self.planner = planner
 
     # ---------------------------------------------------------------- public
 
@@ -1017,6 +1165,9 @@ class MetacognitionEngine:
         if contradictions:
             turn_ctx["has_contradictions"] = True
             turn_ctx["contradictions_list"] = contradictions[:3]
+            
+            # 🔹NEW escalate persistent contradictions to BLOCKER goals
+            await self._escalate_persistent_contradictions(contradictions)
             
         reflection_prompt = self._build_reflection_prompt(turn_ctx)
         schema = {
@@ -1104,9 +1255,72 @@ class MetacognitionEngine:
         # Placeholder; real implementation would query UMS goal status.
         try:
             status = self.mcp.get_goal_status(self.state.current_leaf_goal_id)
-            return status == "completed"
+            if status != "completed":
+                return False
+                
+            # 🔹NEW edge-aware progress check: verify goal has evidence links
+            # Check for outgoing CONSEQUENCE_OF or SUPPORTS links to parent
+            goal_id = self.state.current_leaf_goal_id
+            links_res = self.mcp._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:get_memory_links",
+                {"workflow_id": self.state.workflow_id, "source_memory_id": goal_id}
+            )
+            
+            # Look for evidence that this goal contributed to parent goal
+            evidence_links = [
+                link for link in links_res.get("data", {}).get("links", [])
+                if link["link_type"] in ["CONSEQUENCE_OF", "SUPPORTS"] 
+                and link["target_memory_id"] != goal_id  # avoid self-loops
+            ]
+            
+            return len(evidence_links) > 0  # Only complete if we have evidence
         except Exception:
             return False
+
+    async def _escalate_persistent_contradictions(self, contradictions: List[Tuple[str, str]]) -> None:
+        """Track contradiction pairs and escalate to BLOCKER goals when they persist ≥3 times."""
+        # Simple persistent tracking using UMS metadata
+        for pair in contradictions:
+            pair_key = f"contradiction_{min(pair)}_{max(pair)}"  # normalized key
+            try:
+                # Try to get existing count
+                meta_res = self.mcp._execute_tool_and_parse_for_agent(
+                    "UMS_Server",
+                    "ums:get_workflow_metadata",
+                    {"workflow_id": self.state.workflow_id}
+                )
+                current_meta = meta_res.get("data", {}).get("metadata", {})
+                count = current_meta.get(pair_key, 0) + 1
+                
+                # Update count
+                current_meta[pair_key] = count
+                self.mcp._execute_tool_and_parse_for_agent(
+                    "UMS_Server", 
+                    "ums:update_workflow_metadata",
+                    {"workflow_id": self.state.workflow_id, "metadata": current_meta}
+                )
+                
+                # Escalate if threshold reached
+                if count >= 3 and self.planner:
+                    blocker_title = f"RESOLVE: Contradiction {pair[0][:8]}↔{pair[1][:8]}"
+                    blocker_desc = f"Persistent contradiction detected {count} times. Requires explicit resolution."
+                    self.planner.add_goal(blocker_title, blocker_desc, priority=1)  # highest priority
+
+                    # Tag both memories so other components can suppress them
+                    for mem in pair:
+                        try:
+                            self.mcp._execute_tool_and_parse_for_agent(
+                                "UMS_Server",
+                                "ums:add_tag_to_memory",
+                                {"workflow_id": self.state.workflow_id,
+                                 "memory_id": mem,
+                                 "tag": "BLOCKER"},
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                pass  # fail gracefully if metadata storage isn't available
 
 
 class GraphReasoner:
@@ -1132,9 +1346,10 @@ class GraphReasoner:
 
     # --------------------------------------------------------------------- init
 
-    def __init__(self, mcp_client, orchestrator):
+    def __init__(self, mcp_client, orchestrator, mem_graph):
         self.mcp = mcp_client
         self.llms = orchestrator
+        self.mem_graph = mem_graph
 
     # ----------------------------------------------------------------- builders
 
@@ -1262,6 +1477,12 @@ class GraphReasoner:
         -------
         List[{'title': str, 'tool_hint': str, 'rationale': str}]
         """
+        # Hide memories tagged as BLOCKER to avoid redundant suggestions
+        snapshot["nodes"] = [
+            n for n in snapshot["nodes"]
+            if "tags" not in n or "BLOCKER" not in n["tags"]
+        ]
+        
         graph_info = await self.analyse_graph(snapshot)
         prompt = (
             "You are an autonomous agent strategist. Given the current memory "
@@ -1389,6 +1610,16 @@ class ToolExecutor:
                     tgt_id=action_mem_id,
                     context_snip="input to tool",
                 )
+
+        # 🔹NEW link action -> outputs (if result contains memory_ids)
+        if isinstance(result, dict) and "memory_id" in result:
+            output_id = result["memory_id"]
+            await self.mem_graph.auto_link(
+                src_id=action_mem_id,
+                tgt_id=output_id,
+                context_snip="tool output",
+                kind_hint=LinkKind.SEQUENTIAL,
+            )
         return result
 
 
@@ -1618,6 +1849,15 @@ class ProceduralAgenda:
             "ums:create_or_update_goal",
             args,
         )
+        
+        # 🔹NEW: dump simple markdown checklist after every change
+        try:
+            with open("todo.md", "w", encoding="utf-8") as fh:
+                for g in sorted(self._goals.values(), key=lambda x: x.sequence_number):
+                    ck = "x" if g.status == GoalStatus.COMPLETED else " "
+                    fh.write(f"- [{ck}] {g.title}  <!-- {g.goal_id} -->\n")
+        except OSError:
+            pass  # never block core loop on FS hiccup
 
     def _load_from_ums(self):
         """
@@ -1710,8 +1950,10 @@ class AgentMasterLoop:
         self.tool_exec = ToolExecutor(self.mcp, self.state)
         self.metacog = MetacognitionEngine(self.mcp, self.state, self.mem_graph, self.llms, self.async_queue)
         self.planner = ProceduralAgenda(self.mcp, self.state)
-        self.graph_reasoner = GraphReasoner(self.mcp, self.llms)
+        self.graph_reasoner = GraphReasoner(self.mcp, self.llms, self.mem_graph)
 
+        # 🔹NEW link components after initialization
+        self.metacog.set_planner(self.planner)
     # ---------------------------------------------------------------- bootstrap
 
     def _bootstrap(self, user_goal: str) -> AMLState:
@@ -1757,9 +1999,14 @@ class AgentMasterLoop:
         self.logger.info("[AML] starting main loop for workflow %s", self.state.workflow_id)
         while True:
             step_status = await self._turn()
-            if step_status in {"finished", "failed"}:
-                break
-        self.logger.info("[AML] loop ended – status=%s", step_status)
+
+            if step_status == "finished":
+                self.logger.info("[AML] workflow completed – exiting run()")
+                return                      # ← early exit
+
+            if step_status == "failed":
+                self.logger.error("[AML] workflow failed – exiting run()")
+                return                      # ← early exit
 
     # -------------------------------------------------------------- single turn
 
@@ -1797,6 +2044,11 @@ class AgentMasterLoop:
 
         # 8. Budget & termination checks --------------------------------------
         if self.state.phase == Phase.COMPLETE:
+            # 🔹NEW: signal orchestrators with idle tool call  
+            try:
+                await self.mcp._execute_tool_and_parse_for_agent("idle", {})
+            except Exception:
+                pass  # never block completion on sentinel call failure
             return "finished"
         if self._budget_exceeded():
             self.logger.warning("[AML] hard budget exceeded -> abort")
@@ -1813,10 +2065,10 @@ class AgentMasterLoop:
         # 🔹NEW --- Vector-similar memories for the *current* leaf goal ------
         sim_res = self.mcp._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:vector_search",
+            "ums:get_similar_memories",
             {
                 "workflow_id": self.state.workflow_id,
-                "anchor_memory_id": self.state.current_leaf_goal_id,
+                "memory_id": self.state.current_leaf_goal_id,
                 "k": 8,
                 "include_content": True,
             },
@@ -1828,6 +2080,17 @@ class AgentMasterLoop:
 
         # Procedural agenda summary ------------------------------------------
         active_goals = [g.title for g in self.planner.active_goals()][:5]
+
+        # ⇢ NEW: pick top-central nodes to focus the SMART model on the most
+        #        influential memories rather than only embedding-neighbours.
+        graph_metrics = await self.graph_reasoner.analyse_graph(graph_snapshot)
+        centrality = graph_metrics["centrality"]
+        important_nodes = sorted(
+            graph_snapshot["nodes"].values(),
+            key=lambda n: centrality.get(n["id"], 0.0),
+            reverse=True,
+        )[:10]
+        central_snippets = "\n".join(n["snippet"] for n in important_nodes)
 
         # ------------------------------------------------------------------
         # Recent memories **with outgoing links** (link-aware utility)
@@ -1868,7 +2131,7 @@ class AgentMasterLoop:
             "recent_actions": recent_actions_text,
             "goal_path": goal_path_nodes,
             "top_similar": top_similar,
-            "working_memory": "\n".join(m.get("content", "")[:200] for m in top_similar),
+            "working_memory": central_snippets,
         }
 
     # -------------------------------- helper: spawn background fast tasks
@@ -2045,13 +2308,20 @@ class AgentMasterLoop:
                 return True
             elif dtype == "THOUGHT_PROCESS":
                 thought = decision.get("content", "")
-                await self.mcp.create_memory(
+                mem_id = await self.mcp.create_memory(
                     workflow_id=self.state.workflow_id,
                     content=thought,
                     memory_level="working",
                     memory_type="REASONING_STEP",
                     description="Thought from SMART model",
                 )
+                # ⇢ NEW: link any referenced memories as supporting evidence
+                evid_ids = re.findall(r"mem_[0-9a-f]{8}", thought)
+                if evid_ids:
+                    await self.mem_graph.register_reasoning_trace(
+                        thought_mem_id=mem_id,
+                        evidence_ids=evid_ids,
+                    )
                 return bool(thought.strip())
             elif dtype == "DONE":
                 self.state.phase = Phase.COMPLETE
@@ -2062,13 +2332,19 @@ class AgentMasterLoop:
         else:
             # If it's plain text, store as a reasoning step
             text = str(decision)
-            await self.mcp.create_memory(
+            mem_id = await self.mcp.create_memory(
                 workflow_id=self.state.workflow_id,
                 content=text,
                 memory_level="working",
                 memory_type="REASONING_STEP",
                 description="Unstructured reasoning output",
             )
+            evid_ids = re.findall(r"mem_[0-9a-f]{8}", text)
+            if evid_ids:
+                await self.mem_graph.register_reasoning_trace(
+                    thought_mem_id=mem_id,
+                    evidence_ids=evid_ids,
+                )
             return bool(text.strip())
 
     # ----------------------------------------------------- after-turn misc
