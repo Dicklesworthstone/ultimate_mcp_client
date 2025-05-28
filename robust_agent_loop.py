@@ -34,6 +34,61 @@ if TYPE_CHECKING:
 import networkx as nx
 
 ###############################################################################
+# SECTION 0.5 –  UMS server-side helper façade
+###############################################################################
+
+
+class UMSUtility:
+    """
+    Very thin wrapper around the official **ums:* server tools** so callers can
+    benefit from server-side indices & SIMD routines without re-implementing
+    them client-side.  Falls back gracefully if the util is unavailable (e.g.
+    during offline tests that use the raw SQLite mirror only).
+    """
+
+    def __init__(self, mcp_client):
+        self.mcp = mcp_client
+
+    # ------------------------------------------------------------------ vector
+
+    async def get_embedding(self, workflow_id: str, memory_id: str) -> Optional[list[float]]:
+        """Return the embedding vector or *None* if it doesn't exist server-side."""
+        try:
+            res = self.mcp._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:get_embedding",
+                {"workflow_id": workflow_id, "memory_id": memory_id},
+            )
+            return res["data"]["vector"]
+        except Exception:
+            return None
+
+    async def vector_similarity(self, vec_a: list[float], vec_b: list[float]) -> Optional[float]:
+        """Fast SIMD cosine similarity via the server; *None* on failure."""
+        try:
+            res = self.mcp._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:vector_similarity",
+                {"vec_a": vec_a, "vec_b": vec_b},
+            )
+            return res["data"]["cosine"]
+        except Exception:
+            return None
+
+    # ---------------------------------------------------------------- contradictions
+
+    async def get_contradictions(self, workflow_id: str, limit: int = 50) -> Optional[list[tuple[str, str]]]:
+        try:
+            res = self.mcp._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:get_contradictions",
+                {"workflow_id": workflow_id, "limit": limit},
+            )
+            return [(p["a"], p["b"]) for p in res["data"]["pairs"]]
+        except Exception:
+            return None
+
+###############################################################################
 # SECTION 1. Global constants (tunable via config later)
 ###############################################################################
 
@@ -101,6 +156,7 @@ class AMLState:
     stuck_counter: int = 0
     last_reflection_turn: int = 0
     last_graph_maint_turn: int = 0
+    graph_health: float = 0.9
     pending_attachments: List[str] = dataclasses.field(default_factory=list)
     created_at: _dt.datetime = dataclasses.field(default_factory=_dt.datetime.utcnow)
 
@@ -167,7 +223,8 @@ class MemoryGraphManager:
         self.db.execute("PRAGMA foreign_keys = ON;")
         self.db.execute("PRAGMA journal_mode  = WAL;")
         self.db.row_factory = sqlite3.Row
-
+        # ← NEW: helpers
+        self.ums = UMSUtility(mcp_client)
         # ← NEW: buffered writes
         self._buf = GraphWriteBuffer(self.db)
 
@@ -253,6 +310,18 @@ class MemoryGraphManager:
         return [r[0] for r in rows]
         
     async def detect_inconsistencies(self) -> List[Tuple[str, str]]:
+        """
+        Prefer the server-side `ums:get_contradictions` materialised view.
+        Fallback to the original local heuristic when the util is unavailable.
+        """
+        pairs = await self.ums.get_contradictions(self.state.workflow_id, 50)
+        if pairs is not None:
+            return pairs
+        # -- fallback to slow SQL heuristic ----------------------------------
+        return await self._detect_inconsistencies_sql_fallback()
+
+    # ↓ original heuristic moved verbatim under a new private name ----------
+    async def _detect_inconsistencies_sql_fallback(self) -> List[Tuple[str, str]]:
         """Return list of (mem_a, mem_b) that appear in contradiction.
 
         Heuristic rules:
@@ -382,7 +451,11 @@ class MemoryGraphManager:
         src_vec = self._get_cached_embedding(src_id)
         tgt_vec = self._get_cached_embedding(tgt_id)
         if src_vec is not None and tgt_vec is not None:
-            if self._cosine(src_vec, tgt_vec) >= 0.80:
+            sim = asyncio.run_coroutine_threadsafe(
+                self.ums.vector_similarity(src_vec, tgt_vec),
+                asyncio.get_event_loop(),
+            ).result()
+            if sim is not None and sim >= 0.80:
                 return "RELATED"
 
         # 3. Check tag overlap -------------------------------------------------
@@ -412,8 +485,16 @@ class MemoryGraphManager:
     # ------------------------ misc small helpers ---------------------------
 
     def _get_memory_content(self, memory_id: str) -> str:
-        row = self._exec("SELECT content FROM memories WHERE memory_id = ?", [memory_id])
-        return row[0]["content"] if row else ""
+        row = self._exec("SELECT content, access_count FROM memories WHERE memory_id = ?", [memory_id])
+        if not row:
+            return ""
+        # 🔸CHG bump access_count in-place; no extra round-trip
+        new_cnt = row[0]["access_count"] + 1
+        self._exec(
+            "UPDATE memories SET access_count = ? WHERE memory_id = ?",
+            [new_cnt, memory_id],
+        )
+        return row[0]["content"]
 
     def _get_tags_for_memory(self, memory_id: str) -> Set[str]:
         rows = self._exec(
@@ -442,13 +523,37 @@ class MemoryGraphManager:
     # ----------------------- embedding helpers ------------------------------
 
     def _get_cached_embedding(self, memory_id: str) -> Optional[list[float]]:
+        """
+        1. Ask UMS server (fast, indexed, always fresh).
+        2. Else fall back to local SQLite mirror.
+        3. If still missing, create it server-side to avoid future cache misses.
+        """
+        # Step-1  server
+        vec = asyncio.run_coroutine_threadsafe(           # safe even in sync fn
+            self.ums.get_embedding(self.state.workflow_id, memory_id),
+            asyncio.get_event_loop(),
+        ).result()
+        if vec is not None:
+            return vec
+
+        # Step-2  local mirror
         row = self._exec(
             "SELECT vector FROM embeddings WHERE memory_id = ? LIMIT 1",
             [memory_id],
         )
         if row:
             return json.loads(row[0]["vector"])
-        return None
+
+        # Step-3  generate once on server
+        try:
+            res = self.mcp._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:create_embedding",
+                {"workflow_id": self.state.workflow_id, "memory_id": memory_id},
+            )
+            return res["data"]["vector"]
+        except Exception:
+            return None
 
     @staticmethod
     def _cosine(a: list[float], b: list[float]) -> float:
@@ -746,6 +851,10 @@ class AsyncTaskQueue:
         self._completed: List[AsyncTask] = []
         self._loop = asyncio.get_event_loop()
 
+    def inject_flush_cb(self, cb: Callable[[], None]) -> None:
+        """Allows outer code to register a flush callback executed after drain."""
+        self._flush_cb = cb
+
     # ------------------------------------------------------------------ API
 
     def spawn(self, task: AsyncTask) -> None:
@@ -778,6 +887,13 @@ class AsyncTaskQueue:
                             break
             # Start queued tasks if we have slots.
             await self._fill_slots()
+
+        # Ensure buffered graph writes hit disk before the big-model turn.
+        if hasattr(self, "_flush_cb"):
+            try:
+                self._flush_cb()
+            except Exception:
+                pass  # never block on flush
 
     def cancel_all(self) -> None:
         """Best-effort cancellation of running and pending tasks."""
@@ -863,11 +979,13 @@ class MetacognitionEngine:
         state: AMLState,
         mem_graph: "MemoryGraphManager",
         llm_orch: "LLMOrchestrator",
+        async_queue: "AsyncTaskQueue",
     ) -> None:
         self.mcp = mcp_client
         self.state = state
         self.mem_graph = mem_graph
         self.llm = llm_orch
+        self.async_queue = async_queue
 
     # ---------------------------------------------------------------- public
 
@@ -916,6 +1034,13 @@ class MetacognitionEngine:
         # reset stuck counter after reflection
         self.state.stuck_counter = 0
 
+        # 🔹NEW schedule lightweight graph upkeep (doesn't need smart model)
+        if self.state.loop_count % GRAPH_MAINT_EVERY == 0:
+            async def _maint():
+                await self.mem_graph.decay_link_strengths()
+                await self.mem_graph.promote_hot_memories()
+            self.async_queue.spawn(AsyncTask("graph_maint", _maint()))
+
     async def assess_and_transition(self, progress_made: bool) -> None:
         """Update stuck counter, maybe switch phase."""
         if progress_made:
@@ -928,10 +1053,7 @@ class MetacognitionEngine:
             self.state.phase = Phase.PLAN
         elif self.state.phase == Phase.PLAN and progress_made:
             self.state.phase = Phase.EXECUTE
-        # Graph maintenance interleaving
-        if (self.state.loop_count - self.state.last_graph_maint_turn) >= GRAPH_MAINT_EVERY:
-            self.state.phase = Phase.GRAPH_MAINT
-            self.state.last_graph_maint_turn = self.state.loop_count
+        # Graph maintenance now happens in background via maybe_reflect
 
         # Enter REVIEW if goal reached (placeholder detection)
         if self._goal_completed():
@@ -948,6 +1070,7 @@ class MetacognitionEngine:
             You are the agent's inner voice tasked with reflection.
             Current phase: {self.state.phase}
             Loop: {self.state.loop_count}
+            Graph-health: {getattr(self.state, 'graph_health', 0.9):.2f}
             Recent actions: {recent_actions[:800]}
             Working memory highlights: {memory_snips[:800]}
 
@@ -1104,6 +1227,9 @@ class GraphReasoner:
         Combines graph metrics, linked memories, and embedded goal content.
         """
         graph_info = await self.analyse_graph(snapshot)
+        # NEW graph-health score (simple proxy = 1-density*0.5)
+        health = 1.0 - graph_info["summary_stats"]["density"] * 0.5
+        self.llms.state.graph_health = max(0.0, min(1.0, health))
         prompt = (
             "You are a meta-reasoning assistant. Using the following memory graph "
             "(with centrality scores and community clusters) evaluate how close "
@@ -1248,12 +1374,21 @@ class ToolExecutor:
             memory_type="ACTION",
             description=f"Tool call {tool_name}",
         )
-        # mark provenance in graph
+        # Link provenance ---------------------------------------------------
         await self.mem_graph.auto_link(
             src_id=self.state.current_leaf_goal_id,
             tgt_id=action_mem_id,
             context_snip="attempts to satisfy goal via tool",
         )
+
+        # 🔹NEW link inputs -> action (if args reference memory ids)
+        for val in tool_args.values():
+            if isinstance(val, str) and val.startswith("mem_"):  # crude check
+                await self.mem_graph.auto_link(
+                    src_id=val,
+                    tgt_id=action_mem_id,
+                    context_snip="input to tool",
+                )
         return result
 
 
@@ -1270,6 +1405,14 @@ class LLMOrchestrator:
         self.state.cost_usd += self._fast_query._spent_usd  # accumulate budget
         self._fast_query._spent_usd = 0
         return result
+
+    # 🔹NEW single entry for SMART model; automatically tallies $$.
+    async def big_reasoning_call(self, messages: list[dict], tool_schemas=None):
+        model_name = pick_model(self.state.phase)
+        resp = await self.mcp.smart_llm_call(messages, tool_schemas, model_name=model_name)
+        # assume MCP returns usage → cost
+        self.state.cost_usd += resp.get("cost_usd", 0)
+        return resp["content"]
 
 ###############################################################################
 # SECTION 7. Procedural Agenda & Planner helpers (outline)
@@ -1553,6 +1696,8 @@ class AgentMasterLoop:
         self.state: AMLState = self._bootstrap(user_goal)
         self.mem_graph = MemoryGraphManager(self.mcp, self.state)
         self.async_queue = AsyncTaskQueue(max_concurrency=6)
+        # auto-flush graph after each drain so turns see consistent graph state
+        self.async_queue.inject_flush_cb(self.mem_graph.flush)
 
         # Create orchestrators / engines (requires state + mem_graph) -------
         # ToolExecutor and LLMOrchestrator are expected to be implemented
@@ -1563,7 +1708,7 @@ class AgentMasterLoop:
 
         self.llms = LLMOrchestrator(self.mcp, self.state)
         self.tool_exec = ToolExecutor(self.mcp, self.state)
-        self.metacog = MetacognitionEngine(self.mcp, self.state, self.mem_graph, self.llms)
+        self.metacog = MetacognitionEngine(self.mcp, self.state, self.mem_graph, self.llms, self.async_queue)
         self.planner = ProceduralAgenda(self.mcp, self.state)
         self.graph_reasoner = GraphReasoner(self.mcp, self.llms)
 
@@ -1665,7 +1810,20 @@ class AgentMasterLoop:
 
     async def _gather_context(self) -> Dict[str, Any]:
         """Collects all information fed into the SMART-model prompt."""
-        # Snapshot working-memory graph for reasoning ------------------------
+        # 🔹NEW --- Vector-similar memories for the *current* leaf goal ------
+        sim_res = self.mcp._execute_tool_and_parse_for_agent(
+            "UMS_Server",
+            "ums:vector_search",
+            {
+                "workflow_id": self.state.workflow_id,
+                "anchor_memory_id": self.state.current_leaf_goal_id,
+                "k": 8,
+                "include_content": True,
+            },
+        )
+        top_similar = sim_res["data"]["memories"]   # list[dict]
+
+        # Snapshot graph (no change) -----------------------------------------
         graph_snapshot = await self.mem_graph.snapshot_context_graph()
 
         # Procedural agenda summary ------------------------------------------
@@ -1709,7 +1867,8 @@ class AgentMasterLoop:
             "active_goals": active_goals,
             "recent_actions": recent_actions_text,
             "goal_path": goal_path_nodes,
-            "working_memory": "\n".join(n["snippet"] for n in graph_snapshot["nodes"].values()),
+            "top_similar": top_similar,
+            "working_memory": "\n".join(m.get("content", "")[:200] for m in top_similar),
         }
 
     # -------------------------------- helper: spawn background fast tasks
@@ -1826,12 +1985,15 @@ class AgentMasterLoop:
             "You have access to planning context, working memories, and can "
             "call tools. Return a JSON instruction with a 'decision_type' key."
         )
+        contradiction_note = "⚠️ Contradictions detected\n" if ctx.get("has_contradictions") else ""
         user_msg = (
             f"**Phase**: {self.state.phase}\n"
             f"**Active goals**: {ctx['active_goals']}\n"
             f"**Recent actions**:\n{ctx['recent_actions']}\n"
             f"**Goal path (leaf→root)**: {ctx['goal_path']}\n"
+            f"**Focused memories (most relevant to goal)**:\n{ctx['working_memory']}\n"
             f"**Graph snapshot** (truncated):\n{ctx['graph_snapshot']}\n\n"
+            f"{contradiction_note}"
             "What should be the next step? If a tool call is required, specify "
             "tool name and arguments. Else, think in prose."
         )
