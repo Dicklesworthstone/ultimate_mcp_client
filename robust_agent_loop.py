@@ -34,21 +34,29 @@ if TYPE_CHECKING:
 import networkx as nx
 
 ###############################################################################
-# SECTION 1. Global constants (tunable via config later)
+# SECTION 1. Agent configuration constants
 ###############################################################################
 
-# NOTE: These constants are being phased out in favor of MCPClient config values
-# They remain here for backward compatibility but will be removed in future versions
+# These constants provide default values for agent behavior when MCPClient config is unavailable.
+# All new code should use mcp_client.config values instead of these constants.
 
-MAX_TURNS = 40  # richer reasoning but still bounded - USE mcp_client.config.max_agent_turns instead
-MAX_BUDGET_USD = 5.00  # hard ceiling - USE mcp_client.config.max_budget_usd instead
-REFLECTION_INTERVAL = 6  # generate reflection memories
-GRAPH_MAINT_EVERY = 2  # turns between graph‑maintenance phases
+# Metacognition & reflection timing
+REFLECTION_INTERVAL = 6  # generate reflection memories every N turns
+GRAPH_MAINT_EVERY = 2  # turns between graph‑maintenance phases  
 STALL_THRESHOLD = 3  # consecutive non‑progress turns → forced reflection
 
-SMART_MODEL_NAME = "gpt-4o-2025-05-15"  # USE mcp_client.config.default_model instead
-FAST_MODEL_NAME = "gemini‑flash‑2.5‑05‑20"  # USE mcp_client.config.default_cheap_and_fast_model instead
-FAST_CALL_MAX_USD = 0.003  # per micro‑call
+# Fast LLM call budget (per micro-task)
+FAST_CALL_MAX_USD = 0.003  # per micro‑call budget ceiling
+
+# Default model names (fallback only - use mcp_client.config.default_model instead)
+DEFAULT_SMART_MODEL = "gpt-4o-2025-05-15"
+DEFAULT_FAST_MODEL = "gemini-flash-2.5-05-20"
+
+# DEPRECATED: Removed in favor of MCPClient config
+# MAX_TURNS - use mcp_client.config.max_agent_turns
+# MAX_BUDGET_USD - use mcp_client.config.max_budget_usd  
+# SMART_MODEL_NAME - use mcp_client.config.default_model
+# FAST_MODEL_NAME - use mcp_client.config.default_cheap_and_fast_model
 
 ###############################################################################
 # SECTION 2. Enumerations & simple data classes
@@ -937,11 +945,18 @@ class StructuredCall:
     def __init__(
         self,
         mcp_client,
-        model_name: str = FAST_MODEL_NAME,
-        cost_cap_usd: float = FAST_CALL_MAX_USD,
+        model_name: str = None,
+        cost_cap_usd: float = None,
         max_retries: int = 2,
     ) -> None:
         self.mcp_client = mcp_client
+        
+        # Use MCPClient config values with fallbacks to constants
+        if model_name is None:
+            model_name = getattr(mcp_client.config, 'default_cheap_and_fast_model', DEFAULT_FAST_MODEL)
+        if cost_cap_usd is None:
+            cost_cap_usd = FAST_CALL_MAX_USD
+            
         self.model_name = model_name
         self.cost_cap = cost_cap_usd
         self.max_retries = max_retries
@@ -1921,7 +1936,10 @@ class LLMOrchestrator:
     def __init__(self, mcp_client, state: AMLState):
         self.mcp_client = mcp_client
         self.state = state
-        self._fast_query = StructuredCall(mcp_client, model_name=FAST_MODEL_NAME)
+        
+        # Use MCPClient config for fast model with fallback
+        fast_model = getattr(mcp_client.config, 'default_cheap_and_fast_model', DEFAULT_FAST_MODEL)
+        self._fast_query = StructuredCall(mcp_client, model_name=fast_model)
 
     async def fast_structured_call(self, prompt: str, schema: dict[str, Any]):
         """Thin wrapper that delegates to `StructuredCall.query` which now uses MCPClient infrastructure."""
@@ -2728,17 +2746,21 @@ class AgentMasterLoop:
     async def _gather_context(self) -> Dict[str, Any]:
         """Collects all information fed into the SMART-model prompt."""
         # 🔹NEW --- Vector-similar memories for the *current* leaf goal ------
-        sim_res = self.mcp_client._execute_tool_and_parse_for_agent(
-            "UMS_Server",
-            "get_similar_memories",
-            {
-                "workflow_id": self.state.workflow_id,
-                "memory_id": self.state.current_leaf_goal_id,
-                "k": 8,
-                "include_content": True,
-            },
-        )
-        top_similar = sim_res["data"]["memories"]   # list[dict]
+        try:
+            sim_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "get_similar_memories",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_id": self.state.current_leaf_goal_id,
+                    "k": 8,
+                    "include_content": True,
+                },
+            )
+            top_similar = sim_res.get("data", {}).get("memories", []) if sim_res.get("success") else []
+        except Exception as e:
+            self.logger.warning(f"Failed to get similar memories: {e}")
+            top_similar = []
 
         # Snapshot graph (no change) -----------------------------------------
         graph_snapshot = await self.mem_graph.snapshot_context_graph()
@@ -2760,11 +2782,20 @@ class AgentMasterLoop:
         # ------------------------------------------------------------------
         # Recent memories **with outgoing links** (link-aware utility)
         # ------------------------------------------------------------------
-        mems_res = self.mcp_client._execute_tool_and_parse_for_agent(
-            "UMS_Server",
-            "get_recent_memories_with_links",
-            {"workflow_id": self.state.workflow_id, "limit": 10},
-        )
+        try:
+            mems_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "get_recent_memories_with_links",
+                {"workflow_id": self.state.workflow_id, "limit": 10},
+            )
+            
+            if mems_res.get("success") and mems_res.get("data"):
+                recent_memories = mems_res["data"].get("memories", [])
+            else:
+                recent_memories = []
+        except Exception as e:
+            self.logger.warning(f"Failed to get recent memories: {e}")
+            recent_memories = []
 
         recent_actions_text = "\n".join(
             "• {type} {mid}: {links}".format(
@@ -2772,23 +2803,27 @@ class AgentMasterLoop:
                 mid=m["memory_id"][:6],
                 links=", ".join(l["link_type"] for l in m.get("outgoing_links", [])) or "no links",  # noqa: E741
             )
-            for m in mems_res["data"]["memories"]
+            for m in recent_memories
         )
 
         # ------------------------------------------------------------------
         # Goal context: path leaf-goal ➜ root  (subgraph, link-aware)
         # ------------------------------------------------------------------
-        path_res = self.mcp_client._execute_tool_and_parse_for_agent(
-            "UMS_Server",
-            "get_subgraph",
-            {
-                "workflow_id": self.state.workflow_id,
-                "start_node_id": self.state.current_leaf_goal_id,
-                "direction": "up",
-                "max_hops": 4,
-            },
-        )
-        goal_path_nodes = [n["node_id"] for n in path_res["data"]["nodes"]]
+        try:
+            path_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "get_subgraph",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "start_node_id": self.state.current_leaf_goal_id,
+                    "direction": "up",
+                    "max_hops": 4,
+                },
+            )
+            goal_path_nodes = [n["node_id"] for n in path_res.get("data", {}).get("nodes", [])] if path_res.get("success") else []
+        except Exception as e:
+            self.logger.warning(f"Failed to get goal subgraph: {e}")
+            goal_path_nodes = []
 
         return {
             "graph_snapshot": graph_snapshot,
@@ -3066,10 +3101,7 @@ class AgentMasterLoop:
         )
         self.mem_graph.flush()
 
-    # ------------------------------------------------------------- budget etc
-
-    def _budget_exceeded(self) -> bool:
-        return self.state.cost_usd >= MAX_BUDGET_USD
+    # -------------------------------------------------------- failure handling
 
     def _hard_fail(self, reason: str) -> str:
         """Marks workflow failed and returns 'failed'."""
@@ -3162,7 +3194,7 @@ def pick_model(phase: Phase, *, cost_sensitive: bool = False) -> str:
     Returns
     -------
     str
-        The model name constant (either `SMART_MODEL_NAME` or `FAST_MODEL_NAME`).
+        The model name constant (either `DEFAULT_SMART_MODEL` or `DEFAULT_FAST_MODEL`).
 
     Decision Matrix
     ---------------
@@ -3183,12 +3215,12 @@ def pick_model(phase: Phase, *, cost_sensitive: bool = False) -> str:
     """
     # Forced downgrade if caller signals budget pressure
     if cost_sensitive and phase is not Phase.EXECUTE:
-        return FAST_MODEL_NAME
+        return DEFAULT_FAST_MODEL
 
     if phase in {Phase.UNDERSTAND, Phase.PLAN, Phase.GRAPH_MAINT, Phase.COMPLETE}:
-        return FAST_MODEL_NAME
+        return DEFAULT_FAST_MODEL
     if phase in {Phase.EXECUTE, Phase.REVIEW}:
-        return SMART_MODEL_NAME
+        return DEFAULT_SMART_MODEL
     # Fallback – should never happen but errs on the side of capability
-    return SMART_MODEL_NAME
+    return DEFAULT_SMART_MODEL
 
