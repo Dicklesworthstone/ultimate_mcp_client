@@ -12113,7 +12113,7 @@ class MCPClient:
 
         current_agent_internal_loop = "N/A"
         if self.agent_loop_instance and hasattr(self.agent_loop_instance, "state") and hasattr(self.agent_loop_instance.state, "current_loop"):
-            current_agent_internal_loop = str(self.agent_loop_instance.state.current_loop)
+            current_agent_internal_loop = str(self.agent_loop_instance.state.loop_count)
 
         logger_to_use.info(f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}) DETAILS (BEGIN) ==================")
         logger_to_use.info(f"MCPC AGENT LLM PROMPT (AML Turn {current_agent_internal_loop}): Model for this turn: {model_name}")
@@ -12247,10 +12247,55 @@ class MCPClient:
             if llm_error_message:
                 final_decision = {"decision": "error", "message": llm_error_message, "error_type_for_agent": "LLMError"}
             elif executed_tool_details_for_agent or llm_requested_tool_calls:
-                # ATOMIC TOOL CALL PROCESSING - handles multiple tool calls properly
-                final_decision = self._process_multiple_tool_calls_atomically(
-                    llm_requested_tool_calls, executed_tool_details_for_agent
-                )
+                # PARALLEL TOOL DETECTION - Check for multiple independent tools
+                if len(llm_requested_tool_calls) > 1:
+                    # Check if tools are independent (no arg dependencies)
+                    independent = True
+                    tool_names = [tc["name"] for tc in llm_requested_tool_calls]
+                    
+                    # Simple heuristic: if tools are different types and don't reference each other
+                    for i, tc in enumerate(llm_requested_tool_calls):
+                        for arg_value in tc.get("input", {}).values():
+                            if isinstance(arg_value, str):
+                                # Check if this references another tool's output
+                                for j, other_tc in enumerate(llm_requested_tool_calls):
+                                    if i != j and (
+                                        f"result_{j}" in arg_value or 
+                                        f"output_{j}" in arg_value or
+                                        "previous" in arg_value.lower()
+                                    ):
+                                        independent = False
+                                        break
+                            if not independent:
+                                break
+                        if not independent:
+                            break
+                    
+                    if independent:
+                        # Return special decision type for parallel execution
+                        final_decision = {
+                            "decision": "PARALLEL_TOOLS",
+                            "tool_calls": [
+                                {
+                                    "tool_name": tc["name"],
+                                    "tool_args": tc["input"],
+                                    "tool_id": tc.get("id", f"tool_{i}")
+                                }
+                                for i, tc in enumerate(llm_requested_tool_calls)
+                            ]
+                        }
+                        logger_to_use.info(f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} independent tools for parallel execution: {tool_names}")
+                    else:
+                        # ATOMIC TOOL CALL PROCESSING - handles multiple tool calls properly (sequential)
+                        final_decision = self._process_multiple_tool_calls_atomically(
+                            llm_requested_tool_calls, executed_tool_details_for_agent
+                        )
+                        logger_to_use.info(f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} dependent tools for sequential execution: {tool_names}")
+                else:
+                    # ATOMIC TOOL CALL PROCESSING - handles single tool call
+                    final_decision = self._process_multiple_tool_calls_atomically(
+                        llm_requested_tool_calls, executed_tool_details_for_agent
+                    )
             else:
                 # UNIFIED PLAN PARSING - for text-based content only
                 final_decision = self._parse_agent_plan_unified(
@@ -12334,7 +12379,7 @@ class MCPClient:
             try:
                 agent_model_to_use = default_llm_model_override or self.current_model
                 self.agent_loop_instance = ActualAgentMasterLoopClass(
-                    mcp_client_instance=self,  # Pass self (MCPClient instance)
+                    mcp_client=self,  # Pass self (MCPClient instance)
                     default_llm_model_string=agent_model_to_use,
                     agent_state_file=self.config.agent_state_file_path,  # Pass state file path
                 )
@@ -12426,7 +12471,7 @@ class MCPClient:
         agent_internal_state = self.agent_loop_instance.state  # Get a reference for clarity
 
         # Reset AML's internal processing loop counter FOR THIS NEW RUN.
-        agent_internal_state.current_loop = 0
+        agent_internal_state.loop_count = 0
         # Reset goal_achieved_flag FOR THIS NEW RUN.
         agent_internal_state.goal_achieved_flag = False
         # Reset error tracking FOR THIS NEW RUN.
@@ -12449,9 +12494,9 @@ class MCPClient:
         # Log the state of critical AML properties *after* MCPClient's run-specific resets.
         log.info(
             f"MCPC: Agent run-specific state (re)set for new task '{goal[:50]}...'. "
-            f"AML Internal Loop (target for next turn): {agent_internal_state.current_loop + 1}. "
+            f"AML Internal Loop (target for next turn): {agent_internal_state.loop_count + 1}. "
             f"Effective WF ID from AML state: {_fmt_id(agent_internal_state.workflow_id)}. "
-            f"Effective Current UMS Goal ID from AML state: {_fmt_id(agent_internal_state.current_goal_id)}. "
+            f"Effective Current UMS Goal ID from AML state: {_fmt_id(agent_internal_state.current_leaf_goal_id)}. "
             f"AML Goal Stack Depth: {len(agent_internal_state.goal_stack)}. "
             f"AML Plan Steps: {len(agent_internal_state.current_plan) if agent_internal_state.current_plan else 0}. "
             f"AML NeedsReplan: {agent_internal_state.needs_replan}"
@@ -12506,7 +12551,7 @@ class MCPClient:
             finally:
                 # Update MCPClient's view of the agent's loop count *after* the task finishes
                 # This reflects how many loops AML *actually* ran in its last session for this task.
-                self.agent_current_loop = agent_loop_instance_ref.state.current_loop if agent_loop_instance_ref else self.agent_max_loops
+                self.agent_current_loop = agent_loop_instance_ref.state.loop_count if agent_loop_instance_ref else self.agent_max_loops
                 log.info(
                     f"MCPC Agent Task (Wrapper): Finished. Final MCPC status: {self.agent_status}. AML loops completed: {self.agent_current_loop}."
                 )
@@ -12592,7 +12637,7 @@ class MCPClient:
         # --- If AgentMasterLoop instance exists, get more detailed state ---
         if self.agent_loop_instance:
             agent_state = self.agent_loop_instance.state  # Shortcut to agent's internal state
-            agent_internal_loop_count = agent_state.current_loop
+            agent_internal_loop_count = agent_state.loop_count
             agent_last_action_summary = agent_state.last_action_summary
             agent_target_model_name = self.agent_loop_instance.agent_llm_model  # Get the model AML is configured with
             agent_workflow_id = agent_state.workflow_id
@@ -12624,21 +12669,21 @@ class MCPClient:
 
             # Get current UMS goal and stack summary from agent's state
             # The agent's `self.state.goal_stack` should contain full UMS goal dictionaries
-            # The agent's `self.state.current_goal_id` is the ID of its current operational UMS goal
-            agent_current_ums_goal_id = agent_state.current_goal_id
+            # The agent's `self.state.current_leaf_goal_id` is the ID of its current operational UMS goal
+            agent_current_ums_goal_id = agent_state.current_leaf_goal_id
 
-            if agent_state.current_goal_id and agent_state.goal_stack:
+            if agent_state.current_leaf_goal_id and agent_state.goal_stack:
                 # Find the current operational goal object in the stack
                 current_op_goal_obj_from_stack = next(
-                    (g for g in reversed(agent_state.goal_stack) if isinstance(g, dict) and g.get("goal_id") == agent_state.current_goal_id), None
+                    (g for g in reversed(agent_state.goal_stack) if isinstance(g, dict) and g.get("goal_id") == agent_state.current_leaf_goal_id), None
                 )
                 if current_op_goal_obj_from_stack:
                     agent_current_ums_goal_desc = current_op_goal_obj_from_stack.get("description", "Unnamed UMS Operational Goal")
                 else:
-                    agent_current_ums_goal_desc = f"UMS Goal ID '{_fmt_id(agent_state.current_goal_id)}' (Details not in local stack)"
+                    agent_current_ums_goal_desc = f"UMS Goal ID '{_fmt_id(agent_state.current_leaf_goal_id)}' (Details not in local stack)"
                     
                     # Throttle this warning to prevent log spam - only warn once per 30 seconds per goal ID
-                    warning_key = f"goal_sync_warning_{agent_state.current_goal_id}"
+                    warning_key = f"goal_sync_warning_{agent_state.current_leaf_goal_id}"
                     import time
                     current_time = time.time()
                     
@@ -12648,12 +12693,12 @@ class MCPClient:
                     last_warning_time = self._last_warning_times.get(warning_key, 0)
                     if current_time - last_warning_time > 30:  # Only warn every 30 seconds
                         log.warning(
-                            f"MCPC: Agent's current_goal_id {_fmt_id(agent_state.current_goal_id)} not found in its local goal_stack of {len(agent_state.goal_stack)} items. "
+                            f"MCPC: Agent's current_leaf_goal_id {_fmt_id(agent_state.current_leaf_goal_id)} not found in its local goal_stack of {len(agent_state.goal_stack)} items. "
                             f"This usually indicates a temporary sync issue that resolves automatically."
                         )
                         self._last_warning_times[warning_key] = current_time
                     else:
-                        log.debug(f"MCPC: Goal sync mismatch (throttled warning) - current_goal_id {_fmt_id(agent_state.current_goal_id)} not in local stack")
+                        log.debug(f"MCPC: Goal sync mismatch (throttled warning) - current_leaf_goal_id {_fmt_id(agent_state.current_leaf_goal_id)} not in local stack")
 
                 # Summarize the agent's local view of the UMS goal stack for the API
                 # The stack in agent_state.goal_stack is already ordered root-to-leaf
@@ -12669,11 +12714,11 @@ class MCPClient:
                                 "status": goal_dict_from_agent_stack.get("status", "unknown"),
                             }
                         )
-            elif not agent_state.current_goal_id and agent_state.workflow_id:
+            elif not agent_state.current_leaf_goal_id and agent_state.workflow_id:
                 # Workflow is active, but no specific UMS goal is the current focus (e.g., between root goals, or if root failed to set)
                 agent_current_ums_goal_desc = "Workflow active, UMS operational goal not set."
-                if agent_state.goal_stack:  # Should be empty if current_goal_id is None
-                    log.warning("MCPC: Agent has goal_stack items but no current_goal_id. Inconsistent state.")
+                if agent_state.goal_stack:  # Should be empty if current_leaf_goal_id is None
+                    log.warning("MCPC: Agent has goal_stack items but no current_leaf_goal_id. Inconsistent state.")
 
         # --- Construct the final status dictionary for the API ---
         status_to_return = {
@@ -12738,7 +12783,7 @@ class MCPClient:
                 break
 
             self.agent_current_loop = loop_num_mcp_managed
-            current_aml_loop = agent_loop.state.current_loop + 1
+            current_aml_loop = agent_loop.state.loop_count + 1
             self.safe_print(
                 f"\n--- MCPC: Starting Agent Turn {loop_num_mcp_managed + 1}/{max_agent_loops} (AML Internal Loop: {current_aml_loop}) ---"
             )
@@ -12924,7 +12969,7 @@ class MCPClient:
                     await agent_loop.shutdown()
                 break
 
-            # Note: AgentMasterLoop.state.current_loop is incremented internally by agent_loop.execute_llm_decision upon success.
+            # Note: AgentMasterLoop.state.loop_count is incremented internally by agent_loop.execute_llm_decision upon success.
 
             if agent_loop.state.goal_achieved_flag:
                 self.safe_print("MCPC: Agent goal_achieved_flag is now true after decision execution. Stopping.")
@@ -12936,7 +12981,7 @@ class MCPClient:
             await asyncio.sleep(0.1)
 
         # --- Loop End ---
-        final_aml_loop_count = agent_loop.state.current_loop if agent_loop else 0
+        final_aml_loop_count = agent_loop.state.loop_count if agent_loop else 0
         self.agent_current_loop = final_aml_loop_count  # Ensure final sync for agentStatus API
 
         # Update final status based on how the loop exited
