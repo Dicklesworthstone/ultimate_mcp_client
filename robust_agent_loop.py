@@ -17,7 +17,6 @@ import datetime as _dt
 import enum
 import heapq
 import json
-import logging
 import math
 import os
 import re
@@ -373,7 +372,7 @@ class MemoryGraphManager:
                             result.add((mem_j["memory_id"], mem_i["memory_id"]))
         except Exception:
             pass  # Continue if this rule fails
-
+         
         # Rule 3: Soft negative feedback loops (A→B→…→A via CAUSAL edges) ----
         try:
             causal_res = await self.mcp_client._execute_tool_and_parse_for_agent(
@@ -428,7 +427,7 @@ class MemoryGraphManager:
             
             # Find hubs (memories with >= min_size links)
             hubs = [mem for mem in memories if mem.get("link_count", 0) >= min_size]
-            
+                
             for hub in hubs:
                 hub_id = hub["memory_id"]
                 
@@ -442,7 +441,7 @@ class MemoryGraphManager:
                         "limit": 20
                     }
                 )
-                
+            
                 if not links_res.get("success") or not links_res.get("data"):
                     continue
                     
@@ -665,8 +664,8 @@ class MemoryGraphManager:
             )
             if meta_src_res.get("success") and meta_src_res.get("data"):
                 meta_src = meta_src_res["data"].get("metadata", {}).get("link_type_cache", {})
-                if tgt_id in meta_src:
-                    return meta_src[tgt_id]
+            if tgt_id in meta_src:
+                return meta_src[tgt_id]
                     
             meta_tgt_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
@@ -675,8 +674,8 @@ class MemoryGraphManager:
             )
             if meta_tgt_res.get("success") and meta_tgt_res.get("data"):
                 meta_tgt = meta_tgt_res["data"].get("metadata", {}).get("link_type_cache", {})
-                if src_id in meta_tgt:
-                    return meta_tgt[src_id]
+            if src_id in meta_tgt:
+                return meta_tgt[src_id]
         except Exception:
             # Any metadata hiccup → fall back to normal path
             pass
@@ -869,13 +868,13 @@ class MemoryGraphManager:
                 cache = meta.get("link_type_cache", {})
                 cache[b] = link_type
                 meta["link_type_cache"] = cache
-                
+                    
                 await self.mcp_client._execute_tool_and_parse_for_agent(
                     self.ums_server_name,
                     "update_memory_metadata",
                     {"workflow_id": self.state.workflow_id,
-                     "memory_id": a,
-                     "metadata": meta}
+                    "memory_id": a,
+                    "metadata": meta}
                 )
             except Exception:
                 continue
@@ -1291,7 +1290,7 @@ class MetacognitionEngine:
         mcp_client,
         state: AMLState,
         mem_graph: "MemoryGraphManager",
-        llm_orch: "LLMOrchestrator", 
+        llm_orch: "LLMOrchestrator",
         async_queue: "AsyncTaskQueue",
     ) -> None:
         self.mcp_client = mcp_client
@@ -1764,13 +1763,13 @@ class GraphReasoner:
         
         try:
             result = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+            "UMS_Server",
                 "summarize_text",
-                {
+            {
                     "text": text_blob,
-                    "target_tokens": target_tokens,
+                "target_tokens": target_tokens,
                     "context": "graph_snapshot",
-                    "workflow_id": self.llms.state.workflow_id,
+                "workflow_id": self.llms.state.workflow_id,
                 }
             )
             if result.get("success") and result.get("data"):
@@ -1890,25 +1889,25 @@ class ToolExecutor:
                         context_snip="attempts to satisfy goal via tool",
                     )
 
-                    # Link inputs -> action (if args reference memory ids)
-                    for val in tool_args.values():
-                        if isinstance(val, str) and val.startswith("mem_"):  # crude check
-                            await self.mem_graph.auto_link(
-                                src_id=val,
-                                tgt_id=action_mem_id,
-                                context_snip="input to tool",
-                            )
+            # Link inputs -> action (if args reference memory ids)
+            for val in tool_args.values():
+                if isinstance(val, str) and val.startswith("mem_"):  # crude check
+                    await self.mem_graph.auto_link(
+                        src_id=val,
+                        tgt_id=action_mem_id,
+                        context_snip="input to tool",
+                    )
 
                     # Link action -> outputs (if result contains memory_ids)
                     result_data = result_envelope.get("data", {})
                     if isinstance(result_data, dict) and "memory_id" in result_data:
                         output_id = result_data["memory_id"]
-                        await self.mem_graph.auto_link(
-                            src_id=action_mem_id,
-                            tgt_id=output_id,
-                            context_snip="tool output",
-                            kind_hint=LinkKind.SEQUENTIAL,
-                        )
+            await self.mem_graph.auto_link(
+                src_id=action_mem_id,
+                tgt_id=output_id,
+                context_snip="tool output",
+                kind_hint=LinkKind.SEQUENTIAL,
+            )
                         
         except Exception as memory_error:
             # Log memory creation/linking errors but don't fail the tool execution
@@ -2172,23 +2171,23 @@ class ProceduralAgenda:
                 "UMS_Server",
                 "create_goal",
                 {
-                    "workflow_id": self.state.workflow_id,
-                    "goal_id": goal.goal_id,
-                    "parent_goal_id": goal.parent_goal_id,
-                    "title": goal.title,
-                    "description": goal.description,
-                    "status": goal.status.value,
-                    "priority": goal.priority,
-                    "sequence_number": goal.sequence_number,
+            "workflow_id": self.state.workflow_id,
+            "goal_id": goal.goal_id,
+            "parent_goal_id": goal.parent_goal_id,
+            "title": goal.title,
+            "description": goal.description,
+            "status": goal.status.value,
+            "priority": goal.priority,
+            "sequence_number": goal.sequence_number,
                     "created_at": goal.created_at,
-                    "updated_at": goal.updated_at,
-                }
+            "updated_at": goal.updated_at,
+        }
             )
             
             # If create fails (goal might already exist), try update
             if not create_result.get("success"):
                 update_result = self.mcp_client._execute_tool_and_parse_for_agent(
-                    "UMS_Server",
+            "UMS_Server",
                     "update_goal",
                     {
                         "workflow_id": self.state.workflow_id,
@@ -2251,7 +2250,7 @@ class ProceduralAgenda:
             # Try the standard get_goals tool first
             result = self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
-                "get_goals",
+                    "get_goals",
                 {"workflow_id": self.state.workflow_id},
             )
             
@@ -2270,7 +2269,7 @@ class ProceduralAgenda:
             return  # Start with empty goal set
             
         # Extract goals from result with robust structure handling
-        goals = []
+            goals = []
         if result.get("success") and result.get("data"):
             data = result["data"]
             if isinstance(data, dict):
@@ -2291,9 +2290,9 @@ class ProceduralAgenda:
                 goal = Goal(
                     goal_id=g["goal_id"],
                     parent_goal_id=g.get("parent_goal_id"),
-                    title=g.get("title", "Untitled Goal"),
-                    description=g.get("description", ""),
-                    status=GoalStatus(g.get("status", "planned")),
+                        title=g.get("title", "Untitled Goal"),
+                        description=g.get("description", ""),
+                        status=GoalStatus(g.get("status", "planned")),
                     priority=g.get("priority", 3),
                     sequence_number=g.get("sequence_number", 0),
                     created_at=g.get("created_at", _ts()),
@@ -2612,7 +2611,7 @@ class AgentMasterLoop:
         try:
             # 1. Create workflow
             wf_resp = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+            "UMS_Server",
                 "create_workflow",
                 {
                     "title": f"Agent Task – {overall_goal[:60]}",
@@ -2627,16 +2626,16 @@ class AgentMasterLoop:
 
             # 2. Create root goal
             goal_resp = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+            "UMS_Server",
                 "create_or_update_goal",
                 {
                     "workflow_id": self.state.workflow_id,
                     "title": "Complete Agent Task",
                     "description": overall_goal,
-                    "status": "active",
-                    "priority": 1,
-                },
-            )
+                "status": "active",
+                "priority": 1,
+            },
+        )
             
             if not goal_resp.get("success") or not goal_resp.get("data"):
                 raise RuntimeError("Failed to create root goal in UMS")
@@ -2721,7 +2720,7 @@ class AgentMasterLoop:
             # Fail after too many consecutive errors
             if self.state.consecutive_error_count >= 3:
                 return self._record_failure("consecutive_errors")
-            return "continue"
+        return "continue"
 
     # -------------------------------------------------- helper: gather context
 
@@ -2853,7 +2852,7 @@ class AgentMasterLoop:
                     if new_mem_id:
                         # Link summary ➜ original with ELABORATES so graph queries know
                         await self.mem_graph.auto_link(
-                            src_id=new_mem_id,
+                                    src_id=new_mem_id,
                             tgt_id=target_id,
                             context_snip="machine-generated summary",
                         )
@@ -2906,15 +2905,9 @@ class AgentMasterLoop:
                         # Link both original memories to the analysis node
                         await self.mem_graph.auto_link(
                             src_id=aid,
-                            tgt_id=contr_mem_id,
+                                    tgt_id=contr_mem_id,
                             context_snip="contradiction_summary",
                         )
-                        await self.mem_graph.auto_link(
-                            src_id=bid,
-                            tgt_id=contr_mem_id,
-                            context_snip="contradiction_summary",
-                        )
-
             coro = self.llms.fast_structured_call(prompt, schema)
             task_name = f"contradict_{a_id[:4]}_{b_id[:4]}"
             self.async_queue.spawn(AsyncTask(task_name, coro, callback=_on_contradiction))
@@ -3011,8 +3004,8 @@ class AgentMasterLoop:
                                 thought_mem_id=mem_id,
                                 evidence_ids=evid_ids,
                             )
-                self.state.last_action_summary = "Generated reasoning thought"
-                return bool(thought.strip())
+                        self.state.last_action_summary = "Generated reasoning thought"
+                        return bool(thought.strip())
             elif dtype == "DONE":
                 self.state.phase = Phase.COMPLETE
                 self.state.goal_achieved_flag = True
@@ -3051,8 +3044,8 @@ class AgentMasterLoop:
                             thought_mem_id=mem_id,
                             evidence_ids=evid_ids,
                         )
-            self.state.last_action_summary = "Processed unstructured response"
-            return bool(text.strip())
+                    self.state.last_action_summary = "Processed unstructured response"
+                    return bool(text.strip())
 
     # ----------------------------------------------------- after-turn misc
 
