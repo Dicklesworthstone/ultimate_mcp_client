@@ -47,6 +47,8 @@ dependencies = [
     "typing-extensions",
     "zeroconf",
     "networkx",
+    "numpy",
+    "scipy",
     "opentelemetry-sdk",
     "opentelemetry-api",
     "opentelemetry-instrumentation",
