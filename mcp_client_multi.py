@@ -825,9 +825,11 @@ signal.signal(signal.SIGINT, sigint_handler)
 atexit.register(atexit_handler)
 
 
-def _fmt_id(val: Any, length: int = 8) -> str:
-    s = str(val) if val is not None else "?"
-    return s[:length] if len(s) >= length else s
+def _fmt_id(workflow_id: Optional[str]) -> str:
+    """Helper function to format workflow IDs for logging."""
+    if workflow_id is None:
+        return "None"
+    return workflow_id[:12] if len(workflow_id) > 12 else workflow_id
 
 
 # --- Pydantic Models (ServerAddRequest, ConfigUpdateRequest, etc. - Update ConfigUpdateRequest) ---
@@ -2617,6 +2619,7 @@ class Config:
         # Complex structures
         self.servers: Dict[str, ServerConfig] = {}
         self.cache_ttl_mapping: Dict[str, int] = {}
+
 
     def _apply_env_overrides(self):
         """Overrides simple config values with environment variables if they are set."""
@@ -5218,7 +5221,7 @@ class MCPClient:
         self.agent_loop_instance: Optional[AgentMasterLoop] = None
         self.agent_task: Optional[asyncio.Task] = None
         self.agent_goal: Optional[str] = None
-        self.agent_status: str = "idle"  # idle, running, completed, failed, stopped
+        self.agent_status: str = "idle"  # possible values: "idle", "starting", "running", "stopping", "stopped", "completed", "failed", "error_initializing_agent"
         self.agent_last_message: Optional[str] = None
         self.agent_current_loop: int = 0
         self.agent_max_loops: int = 0
@@ -5292,6 +5295,68 @@ class MCPClient:
         else:
             self.logger.info("Readline setup skipped on Windows.")  # Use self.logger
 
+    async def _initialize_agent_if_needed(self, default_llm_model_override: Optional[str] = None) -> bool:
+        """
+        Instantiate or re-initialize the AgentMasterLoop instance.
+        
+        Args:
+            default_llm_model_override: Optional model string to override the default
+            
+        Returns:
+            bool: True if initialization was successful, False otherwise
+        """
+        if self.agent_loop_instance is None:
+            log.info("MCPC: Initializing AgentMasterLoop instance for the first time...")
+            ActualAgentMasterLoopClass = None
+            
+            try:
+                from robust_agent_loop import AgentMasterLoop as AMLClass
+                ActualAgentMasterLoopClass = AMLClass
+                log.debug(f"MCPC: Successfully imported AgentMasterLoop as AMLClass: {type(ActualAgentMasterLoopClass)}")
+            except ImportError as ie:
+                log.critical(f"MCPC: CRITICAL - Failed to import AgentMasterLoop class from 'robust_agent_loop.py': {ie}", exc_info=True)
+                return False
+                
+            if not callable(ActualAgentMasterLoopClass):  # Check if it's a class
+                log.critical(f"MCPC: CRITICAL - AgentMasterLoop is not a callable class after import. Type: {type(ActualAgentMasterLoopClass)}")
+                return False
+                
+            model_to_use = default_llm_model_override or self.config.default_model
+            
+            try:
+                self.agent_loop_instance = ActualAgentMasterLoopClass(
+                    mcp_client=self,
+                    default_llm_model_string=model_to_use,
+                    agent_state_file=self.config.agent_state_file_path
+                )
+                log.info(f"MCPC: AgentMasterLoop instance created. Model: {model_to_use}")
+            except Exception as e:
+                log.critical(f"MCPC: CRITICAL - Error instantiating AgentMasterLoop: {e}", exc_info=True)
+                self.agent_loop_instance = None
+                return False
+        else:
+            log.info("MCPC: Reusing existing AgentMasterLoop instance for new task. Will re-initialize its state.")
+            
+            if default_llm_model_override is not None and self.agent_loop_instance.agent_llm_model != default_llm_model_override:
+                log.info(f"MCPC: Updating agent's LLM model for new task from '{self.agent_loop_instance.agent_llm_model}' to '{default_llm_model_override}'.")
+                self.agent_loop_instance.agent_llm_model = default_llm_model_override
+        
+        # Initialize/re-initialize the agent state
+        log.info("MCPC: Calling .initialize() on AgentMasterLoop instance to prepare for new task...")
+        try:
+            initialization_success = await self.agent_loop_instance.initialize()
+            if not initialization_success:
+                log.error("MCPC: AgentMasterLoop instance .initialize() method FAILED. Agent task cannot start correctly.")
+                self.agent_status = "error_initializing_agent"
+                return False
+        except Exception as e:
+            log.error(f"MCPC: Exception during AgentMasterLoop .initialize(): {e}", exc_info=True)
+            self.agent_status = "error_initializing_agent"
+            return False
+            
+        log.info(f"MCPC: AgentMasterLoop initialized/re-initialized successfully for new task. Effective WF ID: {_fmt_id(self.agent_loop_instance.state.workflow_id)}")
+        return True
+        
     def _initialize_commands(self):
         """Populates the command dictionary."""
         # Map command strings to their corresponding async methods
@@ -12791,40 +12856,54 @@ class MCPClient:
             self.agent_status = "running"
             self.agent_last_message = f"Executing turn {current_aml_loop}."
 
-            # 1. Agent prepares data for the LLM turn.
-            turn_data_for_llm_dict: Optional[Dict[str, Any]] = None  # Initialize
-            prompt_messages: Optional[List[Dict[str, Any]]] = None
-            tool_schemas: Optional[List[Dict[str, Any]]] = None
+            # 1. Agent prepares data for the LLM turn by calling run_main_loop
+            turn_data_for_llm: Optional[Dict[str, Any]] = None
 
             try:
-                turn_data_for_llm_dict = await agent_loop.run_main_loop(overall_goal, max_agent_loops)
-                if turn_data_for_llm_dict is None:
+                turn_data_for_llm = await agent_loop.run_main_loop(overall_goal, max_agent_loops)
+                
+                # Handle agent signals stop (return None)
+                if turn_data_for_llm is None:
                     self.safe_print("MCPC: Agent signaled termination during its data preparation phase (run_main_loop returned None).")
                     log.info("MCPC: AgentMasterLoop.run_main_loop returned None, signaling stop.")
                     self.agent_status = "stopped"
                     self.agent_last_message = "Agent run_main_loop phase signaled stop."
                     break
 
-                if (
-                    not isinstance(turn_data_for_llm_dict, dict)
-                    or "prompt_messages" not in turn_data_for_llm_dict
-                    or "tool_schemas" not in turn_data_for_llm_dict
-                ):
-                    log.error(
-                        f"MCPC: CRITICAL - AgentMasterLoop.run_main_loop returned unexpected data format: {type(turn_data_for_llm_dict)}. Keys: {list(turn_data_for_llm_dict.keys()) if isinstance(turn_data_for_llm_dict, dict) else 'N/A'}. Expected dict with 'prompt_messages' and 'tool_schemas'."
-                    )
+                # Validate structure of turn_data_for_llm (must be dict with required keys)
+                required_keys = ["prompt_messages", "tool_schemas", "force_structured_output", "force_tool_choice", "ums_tool_schemas"]
+                if not isinstance(turn_data_for_llm, dict):
+                    log.error(f"MCPC: CRITICAL - AgentMasterLoop.run_main_loop returned non-dict: {type(turn_data_for_llm)}")
                     self.agent_status = "failed"
-                    self.agent_last_message = "Internal error: Agent data preparation failed."
+                    self.agent_last_message = "Internal error: Agent data preparation failed - invalid data type."
                     if agent_loop and not agent_loop._shutdown_event.is_set():
                         await agent_loop.shutdown()
                     break
 
-                prompt_messages = turn_data_for_llm_dict.get("prompt_messages")
-                tool_schemas = turn_data_for_llm_dict.get("tool_schemas")
+                missing_keys = [key for key in required_keys if key not in turn_data_for_llm]
+                if missing_keys:
+                    log.error(
+                        f"MCPC: CRITICAL - AgentMasterLoop.run_main_loop returned dict missing required keys: {missing_keys}. "
+                        f"Available keys: {list(turn_data_for_llm.keys())}"
+                    )
+                    self.agent_status = "failed"
+                    self.agent_last_message = "Internal error: Agent data structure missing required keys."
+                    if agent_loop and not agent_loop._shutdown_event.is_set():
+                        await agent_loop.shutdown()
+                    break
 
+                # Extract values from turn_data_for_llm
+                prompt_messages = turn_data_for_llm.get("prompt_messages")
+                tool_schemas = turn_data_for_llm.get("tool_schemas")
+                force_structured_output = turn_data_for_llm.get("force_structured_output")
+                force_tool_choice = turn_data_for_llm.get("force_tool_choice")
+                ums_tool_schemas_for_llm = turn_data_for_llm.get("ums_tool_schemas")
+
+                # Additional validation for critical values
                 if prompt_messages is None or tool_schemas is None:
                     log.error(
-                        f"MCPC: CRITICAL - 'prompt_messages' or 'tool_schemas' missing from agent_loop.run_main_loop result. PM type: {type(prompt_messages)}, TS type: {type(tool_schemas)}"
+                        f"MCPC: CRITICAL - 'prompt_messages' or 'tool_schemas' is None. "
+                        f"PM type: {type(prompt_messages)}, TS type: {type(tool_schemas)}"
                     )
                     self.agent_status = "failed"
                     self.agent_last_message = "Internal error: Agent data structure malformed."
@@ -12849,55 +12928,21 @@ class MCPClient:
                     await agent_loop.shutdown()
                 break
 
-            # Ensure prompt_messages and tool_schemas are not None before proceeding
-            if prompt_messages is None or tool_schemas is None:
-                # This case should have been caught by the checks above, but as a safeguard:
-                log.critical("MCPC: prompt_messages or tool_schemas is None after preparation block. This indicates a logic flaw.")
-                self.agent_status = "failed"
-                self.agent_last_message = "Internal critical error: Malformed agent data."
-                if agent_loop and not agent_loop._shutdown_event.is_set():
-                    await agent_loop.shutdown()
-                break
-
-            # 2. MCPClient makes the LLM call
+            # 2. MCPClient makes the LLM call using process_agent_llm_turn
             self.safe_print(f"MCPC: Requesting LLM decision (Model: {agent_loop.agent_llm_model})...")
             self.agent_last_message = f"Requesting LLM decision for turn {current_aml_loop}..."
 
-            # Detect if we're in a needs_replan state - determine if we should use structured output
-            force_structured_output = False
-            force_tool_choice = None
-            if agent_loop.state.needs_replan:
-                # When replanning is needed, we want to force structured output and tool choice
-                force_structured_output = True
-                # We'll use the provider name later when passing to process_streaming_query
-                # Force tool choice for agent:update_plan
-                sanitized_tool_name = None
-                for schema in tool_schemas:
-                    name = schema.get("name", "")
-                    if not name:
-                        continue
-                    original = self.server_manager.sanitized_to_original.get(name)
-                    if original == AGENT_TOOL_UPDATE_PLAN:
-                        sanitized_tool_name = name
-                        break
-                if sanitized_tool_name:
-                    force_tool_choice = sanitized_tool_name
-                    log.info(f"MCPC: Agent needs replan - forcing structured output and tool choice: {sanitized_tool_name}")
-
             try:
-                # Extract ums_tool_schemas from the turn_data_for_llm_dict if available
-                ums_tool_schemas = turn_data_for_llm_dict.get("ums_tool_schemas", {})
-                
                 # Add timeout protection for LLM calls (3 minutes max)
-                llm_decision = await asyncio.wait_for(
+                llm_decision: Dict = await asyncio.wait_for(
                     self.process_agent_llm_turn(
-                        prompt_messages=prompt_messages,  # Now correctly assigned
-                        tool_schemas=tool_schemas,  # Now correctly assigned
+                        prompt_messages=prompt_messages,
+                        tool_schemas=tool_schemas,
                         model_name=agent_loop.agent_llm_model,
                         ui_websocket_sender=ui_websocket_sender,
                         force_structured_output=force_structured_output,
                         force_tool_choice=force_tool_choice,
-                        ums_tool_schemas=ums_tool_schemas,  # NEW: Pass UMS schemas for structured outputs
+                        ums_tool_schemas=ums_tool_schemas_for_llm,
                     ),
                     timeout=180.0  # 3 minutes timeout
                 )
@@ -12928,14 +12973,15 @@ class MCPClient:
                     await agent_loop.shutdown()
                 break
 
-            # 3. Agent executes the LLM decision.
+            # 3. Agent executes the LLM decision using execute_llm_decision
             decision_type_log = llm_decision.get("decision", "unknown")
             self.safe_print(f"MCPC: Passing LLM decision (type: {decision_type_log}) to agent for execution...")
             log.debug(f"MCPC: LLM decision for agent: {str(llm_decision)[:300]}")
             self.agent_last_message = f"Executing LLM decision (type: {decision_type_log}) for turn {current_aml_loop}..."
+            
             try:
-                # Call execute_llm_decision directly on the agent_loop instance
-                should_continue_loop = await agent_loop.execute_llm_decision(llm_decision)
+                # Call execute_llm_decision and get should_continue flag
+                should_continue: bool = await agent_loop.execute_llm_decision(llm_decision)
 
                 # Relay agent's internal action summary if sender available (AFTER execution)
                 if ui_websocket_sender and agent_loop and agent_loop.state.last_action_summary:
@@ -12944,7 +12990,8 @@ class MCPClient:
                         "agent_activity_log", {"summary": activity_summary, "timestamp": datetime.now(timezone.utc).isoformat()}
                     )
 
-                if not should_continue_loop:
+                # Handle should_continue and other termination conditions
+                if not should_continue:
                     self.safe_print("MCPC: Agent signaled loop termination after executing decision.")
                     log.info("MCPC: AgentMasterLoop.execute_llm_decision returned False (stop).")
                     if not agent_loop.state.goal_achieved_flag:

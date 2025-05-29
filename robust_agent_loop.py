@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-"""agent_master_loop.py – *Outline V4*  
-Leveraging full UMS semantic‑graph power + dual–LLM orchestration.
-
-This version provides **finished, fully‑working code for `MemoryGraphManager`** while keeping the rest of the architecture identical to the outline delivered in V4.  
-All TODOs inside that class are removed; every public method really performs its work against the local UMS SQLite store that the MCP keeps at `ums.db`.
-"""
+"""Robust Agent Loop implementation using MCPClient infrastructure."""
 
 ###############################################################################
 # SECTION 0. Imports & typing helpers
@@ -31,6 +26,8 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Dict, Lis
 if TYPE_CHECKING:
     from pathlib import Path
 
+import logging
+
 import networkx as nx
 
 ###############################################################################
@@ -38,25 +35,18 @@ import networkx as nx
 ###############################################################################
 
 # These constants provide default values for agent behavior when MCPClient config is unavailable.
-# All new code should use mcp_client.config values instead of these constants.
 
 # Metacognition & reflection timing
-REFLECTION_INTERVAL = 6  # generate reflection memories every N turns
-GRAPH_MAINT_EVERY = 2  # turns between graph‑maintenance phases  
+REFLECTION_INTERVAL = 15  # generate reflection memories every N turns
+GRAPH_MAINT_EVERY = 10  # turns between graph‑maintenance phases  
 STALL_THRESHOLD = 3  # consecutive non‑progress turns → forced reflection
 
 # Fast LLM call budget (per micro-task)
-FAST_CALL_MAX_USD = 0.003  # per micro‑call budget ceiling
+FAST_CALL_MAX_USD = 0.02  # per micro‑call budget ceiling
 
 # Default model names (fallback only - use mcp_client.config.default_model instead)
-DEFAULT_SMART_MODEL = "gpt-4o-2025-05-15"
-DEFAULT_FAST_MODEL = "gemini-flash-2.5-05-20"
-
-# DEPRECATED: Removed in favor of MCPClient config
-# MAX_TURNS - use mcp_client.config.max_agent_turns
-# MAX_BUDGET_USD - use mcp_client.config.max_budget_usd  
-# SMART_MODEL_NAME - use mcp_client.config.default_model
-# FAST_MODEL_NAME - use mcp_client.config.default_cheap_and_fast_model
+DEFAULT_SMART_MODEL = "gpt-4.1"
+DEFAULT_FAST_MODEL = "gemini-2.5-flash-preview-05-20"
 
 ###############################################################################
 # SECTION 2. Enumerations & simple data classes
@@ -80,9 +70,9 @@ class LinkKind(str, enum.Enum):
     GENERALISES   = "GENERALISES"
     SPECIALISES   = "SPECIALISES"
     SEQUENTIAL    = "SEQUENTIAL"
-    ELABORATES    = "ELABORATES"         # new - richer narrative chains
-    QUESTION_OF   = "QUESTION_OF"        # reasoning trace ⇄ evidence
-    CONSEQUENCE   = "CONSEQUENCE_OF"     # downstream effect; alias for CAUSAL
+    ELABORATES    = "ELABORATES"    
+    QUESTION_OF   = "QUESTION_OF"   
+    CONSEQUENCE   = "CONSEQUENCE_OF"
 
 class Phase(str, enum.Enum):
     UNDERSTAND = "understand"
@@ -99,7 +89,6 @@ class DecisionType(str, enum.Enum):
     TOOL_BATCH = "multiple_tools_executed_by_mcp"
     DONE = "idle"
     ERROR = "error"
-
 
 @dataclasses.dataclass
 class AMLState:
@@ -1325,6 +1314,10 @@ class MetacognitionEngine:
         """Link the planner for contradiction escalation to BLOCKER goals."""
         self.planner = planner
 
+    def _get_ums_tool_name(self, base_tool_name: str) -> str:
+        """Convert a base tool name to the UMS-prefixed version."""
+        return f"ums:{base_tool_name}"
+
     # ---------------------------------------------------------------- public
 
     async def maybe_reflect(self, turn_ctx: Dict[str, Any]) -> None:
@@ -1925,6 +1918,10 @@ class ToolExecutor:
         self.mcp_client = mcp_client
         self.state = state
         self.mem_graph = mem_graph
+
+    def _get_ums_tool_name(self, base_tool_name: str) -> str:
+        """Convert a base tool name to the UMS-prefixed version."""
+        return f"ums:{base_tool_name}"
 
     async def run(self, tool_name: str, tool_args: dict[str, Any]) -> Any:
         """
@@ -2584,39 +2581,57 @@ class AgentMasterLoop:
 
     def __init__(self, mcp_client, default_llm_model_string: str, agent_state_file: str) -> None:
         """
+        Initialize the AgentMasterLoop with MCP client integration.
+        
         Parameters
         ----------
         mcp_client : MCPClient
-            The main MCP SDK client (must expose tool execution helpers).
+            The MCP client instance for tool execution and LLM calls
         default_llm_model_string : str
-            Default LLM model to use for reasoning calls.
+            Default model name to use for reasoning calls
         agent_state_file : str
-            Path to the agent's persistent state file.
+            Path to the local state file for persistence
         """
         self.mcp_client = mcp_client
         self.default_llm_model = default_llm_model_string
-        self.agent_llm_model = default_llm_model_string  # For compatibility with MCPClient
-        self.agent_state_file_path = agent_state_file
-        self.logger = self.mcp_client.logger
+        self.agent_state_file = agent_state_file
+        self.logger = logging.getLogger("AML")
         
-        # Initialize with default state - will be loaded/validated in initialize()
+        # Agent state - will be loaded/initialized in initialize()
         self.state = AMLState()
         
-        # Shutdown control
-        self._shutdown_event = asyncio.Event()
-        
-        # Component references - will be initialized in initialize()
+        # Component instances - initialized in _initialize_components()
         self.mem_graph: Optional[MemoryGraphManager] = None
-        self.async_queue: Optional[AsyncTaskQueue] = None
-        self.llms: Optional[LLMOrchestrator] = None
         self.tool_exec: Optional[ToolExecutor] = None
+        self.llms: Optional[LLMOrchestrator] = None
+        self.async_queue: Optional[AsyncTaskQueue] = None
         self.metacog: Optional[MetacognitionEngine] = None
         self.planner: Optional[ProceduralAgenda] = None
         self.graph_reasoner: Optional[GraphReasoner] = None
-        self.tool_schemas: Optional[List[Dict[str, Any]]] = None
-        self._tool_effectiveness_cache: Dict[str, Dict[str, float]] = {}
-        self._tool_category_map: Dict[str, List[str]] = self._build_tool_categories()
+        
+        # Tool schemas cache
+        self.tool_schemas: List[Dict[str, Any]] = []
+        self.ums_tool_schemas: Dict[str, Dict[str, Any]] = {}
+        
+        # Tool effectiveness tracking
+        self._tool_effectiveness_cache: Dict[str, Dict[str, int]] = {}
 
+        # Tool categorization map  
+        self._tool_category_map = self._build_tool_categories()
+
+        # Shutdown coordination
+        self._shutdown_event = asyncio.Event()
+
+    @property
+    def agent_llm_model(self) -> str:
+        """Compatibility property for MCPClient access."""
+        return self.default_llm_model
+
+    @agent_llm_model.setter  
+    def agent_llm_model(self, value: str) -> None:
+        """Compatibility setter for MCPClient access."""
+        self.default_llm_model = value
+        
     # ---------------------------------------------------------------- initialization
 
     async def initialize(self) -> bool:
@@ -2675,8 +2690,8 @@ class AgentMasterLoop:
 
             import aiofiles
             
-            if os.path.exists(self.agent_state_file_path):
-                async with aiofiles.open(self.agent_state_file_path, 'r') as f:
+            if os.path.exists(self.agent_state_file):
+                async with aiofiles.open(self.agent_state_file, 'r') as f:
                     state_data = json.loads(await f.read())
                 
                 # Reconstruct AMLState from saved data
@@ -2687,12 +2702,12 @@ class AgentMasterLoop:
                 # Create new state with loaded data
                 loaded_state = AMLState(**{k: v for k, v in state_data.items() if hasattr(AMLState, k)})
                 self.state = loaded_state
-                self.logger.info(f"Loaded agent state from {self.agent_state_file_path}")
+                self.logger.info(f"Loaded agent state from {self.agent_state_file}")
             else:
-                self.logger.info(f"No existing state file found at {self.agent_state_file_path}, using default state")
+                self.logger.info(f"No existing state file found at {self.agent_state_file}, using default state")
                 
         except Exception as e:
-            self.logger.warning(f"Failed to load agent state from {self.agent_state_file_path}: {e}")
+            self.logger.warning(f"Failed to load agent state from {self.agent_state_file}: {e}")
             self.logger.info("Using default state")
 
     async def _validate_and_reset_state(self) -> None:
@@ -2949,21 +2964,24 @@ class AgentMasterLoop:
                 state_dict['created_at'] = self.state.created_at.isoformat()
                 
             # Ensure directory exists
-            os.makedirs(os.path.dirname(self.agent_state_file_path), exist_ok=True)
+            os.makedirs(os.path.dirname(self.agent_state_file), exist_ok=True)
             
-            async with aiofiles.open(self.agent_state_file_path, 'w') as f:
+            async with aiofiles.open(self.agent_state_file, 'w') as f:
                 await f.write(json.dumps(state_dict, indent=2))
                 
-            self.logger.debug(f"Saved agent state to {self.agent_state_file_path}")
+            self.logger.debug(f"Saved agent state to {self.agent_state_file}")
             
         except Exception as e:
             self.logger.warning(f"Failed to save agent state: {e}")
 
     # ---------------------------------------------------------------- run-loop
 
-    async def run_main_loop(self, overall_goal: str, max_mcp_loops: int) -> Optional[Dict[str, Any]]:
+    async def run_main_loop(self, overall_goal: str, max_mcp_loops: int) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]], bool, Optional[str], Dict[str, Dict[str, Any]]]:
         """
-        Main asynchronous loop for a specific agent task activation.
+        Main preparation method for agent reasoning turn.
+        
+        This method prepares all the context and returns the parameters needed
+        for MCPClient.process_agent_llm_turn() rather than calling the LLM directly.
         
         Parameters
         ----------
@@ -2974,45 +2992,63 @@ class AgentMasterLoop:
             
         Returns
         -------
-        Optional[Dict[str, Any]]
-            Result dictionary if task completed, None if stopped for other reasons.
+        Tuple[List[Dict[str, str]], List[Dict[str, Any]], bool, Optional[str], Dict[str, Dict[str, Any]]]
+            Returns (prompt_messages, tool_schemas, force_structured_output, force_tool_choice, ums_tool_schemas)
+            for MCPClient.process_agent_llm_turn()
         """
-        self.logger.info(f"[AML] Starting main loop for goal: {overall_goal[:100]}...")
+        self.logger.info(f"[AML] Preparing agent turn for goal: {overall_goal[:100]}...")
         
         # Ensure we have a valid workflow and root goal
         await self._ensure_workflow_and_goal(overall_goal)
         
-        # Main agent loop
-        while self.state.loop_count < max_mcp_loops:
-            step_status = await self._turn()
+        # Prepare context for this turn
+        self.state.loop_count += 1
+        loop_idx = self.state.loop_count
+        self.logger.debug("==== TURN %s  | phase=%s ====", loop_idx, self.state.phase)
 
-            if step_status == "finished":
-                self.logger.info("[AML] Task completed successfully")
-                self.state.goal_achieved_flag = True
-                return {
-                    "status": "completed",
-                    "goal": overall_goal,
-                    "loops_used": self.state.loop_count,
-                    "workflow_id": self.state.workflow_id
-                }
+        # Check if we should shutdown
+        if self._shutdown_event.is_set():
+            self.logger.info("[AML] Shutdown event set, stopping preparation")
+            # Return empty parameters to signal stop
+            return [], [], False, None, {}
 
-            if step_status == "failed":
-                self.logger.error("[AML] Task failed")
-                return {
-                    "status": "failed", 
-                    "goal": overall_goal,
-                    "loops_used": self.state.loop_count,
-                    "error": self.state.last_error_details
-                }
-                
-        # Reached max loops without completion
-        self.logger.warning("[AML] Reached maximum loops without completion")
-        return {
-            "status": "max_loops_reached",
-            "goal": overall_goal, 
-            "loops_used": self.state.loop_count,
-            "workflow_id": self.state.workflow_id
-        }
+        try:
+            # 0. Finish/background cheap tasks -----------------------------------
+            await self.async_queue.drain()
+
+            # 1. Gather context ---------------------------------------------------
+            context = await self._gather_context()
+
+            # 2. Maybe spawn new micro-tasks (runs in background) -----------------
+            await self._maybe_spawn_fast_tasks(context)
+
+            # 3. Build reasoning messages & tool schemas --------------------------
+            messages = self._build_messages(context)
+            tool_schemas = await self._get_tool_schemas()
+
+            # 4. Check for loops and add to context if detected
+            if len(self.state.recent_action_signatures) >= 3:
+                loop_detected, loop_info = self._detect_action_loops()
+                if loop_detected:
+                    context["loop_detected"] = True
+                    context["loop_info"] = loop_info
+
+            # 5. Return parameters for MCPClient to handle
+            return (
+                messages,
+                tool_schemas or [],
+                False,  # force_structured_output 
+                None,   # force_tool_choice
+                self.ums_tool_schemas  # UMS tool schemas for structured output
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error preparing agent turn {loop_idx}: {e}", exc_info=True)
+            self.state.last_error_details = {"error": str(e), "turn": loop_idx}
+            self.state.consecutive_error_count += 1
+            
+            # Return empty parameters to signal error
+            return [], [], False, None, {}
 
     async def _ensure_workflow_and_goal(self, overall_goal: str) -> None:
         """Ensure we have a valid workflow and root goal, creating them if needed."""
@@ -3058,7 +3094,7 @@ class AgentMasterLoop:
             if not goal_resp.get("success") or not goal_resp.get("data"):
                 raise RuntimeError("Failed to create root goal in UMS")
                 
-            self.state.root_goal_id = goal_resp["data"]["goal_id"]
+            self.state.root_goal_id = goal_resp["data"]["goal"]["goal_id"]
             self.state.current_leaf_goal_id = self.state.root_goal_id
             self.state.needs_replan = False
             
@@ -3394,19 +3430,17 @@ class AgentMasterLoop:
         
         return "Task"
         
-    def _get_tool_schemas(self) -> Optional[List[Dict[str, Any]]]:
+    async def _get_tool_schemas(self) -> Optional[List[Dict[str, Any]]]:
         """Return JSON-schema list of the most relevant tools."""
         if not self.state.current_leaf_goal_id:
             # No goal yet, return basic tools
             return self.tool_schemas[:15]
         
         # Get current goal description
-        goal_desc = asyncio.run(self._get_current_goal_description())
+        goal_desc = await self._get_current_goal_description()
         
         # Get ranked tools
-        ranked_tools = asyncio.run(
-            self._rank_tools_for_goal(goal_desc, self.state.phase, limit=15)
-        )
+        ranked_tools = await self._rank_tools_for_goal(goal_desc, self.state.phase, limit=15)
         
         return ranked_tools
 
@@ -3526,16 +3560,20 @@ class AgentMasterLoop:
             dtype = decision.get("decision_type", "").upper()
             
             if dtype == "TOOL_EXECUTED_BY_MCP":
-                # MCPClient already executed the tool, process the result
-                tool_result = decision.get("tool_result", {})
+                # MCPClient already executed the tool via process_agent_llm_turn, process the result
+                tool_name = decision.get("tool_name", "unknown")
+                tool_result = decision.get("result", {})
                 success = tool_result.get("success", False)
+                
                 if success:
-                    self.state.last_action_summary = f"Successfully executed {decision.get('tool_name', 'unknown tool')}"
+                    self.state.last_action_summary = f"Successfully executed {tool_name}"
+                    # The tool result is already parsed by MCPClient's _execute_tool_and_parse_for_agent
+                    return True
                 else:
                     error_msg = tool_result.get("error_message", "Unknown error")
-                    self.state.last_action_summary = f"Failed to execute {decision.get('tool_name', 'unknown tool')}: {error_msg}"
-                return success
-                
+                    self.state.last_action_summary = f"Failed to execute {tool_name}: {error_msg}"
+                    return False
+                    
             elif dtype in {"CALL_TOOL", "TOOL_SINGLE"}:
                 # MCPClient didn't handle this tool - execute it directly
                 tool_name = decision["tool_name"]
@@ -3545,24 +3583,15 @@ class AgentMasterLoop:
                 success = result.get("success", False)
                 self.state.last_action_summary = f"Executed {tool_name}: {'success' if success else 'failed'}"
                 return success
-            elif dtype == "PARALLEL_TOOLS":
-                # MCPClient detected multiple independent tool calls
-                tool_calls = decision.get("tool_calls", [])
-                self.logger.info(f"[AML] → executing {len(tool_calls)} tools in parallel")
                 
-                result = await self.tool_exec.run_parallel(tool_calls)
+            elif dtype == "MULTIPLE_TOOLS_EXECUTED_BY_MCP":
+                # MCPClient handled multiple tools in parallel
+                results = decision.get("results", [])
+                successful_count = sum(1 for r in results if r.get("success", False))
+                total_count = len(results)
                 
-                if result["success"]:
-                    # Process individual results
-                    successes = sum(1 for r in result["results"] if r.get("success", False))
-                    self.state.last_action_summary = (
-                        f"Executed {len(tool_calls)} tools in parallel "
-                        f"({successes} succeeded) in {sum(result['timing'].values()):.1f}s total"
-                    )
-                else:
-                    self.state.last_action_summary = "All parallel tool executions failed"
-                
-                return result["success"]                
+                self.state.last_action_summary = f"Parallel execution: {successful_count}/{total_count} tools succeeded"
+                return successful_count > 0
             elif dtype == "THOUGHT_PROCESS":
                 thought = decision.get("content", "")
                 thought_res = await self.mcp_client._execute_tool_and_parse_for_agent(
