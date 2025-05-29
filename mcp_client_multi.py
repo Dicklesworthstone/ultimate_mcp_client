@@ -267,14 +267,46 @@ from starlette.responses import FileResponse
 from typing_extensions import Annotated, Literal, TypeAlias
 from zeroconf import EventLoopBlocked, NonUniqueNameException, ServiceBrowser, ServiceInfo, Zeroconf
 
-from agent_master_loop import (
-    MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA,
-    MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT,
-    MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT,
-)
+# Model constants previously imported from agent_master_loop
+MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT = {
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "claude-3-7-sonnet-20250219",
+    "claude-3-5-haiku-20241022",
+    "claude-3-opus-20240229",
+    "claude-3-sonnet-20240229",
+    "gemini-2.0-flash",
+    "gemini-2.5-pro-exp-03-25",
+}
+
+MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT = {
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "grok-3-latest",
+    "grok-3-fast-latest",
+    "grok-3-mini-latest",
+    "grok-3-mini-fast-latest",
+    "groq/llama-3.3-70b-versatile",
+    "groq/meta-llama/llama-4-scout-17b-16e-instruct",
+    "groq/mistral-saba-24b",
+    "groq/qwen-qwq-32b",
+    "groq/gemma2-9b-it",
+    "groq/compound-beta",
+    "groq/compound-beta-mini",
+    "cerebras/llama-4-scout-17b-16e-instruct",
+    "cerebras/llama-3.3-70b",
+}
+
+MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA = {
+    "mistral-large-latest",
+    "mistral-small-latest",
+}
 
 if TYPE_CHECKING:
-    from agent_master_loop import AgentMasterLoop, PlanStep
+    from robust_agent_loop import AgentMasterLoop
 else:
     AgentMasterLoop = "AgentMasterLoop"  # Placeholder for AgentMasterLoop
     PlanStep = "PlanStep"  # Placeholder for PlanStep
@@ -12287,7 +12319,7 @@ class MCPClient:
             ActualAgentMasterLoopClass = None
             try:
                 # Ensure this import path is correct for your project structure
-                from agent_master_loop import AgentMasterLoop as AMLClass
+                from robust_agent_loop import AgentMasterLoop as AMLClass
 
                 ActualAgentMasterLoopClass = AMLClass
                 log.debug(f"MCPC: Successfully imported AgentMasterLoop as AMLClass: {type(ActualAgentMasterLoopClass)}")
