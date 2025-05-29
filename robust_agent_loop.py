@@ -1313,6 +1313,7 @@ class MetacognitionEngine:
         self.llm = llm_orch
         self.async_queue = async_queue
         self.planner: Optional["ProceduralAgenda"] = None  # Set later by AML
+        self.logger = mcp_client.logger  # Add logger reference
 
     def set_planner(self, planner: "ProceduralAgenda") -> None:
         """Link the planner for contradiction escalation to BLOCKER goals."""
@@ -1343,30 +1344,42 @@ class MetacognitionEngine:
         if not any(conditions):
             return
 
-        try:
-            # Try using the UMS contradictions tool first
-            contradictions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                UMS_SERVER_NAME,
-                self._get_ums_tool_name("query_graph_by_link_type"),
-                {
-                    "workflow_id": self.state.workflow_id,
-                    "link_type": "CONTRADICTS",
-                    "limit": 20,
-                },
-            )
-            if contradictions_res.get("success") and contradictions_res.get("data"):
-                contradictions = contradictions_res["data"].get("pairs", [])
-                # Convert to list of tuples if needed
-                contradictions = [(p["a"], p["b"]) for p in contradictions]
-            else:
-                contradictions = []
-        except Exception:
-            # Fallback to the MemoryGraphManager's detect_inconsistencies method
-            contradictions = await self.mem_graph.detect_inconsistencies()
+        # Use contradictions from context instead of fetching separately
+        # This harmonizes with the new _gather_context method
+        contradictions = turn_ctx.get('contradictions', [])
+        
+        # Only fetch contradictions if not already provided by context
+        if not contradictions:
+            try:
+                # Try using the UMS contradictions tool first
+                contradictions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    UMS_SERVER_NAME,
+                    self._get_ums_tool_name("query_graph_by_link_type"),
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "link_type": "CONTRADICTS",
+                        "limit": 20,
+                    },
+                )
+                if contradictions_res.get("success") and contradictions_res.get("data"):
+                    contradictions = contradictions_res["data"].get("pairs", [])
+                    # Convert to list of tuples if needed
+                    contradictions = [(p["a"], p["b"]) for p in contradictions]
+                else:
+                    contradictions = []
+            except Exception:
+                # Fallback to the MemoryGraphManager's detect_inconsistencies method
+                contradictions = await self.mem_graph.detect_inconsistencies()
+            
+            # Update context with the contradictions we found
+            turn_ctx["contradictions"] = contradictions
             
         if contradictions:
             turn_ctx["has_contradictions"] = True
-            turn_ctx["contradictions_list"] = contradictions[:3]
+            
+            # Try to actively resolve contradictions
+            for pair in contradictions[:2]:  # Resolve up to 2 per turn to avoid overwhelming
+                await self._resolve_contradiction(pair[0], pair[1])
             
             # Escalate persistent contradictions to BLOCKER goals
             await self._escalate_persistent_contradictions(contradictions)
@@ -1402,6 +1415,21 @@ class MetacognitionEngine:
         # reset stuck counter after reflection
         self.state.stuck_counter = 0
 
+        # Optimize working memory periodically to keep it focused
+        if self.state.loop_count % 5 == 0:  # Every 5 turns
+            try:
+                await self.mcp_client._execute_tool_and_parse_for_agent(
+                    UMS_SERVER_NAME,
+                    "optimize_working_memory",
+                    {
+                        "context_id": self.state.workflow_id,
+                        "strategy": "balanced"
+                    }
+                )
+                self.logger.debug("Optimized working memory")
+            except Exception as e:
+                self.logger.debug(f"Working memory optimization failed (non-critical): {e}")
+
         # Schedule lightweight graph upkeep (doesn't need smart model)
         if self.state.loop_count % GRAPH_MAINT_EVERY == 0:
             async def _maint():
@@ -1431,8 +1459,10 @@ class MetacognitionEngine:
 
     def _build_reflection_prompt(self, ctx: Dict[str, Any]) -> str:
         """Compose a concise reflection prompt for the cheap LLM."""
-        recent_actions = ctx.get("recent_actions", "")
-        memory_snips = ctx.get("working_memory", "")
+        # Use recent_actions_text instead of recent_actions (which is a list)
+        recent_actions = ctx.get("recent_actions_text", "")
+        # Use working_memory_summary instead of working_memory (which is a dict)
+        memory_snips = ctx.get("working_memory_summary", "")
         prompt = textwrap.dedent(
             f"""
             You are the agent's inner voice tasked with reflection.
@@ -1449,9 +1479,11 @@ class MetacognitionEngine:
             """
         ).strip()
         if ctx.get("has_contradictions"):
+            # Use contradictions instead of contradictions_list
+            contradictions = ctx.get("contradictions", [])
             prompt += (
                 "\nDetected potential contradictions in working memory. "
-                f"IDs: {ctx['contradictions_list']}.  Analyse whether one of them "
+                f"IDs: {contradictions[:3]}.  Analyse whether one of them "
                 "blocks progress and propose a resolution strategy."
             )
         return prompt
@@ -1517,7 +1549,7 @@ class MetacognitionEngine:
             # Get goal details via UMS tool
             goal_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
-                self._get_ums_tool_name("get_goal_details"),
+                "get_goal_details",
                 {"workflow_id": self.state.workflow_id, "goal_id": self.state.current_leaf_goal_id}
             )
             if not goal_res.get("success") or not goal_res.get("data"):
@@ -1528,87 +1560,35 @@ class MetacognitionEngine:
             if status != "completed":
                 return False
             
-            # NEW: Artifact validation for creation goals
-            goal_desc = goal_data.get("description", "").lower()
-            goal_title = goal_data.get("title", "").lower()
+            # Use the enhanced validation method
+            is_valid, reason = await self._validate_goal_outputs(self.state.current_leaf_goal_id)
             
-            # Keywords that indicate artifact creation is expected
-            creation_keywords = [
-                "create", "generate", "write", "produce", "build", "make",
-                "develop", "design", "implement", "output", "save", "export"
-            ]
+            if not is_valid:
+                self.logger.info(f"Goal completion validation failed: {reason}")
+                
+                # Store detailed validation failure
+                await self.mcp_client._execute_tool_and_parse_for_agent(
+                    UMS_SERVER_NAME,
+                    "store_memory",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "content": f"Goal completion validation failed: {reason}. Goal: {goal_data.get('title', 'Unknown')}",
+                        "memory_type": "validation_failure",
+                        "memory_level": "working",
+                        "importance": 7.0,
+                        "description": f"Validation failure: {reason}"
+                    }
+                )
+                
+                return False
             
-            expects_artifact = any(keyword in goal_desc or keyword in goal_title 
-                                  for keyword in creation_keywords)
-            
-            if expects_artifact:
-                # Check if any artifacts were created
-                try:
-                    artifacts_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                        UMS_SERVER_NAME,
-                        self._get_ums_tool_name("get_artifacts"),
-                        {
-                            "workflow_id": self.state.workflow_id,
-                            "limit": 10,
-                            "is_output": True  # Only check output artifacts
-                        }
-                    )
-                    
-                    if not artifacts_res.get("success"):
-                        # If we can't check artifacts, assume incomplete
-                        self.logger.warning("Could not verify artifacts for creation goal")
-                        return False
-                    
-                    artifacts = artifacts_res.get("data", {}).get("artifacts", [])
-                    
-                    if not artifacts:
-                        # No artifacts but goal expects creation
-                        self.logger.info(f"Goal '{goal_title}' expects artifacts but none found")
-                        
-                        # Give specific feedback
-                        await self.mcp_client._execute_tool_and_parse_for_agent(
-                            UMS_SERVER_NAME,
-                            self._get_ums_tool_name("store_memory"),
-                            {
-                                "workflow_id": self.state.workflow_id,
-                                "content": f"Goal marked complete but no artifacts created. Goal: {goal_title}",
-                                "memory_type": "validation_failure",
-                                "memory_level": "working",
-                                "importance": 7.0,
-                                "description": "Missing expected artifacts"
-                            }
-                        )
-                        
-                        return False
-                    
-                    # Additional validation: check artifact recency
-                    # (artifacts should be created after goal was set)
-                    goal_created = goal_data.get("created_at", 0)
-                    recent_artifacts = [
-                        a for a in artifacts 
-                        if a.get("created_at", 0) >= goal_created
-                    ]
-                    
-                    if not recent_artifacts:
-                        self.logger.info("No artifacts created after goal was set")
-                        return False
-                    
-                    # Log successful validation
-                    self.logger.info(f"Goal '{goal_title}' validated with {len(recent_artifacts)} artifacts")
-                    
-                except Exception as artifact_error:
-                    # If artifact checking fails, fall back to original validation
-                    self.logger.warning(f"Artifact validation failed, using fallback: {artifact_error}")
-
-            # Edge-aware progress check: verify goal has evidence links
-            # Check for outgoing CONSEQUENCE_OF or SUPPORTS links to parent
-            goal_id = self.state.current_leaf_goal_id
+            # Additional edge-aware progress check: verify goal has evidence links
             links_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
-                self._get_ums_tool_name("get_linked_memories"),
+                "get_linked_memories",
                 {
                     "workflow_id": self.state.workflow_id, 
-                    "memory_id": goal_id,
+                    "memory_id": self.state.current_leaf_goal_id,
                     "direction": "outgoing"
                 }
             )
@@ -1620,11 +1600,18 @@ class MetacognitionEngine:
             evidence_links = [
                 link for link in links_res["data"].get("links", [])
                 if link.get("link_type") in ["CONSEQUENCE_OF", "SUPPORTS"] 
-                and link.get("target_memory_id") != goal_id  # avoid self-loops
+                and link.get("target_memory_id") != self.state.current_leaf_goal_id  # avoid self-loops
             ]
             
-            return len(evidence_links) > 0  # Only complete if we have evidence
-        except Exception:
+            if not evidence_links:
+                self.logger.info("Goal lacks evidence links - completion may be premature")
+                return False
+            
+            self.logger.info(f"Goal completion validated successfully: {reason}")
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Error validating goal completion: {e}")
             return False
 
     async def _escalate_persistent_contradictions(self, contradictions: List[Tuple[str, str]]) -> None:
@@ -1636,7 +1623,7 @@ class MetacognitionEngine:
                 # Try to get existing count
                 meta_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     UMS_SERVER_NAME,
-                    self._get_ums_tool_name("get_workflow_metadata"),
+                    "get_workflow_metadata",
                     {"workflow_id": self.state.workflow_id}
                 )
                 if meta_res.get("success") and meta_res.get("data"):
@@ -1649,7 +1636,7 @@ class MetacognitionEngine:
                 current_meta[pair_key] = count
                 await self.mcp_client._execute_tool_and_parse_for_agent(
                     UMS_SERVER_NAME, 
-                    self._get_ums_tool_name("update_workflow_metadata"),
+                    "update_workflow_metadata",
                     {"workflow_id": self.state.workflow_id, "metadata": current_meta}
                 )
                 
@@ -1657,14 +1644,14 @@ class MetacognitionEngine:
                 if count >= 3 and self.planner:
                     blocker_title = f"RESOLVE: Contradiction {pair[0][:8]}↔{pair[1][:8]}"
                     blocker_desc = f"Persistent contradiction detected {count} times. Requires explicit resolution."
-                    self.planner.add_goal(blocker_title, blocker_desc, priority=1)  # highest priority
+                    await self.planner.add_goal(blocker_title, blocker_desc, priority=1)  # highest priority
 
                     # Tag both memories so other components can suppress them
                     for mem in pair:
                         try:
                             await self.mcp_client._execute_tool_and_parse_for_agent(
                                 UMS_SERVER_NAME,
-                                self._get_ums_tool_name("add_tag_to_memory"),
+                                "add_tag_to_memory",
                                 {"workflow_id": self.state.workflow_id,
                                  "memory_id": mem,
                                  "tag": "BLOCKER"},
@@ -1673,6 +1660,175 @@ class MetacognitionEngine:
                             pass
             except Exception:
                 pass  # fail gracefully if metadata storage isn't available
+
+    async def _validate_goal_outputs(self, goal_id: str) -> Tuple[bool, str]:
+        """
+        Validate that a goal has produced expected outputs.
+        
+        Returns
+        -------
+        Tuple[bool, str]
+            (is_valid, reason) - True if goal outputs are valid, False with reason if not
+        """
+        try:
+            # Get goal details
+            goal_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                "get_goal_details",
+                {"workflow_id": self.state.workflow_id, "goal_id": goal_id}
+            )
+            
+            if not goal_res.get("success") or not goal_res.get("data"):
+                return False, "Could not retrieve goal details"
+                
+            goal_data = goal_res["data"]
+            goal_desc = goal_data.get("description", "").lower()
+            goal_title = goal_data.get("title", "").lower()
+            
+            # Check if goal expects artifact creation
+            creation_verbs = ["create", "write", "generate", "produce", "build", "develop", "implement", "design", "make", "output", "save", "export"]
+            expects_artifact = any(verb in goal_desc or verb in goal_title for verb in creation_verbs)
+            
+            if expects_artifact:
+                # Check for artifacts
+                artifacts_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    UMS_SERVER_NAME,
+                    "get_artifacts",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "limit": 10,
+                        "is_output": True
+                    }
+                )
+                
+                if artifacts_res.get("success"):
+                    artifacts = artifacts_res.get("data", {}).get("artifacts", [])
+                    goal_created = goal_data.get("created_at", 0)
+                    recent_artifacts = [
+                        a for a in artifacts 
+                        if a.get("created_at", 0) >= goal_created
+                    ]
+                    
+                    if not recent_artifacts:
+                        return False, f"Goal expects artifact creation but none found since goal creation"
+                else:
+                    return False, "Could not verify artifacts for creation goal"
+            
+            # Check for substantive memory traces
+            memories_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                "get_linked_memories",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_id": goal_id,
+                    "limit": 20
+                }
+            )
+            
+            if memories_res.get("success") and memories_res.get("data"):
+                memories = memories_res["data"].get("links", [])
+                if len(memories) < 2:  # At least goal creation + some evidence
+                    return False, "Insufficient memory trace for goal completion"
+            else:
+                return False, "Could not verify memory traces for goal"
+            
+            return True, "Goal outputs validated successfully"
+            
+        except Exception as e:
+            return False, f"Validation error: {str(e)}"
+
+    async def _resolve_contradiction(self, mem_a: str, mem_b: str) -> None:
+        """
+        Actively resolve a contradiction by analyzing it with the LLM and creating a resolution.
+        
+        Parameters
+        ----------
+        mem_a, mem_b : str
+            Memory IDs of the contradicting memories
+        """
+        try:
+            # Get both memories
+            mem_a_content = await self.mem_graph._get_memory_content(mem_a)
+            mem_b_content = await self.mem_graph._get_memory_content(mem_b)
+            
+            if not mem_a_content or not mem_b_content:
+                self.logger.warning(f"Could not retrieve content for contradiction resolution: {mem_a}, {mem_b}")
+                return
+            
+            # Use fast LLM to analyze and resolve
+            resolution_prompt = f"""
+            Two memories contradict each other. Analyze the contradiction and provide a resolution.
+            
+            Memory A: {mem_a_content[:500]}
+            Memory B: {mem_b_content[:500]}
+            
+            Provide:
+            1. Why they contradict (brief explanation)
+            2. Which is likely correct (A, B, both partially, or neither)
+            3. A resolution statement that reconciles the information
+            4. Confidence in the resolution (0.0-1.0)
+            """
+            
+            schema = {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string"},
+                    "assessment": {"type": "string"},
+                    "resolution": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                },
+                "required": ["reason", "assessment", "resolution", "confidence"]
+            }
+            
+            result = await self.llm.fast_structured_call(resolution_prompt, schema)
+            
+            # Store resolution as a new memory
+            resolution_content = (
+                f"CONTRADICTION RESOLUTION:\n"
+                f"Reason: {result['reason']}\n"
+                f"Assessment: {result['assessment']}\n"
+                f"Resolution: {result['resolution']}\n"
+                f"Confidence: {result['confidence']:.2f}"
+            )
+            
+            resolution_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                "store_memory",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "content": resolution_content,
+                    "memory_type": "contradiction_resolution",
+                    "memory_level": "working",
+                    "importance": 8.0,  # High importance for resolutions
+                    "description": f"Resolution of contradiction between {mem_a[:8]} and {mem_b[:8]}"
+                }
+            )
+            
+            if resolution_res.get("success") and resolution_res.get("data"):
+                resolution_mem_id = resolution_res["data"].get("memory_id")
+                
+                if resolution_mem_id:
+                    # Link both original memories to the resolution
+                    await self.mem_graph.auto_link(
+                        src_id=mem_a,
+                        tgt_id=resolution_mem_id,
+                        context_snip="resolved contradiction",
+                        kind_hint=LinkKind.REFERENCES
+                    )
+                    await self.mem_graph.auto_link(
+                        src_id=mem_b,
+                        tgt_id=resolution_mem_id,
+                        context_snip="resolved contradiction",
+                        kind_hint=LinkKind.REFERENCES
+                    )
+                    
+                    # Mark the original contradiction as resolved
+                    await self.mem_graph.mark_contradiction_resolved(mem_a, mem_b)
+                    
+                    self.logger.info(f"Resolved contradiction between {mem_a[:8]} and {mem_b[:8]} with confidence {result['confidence']:.2f}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to resolve contradiction between {mem_a} and {mem_b}: {e}")
 
 
 class GraphReasoner:
@@ -1981,14 +2137,16 @@ class ToolExecutor:
         
         if tool_name in ums_tools:
             server_name = UMS_SERVER_NAME
+            # For UMS tools, pass the tool name directly - MCPClient handles server:tool mapping
+            actual_tool_name = tool_name
         else:
             # For non-UMS tools, try to determine the server or use a default
-            # This might need to be refined based on the actual tool registry
             server_name = "Unknown_Server"  # MCPClient should handle server resolution
+            actual_tool_name = tool_name
         
         # Execute the tool via MCPClient
         result_envelope = await self.mcp_client._execute_tool_and_parse_for_agent(
-            server_name, self._get_ums_tool_name(tool_name), tool_args
+            server_name, actual_tool_name, tool_args
         )
         
         # Check if the tool execution was successful
@@ -2023,7 +2181,7 @@ class ToolExecutor:
             # Create ACTION memory using UMS tools
             action_memory_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
-                self._get_ums_tool_name("store_memory"),
+                "store_memory",
                 {
                     'workflow_id': self.state.workflow_id,
                     'content': json.dumps({"tool": tool_name, "args": tool_args})[:1500],
@@ -2338,7 +2496,7 @@ class ProceduralAgenda:
 
     # ---- CRUD operations --------------------------------------------------
 
-    def add_goal(
+    async def add_goal(
         self,
         title: str,
         description: str,
@@ -2367,16 +2525,16 @@ class ProceduralAgenda:
             updated_at=_ts(),
         )
         self._store_goal(goal)
-        self._persist_goal(goal)
+        await self._persist_goal(goal)
         return goal_id
 
-    def update_goal_status(self, goal_id: str, status: GoalStatus) -> None:
+    async def update_goal_status(self, goal_id: str, status: GoalStatus) -> None:
         goal = self._goals[goal_id]
         goal.status = status
         goal.updated_at = _ts()
-        self._persist_goal(goal)
+        await self._persist_goal(goal)
 
-    def reprioritise_goal(self, goal_id: str, new_priority: int) -> None:
+    async def reprioritise_goal(self, goal_id: str, new_priority: int) -> None:
         goal = self._goals[goal_id]
         if new_priority == goal.priority:
             return
@@ -2385,11 +2543,11 @@ class ProceduralAgenda:
         # remove old pq item and re-insert
         self._remove_from_queue(goal)
         self._insert_to_queue(goal)
-        self._persist_goal(goal)
+        await self._persist_goal(goal)
 
     # ---- retrieval & iteration -------------------------------------------
 
-    def next_goal(self) -> Optional[Goal]:
+    async def next_goal(self) -> Optional[Goal]:
         """Pop the highest-priority PLANNED/ACTIVE goal from queue."""
         while self._pq:
             top = heapq.heappop(self._pq)
@@ -2397,7 +2555,7 @@ class ProceduralAgenda:
             if goal and goal.status in {GoalStatus.PLANNED, GoalStatus.ACTIVE}:
                 goal.status = GoalStatus.ACTIVE
                 goal.updated_at = _ts()
-                self._persist_goal(goal)
+                await self._persist_goal(goal)
                 return goal
         return None
 
@@ -2443,14 +2601,14 @@ class ProceduralAgenda:
 
     # ---- UMS persistence layer -------------------------------------------
 
-    def _persist_goal(self, goal: Goal):
+    async def _persist_goal(self, goal: Goal):
         """Create or update goal in UMS via MCP tools.
         
         Uses separate create and update operations as UMS likely has distinct tools for these.
         """
         try:
             # Try to create a new goal first
-            create_result = self.mcp_client._execute_tool_and_parse_for_agent(
+            create_result = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
                 self._get_ums_tool_name("create_goal"),
                 {
@@ -2469,7 +2627,7 @@ class ProceduralAgenda:
             
             # If create fails (goal might already exist), try update
             if not create_result.get("success"):
-                update_result = self.mcp_client._execute_tool_and_parse_for_agent(
+                update_result = await self.mcp_client._execute_tool_and_parse_for_agent(
                     UMS_SERVER_NAME,
                     self._get_ums_tool_name("update_goal_status"),
                     {
@@ -2726,6 +2884,12 @@ class AgentMasterLoop:
                     state_data['created_at'] = _dt.datetime.fromisoformat(state_data['created_at'])
                 
                 # Create new state with loaded data
+                # Convert phase string back to enum if present
+                if 'phase' in state_data and isinstance(state_data['phase'], str):
+                    try:
+                        state_data['phase'] = Phase(state_data['phase'])
+                    except ValueError:
+                        state_data['phase'] = Phase.UNDERSTAND  # fallback
                 loaded_state = AMLState(**{k: v for k, v in state_data.items() if hasattr(AMLState, k)})
                 self.state = loaded_state
                 self.logger.info(f"Loaded agent state from {self.agent_state_file}")
@@ -3014,6 +3178,73 @@ class AgentMasterLoop:
         except Exception as e:
             self.logger.warning(f"Failed to save agent state: {e}")
 
+    async def _create_checkpoint(self, reason: str) -> Optional[str]:
+        """
+        Create a checkpoint of current cognitive state for recovery.
+        
+        Parameters
+        ----------
+        reason : str
+            Reason for creating the checkpoint
+            
+        Returns
+        -------
+        Optional[str]
+            Checkpoint ID if successful, None otherwise
+        """
+        try:
+            # Get current working memory
+            working_memory_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                "get_working_memory",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "focus_goal_id": self.state.current_leaf_goal_id,
+                    "limit": 20
+                }
+            )
+            
+            working_memory_ids = []
+            if working_memory_res.get("success") and working_memory_res.get("data"):
+                memories = working_memory_res["data"].get("memories", [])
+                working_memory_ids = [mem.get("memory_id") for mem in memories if mem.get("memory_id")]
+            
+            # Create checkpoint memory
+            checkpoint_content = {
+                "checkpoint_reason": reason,
+                "workflow_id": self.state.workflow_id,
+                "current_goal_id": self.state.current_leaf_goal_id,
+                "root_goal_id": self.state.root_goal_id,
+                "phase": self.state.phase.value,
+                "loop_count": self.state.loop_count,
+                "working_memory_ids": working_memory_ids[:15],  # Limit to avoid huge checkpoints
+                "recent_actions": self.state.recent_action_signatures[-5:],
+                "created_at": int(time.time())
+            }
+            
+            checkpoint_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                "store_memory",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "content": json.dumps(checkpoint_content, indent=2),
+                    "memory_type": "checkpoint",
+                    "memory_level": "episodic",  # Long-term storage
+                    "importance": 9.0,  # High importance for recovery
+                    "description": f"Cognitive checkpoint: {reason}"
+                }
+            )
+            
+            if checkpoint_res.get("success") and checkpoint_res.get("data"):
+                checkpoint_id = checkpoint_res["data"].get("memory_id")
+                self.logger.info(f"Created checkpoint {checkpoint_id[:8]} for reason: {reason}")
+                return checkpoint_id
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to create checkpoint: {e}")
+        
+        return None
+
     # ---------------------------------------------------------------- run-loop
 
     async def run_main_loop(self, overall_goal: str, max_mcp_loops: int) -> Optional[Dict[str, Any]]:
@@ -3231,6 +3462,14 @@ class AgentMasterLoop:
             await self.metacog.maybe_reflect(context)
             await self.metacog.assess_and_transition(progress)
 
+            # Create checkpoint at key decision points
+            if self.state.phase == Phase.COMPLETE or self.state.goal_achieved_flag:
+                await self._create_checkpoint("goal_completion")
+            elif self.state.consecutive_error_count >= 2:
+                await self._create_checkpoint("error_recovery_point")
+            elif self.state.loop_count % 15 == 0:  # Periodic checkpoints
+                await self._create_checkpoint("periodic_save")
+
             # 7. Persist state -----------------------------------------------------
             await self._save_state_internal()
 
@@ -3264,9 +3503,8 @@ class AgentMasterLoop:
 
     # -------------------------------------------------- helper: gather context
 
-
     async def _gather_context(self) -> Dict[str, Any]:
-        """Collects all information fed into the SMART-model prompt using purpose-built UMS context tools."""
+        """Collects all information using the rich context package tool."""
         
         # Step 1: Use the rich context package tool - this should be our primary context source
         rich_context = {}
@@ -3287,146 +3525,120 @@ class AgentMasterLoop:
                 rich_context = rich_res["data"]
                 self.logger.info(f"[Context] Rich context package loaded successfully")
             else:
-                self.logger.warning(f"[Context] Rich context package failed: {rich_res.get('error_message', 'Unknown error')}")
+                error_msg = rich_res.get("error_message", "Unknown error")
+                self.logger.warning(f"[Context] Rich context package failed: {error_msg}")
         except Exception as e:
             self.logger.warning(f"[Context] Failed to get rich context package: {e}")
 
-        # Step 2: Get optimized working memory
-        working_memory = {}
-        try:
-            wm_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                UMS_SERVER_NAME,
-                self._get_ums_tool_name("get_working_memory"),
-                {
-                    "workflow_id": self.state.workflow_id,
-                    "focus_goal_id": self.state.current_leaf_goal_id,
-                    "optimize": True
-                }
-            )
-            if wm_res.get("success") and wm_res.get("data"):
-                working_memory = wm_res["data"]
-                self.logger.debug(f"[Context] Working memory loaded: {len(working_memory.get('memories', []))} items")
-            else:
-                self.logger.warning(f"[Context] Working memory failed: {wm_res.get('error_message', 'Unknown error')}")
-        except Exception as e:
-            self.logger.warning(f"[Context] Failed to get working memory: {e}")
-
-        # Step 3: Get goal stack/hierarchy
-        goal_stack = []
-        try:
-            goals_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                UMS_SERVER_NAME,
-                self._get_ums_tool_name("get_goal_stack"),
-                {
-                    "workflow_id": self.state.workflow_id,
-                    "current_goal_id": self.state.current_leaf_goal_id
-                }
-            )
-            if goals_res.get("success") and goals_res.get("data"):
-                goal_stack = goals_res["data"].get("goal_stack", [])
-                self.logger.debug(f"[Context] Goal stack loaded: {len(goal_stack)} goals")
-            else:
-                self.logger.warning(f"[Context] Goal stack failed: {goals_res.get('error_message', 'Unknown error')}")
-        except Exception as e:
-            self.logger.warning(f"[Context] Failed to get goal stack: {e}")
-
-        # Step 4: Get recent actions 
-        recent_actions = []
-        try:
-            actions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                UMS_SERVER_NAME,
-                self._get_ums_tool_name("get_recent_actions"),
-                {
-                    "workflow_id": self.state.workflow_id,
-                    "limit": 10,
-                    "include_context": True
-                }
-            )
-            if actions_res.get("success") and actions_res.get("data"):
-                recent_actions = actions_res["data"].get("actions", [])
-                self.logger.debug(f"[Context] Recent actions loaded: {len(recent_actions)} actions")
-            else:
-                self.logger.warning(f"[Context] Recent actions failed: {actions_res.get('error_message', 'Unknown error')}")
-        except Exception as e:
-            self.logger.warning(f"[Context] Failed to get recent actions: {e}")
-
-        # Step 5: Auto-update focus if available
-        try:
-            await self.mcp_client._execute_tool_and_parse_for_agent(
-                UMS_SERVER_NAME,
-                self._get_ums_tool_name("auto_update_focus"),
-                {
-                    "workflow_id": self.state.workflow_id,
-                    "current_goal_id": self.state.current_leaf_goal_id,
-                    "recent_actions": recent_actions[-5:] if recent_actions else []
-                }
-            )
-        except Exception as e:
-            self.logger.debug(f"[Context] Auto-update focus failed (optional): {e}")
-
-        # Fallback: Use procedural agenda if UMS tools failed
-        active_goals = []
-        if not goal_stack:
-            try:
-                active_goals = [g.title for g in self.planner.active_goals()][:5]
-                self.logger.debug(f"[Context] Using fallback active goals: {len(active_goals)} goals")
-            except Exception as e:
-                self.logger.warning(f"[Context] Fallback active goals failed: {e}")
-
-        # Validate we have minimum required context
+        # Extract context package
+        context_package = rich_context.get("context_package", {})
+        
+        # Extract recent actions and format them
+        recent_actions = context_package.get("recent_actions", [])
+        recent_actions_text = "No recent actions"
+        if recent_actions:
+            # Format recent actions into readable text
+            action_summaries = []
+            for action in recent_actions[:5]:  # Limit to last 5 actions
+                action_type = action.get("action_type", "unknown")
+                description = action.get("description", "No description")
+                status = action.get("status", "unknown")
+                action_summaries.append(f"- {action_type}: {description} (Status: {status})")
+            recent_actions_text = "\n".join(action_summaries)
+        
+        # Extract graph snapshot
+        graph_snapshot = context_package.get("graph_snapshot", {"nodes": [], "edges": []})
+        # Convert nodes list to dict format if needed for compatibility
+        graph_nodes = {}
+        if isinstance(graph_snapshot.get("nodes"), list):
+            for node in graph_snapshot.get("nodes", []):
+                node_id = node.get("memory_id")
+                if node_id:
+                    graph_nodes[node_id] = {
+                        "snippet": node.get("content", "")[:2000],  # Ensure snippet exists
+                        "type": node.get("memory_type", "unknown"),
+                        "importance": node.get("importance", 5.0),
+                        **node  # Include other fields
+                    }
+        else:
+            # If already a dict, ensure each node has a snippet field
+            for node_id, node_data in graph_snapshot.get("nodes", {}).items():
+                if isinstance(node_data, dict):
+                    graph_nodes[node_id] = {
+                        "snippet": node_data.get("content", node_data.get("snippet", ""))[:2000],
+                        "type": node_data.get("memory_type", node_data.get("type", "unknown")),
+                        "importance": node_data.get("importance", 5.0),
+                        **node_data
+                    }
+                else:
+                    # Fallback for unexpected data structure
+                    graph_nodes[node_id] = {
+                        "snippet": str(node_data)[:2000],
+                        "type": "unknown",
+                        "importance": 5.0
+                    }
+        
+        # Extract working memory from core context
+        core_context = context_package.get("core_context", {})
+        working_memory = {
+            "important_memories": core_context.get("important_memories", []),
+            "key_thoughts": core_context.get("key_thoughts", []),
+            "workflow_summary": core_context.get("workflow_summary", "No summary available"),
+        }
+        
+        # Create working memory summary
+        working_memory_summary = "Context from rich package"
+        if core_context.get("workflow_summary"):
+            working_memory_summary = core_context["workflow_summary"][:200] + "..." if len(core_context["workflow_summary"]) > 200 else core_context["workflow_summary"]
+        
+        # Extract contradictions for agent awareness
+        contradictions = context_package.get("contradictions", {})
+        contradictions_found = contradictions.get("contradictions_found", [])
+        
+        # Extract and format the data from rich_context for compatibility
         context = {
             "rich_context": rich_context,
             "working_memory": working_memory,
-            "goal_stack": goal_stack,
+            "goal_stack": [core_context],  # Simplified goal stack using core context
             "recent_actions": recent_actions,
-            "active_goals": active_goals,  # fallback
             
             # Extract key fields for compatibility with existing prompt builder
-            "graph_snapshot": rich_context.get("graph_snapshot", {"nodes": {}, "edges": []}),
-            "top_similar": working_memory.get("relevant_memories", []),
-            "goal_path": [g.get("goal_id") for g in goal_stack] if goal_stack else [],
-            "recent_actions_text": self._format_recent_actions(recent_actions),
-            "working_memory_summary": self._format_working_memory(working_memory),
+            "graph_snapshot": {
+                "nodes": graph_nodes,
+                "edges": graph_snapshot.get("edges", []),
+                "node_count": graph_snapshot.get("node_count", len(graph_nodes)),
+                "edge_count": graph_snapshot.get("edge_count", len(graph_snapshot.get("edges", [])))
+            },
+            "top_similar": context_package.get("proactive_memories", {}).get("memories", []),
+            "recent_actions_text": recent_actions_text,
+            "working_memory_summary": working_memory_summary,
+            
+            # Add new fields from enhanced context package
+            "contradictions": contradictions_found,
+            "contextual_links": context_package.get("contextual_links", {}),
+            "relevant_procedures": context_package.get("relevant_procedures", {}).get("procedures", []),
+            
+            # Metadata
+            "context_retrieval_timestamp": context_package.get("retrieval_timestamp_ums_package"),
+            "has_contradictions": len(contradictions_found) > 0,
+            "context_sources": {
+                "core_context": bool(core_context),
+                "proactive_memories": bool(context_package.get("proactive_memories")),
+                "graph_snapshot": bool(graph_snapshot.get("nodes")),
+                "contradictions": bool(contradictions_found),
+                "contextual_links": bool(context_package.get("contextual_links")),
+            }
         }
-
-        # Critical validation: Ensure we have SOME context
-        has_context = any([
-            rich_context,
-            working_memory.get("memories"),
-            goal_stack,
-            recent_actions,
-            active_goals
-        ])
-
-        if not has_context:
-            # This should NEVER happen in a properly functioning agent
-            self.logger.error("[Context] CRITICAL: All context gathering failed - this indicates a serious UMS connectivity issue")
-            
-            # Emergency fallback: create minimal context from agent state
-            current_goal_desc = await self._get_current_goal_description()
-            context.update({
-                "emergency_fallback": True,
-                "current_goal": current_goal_desc,
-                "agent_phase": self.state.phase.value,
-                "loop_count": self.state.loop_count,
-                "error_message": "All UMS context tools failed - using emergency fallback"
-            })
-            
-            # Store this as a critical error memory
-            try:
-                await self._store_memory_with_auto_linking(
-                    content="CRITICAL: Context gathering completely failed. All UMS context tools are non-functional.",
-                    memory_type="critical_error",
-                    memory_level="working",
-                    importance=10.0,
-                    description="Context gathering system failure"
-                )
-            except Exception:
-                pass  # Can't even store error - system is severely broken
-
-        else:
-            self.logger.info(f"[Context] Successfully gathered context with {len([k for k, v in context.items() if v])} populated fields")
-
+        
+        # Log context summary for debugging
+        self.logger.info(
+            f"[Context] Assembled context: "
+            f"{len(recent_actions)} recent actions, "
+            f"{len(context['top_similar'])} similar memories, "
+            f"{context['graph_snapshot']['node_count']} graph nodes, "
+            f"{len(contradictions_found)} contradictions"
+        )
+        
         return context
 
     # -------------------------------- helper: spawn background fast tasks
@@ -3493,7 +3705,12 @@ class AgentMasterLoop:
         ##########################################################################
         # 2) Detect and digest contradictions
         ##########################################################################
-        contradictions = await self.mem_graph.detect_inconsistencies()
+        # Use contradictions from context instead of separate call
+        contradictions = ctx.get('contradictions', [])
+        if not contradictions:
+            # Fallback to original method if context doesn't have them
+            contradictions = await self.mem_graph.detect_inconsistencies()
+        
         for a_id, b_id in contradictions[:3]:  # cap to 3 per turn
             prompt = (
                 "You are an analyst spotting inconsistent facts.\n"
@@ -3555,9 +3772,22 @@ class AgentMasterLoop:
         )
         
         # Extract context fields with robust defaults
-        active_goals = ctx.get('active_goals', ['No active goals'])
-        recent_actions = ctx.get('recent_actions_text', 'No recent actions')
+        active_goals = ctx.get('active_goals', [])
+        if not active_goals:
+            # Extract from goal_stack or use fallback
+            goal_stack = ctx.get('goal_stack', [])
+            if goal_stack and goal_stack[0]:
+                active_goals = [goal_stack[0].get('workflow_title', 'Current task')]
+            else:
+                active_goals = ['No active goals']
+
+        # Extract goal_path from goal_stack
         goal_path = ctx.get('goal_path', [])
+        if not goal_path and ctx.get('goal_stack'):
+            # Create a simple goal path from the goal stack
+            goal_path = [goal.get('workflow_id', 'unknown') for goal in ctx['goal_stack'] if goal]
+        
+        recent_actions = ctx.get('recent_actions_text', 'No recent actions')
         working_memory = ctx.get('working_memory_summary', 'No working memory available')
         graph_snapshot = ctx.get('graph_snapshot', {'nodes': {}, 'edges': []})
         
@@ -3682,6 +3912,23 @@ class AgentMasterLoop:
             most_common, count = counts.most_common(1)[0]
             if count >= 5:
                 return True, f"Action '{most_common}' repeated {count}/8 times"
+        
+        # Pattern 5: Semantic similarity (same intent, different form)
+        if len(recent) >= 4:
+            # Check for repeated memory operations that might indicate confusion
+            memory_ops = [sig for sig in recent[-4:] if any(op in sig for op in ['store_memory', 'get_memory', 'query_memories'])]
+            if len(memory_ops) >= 3:
+                return True, f"Repeated memory operations: {', '.join(set(memory_ops))}"
+            
+            # Check for repeated search/retrieval operations
+            search_ops = [sig for sig in recent[-4:] if any(op in sig for op in ['search', 'get_', 'query_', 'fetch'])]
+            if len(search_ops) >= 3:
+                return True, f"Repeated search/retrieval operations: {', '.join(set(search_ops))}"
+                
+            # Check for repeated creation attempts
+            create_ops = [sig for sig in recent[-4:] if any(op in sig for op in ['create_', 'store_', 'add_'])]
+            if len(create_ops) >= 3:
+                return True, f"Repeated creation attempts: {', '.join(set(create_ops))}"
         
         return False, ""
         
