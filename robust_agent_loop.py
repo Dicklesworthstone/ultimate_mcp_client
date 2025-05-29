@@ -168,7 +168,7 @@ class MemoryGraphManager:
 
         await self.mcp_client._execute_tool_and_parse_for_agent(
             self.ums_server_name,
-            "ums:create_memory_link",
+            "create_memory_link",
             {
                 "workflow_id": self.state.workflow_id,
                 "source_memory_id": src_id,
@@ -212,7 +212,7 @@ class MemoryGraphManager:
             # Use UMS tool to get memory links
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:get_memory_links", 
+                "get_memory_links", 
                 {
                     "workflow_id": self.state.workflow_id,
                     "memory_id": mem_id,
@@ -237,14 +237,14 @@ class MemoryGraphManager:
         
     async def detect_inconsistencies(self) -> List[Tuple[str, str]]:
         """
-        Use the server-side `ums:get_contradictions` tool.
+        Use the server-side `get_contradictions` tool.
         Fallback to client-side analysis when the tool is unavailable.
         """
         try:
             # Try using the server-side contradictions tool first
             contradictions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:get_contradictions",
+                "get_contradictions",
                 {"workflow_id": self.state.workflow_id, "limit": 50}
             )
             if contradictions_res.get("success") and contradictions_res.get("data"):
@@ -257,7 +257,7 @@ class MemoryGraphManager:
                     try:
                         link_meta_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                             self.ums_server_name,
-                            "ums:get_memory_link_metadata", 
+                            "get_memory_link_metadata", 
                             {
                                 "workflow_id": self.state.workflow_id,
                                 "source_memory_id": src,
@@ -295,7 +295,7 @@ class MemoryGraphManager:
             # Get all CONTRADICTS links for this workflow
             contradicts_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:query_graph_by_link_type",
+                "query_graph_by_link_type",
                 {
                     "workflow_id": self.state.workflow_id,
                     "link_type": "CONTRADICTS",
@@ -312,7 +312,7 @@ class MemoryGraphManager:
                     try:
                         link_meta_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                             self.ums_server_name,
-                            "ums:get_memory_link_metadata", 
+                            "get_memory_link_metadata", 
                             {
                                 "workflow_id": self.state.workflow_id,
                                 "source_memory_id": src,
@@ -337,7 +337,7 @@ class MemoryGraphManager:
         try:
             recent_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:query_memories",
+                "query_memories",
                 {
                     "workflow_id": self.state.workflow_id,
                     "memory_level": "working",
@@ -365,7 +365,7 @@ class MemoryGraphManager:
         try:
             causal_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:query_graph_by_link_type",
+                "query_graph_by_link_type",
                 {
                     "workflow_id": self.state.workflow_id,
                     "link_type": "CAUSAL",
@@ -399,7 +399,7 @@ class MemoryGraphManager:
             # Get all memories with their link counts via UMS
             memories_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:query_memories",
+                "query_memories",
                 {
                     "workflow_id": self.state.workflow_id,
                     "memory_level": "working",
@@ -422,7 +422,7 @@ class MemoryGraphManager:
                 # Get linked memories for this hub
                 links_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     self.ums_server_name,
-                    "ums:get_memory_links",
+                    "get_memory_links",
                     {
                         "workflow_id": self.state.workflow_id,
                         "memory_id": hub_id,
@@ -447,7 +447,7 @@ class MemoryGraphManager:
                 for mem_id in linked_memory_ids:
                     mem_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                         self.ums_server_name,
-                        "ums:get_memory_by_id",
+                        "get_memory_by_id",
                         {
                             "workflow_id": self.state.workflow_id,
                             "memory_id": mem_id
@@ -483,7 +483,7 @@ class MemoryGraphManager:
                 avg_importance = statistics.mean(importances) if importances else 5.0
                 summary_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     self.ums_server_name,
-                    "ums:store_memory",
+                    "store_memory",
                     {
                         "workflow_id": self.state.workflow_id,
                         "content": summary,
@@ -518,7 +518,7 @@ class MemoryGraphManager:
             # Query for promotion candidates via UMS
             candidates_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:query_memories",
+                "query_memories",
                 {
                     "workflow_id": self.state.workflow_id,
                     "memory_level": "working",
@@ -540,7 +540,7 @@ class MemoryGraphManager:
                 if importance >= importance_cutoff or access_count >= access_cutoff:
                     await self.mcp_client._execute_tool_and_parse_for_agent(
                         self.ums_server_name,
-                        "ums:update_memory",
+                        "update_memory",
                         {
                             "workflow_id": self.state.workflow_id,
                             "memory_id": memory["memory_id"],
@@ -567,7 +567,7 @@ class MemoryGraphManager:
             # Get recent working memories
             recent_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:query_memories",
+                "query_memories",
                 {
                     "workflow_id": self.state.workflow_id,
                     "memory_level": "working",
@@ -594,7 +594,7 @@ class MemoryGraphManager:
                 # Get outgoing links for this memory
                 links_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     self.ums_server_name,
-                    "ums:get_memory_links",
+                    "get_memory_links",
                     {
                         "workflow_id": self.state.workflow_id,
                         "memory_id": mem_id,
@@ -613,7 +613,7 @@ class MemoryGraphManager:
                         if tgt_id not in nodes:
                             tgt_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                                 self.ums_server_name,
-                                "ums:get_memory_by_id",
+                                "get_memory_by_id",
                                 {
                                     "workflow_id": self.state.workflow_id,
                                     "memory_id": tgt_id
@@ -647,7 +647,7 @@ class MemoryGraphManager:
         try:
             meta_src_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:get_memory_metadata",
+                "get_memory_metadata",
                 {"workflow_id": self.state.workflow_id, "memory_id": src_id}
             )
             if meta_src_res.get("success") and meta_src_res.get("data"):
@@ -657,7 +657,7 @@ class MemoryGraphManager:
                     
             meta_tgt_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:get_memory_metadata",
+                "get_memory_metadata",
                 {"workflow_id": self.state.workflow_id, "memory_id": tgt_id}
             )
             if meta_tgt_res.get("success") and meta_tgt_res.get("data"):
@@ -725,7 +725,7 @@ class MemoryGraphManager:
         try:
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:get_memory_by_id",
+                "get_memory_by_id",
                 {
                     "workflow_id": self.state.workflow_id,
                     "memory_id": memory_id
@@ -743,7 +743,7 @@ class MemoryGraphManager:
         try:
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:get_memory_tags",
+                "get_memory_tags",
                 {
                     "workflow_id": self.state.workflow_id,
                     "memory_id": memory_id
@@ -771,7 +771,7 @@ class MemoryGraphManager:
             # Try to get embedding from UMS
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:get_embedding",
+                "get_embedding",
                 {"workflow_id": self.state.workflow_id, "memory_id": memory_id}
             )
             if res.get("success") and res.get("data"):
@@ -780,7 +780,7 @@ class MemoryGraphManager:
             # If no embedding exists, try to create one
             create_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:create_embedding",
+                "create_embedding",
                 {"workflow_id": self.state.workflow_id, "memory_id": memory_id}
             )
             if create_res.get("success") and create_res.get("data"):
@@ -796,7 +796,7 @@ class MemoryGraphManager:
             # Try server-side computation first
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:vector_similarity",
+                "vector_similarity",
                 {"vec_a": vec_a, "vec_b": vec_b}
             )
             if res.get("success") and res.get("data"):
@@ -821,7 +821,7 @@ class MemoryGraphManager:
             # Use UMS tool if available, otherwise skip
             await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:decay_link_strengths",
+                "decay_link_strengths",
                 {
                     "workflow_id": self.state.workflow_id,
                     "half_life_days": half_life_days
@@ -838,7 +838,7 @@ class MemoryGraphManager:
         try:
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                "ums:get_memory_metadata",
+                "get_memory_metadata",
                 {"workflow_id": self.state.workflow_id,
                  "memory_id": memory_id}
             )
@@ -859,7 +859,7 @@ class MemoryGraphManager:
                 
                 await self.mcp_client._execute_tool_and_parse_for_agent(
                     self.ums_server_name,
-                    "ums:update_memory_metadata",
+                    "update_memory_metadata",
                     {"workflow_id": self.state.workflow_id,
                      "memory_id": a,
                      "metadata": meta}
@@ -877,7 +877,7 @@ class MemoryGraphManager:
             try:
                 await self.mcp_client._execute_tool_and_parse_for_agent(
                     self.ums_server_name, 
-                    "ums:update_memory_link_metadata",
+                    "update_memory_link_metadata",
                     {
                         "workflow_id": self.state.workflow_id,
                         "source_memory_id": a,
@@ -1307,7 +1307,7 @@ class MetacognitionEngine:
             # Try using the UMS utility first
             contradictions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
-                "ums:query_graph_by_link_type",
+                "query_graph_by_link_type",
                 {
                     "workflow_id": self.state.workflow_id,
                     "link_type": "CONTRADICTS",
@@ -1408,7 +1408,7 @@ class MetacognitionEngine:
         # Use UMS tool to store memory
         await self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:store_memory",
+            "store_memory",
             {
                 "workflow_id": self.state.workflow_id,
                 "content": content,
@@ -1425,7 +1425,7 @@ class MetacognitionEngine:
             # Get goal status via UMS tool
             goal_res = self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
-                "ums:get_goal_details",
+                "get_goal_details",
                 {"workflow_id": self.state.workflow_id, "goal_id": self.state.current_leaf_goal_id}
             )
             if not goal_res.get("success") or not goal_res.get("data"):
@@ -1440,7 +1440,7 @@ class MetacognitionEngine:
             goal_id = self.state.current_leaf_goal_id
             links_res = self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
-                "ums:get_memory_links",
+                "get_memory_links",
                 {"workflow_id": self.state.workflow_id, "source_memory_id": goal_id}
             )
             
@@ -1464,7 +1464,7 @@ class MetacognitionEngine:
                 # Try to get existing count
                 meta_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     "UMS_Server",
-                    "ums:get_workflow_metadata",
+                    "get_workflow_metadata",
                     {"workflow_id": self.state.workflow_id}
                 )
                 if meta_res.get("success") and meta_res.get("data"):
@@ -1477,7 +1477,7 @@ class MetacognitionEngine:
                 current_meta[pair_key] = count
                 await self.mcp_client._execute_tool_and_parse_for_agent(
                     "UMS_Server", 
-                    "ums:update_workflow_metadata",
+                    "update_workflow_metadata",
                     {"workflow_id": self.state.workflow_id, "metadata": current_meta}
                 )
                 
@@ -1492,7 +1492,7 @@ class MetacognitionEngine:
                         try:
                             await self.mcp_client._execute_tool_and_parse_for_agent(
                                 "UMS_Server",
-                                "ums:add_tag_to_memory",
+                                "add_tag_to_memory",
                                 {"workflow_id": self.state.workflow_id,
                                  "memory_id": mem,
                                  "tag": "BLOCKER"},
@@ -1740,7 +1740,7 @@ class GraphReasoner:
         text_blob = repr(sub_snapshot)
         result = await self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:summarize_context_block",
+            "summarize_context_block",
             {
                 "text_to_summarize": text_blob,
                 "target_tokens": target_tokens,
@@ -1769,7 +1769,7 @@ class ToolExecutor:
         Parameters
         ----------
         tool_name : str
-            The original MCP tool name (e.g., "ums:store_memory")
+            The original MCP tool name (e.g., "store_memory")
         tool_args : dict
             Tool arguments
             
@@ -1779,7 +1779,7 @@ class ToolExecutor:
             The tool execution result
         """
         # Determine the server name - for UMS tools, use UMS_Server
-        if tool_name.startswith("ums:"):
+        if tool_name.startswith(""):
             server_name = "UMS_Server"
         else:
             # For non-UMS tools, try to determine the server or use a default
@@ -1800,7 +1800,7 @@ class ToolExecutor:
             try:
                 await self.mcp_client._execute_tool_and_parse_for_agent(
                     "UMS_Server", 
-                    "ums:store_memory", 
+                    "store_memory", 
                     {
                         'workflow_id': self.state.workflow_id,
                         'content': f"TOOL ERROR: {tool_name} failed with: {error_msg}",
@@ -1823,7 +1823,7 @@ class ToolExecutor:
             # Create ACTION memory using UMS tools
             action_memory_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
-                "ums:store_memory",
+                "store_memory",
                 {
                     'workflow_id': self.state.workflow_id,
                     'content': json.dumps({"tool": tool_name, "args": tool_args})[:1500],
@@ -1998,8 +1998,8 @@ class ProceduralAgenda:
 
     # ------------------------------------------------------------------ init
 
-    def __init__(self, mcp_client, state):
-        self.mcp = mcp_client
+    def __init__(self, mcp_client, state: AMLState):
+        self.mcp_client = mcp_client
         self.state = state
         self._goals: Dict[str, Goal] = {}
         self._pq: List[_PQItem] = []
@@ -2117,30 +2117,82 @@ class ProceduralAgenda:
     # ---- UMS persistence layer -------------------------------------------
 
     def _persist_goal(self, goal: Goal):
-        """Create or update goal in UMS via MCP `ums:create_or_update_goal`."""
-        args = {
-            "workflow_id": self.state.workflow_id,
-            "goal_id": goal.goal_id,
-            "parent_goal_id": goal.parent_goal_id,
-            "title": goal.title,
-            "description": goal.description,
-            "status": goal.status.value,
-            "priority": goal.priority,
-            "sequence_number": goal.sequence_number,
-            "updated_at": goal.updated_at,
-        }
-        self.mcp_client._execute_tool_and_parse_for_agent(
-            "UMS_Server",
-            "ums:create_or_update_goal",
-            args,
-        )
+        """Create or update goal in UMS via MCP tools.
         
-        # 🔹NEW: dump simple markdown checklist after every change
+        Uses separate create and update operations as UMS likely has distinct tools for these.
+        """
         try:
-            with open("todo.md", "w", encoding="utf-8") as fh:
-                for g in sorted(self._goals.values(), key=lambda x: x.sequence_number):
-                    ck = "x" if g.status == GoalStatus.COMPLETED else " "
-                    fh.write(f"- [{ck}] {g.title}  <!-- {g.goal_id} -->\n")
+            # Try to create a new goal first
+            create_result = self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "create_goal",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "goal_id": goal.goal_id,
+                    "parent_goal_id": goal.parent_goal_id,
+                    "title": goal.title,
+                    "description": goal.description,
+                    "status": goal.status.value,
+                    "priority": goal.priority,
+                    "sequence_number": goal.sequence_number,
+                    "created_at": goal.created_at,
+                    "updated_at": goal.updated_at,
+                }
+            )
+            
+            # If create fails (goal might already exist), try update
+            if not create_result.get("success"):
+                update_result = self.mcp_client._execute_tool_and_parse_for_agent(
+                    "UMS_Server",
+                    "update_goal",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "goal_id": goal.goal_id,
+                        "status": goal.status.value,
+                        "priority": goal.priority,
+                        "updated_at": goal.updated_at,
+                    }
+                )
+                if not update_result.get("success"):
+                    # If both fail, try the combined tool name as fallback
+                    fallback_result = self.mcp_client._execute_tool_and_parse_for_agent(
+                        "UMS_Server",
+                        "create_or_update_goal",
+                        {
+                            "workflow_id": self.state.workflow_id,
+                            "goal_id": goal.goal_id,
+                            "parent_goal_id": goal.parent_goal_id,
+                            "title": goal.title,
+                            "description": goal.description,
+                            "status": goal.status.value,
+                            "priority": goal.priority,
+                            "sequence_number": goal.sequence_number,
+                            "updated_at": goal.updated_at,
+                        }
+                    )
+                    if not fallback_result.get("success"):
+                        self.mcp_client.logger.warning(f"Failed to persist goal {goal.goal_id}: all UMS operations failed")
+                        
+        except Exception as e:
+            self.mcp_client.logger.warning(f"Failed to persist goal {goal.goal_id}: {e}")
+        
+        # Optional: dump simple markdown checklist after every change
+        # This is useful for debugging but can be disabled for production
+        self._maybe_dump_todo_markdown()
+
+    def _maybe_dump_todo_markdown(self):
+        """Optional markdown checklist generation for debugging purposes."""
+        try:
+            # Only create if in development/debug mode (check via environment or config)
+            if os.environ.get("AGENT_DEBUG_MODE") or getattr(self.mcp_client.config, 'debug_mode', False):
+                with open("todo.md", "w", encoding="utf-8") as fh:
+                    fh.write("# Agent Goals\n\n")
+                    for g in sorted(self._goals.values(), key=lambda x: x.sequence_number):
+                        ck = "x" if g.status == GoalStatus.COMPLETED else " "
+                        priority_marker = "!" * min(g.priority, 3)  # Visual priority indicator
+                        fh.write(f"- [{ck}] {priority_marker} {g.title}  <!-- {g.goal_id} -->\n")
+                        if g.description and g.description != g.title:
+                            fh.write(f"  - {g.description}\n")
         except OSError:
             pass  # never block core loop on FS hiccup
 
@@ -2148,33 +2200,66 @@ class ProceduralAgenda:
         """
         Fetch existing goals for the workflow and seed in-memory structures.
 
-        Invokes `ums:get_goals` util which returns a list of goal dicts.
+        Uses UMS goal retrieval tools with proper error handling and structure validation.
         """
-        result = self.mcp_client._execute_tool_and_parse_for_agent(
-            "UMS_Server",
-            "ums:get_goals",
-            {"workflow_id": self.state.workflow_id},
-        )
-        if result.get("success") and result.get("data"):
-            goals = result["data"].get("goals", [])
-        else:
-            goals = []
-            
-        for g in goals:
-            goal = Goal(
-                goal_id=g["goal_id"],
-                parent_goal_id=g.get("parent_goal_id"),
-                title=g["title"],
-                description=g["description"],
-                status=GoalStatus(g["status"]),
-                priority=g.get("priority", 3),
-                sequence_number=g.get("sequence_number", 0),
-                created_at=g.get("created_at", _ts()),
-                updated_at=g.get("updated_at", _ts()),
+        try:
+            # Try the standard get_goals tool first
+            result = self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "get_goals",
+                {"workflow_id": self.state.workflow_id},
             )
-            self._goals[goal.goal_id] = goal
-            if goal.status in {GoalStatus.PLANNED, GoalStatus.ACTIVE}:
-                self._insert_to_queue(goal)
+            
+            if not result.get("success"):
+                # Try alternative tool names if the first fails
+                alt_result = self.mcp_client._execute_tool_and_parse_for_agent(
+                    "UMS_Server", 
+                    "query_goals",
+                    {"workflow_id": self.state.workflow_id}
+                )
+                if alt_result.get("success"):
+                    result = alt_result
+                    
+        except Exception as e:
+            self.mcp_client.logger.warning(f"Failed to load goals from  {e}")
+            return  # Start with empty goal set
+            
+        # Extract goals from result with robust structure handling
+        goals = []
+        if result.get("success") and result.get("data"):
+            data = result["data"]
+            if isinstance(data, dict):
+                # Try different possible structures
+                goals = (data.get("goals") or 
+                        data.get("goal_list") or 
+                        data.get("items") or 
+                        [])
+            elif isinstance(data, list):
+                goals = data
+        
+        # Process each goal with validation
+        for g in goals:
+            if not isinstance(g, dict) or "goal_id" not in g:
+                continue  # Skip malformed goal entries
+                
+            try:
+                goal = Goal(
+                    goal_id=g["goal_id"],
+                    parent_goal_id=g.get("parent_goal_id"),
+                    title=g.get("title", "Untitled Goal"),
+                    description=g.get("description", ""),
+                    status=GoalStatus(g.get("status", "planned")),
+                    priority=g.get("priority", 3),
+                    sequence_number=g.get("sequence_number", 0),
+                    created_at=g.get("created_at", _ts()),
+                    updated_at=g.get("updated_at", _ts()),
+                )
+                self._goals[goal.goal_id] = goal
+                if goal.status in {GoalStatus.PLANNED, GoalStatus.ACTIVE}:
+                    self._insert_to_queue(goal)
+            except (ValueError, KeyError) as e:
+                self.mcp_client.logger.warning(f"Skipping malformed goal {g.get('goal_id', 'unknown')}: {e}")
+                continue
 
     # ----------------------------------------------------------------- dunder
 
@@ -2253,7 +2338,7 @@ class AgentMasterLoop:
         # 1. Create workflow -------------------------------------------------
         wf_resp = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:create_workflow",
+            "create_workflow",
             {
                 "title": f"Workflow – {user_goal[:60]}",
                 "description": user_goal,
@@ -2264,7 +2349,7 @@ class AgentMasterLoop:
         # 2. Create root goal -----------------------------------------------
         goal_resp = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:create_or_update_goal",
+            "create_or_update_goal",
             {
                 "workflow_id": workflow_id,
                 "title": "Root goal",
@@ -2355,7 +2440,7 @@ class AgentMasterLoop:
         # 🔹NEW --- Vector-similar memories for the *current* leaf goal ------
         sim_res = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:get_similar_memories",
+            "get_similar_memories",
             {
                 "workflow_id": self.state.workflow_id,
                 "memory_id": self.state.current_leaf_goal_id,
@@ -2387,7 +2472,7 @@ class AgentMasterLoop:
         # ------------------------------------------------------------------
         mems_res = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:get_recent_memories_with_links",
+            "get_recent_memories_with_links",
             {"workflow_id": self.state.workflow_id, "limit": 10},
         )
 
@@ -2405,7 +2490,7 @@ class AgentMasterLoop:
         # ------------------------------------------------------------------
         path_res = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:get_subgraph",
+            "get_subgraph",
             {
                 "workflow_id": self.state.workflow_id,
                 "start_node_id": self.state.current_leaf_goal_id,
@@ -2463,7 +2548,7 @@ class AgentMasterLoop:
             async def _on_summary(res: Dict[str, str], target_id: str = mem_id) -> None:
                 summary_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     "UMS_Server",
-                    "ums:store_memory",
+                    "store_memory",
                     {
                         "workflow_id": self.state.workflow_id,
                         "content": res["summary"],
@@ -2515,7 +2600,7 @@ class AgentMasterLoop:
             ) -> None:
                 contr_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     "UMS_Server",
-                    "ums:store_memory",
+                    "store_memory",
                     {
                         "workflow_id": self.state.workflow_id,
                         "content": f"{res['summary']}\n\nCLARIFY: {res['question']}",
@@ -2614,7 +2699,7 @@ class AgentMasterLoop:
                 thought = decision.get("content", "")
                 thought_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     "UMS_Server",
-                    "ums:store_memory",
+                    "store_memory",
                     {
                         "workflow_id": self.state.workflow_id,
                         "content": thought,
@@ -2645,7 +2730,7 @@ class AgentMasterLoop:
             text = str(decision)
             text_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
-                "ums:store_memory",
+                "store_memory",
                 {
                     "workflow_id": self.state.workflow_id,
                     "content": text,
@@ -2671,7 +2756,7 @@ class AgentMasterLoop:
         """Persist minimal state back to UMS to allow recovery."""
         self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:update_workflow_metadata",
+            "update_workflow_metadata",
             {
                 "workflow_id": self.state.workflow_id,
                 "metadata": {
@@ -2693,7 +2778,7 @@ class AgentMasterLoop:
         """Marks workflow failed and returns 'failed'."""
         self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
-            "ums:update_workflow_status",
+            "update_workflow_status",
             {"workflow_id": self.state.workflow_id, "status": "failed", "reason": reason},
         )
         return "failed"
