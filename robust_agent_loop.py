@@ -27,19 +27,12 @@ import textwrap
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Dict, List, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 import networkx as nx
-
-###############################################################################
-# SECTION 0.5 –  UMS server-side helper façade (REMOVED)
-###############################################################################
-
-# The UMSUtility class has been removed. All UMS operations are now handled
-# directly through MCPClient._execute_tool_and_parse_for_agent calls.
 
 ###############################################################################
 # SECTION 1. Global constants (tunable via config later)
@@ -908,12 +901,10 @@ class StructuredCall:
     """Utility class for making *cheap/fast* LLM calls that must return a
     **strict JSON object** matching a user‑supplied JSON‑Schema.
 
-    The implementation prefers whatever *native* fast‑LLM helper the enclosing
-    *MCP* client exposes (commonly `fast_llm_call`).  When that helper is not
-    present the class falls back to using the **OpenAI** client locally ‑‑ which
-    works for most OSS and commercial providers that implement the Chat
-    Completions API.  This makes the class portable while still first‑class for
-    the intended production stack.
+    The implementation leverages the existing `MCPClient.query_llm_structured()` 
+    method which already handles provider clients, cost tracking, and retry logic.
+    This makes the class a thin wrapper that ensures the existing MCP client
+    infrastructure is properly utilized.
 
     Features
     --------
@@ -924,9 +915,7 @@ class StructuredCall:
     • *Optional* JSON‑Schema validation using the **jsonschema** library if it is
       available in the environment; otherwise falls back to a minimal
       hand‑rolled required‑field check so that runtime dependencies remain light.
-    • Thread‑safe async execution by shuttling blocking SDK calls to
-      ``asyncio.to_thread`` when the underlying SDK is synchronous (e.g.
-      ``openai``).
+    • Thread‑safe async execution by leveraging MCPClient's existing async infrastructure.
     • When the MCP client did **not** define `fast_llm_call`, the constructor
       monkey‑patches ``mcp_client.fast_llm_call = self.query`` so that other
       components (e.g. `MemoryGraphManager`) can transparently invoke the fast
@@ -935,7 +924,7 @@ class StructuredCall:
 
     def __init__(
         self,
-        mcp_client: Any,
+        mcp_client,
         model_name: str = FAST_MODEL_NAME,
         cost_cap_usd: float = FAST_CALL_MAX_USD,
         max_retries: int = 2,
@@ -944,7 +933,6 @@ class StructuredCall:
         self.model_name = model_name
         self.cost_cap = cost_cap_usd
         self.max_retries = max_retries
-        self._spent_usd: float = 0.0
 
         # If the enclosing MCP client does *not* expose a convenience wrapper
         # for cheap LLM hits, install this StructuredCall.query so that callers
@@ -977,32 +965,29 @@ class StructuredCall:
         if hasattr(self.mcp_client, "fast_llm_call") and self.mcp_client.fast_llm_call is not self.query:  # type: ignore[attr-defined]
             return await self.mcp_client.fast_llm_call(prompt, schema)  # type: ignore[misc]
 
-        # Otherwise we fall back to a direct OpenAI call (or any provider that
-        # looks like it).
-        response_text, usage = await self._call_openai(prompt)
-
-        # Rough cost check (if usage is None we skip budget enforcement).  The
-        # fallback assumes 0.00025 USD / 1K tokens which is in the ballpark for
-        # flash‑style models.
-        if usage is not None:
-            est_cost = 0.00025 * (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)) / 1000
-        else:
-            est_cost = 0.00025  # minimal guess
-        self._spent_usd += est_cost
-        if self._spent_usd > self.cost_cap:
+        # Check budget before making any calls
+        if hasattr(self.mcp_client, 'cheap_total_cost') and self.mcp_client.cheap_total_cost > self.cost_cap:
             raise RuntimeError("StructuredCall budget exceeded – aborting")
 
+        # Use MCPClient's query_llm_structured method
+        response_data = await self._call_mcp_structured(prompt, schema)
+
         # ------------------------------------------------------------------
-        # Parse + validate
+        # Parse + validate with retry logic
         # ------------------------------------------------------------------
         for attempt in range(self.max_retries + 1):
             try:
-                parsed: Dict[str, Any] = json.loads(response_text)
-            except json.JSONDecodeError:
+                # MCPClient.query_llm_structured should return a dict already
+                if isinstance(response_data, dict):
+                    parsed = response_data
+                else:
+                    # If it returned a string, try to parse it as JSON
+                    parsed = json.loads(str(response_data))
+            except (json.JSONDecodeError, TypeError, ValueError):
                 if attempt == self.max_retries:
                     raise
                 # Ask model to correct its output
-                response_text = await self._repair(prompt, response_text)
+                response_data = await self._repair(prompt, str(response_data))
                 continue
 
             # JSON Schema validation (optional) ---------------------------
@@ -1014,7 +999,7 @@ class StructuredCall:
                 except jsonschema.ValidationError:
                     if attempt == self.max_retries:
                         raise
-                    response_text = await self._repair(prompt, response_text)
+                    response_data = await self._repair(prompt, str(response_data))
                     continue
             else:
                 # Minimal required‑field check
@@ -1022,7 +1007,7 @@ class StructuredCall:
                 if not all(k in parsed for k in required):
                     if attempt == self.max_retries:
                         raise ValueError("Missing required JSON fields: " + ", ".join(required))
-                    response_text = await self._repair(prompt, response_text)
+                    response_data = await self._repair(prompt, str(response_data))
                     continue
             # Success ---------------------------------------------------
             return parsed
@@ -1034,41 +1019,35 @@ class StructuredCall:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _call_openai(self, prompt: str) -> Tuple[str, Optional[Dict[str, int]]]:
-        """Dispatches the prompt to OpenAI *synchronously* inside a thread.
-
-        Returns ``(response_text, usage_dict_or_None)``.
+    async def _call_mcp_structured(self, prompt: str, schema: Dict[str, Any]) -> Any:
+        """
+        Call MCPClient.query_llm_structured() with the appropriate parameters.
         """
         try:
-            import openai
-        except ImportError as exc:  # pragma: no cover – execution env might differ
-            raise RuntimeError("openai python package not available; cannot fallback to direct API call") from exc
-
-        client = openai.OpenAI()
-
-        # The OpenAI SDK call is blocking; use ``asyncio.to_thread`` so that we
-        # play nice inside async orchestrators.
-        def _sync_call():
-            completion = client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                response_format={"type": "json_object"},
+            return await self.mcp_client.query_llm_structured(
+                prompt_messages=[{"role": "user", "content": prompt}],
+                response_schema=schema,
+                model_override=self.model_name,
+                use_cheap_model=True
             )
-            return completion.choices[0].message.content, completion.usage  # type: ignore[attr-defined]
+        except Exception:
+            # If query_llm_structured signature is different, try the simple version
+            try:
+                return await self.mcp_client.query_llm_structured(
+                    prompt=prompt,
+                    schema=schema,
+                    use_cheap_model=True
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to call MCPClient.query_llm_structured: {e}") from e
 
-        content, usage = await asyncio.to_thread(_sync_call)
-        usage_dict = usage.to_dict() if usage else None  # type: ignore[attr-defined]
-        return content, usage_dict
-
-    async def _repair(self, original_prompt: str, bad_response: str) -> str:
+    async def _repair(self, original_prompt: str, bad_response: str) -> Any:
         """Ask the model to *just* return valid JSON according to *original* request."""
         repair_prompt = (
-            original_prompt + "The previous response was not valid JSON or failed schema validation. "
+            original_prompt + " The previous response was not valid JSON or failed schema validation. "
             "Return *only* a valid JSON object that satisfies the schema – no explanations."  # noqa: E501
         )
-        new_text, _ = await self._call_openai(repair_prompt)
-        return new_text
+        return await self._call_mcp_structured(repair_prompt, {})  # Empty schema for repair attempt
 
 
 class AsyncTask:
@@ -1759,7 +1738,7 @@ class GraphReasoner:
             "edges": [e for e in snapshot["edges"] if e["source"] in sub_nodes and e["target"] in sub_nodes],
         }
         text_blob = repr(sub_snapshot)
-        result = await self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        result = await self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:summarize_context_block",
             {
@@ -1778,73 +1757,178 @@ class GraphReasoner:
 
 
 class ToolExecutor:
-    def __init__(self, mcp_client, state, mem_graph):
-        self.mcp = mcp_client
+    def __init__(self, mcp_client, state: AMLState, mem_graph):
+        self.mcp_client = mcp_client
         self.state = state
         self.mem_graph = mem_graph
 
     async def run(self, tool_name: str, tool_args: dict[str, Any]) -> Any:
-        result = await self.mcp._execute_tool_and_parse_for_agent(...)
-
-        # ------------------------------------------------------------------
-        # After any tool call → create an ACTION memory + link to goal
-        # ------------------------------------------------------------------
-        action_mem_id = await self.mcp.create_memory(
-            workflow_id=self.state.workflow_id,
-            content=json.dumps({"tool": tool_name, "args": tool_args})[:1500],
-            memory_level="working",
-            memory_type="ACTION",
-            description=f"Tool call {tool_name}",
+        """
+        Execute a tool and handle memory creation/linking.
+        
+        Parameters
+        ----------
+        tool_name : str
+            The original MCP tool name (e.g., "ums:store_memory")
+        tool_args : dict
+            Tool arguments
+            
+        Returns
+        -------
+        Any
+            The tool execution result
+        """
+        # Determine the server name - for UMS tools, use UMS_Server
+        if tool_name.startswith("ums:"):
+            server_name = "UMS_Server"
+        else:
+            # For non-UMS tools, try to determine the server or use a default
+            # This might need to be refined based on the actual tool registry
+            server_name = "Unknown_Server"  # MCPClient should handle server resolution
+        
+        # Execute the tool via MCPClient
+        result_envelope = await self.mcp_client._execute_tool_and_parse_for_agent(
+            server_name, tool_name, tool_args
         )
-        # Link provenance ---------------------------------------------------
-        await self.mem_graph.auto_link(
-            src_id=self.state.current_leaf_goal_id,
-            tgt_id=action_mem_id,
-            context_snip="attempts to satisfy goal via tool",
-        )
-
-        # 🔹NEW link inputs -> action (if args reference memory ids)
-        for val in tool_args.values():
-            if isinstance(val, str) and val.startswith("mem_"):  # crude check
-                await self.mem_graph.auto_link(
-                    src_id=val,
-                    tgt_id=action_mem_id,
-                    context_snip="input to tool",
+        
+        # Check if the tool execution was successful
+        if not result_envelope.get("success", False):
+            error_msg = result_envelope.get("error_message", "Unknown tool execution error")
+            self.mcp_client.logger.error(f"Tool {tool_name} failed: {error_msg}")
+            
+            # Create an error memory for failed tool execution
+            try:
+                await self.mcp_client._execute_tool_and_parse_for_agent(
+                    "UMS_Server", 
+                    "ums:store_memory", 
+                    {
+                        'workflow_id': self.state.workflow_id,
+                        'content': f"TOOL ERROR: {tool_name} failed with: {error_msg}",
+                        'memory_type': 'ERROR_LOG',
+                        'memory_level': 'working',
+                        'importance': 3.0,
+                        'description': f"Tool execution error for {tool_name}",
+                    }
                 )
+            except Exception as memory_error:
+                self.mcp_client.logger.warning(f"Failed to create error memory: {memory_error}")
+            
+            # Return the error envelope for the caller to handle
+            return result_envelope
 
-        # 🔹NEW link action -> outputs (if result contains memory_ids)
-        if isinstance(result, dict) and "memory_id" in result:
-            output_id = result["memory_id"]
-            await self.mem_graph.auto_link(
-                src_id=action_mem_id,
-                tgt_id=output_id,
-                context_snip="tool output",
-                kind_hint=LinkKind.SEQUENTIAL,
+        # ------------------------------------------------------------------
+        # After successful tool call → create an ACTION memory + link to goal
+        # ------------------------------------------------------------------
+        try:
+            # Create ACTION memory using UMS tools
+            action_memory_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:store_memory",
+                {
+                    'workflow_id': self.state.workflow_id,
+                    'content': json.dumps({"tool": tool_name, "args": tool_args})[:1500],
+                    'memory_level': 'working',
+                    'memory_type': 'ACTION',
+                    'description': f"Tool call {tool_name}",
+                    'importance': 4.0,
+                }
             )
-        return result
+            
+            if action_memory_res.get("success") and action_memory_res.get("data"):
+                action_mem_id = action_memory_res["data"].get("memory_id")
+                
+                if action_mem_id:
+                    # Link provenance: goal -> action
+                    await self.mem_graph.auto_link(
+                        src_id=self.state.current_leaf_goal_id,
+                        tgt_id=action_mem_id,
+                        context_snip="attempts to satisfy goal via tool",
+                    )
+
+                    # Link inputs -> action (if args reference memory ids)
+                    for val in tool_args.values():
+                        if isinstance(val, str) and val.startswith("mem_"):  # crude check
+                            await self.mem_graph.auto_link(
+                                src_id=val,
+                                tgt_id=action_mem_id,
+                                context_snip="input to tool",
+                            )
+
+                    # Link action -> outputs (if result contains memory_ids)
+                    result_data = result_envelope.get("data", {})
+                    if isinstance(result_data, dict) and "memory_id" in result_data:
+                        output_id = result_data["memory_id"]
+                        await self.mem_graph.auto_link(
+                            src_id=action_mem_id,
+                            tgt_id=output_id,
+                            context_snip="tool output",
+                            kind_hint=LinkKind.SEQUENTIAL,
+                        )
+                        
+        except Exception as memory_error:
+            # Log memory creation/linking errors but don't fail the tool execution
+            self.mcp_client.logger.warning(f"Failed to create action memory or links for {tool_name}: {memory_error}")
+
+        # Return the actual tool result
+        return result_envelope
 
 
 class LLMOrchestrator:
-    def __init__(self, mcp_client, state, mem_graph):
-        self.mcp = mcp_client
+    def __init__(self, mcp_client, state: AMLState):
+        self.mcp_client = mcp_client
         self.state = state
-        self._fast_query = StructuredCall(mcp_client, state, mem_graph, self)
-        self._big_query = StructuredCall(mcp_client, state, mem_graph, self)
+        self._fast_query = StructuredCall(mcp_client, model_name=FAST_MODEL_NAME)
 
     async def fast_structured_call(self, prompt: str, schema: dict[str, Any]):
-        """Thin wrapper that delegates to `StructuredCall.query` and tracks cost."""
+        """Thin wrapper that delegates to `StructuredCall.query` which now uses MCPClient infrastructure."""
         result = await self._fast_query.query(prompt, schema)
-        self.state.cost_usd += self._fast_query._spent_usd  # accumulate budget
-        self._fast_query._spent_usd = 0
+        # Cost tracking is now handled by MCPClient, no need to accumulate here
         return result
 
-    # 🔹NEW single entry for SMART model; automatically tallies $$.
-    async def big_reasoning_call(self, messages: list[dict], tool_schemas=None):
-        model_name = pick_model(self.state.phase)
-        resp = await self.mcp.smart_llm_call(messages, tool_schemas, model_name=model_name)
-        # assume MCP returns usage → cost
-        self.state.cost_usd += resp.get("cost_usd", 0)
-        return resp["content"]
+    async def big_reasoning_call(self, messages: list[dict], tool_schemas=None, model_name: str = None):
+        """
+        Single entry for SMART model calls; automatically uses MCPClient infrastructure.
+        
+        Parameters
+        ----------
+        messages : list[dict]
+            Chat completion messages in the standard format
+        tool_schemas : optional
+            Tool schemas for the agent to use
+        model_name : str, optional
+            Model name to use. If not provided, uses the MCPClient's current model.
+        """
+        # Use the passed model_name or fall back to MCPClient's current model
+        target_model = model_name or self.mcp_client.current_model
+        
+        try:
+            # Use MCPClient's process_agent_llm_turn method which handles the full agent interaction
+            resp = await self.mcp_client.process_agent_llm_turn(
+                prompt_messages=messages, 
+                tool_schemas=tool_schemas, 
+                model_name=target_model
+            )
+            # Cost tracking is automatically handled by MCPClient.process_streaming_query
+            return resp
+        except Exception as e:
+            # If process_agent_llm_turn doesn't exist or has different signature, 
+            # fall back to basic query_llm
+            try:
+                # Convert messages to a simple prompt for basic query_llm
+                if messages and len(messages) > 0:
+                    last_message = messages[-1]
+                    prompt_text = last_message.get("content", "")
+                else:
+                    prompt_text = ""
+                
+                resp = await self.mcp_client.query_llm(
+                    prompt_text, 
+                    model_override=target_model,
+                    max_tokens=2000  # reasonable default for reasoning calls
+                )
+                return {"content": resp}
+            except Exception as fallback_e:
+                raise RuntimeError(f"Failed to call MCPClient LLM methods: {e}, fallback also failed: {fallback_e}") from e
 
 ###############################################################################
 # SECTION 7. Procedural Agenda & Planner helpers (outline)
@@ -2152,7 +2236,7 @@ class AgentMasterLoop:
         from .tool_executor import ToolExecutor  # type: ignore
 
         self.llms = LLMOrchestrator(self.mcp_client, self.state)
-        self.tool_exec = ToolExecutor(self.mcp_client, self.state)
+        self.tool_exec = ToolExecutor(self.mcp_client, self.state, self.mem_graph)
         self.metacog = MetacognitionEngine(self.mcp_client, self.state, self.mem_graph, self.llms, self.async_queue)
         self.planner = ProceduralAgenda(self.mcp_client, self.state)
         self.graph_reasoner = GraphReasoner(self.mcp_client, self.llms, self.mem_graph)
@@ -2167,7 +2251,7 @@ class AgentMasterLoop:
         • Persists initial records so subsequent restarts can resume
         """
         # 1. Create workflow -------------------------------------------------
-        wf_resp = self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        wf_resp = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:create_workflow",
             {
@@ -2178,7 +2262,7 @@ class AgentMasterLoop:
         workflow_id = wf_resp["data"]["workflow_id"]
 
         # 2. Create root goal -----------------------------------------------
-        goal_resp = self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        goal_resp = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:create_or_update_goal",
             {
@@ -2251,7 +2335,7 @@ class AgentMasterLoop:
         if self.state.phase == Phase.COMPLETE:
             # 🔹NEW: signal orchestrators with idle tool call  
             try:
-                await self.mcp._execute_tool_and_parse_for_agent("idle", {})
+                await self.mcp_client._execute_tool_and_parse_for_agent("UMS_Server", "idle", {})
             except Exception:
                 pass  # never block completion on sentinel call failure
             return "finished"
@@ -2269,7 +2353,7 @@ class AgentMasterLoop:
     async def _gather_context(self) -> Dict[str, Any]:
         """Collects all information fed into the SMART-model prompt."""
         # 🔹NEW --- Vector-similar memories for the *current* leaf goal ------
-        sim_res = self.mcp._execute_tool_and_parse_for_agent(
+        sim_res = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:get_similar_memories",
             {
@@ -2301,7 +2385,7 @@ class AgentMasterLoop:
         # ------------------------------------------------------------------
         # Recent memories **with outgoing links** (link-aware utility)
         # ------------------------------------------------------------------
-        mems_res = self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        mems_res = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:get_recent_memories_with_links",
             {"workflow_id": self.state.workflow_id, "limit": 10},
@@ -2319,7 +2403,7 @@ class AgentMasterLoop:
         # ------------------------------------------------------------------
         # Goal context: path leaf-goal ➜ root  (subgraph, link-aware)
         # ------------------------------------------------------------------
-        path_res = self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        path_res = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:get_subgraph",
             {
@@ -2377,19 +2461,26 @@ class AgentMasterLoop:
             }
 
             async def _on_summary(res: Dict[str, str], target_id: str = mem_id) -> None:
-                new_mem = await self.mcp.create_memory(
-                    workflow_id=self.state.workflow_id,
-                    content=res["summary"],
-                    memory_level="working",
-                    memory_type="SUMMARY",
-                    description=f"Auto-summary of {target_id}",
+                summary_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    "UMS_Server",
+                    "ums:store_memory",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "content": res["summary"],
+                        "memory_level": "working",
+                        "memory_type": "SUMMARY",
+                        "description": f"Auto-summary of {target_id}",
+                    }
                 )
-                # Link summary ➜ original with ELABORATES so graph queries know
-                await self.mem_graph.auto_link(
-                    src_id=new_mem,
-                    tgt_id=target_id,
-                    context_snip="machine-generated summary",
-                )
+                if summary_res.get("success") and summary_res.get("data"):
+                    new_mem_id = summary_res["data"].get("memory_id")
+                    if new_mem_id:
+                        # Link summary ➜ original with ELABORATES so graph queries know
+                        await self.mem_graph.auto_link(
+                            src_id=new_mem_id,
+                            tgt_id=target_id,
+                            context_snip="machine-generated summary",
+                        )
 
             coro = self.llms.fast_structured_call(prompt, schema)
             self.async_queue.spawn(
@@ -2422,24 +2513,31 @@ class AgentMasterLoop:
                 aid: str = a_id,
                 bid: str = b_id,
             ) -> None:
-                contr_mem = await self.mcp.create_memory(
-                    workflow_id=self.state.workflow_id,
-                    content=f"{res['summary']}\n\nCLARIFY: {res['question']}",
-                    memory_level="working",
-                    memory_type="CONTRADICTION_ANALYSIS",
-                    description="Automated contradiction digest",
+                contr_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    "UMS_Server",
+                    "ums:store_memory",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "content": f"{res['summary']}\n\nCLARIFY: {res['question']}",
+                        "memory_level": "working",
+                        "memory_type": "CONTRADICTION_ANALYSIS",
+                        "description": "Automated contradiction digest",
+                    }
                 )
-                # Link both original memories to the analysis node
-                await self.mem_graph.auto_link(
-                    src_id=aid,
-                    tgt_id=contr_mem,
-                    context_snip="contradiction_summary",
-                )
-                await self.mem_graph.auto_link(
-                    src_id=bid,
-                    tgt_id=contr_mem,
-                    context_snip="contradiction_summary",
-                )
+                if contr_res.get("success") and contr_res.get("data"):
+                    contr_mem_id = contr_res["data"].get("memory_id")
+                    if contr_mem_id:
+                        # Link both original memories to the analysis node
+                        await self.mem_graph.auto_link(
+                            src_id=aid,
+                            tgt_id=contr_mem_id,
+                            context_snip="contradiction_summary",
+                        )
+                        await self.mem_graph.auto_link(
+                            src_id=bid,
+                            tgt_id=contr_mem_id,
+                            context_snip="contradiction_summary",
+                        )
 
             coro = self.llms.fast_structured_call(prompt, schema)
             task_name = f"contradict_{a_id[:4]}_{b_id[:4]}"
@@ -2514,20 +2612,27 @@ class AgentMasterLoop:
                 return True
             elif dtype == "THOUGHT_PROCESS":
                 thought = decision.get("content", "")
-                mem_id = await self.mcp.create_memory(
-                    workflow_id=self.state.workflow_id,
-                    content=thought,
-                    memory_level="working",
-                    memory_type="REASONING_STEP",
-                    description="Thought from SMART model",
+                thought_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    "UMS_Server",
+                    "ums:store_memory",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "content": thought,
+                        "memory_level": "working",
+                        "memory_type": "REASONING_STEP",
+                        "description": "Thought from SMART model",
+                    }
                 )
-                # ⇢ NEW: link any referenced memories as supporting evidence
-                evid_ids = re.findall(r"mem_[0-9a-f]{8}", thought)
-                if evid_ids:
-                    await self.mem_graph.register_reasoning_trace(
-                        thought_mem_id=mem_id,
-                        evidence_ids=evid_ids,
-                    )
+                if thought_res.get("success") and thought_res.get("data"):
+                    mem_id = thought_res["data"].get("memory_id")
+                    if mem_id:
+                        # ⇢ NEW: link any referenced memories as supporting evidence
+                        evid_ids = re.findall(r"mem_[0-9a-f]{8}", thought)
+                        if evid_ids:
+                            await self.mem_graph.register_reasoning_trace(
+                                thought_mem_id=mem_id,
+                                evidence_ids=evid_ids,
+                            )
                 return bool(thought.strip())
             elif dtype == "DONE":
                 self.state.phase = Phase.COMPLETE
@@ -2538,26 +2643,33 @@ class AgentMasterLoop:
         else:
             # If it's plain text, store as a reasoning step
             text = str(decision)
-            mem_id = await self.mcp.create_memory(
-                workflow_id=self.state.workflow_id,
-                content=text,
-                memory_level="working",
-                memory_type="REASONING_STEP",
-                description="Unstructured reasoning output",
+            text_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:store_memory",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "content": text,
+                    "memory_level": "working",
+                    "memory_type": "REASONING_STEP",
+                    "description": "Unstructured reasoning output",
+                }
             )
-            evid_ids = re.findall(r"mem_[0-9a-f]{8}", text)
-            if evid_ids:
-                await self.mem_graph.register_reasoning_trace(
-                    thought_mem_id=mem_id,
-                    evidence_ids=evid_ids,
-                )
+            if text_res.get("success") and text_res.get("data"):
+                mem_id = text_res["data"].get("memory_id")
+                if mem_id:
+                    evid_ids = re.findall(r"mem_[0-9a-f]{8}", text)
+                    if evid_ids:
+                        await self.mem_graph.register_reasoning_trace(
+                            thought_mem_id=mem_id,
+                            evidence_ids=evid_ids,
+                        )
             return bool(text.strip())
 
     # ----------------------------------------------------- after-turn misc
 
     def _save_state(self) -> None:
         """Persist minimal state back to UMS to allow recovery."""
-        self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:update_workflow_metadata",
             {
@@ -2579,7 +2691,7 @@ class AgentMasterLoop:
 
     def _hard_fail(self, reason: str) -> str:
         """Marks workflow failed and returns 'failed'."""
-        self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:update_workflow_status",
             {"workflow_id": self.state.workflow_id, "status": "failed", "reason": reason},

@@ -46,6 +46,7 @@ dependencies = [
     "psutil",
     "typing-extensions",
     "zeroconf",
+    "networkx",
     "opentelemetry-sdk",
     "opentelemetry-api",
     "opentelemetry-instrumentation",
