@@ -48,31 +48,35 @@ class UMSUtility:
     """
 
     def __init__(self, mcp_client):
-        self.mcp = mcp_client
+        self.mcp_client = mcp_client
 
     # ------------------------------------------------------------------ vector
 
     async def get_embedding(self, workflow_id: str, memory_id: str) -> Optional[list[float]]:
         """Return the embedding vector or *None* if it doesn't exist server-side."""
         try:
-            res = self.mcp._execute_tool_and_parse_for_agent(
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
                 "ums:get_embedding",
                 {"workflow_id": workflow_id, "memory_id": memory_id},
             )
-            return res["data"]["vector"]
+            if res.get("success") and res.get("data"):
+                return res["data"].get("vector")
+            return None
         except Exception:
             return None
 
     async def vector_similarity(self, vec_a: list[float], vec_b: list[float]) -> Optional[float]:
         """Fast SIMD cosine similarity via the server; *None* on failure."""
         try:
-            res = self.mcp._execute_tool_and_parse_for_agent(
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
                 "ums:vector_similarity",
                 {"vec_a": vec_a, "vec_b": vec_b},
             )
-            return res["data"]["cosine"]
+            if res.get("success") and res.get("data"):
+                return res["data"].get("cosine")
+            return None
         except Exception:
             return None
 
@@ -80,12 +84,15 @@ class UMSUtility:
 
     async def get_contradictions(self, workflow_id: str, limit: int = 50) -> Optional[list[tuple[str, str]]]:
         try:
-            res = self.mcp._execute_tool_and_parse_for_agent(
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
                 "ums:get_contradictions",
                 {"workflow_id": workflow_id, "limit": limit},
             )
-            return [(p["a"], p["b"]) for p in res["data"]["pairs"]]
+            if res.get("success") and res.get("data"):
+                pairs_data = res["data"].get("pairs", [])
+                return [(p["a"], p["b"]) for p in pairs_data]
+            return None
         except Exception:
             return None
 
@@ -216,35 +223,21 @@ class MemoryGraphManager:
     # Construction / low‑level helpers
     #############################################################
 
-    def __init__(self, mcp_client, state: AMLState, db_path: str | Path = "ums.db"):
-        self.mcp = mcp_client
+    def __init__(self, mcp_client, state: AMLState):
+        self.mcp_client = mcp_client
         self.state = state
-        self.db = sqlite3.connect(str(db_path), check_same_thread=False)
-        # ensure foreign keys, WAL for concurrency
-        self.db.execute("PRAGMA foreign_keys = ON;")
-        self.db.execute("PRAGMA journal_mode  = WAL;")
-        self.db.row_factory = sqlite3.Row
+        # Remove direct SQLite connection - use UMS tools via MCPClient instead
+        # self.db = sqlite3.connect(str(db_path), check_same_thread=False)
+        # self.db.execute("PRAGMA foreign_keys = ON;")
+        # self.db.execute("PRAGMA journal_mode  = WAL;")
+        # self.db.row_factory = sqlite3.Row
+        
         # ← NEW: helpers
         self.ums = UMSUtility(mcp_client)
-        # ← NEW: buffered writes
-        self._buf = GraphWriteBuffer(self.db)
+        # ← NEW: Remove buffered writes - use UMS tools directly
+        # self._buf = GraphWriteBuffer(self.db)
 
-    def _exec(self, sql: str, params: Sequence | None = None) -> list[sqlite3.Row]:
-        """Helper that executes *and commits* (when mutating). Returns rows."""
-        if params is None:
-            params = []
-        if sql.lstrip().upper().startswith("SELECT"):
-            return self._buf.execute_read(sql, params)
-        # mutating → add to buffer
-        self._buf.add(sql, params)
-        return []
-
-    def _uuid(self) -> str:  # deterministic helper wrapper
-        return str(uuid.uuid4())
-
-    #############################################################
-    # Public high‑level operations
-    #############################################################
+    # ----------------------------------------------------------- public API
 
     async def auto_link(
         self,
@@ -272,7 +265,7 @@ class MemoryGraphManager:
             await self._infer_link_type(src_id, tgt_id, context_snip)
         )).value
 
-        await self.mcp._execute_tool_and_parse_for_agent(
+        await self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:create_memory_link",
             {
@@ -314,18 +307,32 @@ class MemoryGraphManager:
         """
         Return memory_ids of facts or evidence that *contradict* the given memory.
         """
-        rows = self._exec(
-            """
-            SELECT target_memory_id FROM memory_links
-            WHERE source_memory_id = ? AND link_type = 'CONTRADICTS'
-            UNION
-            SELECT source_memory_id FROM memory_links
-            WHERE target_memory_id = ? AND link_type = 'CONTRADICTS'
-            LIMIT ?
-            """,
-            [mem_id, mem_id, limit],
-        )
-        return [r[0] for r in rows]
+        try:
+            # Use UMS tool to get memory links
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:get_memory_links", 
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_id": mem_id,
+                    "link_type": "CONTRADICTS",
+                    "bidirectional": True,
+                    "limit": limit
+                }
+            )
+            if res.get("success") and res.get("data"):
+                links = res["data"].get("links", [])
+                contradicting_ids = []
+                for link in links:
+                    # Collect both source and target IDs, excluding the original memory
+                    if link.get("source_memory_id") != mem_id:
+                        contradicting_ids.append(link["source_memory_id"])
+                    if link.get("target_memory_id") != mem_id:
+                        contradicting_ids.append(link["target_memory_id"])
+                return list(set(contradicting_ids))[:limit]  # Remove duplicates and limit
+            return []
+        except Exception:
+            return []
         
     async def detect_inconsistencies(self) -> List[Tuple[str, str]]:
         """
@@ -347,64 +354,104 @@ class MemoryGraphManager:
         2. Newer memory that negates ("not", "no", "false", etc.) a fact
            stored earlier → flagged.
         """
-        # Rule 1: explicit contradicts links ---------------------------------
-        rows = self._exec("SELECT source_memory_id, target_memory_id FROM memory_links WHERE link_type = 'CONTRADICTS'")
         result: Set[Tuple[str, str]] = set()
         
-        # ⇢ NEW: filter out resolved contradictions
-        for r in rows:
-            src, tgt = r["source_memory_id"], r["target_memory_id"]
-            # Check if this contradiction has been marked as resolved
-            try:
-                link_meta_res = self.mcp._execute_tool_and_parse_for_agent(
-                    "UMS_Server",
-                    "ums:get_memory_link_metadata", 
-                    {
-                        "workflow_id": self.state.workflow_id,
-                        "source_memory_id": src,
-                        "target_memory_id": tgt,
-                        "link_type": "CONTRADICTS",
-                    }
-                )
-                metadata = link_meta_res.get("data", {}).get("metadata", {})
-                if "resolved_at" not in metadata:
-                    result.add((src, tgt))
-            except Exception:
-                # If we can't check metadata, include it (fail-safe)
-                result.add((src, tgt))
+        # Rule 1: explicit contradicts links ---------------------------------
+        try:
+            # Get all CONTRADICTS links for this workflow
+            contradicts_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:query_graph_by_link_type",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "link_type": "CONTRADICTS",
+                    "limit": 100
+                }
+            )
+            if contradicts_res.get("success") and contradicts_res.get("data"):
+                pairs = contradicts_res["data"].get("pairs", [])
+                
+                # ⇢ NEW: filter out resolved contradictions
+                for pair in pairs:
+                    src, tgt = pair["a"], pair["b"]
+                    # Check if this contradiction has been marked as resolved
+                    try:
+                        link_meta_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                            "UMS_Server",
+                            "ums:get_memory_link_metadata", 
+                            {
+                                "workflow_id": self.state.workflow_id,
+                                "source_memory_id": src,
+                                "target_memory_id": tgt,
+                                "link_type": "CONTRADICTS",
+                            }
+                        )
+                        if link_meta_res.get("success") and link_meta_res.get("data"):
+                            metadata = link_meta_res["data"].get("metadata", {})
+                            if "resolved_at" not in metadata:
+                                result.add((src, tgt))
+                        else:
+                            # If we can't check metadata, include it (fail-safe)
+                            result.add((src, tgt))
+                    except Exception:
+                        # If we can't check metadata, include it (fail-safe)
+                        result.add((src, tgt))
+        except Exception:
+            pass  # Continue to other rules if this fails
         
         # Rule 2: naive negation check on recent memories ---------------------
-        recent = self._exec(
-            """SELECT memory_id, content FROM memories
-                   WHERE workflow_id = ?
-                     AND memory_level = 'working'
-                ORDER BY created_at DESC LIMIT 40""",
-            [self.state.workflow_id],
-        )
-        for i, row_i in enumerate(recent):
-            text_i = row_i["content"].lower()
-            for j in range(i + 1, len(recent)):
-                row_j = recent[j]
-                text_j = row_j["content"].lower()
-                # simple negation pattern: one text contains "not" + other statement substring
-                if (" not " in text_i or " no " in text_i) and row_j["content"][:40].lower() in text_i:
-                    result.add((row_i["memory_id"], row_j["memory_id"]))
-                if (" not " in text_j or " no " in text_j) and row_i["content"][:40].lower() in text_j:
-                    result.add((row_j["memory_id"], row_i["memory_id"]))
-         
-         # Rule 3: Soft negative feedback loops (A→B→…→A via CAUSAL edges) ----
-        g = nx.DiGraph()
-        causal_rows = self._exec(
-            "SELECT source_memory_id, target_memory_id FROM memory_links "
-            "WHERE link_type = 'CAUSAL'"
-        )
-        g.add_edges_from((r["source_memory_id"], r["target_memory_id"]) for r in causal_rows)
         try:
-            for cycle in nx.simple_cycles(g):
-                if len(cycle) > 1:
-                    result.add((cycle[0], cycle[-1]))
-        except nx.NetworkXError:
-            pass  # ignore if graph is empty or malformed
+            recent_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:query_memories",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_level": "working",
+                    "limit": 40,
+                    "sort_by": "created_at",
+                    "sort_order": "desc"
+                }
+            )
+            if recent_res.get("success") and recent_res.get("data"):
+                recent_memories = recent_res["data"].get("memories", [])
+                for i, mem_i in enumerate(recent_memories):
+                    text_i = mem_i.get("content", "").lower()
+                    for j in range(i + 1, len(recent_memories)):
+                        mem_j = recent_memories[j]
+                        text_j = mem_j.get("content", "").lower()
+                        # simple negation pattern: one text contains "not" + other statement substring
+                        if (" not " in text_i or " no " in text_i) and mem_j.get("content", "")[:40].lower() in text_i:
+                            result.add((mem_i["memory_id"], mem_j["memory_id"]))
+                        if (" not " in text_j or " no " in text_j) and mem_i.get("content", "")[:40].lower() in text_j:
+                            result.add((mem_j["memory_id"], mem_i["memory_id"]))
+        except Exception:
+            pass  # Continue if this rule fails
+         
+        # Rule 3: Soft negative feedback loops (A→B→…→A via CAUSAL edges) ----
+        try:
+            causal_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:query_graph_by_link_type",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "link_type": "CAUSAL",
+                    "limit": 200
+                }
+            )
+            if causal_res.get("success") and causal_res.get("data"):
+                g = nx.DiGraph()
+                causal_pairs = causal_res["data"].get("pairs", [])
+                for pair in causal_pairs:
+                    g.add_edge(pair["a"], pair["b"])
+                
+                try:
+                    for cycle in nx.simple_cycles(g):
+                        if len(cycle) > 1:
+                            result.add((cycle[0], cycle[-1]))
+                except nx.NetworkXError:
+                    pass  # ignore if graph is empty or malformed
+        except Exception:
+            pass  # Continue if this rule fails
         
         return list(result)
 
@@ -538,8 +585,8 @@ class MemoryGraphManager:
                 return "RELATED"
 
         # 3. Check tag overlap -------------------------------------------------
-        tags_src = self._get_tags_for_memory(src_id)
-        tags_tgt = self._get_tags_for_memory(tgt_id)
+        tags_src = await self._get_tags_for_memory(src_id)
+        tags_tgt = await self._get_tags_for_memory(tgt_id)
         if tags_src & tags_tgt:
             return "RELATED"
         # 4. Fallback to cheap LLM structured call ----------------------------
@@ -548,14 +595,19 @@ class MemoryGraphManager:
             "You are an expert knowledge‑graph assistant. Given two text snippets, "
             "classify the best relationship type among: RELATED, CAUSAL, SEQUENTIAL, "
             "CONTRADICTS, SUPPORTS, GENERALIZES, SPECIALIZES.\n"  # limited to those the DB knows
-            f"SRC: {self._get_memory_content(src_id)[:300]}\n"  # limit snippet
-            f"TGT: {self._get_memory_content(tgt_id)[:300]}\n"
+            f"SRC: {(await self._get_memory_content(src_id))[:300]}\n"  # limit snippet
+            f"TGT: {(await self._get_memory_content(tgt_id))[:300]}\n"
             'Answer with JSON: {"link_type": '
             "<TYPE>"
             "}"
         )
         try:
-            resp = await self.mcp.fast_llm_call(prompt, schema)  # assumes such helper; else fallback
+            # Use MCPClient's LLM infrastructure for cheap/fast calls
+            if hasattr(self.mcp_client, 'fast_llm_call'):
+                resp = await self.mcp_client.fast_llm_call(prompt, schema)
+            else:
+                # Fallback to a basic structured call - this would need to be implemented
+                resp = {"link_type": "RELATED"}  # Safe fallback
             t = resp.get("link_type", "RELATED").upper()
             inferred = t if t in {"RELATED", "CAUSAL", "SEQUENTIAL", "CONTRADICTS", "SUPPORTS", "GENERALIZES", "SPECIALIZES"} else "RELATED"
         except Exception:
@@ -572,26 +624,40 @@ class MemoryGraphManager:
 
     # ------------------------ misc small helpers ---------------------------
 
-    def _get_memory_content(self, memory_id: str) -> str:
-        row = self._exec("SELECT content, access_count FROM memories WHERE memory_id = ?", [memory_id])
-        if not row:
+    async def _get_memory_content(self, memory_id: str) -> str:
+        try:
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:get_memory_by_id",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_id": memory_id
+                }
+            )
+            if res.get("success") and res.get("data"):
+                content = res["data"].get("content", "")
+                # TODO: Update access count via UMS tool if available
+                return content
             return ""
-        # 🔸CHG bump access_count in-place; no extra round-trip
-        new_cnt = row[0]["access_count"] + 1
-        self._exec(
-            "UPDATE memories SET access_count = ? WHERE memory_id = ?",
-            [new_cnt, memory_id],
-        )
-        return row[0]["content"]
+        except Exception:
+            return ""
 
-    def _get_tags_for_memory(self, memory_id: str) -> Set[str]:
-        rows = self._exec(
-            """SELECT t.name FROM tags t
-                 JOIN artifact_tags at ON at.tag_id = t.tag_id
-                 WHERE at.artifact_id = ?""",  # might be empty if not an artifact
-            [memory_id],
-        )
-        return {r[0] for r in rows}
+    async def _get_tags_for_memory(self, memory_id: str) -> Set[str]:
+        try:
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:get_memory_tags",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_id": memory_id
+                }
+            )
+            if res.get("success") and res.get("data"):
+                tags = res["data"].get("tags", [])
+                return set(tags)
+            return set()
+        except Exception:
+            return set()
 
     def _insert_memory(self, *, content: str, level: str, mtype: str, description: str | None = None) -> str:
         new_id = self._uuid()
@@ -762,7 +828,7 @@ class StructuredCall:
         cost_cap_usd: float = FAST_CALL_MAX_USD,
         max_retries: int = 2,
     ) -> None:
-        self.mcp = mcp_client
+        self.mcp_client = mcp_client
         self.model_name = model_name
         self.cost_cap = cost_cap_usd
         self.max_retries = max_retries
@@ -771,8 +837,8 @@ class StructuredCall:
         # If the enclosing MCP client does *not* expose a convenience wrapper
         # for cheap LLM hits, install this StructuredCall.query so that callers
         # like `MemoryGraphManager` can always do `await mcp.fast_llm_call(...)`.
-        if not hasattr(self.mcp, "fast_llm_call"):
-            self.mcp.fast_llm_call = self.query
+        if not hasattr(self.mcp_client, "fast_llm_call"):
+            self.mcp_client.fast_llm_call = self.query
 
         # Try importing optional deps only once so that ImportError is neat.
         try:
@@ -796,8 +862,8 @@ class StructuredCall:
         # First, if the MCP client already implements its own fast helper we use
         # it directly – that covers the production path and also lets that
         # helper handle cost tracking.
-        if hasattr(self.mcp, "fast_llm_call") and self.mcp.fast_llm_call is not self.query:  # type: ignore[attr-defined]
-            return await self.mcp.fast_llm_call(prompt, schema)  # type: ignore[misc]
+        if hasattr(self.mcp_client, "fast_llm_call") and self.mcp_client.fast_llm_call is not self.query:  # type: ignore[attr-defined]
+            return await self.mcp_client.fast_llm_call(prompt, schema)  # type: ignore[misc]
 
         # Otherwise we fall back to a direct OpenAI call (or any provider that
         # looks like it).
@@ -1124,7 +1190,7 @@ class MetacognitionEngine:
         llm_orch: "LLMOrchestrator",
         async_queue: "AsyncTaskQueue",
     ) -> None:
-        self.mcp = mcp_client
+        self.mcp_client = mcp_client
         self.state = state
         self.mem_graph = mem_graph
         self.llm = llm_orch
@@ -1148,7 +1214,7 @@ class MetacognitionEngine:
 
         try:
             # Try using the UMS utility first
-            contradictions_res = self.mcp._execute_tool_and_parse_for_agent(
+            contradictions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
                 "ums:query_graph_by_link_type",
                 {
@@ -1157,7 +1223,12 @@ class MetacognitionEngine:
                     "limit": 20,
                 },
             )
-            contradictions = contradictions_res["data"]["pairs"]
+            if contradictions_res.get("success") and contradictions_res.get("data"):
+                contradictions = contradictions_res["data"].get("pairs", [])
+                # Convert to list of tuples if needed
+                contradictions = [(p["a"], p["b"]) for p in contradictions]
+            else:
+                contradictions = []
         except Exception:
             # Fallback to the original detect_inconsistencies method
             contradictions = await self.mem_graph.detect_inconsistencies()
@@ -1242,26 +1313,41 @@ class MetacognitionEngine:
     async def _store_reflection(self, data: Dict[str, Any]) -> None:
         """Persist reflection into UMS as both memory and thought."""
         content = data["summary"] + "\nNEXT: " + data["next_steps"]
-        await self.mcp.create_memory(
-            workflow_id=self.state.workflow_id,
-            content=content,
-            memory_level="episodic",
-            memory_type="REFLECTION",
-            importance=min(max(float(data.get("confidence", 0.5)), 0.1), 1.0),
-            description="Automated self-reflection",
+        
+        # Use UMS tool to store memory
+        await self.mcp_client._execute_tool_and_parse_for_agent(
+            "UMS_Server",
+            "ums:store_memory",
+            {
+                "workflow_id": self.state.workflow_id,
+                "content": content,
+                "memory_level": "episodic",
+                "memory_type": "REFLECTION",
+                "importance": min(max(float(data.get("confidence", 0.5)), 0.1), 1.0),
+                "description": "Automated self-reflection",
+            }
         )
 
     def _goal_completed(self) -> bool:
         # Placeholder; real implementation would query UMS goal status.
         try:
-            status = self.mcp.get_goal_status(self.state.current_leaf_goal_id)
+            # Get goal status via UMS tool
+            goal_res = self.mcp_client._execute_tool_and_parse_for_agent(
+                "UMS_Server",
+                "ums:get_goal_details",
+                {"workflow_id": self.state.workflow_id, "goal_id": self.state.current_leaf_goal_id}
+            )
+            if not goal_res.get("success") or not goal_res.get("data"):
+                return False
+                
+            status = goal_res["data"].get("status", "")
             if status != "completed":
                 return False
                 
             # 🔹NEW edge-aware progress check: verify goal has evidence links
             # Check for outgoing CONSEQUENCE_OF or SUPPORTS links to parent
             goal_id = self.state.current_leaf_goal_id
-            links_res = self.mcp._execute_tool_and_parse_for_agent(
+            links_res = self.mcp_client._execute_tool_and_parse_for_agent(
                 "UMS_Server",
                 "ums:get_memory_links",
                 {"workflow_id": self.state.workflow_id, "source_memory_id": goal_id}
@@ -1285,17 +1371,20 @@ class MetacognitionEngine:
             pair_key = f"contradiction_{min(pair)}_{max(pair)}"  # normalized key
             try:
                 # Try to get existing count
-                meta_res = self.mcp._execute_tool_and_parse_for_agent(
+                meta_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                     "UMS_Server",
                     "ums:get_workflow_metadata",
                     {"workflow_id": self.state.workflow_id}
                 )
-                current_meta = meta_res.get("data", {}).get("metadata", {})
+                if meta_res.get("success") and meta_res.get("data"):
+                    current_meta = meta_res["data"].get("metadata", {})
+                else:
+                    current_meta = {}
                 count = current_meta.get(pair_key, 0) + 1
                 
                 # Update count
                 current_meta[pair_key] = count
-                self.mcp._execute_tool_and_parse_for_agent(
+                await self.mcp_client._execute_tool_and_parse_for_agent(
                     "UMS_Server", 
                     "ums:update_workflow_metadata",
                     {"workflow_id": self.state.workflow_id, "metadata": current_meta}
@@ -1310,7 +1399,7 @@ class MetacognitionEngine:
                     # Tag both memories so other components can suppress them
                     for mem in pair:
                         try:
-                            self.mcp._execute_tool_and_parse_for_agent(
+                            await self.mcp_client._execute_tool_and_parse_for_agent(
                                 "UMS_Server",
                                 "ums:add_tag_to_memory",
                                 {"workflow_id": self.state.workflow_id,
@@ -1844,7 +1933,7 @@ class ProceduralAgenda:
             "sequence_number": goal.sequence_number,
             "updated_at": goal.updated_at,
         }
-        self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:create_or_update_goal",
             args,
@@ -1865,12 +1954,16 @@ class ProceduralAgenda:
 
         Invokes `ums:get_goals` util which returns a list of goal dicts.
         """
-        result = self.mcp._execute_tool_and_parse_for_agent(  # noqa: SLF001
+        result = self.mcp_client._execute_tool_and_parse_for_agent(
             "UMS_Server",
             "ums:get_goals",
             {"workflow_id": self.state.workflow_id},
         )
-        goals = result["data"]["goals"]
+        if result.get("success") and result.get("data"):
+            goals = result["data"].get("goals", [])
+        else:
+            goals = []
+            
         for g in goals:
             goal = Goal(
                 goal_id=g["goal_id"],
@@ -1929,12 +2022,12 @@ class AgentMasterLoop:
         user_goal:
             Natural-language user goal that seeds the initial workflow/goal.
         """
-        self.mcp = mcp_client
+        self.mcp_client = mcp_client
         self.logger = logging.getLogger("AgentMasterLoop")
 
         # Bootstrap ---------------------------------------------------------
         self.state: AMLState = self._bootstrap(user_goal)
-        self.mem_graph = MemoryGraphManager(self.mcp, self.state)
+        self.mem_graph = MemoryGraphManager(self.mcp_client, self.state)
         self.async_queue = AsyncTaskQueue(max_concurrency=6)
         # auto-flush graph after each drain so turns see consistent graph state
         self.async_queue.inject_flush_cb(self.mem_graph.flush)
@@ -1946,11 +2039,11 @@ class AgentMasterLoop:
         from .llm_orchestrator import LLMOrchestrator  # type: ignore
         from .tool_executor import ToolExecutor  # type: ignore
 
-        self.llms = LLMOrchestrator(self.mcp, self.state)
-        self.tool_exec = ToolExecutor(self.mcp, self.state)
-        self.metacog = MetacognitionEngine(self.mcp, self.state, self.mem_graph, self.llms, self.async_queue)
-        self.planner = ProceduralAgenda(self.mcp, self.state)
-        self.graph_reasoner = GraphReasoner(self.mcp, self.llms, self.mem_graph)
+        self.llms = LLMOrchestrator(self.mcp_client, self.state)
+        self.tool_exec = ToolExecutor(self.mcp_client, self.state)
+        self.metacog = MetacognitionEngine(self.mcp_client, self.state, self.mem_graph, self.llms, self.async_queue)
+        self.planner = ProceduralAgenda(self.mcp_client, self.state)
+        self.graph_reasoner = GraphReasoner(self.mcp_client, self.llms, self.mem_graph)
 
         # 🔹NEW link components after initialization
         self.metacog.set_planner(self.planner)
@@ -2059,6 +2152,7 @@ class AgentMasterLoop:
         return "continue"
 
     # -------------------------------------------------- helper: gather context
+
 
     async def _gather_context(self) -> Dict[str, Any]:
         """Collects all information fed into the SMART-model prompt."""
