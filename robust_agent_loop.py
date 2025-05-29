@@ -1741,9 +1741,9 @@ class GraphReasoner:
             • summary_stats: Dict[str, Any]
         """
         g = self._snapshot_to_digraph(snapshot)
-        centrality = nx.algorithms.centrality.pagerank(g, alpha=0.85)
+        centrality = nx.pagerank(g, alpha=0.85)
         # Greedy modularity community detection
-        communities = list(nx.algorithms.community.louvain_communities(g))
+        communities = list(nx.community.louvain_communities(g))
         density = nx.density(g)
         avg_deg = statistics.mean(dict(g.degree()).values()) if g.nodes else 0
 
@@ -2030,8 +2030,8 @@ class ToolExecutor:
 
                     # Link action -> outputs (if result contains memory_ids)
                     result_data = result_envelope.get("data", {})
-                    if isinstance(result_data, dict) and "memory_id" in result_data:
-                        output_id = result_data["memory_id"]
+                    if isinstance(result_data, dict) and "memory" in result_data and "memory_id" in result_data["memory"]:
+                        output_id = result_data["memory"]["memory_id"]
             await self.mem_graph.auto_link(
                 src_id=action_mem_id,
                 tgt_id=output_id,
@@ -2138,8 +2138,8 @@ class ToolExecutor:
             }
         )
         
-        batch_memory_id = batch_mem_res.get("data", {}).get("memory_id") if batch_mem_res.get("success") else None
-        
+        batch_memory_id = batch_mem_res.get("data", {}).get("memory", {}).get("memory_id") if batch_mem_res.get("success") else None
+
         # Link batch memory to current goal
         if batch_memory_id and self.state.current_leaf_goal_id:
             await self.mem_graph.auto_link(
@@ -3059,7 +3059,12 @@ class AgentMasterLoop:
             self.logger.info("Workflow exists but needs replanning")
             # Could update the goal description or create sub-goals here
             self.state.needs_replan = False
-            
+
+        # Ensure we have a current leaf goal if we have a root goal
+        if self.state.root_goal_id and not self.state.current_leaf_goal_id:
+            self.state.current_leaf_goal_id = self.state.root_goal_id
+            self.logger.info(f"Set current_leaf_goal_id to root_goal_id: {self.state.root_goal_id}")            
+
     async def _create_workflow_and_goal(self, overall_goal: str) -> None:
         """Create a new UMS workflow and root goal for the current task."""
         try:
@@ -3181,8 +3186,8 @@ class AgentMasterLoop:
 
     async def _gather_context(self) -> Dict[str, Any]:
         """Collects all information fed into the SMART-model prompt."""
-        # 🔹NEW --- Vector-similar memories for the *current* leaf goal ------
-        # TODO: Verify if get_similar_memories tool actually exists in UMS
+        # Vector-similar memories for the *current* leaf goal ------
+        top_similar = []
         try:
             sim_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
@@ -3198,8 +3203,7 @@ class AgentMasterLoop:
         except Exception as e:
             self.logger.warning(f"Failed to get similar memories: {e}")
             top_similar = []
-
-        # Snapshot graph (no change) -----------------------------------------
+        # Snapshot graph -----------------------------------------------
         graph_snapshot = await self.mem_graph.snapshot_context_graph()
 
         # Procedural agenda summary ------------------------------------------
@@ -3424,7 +3428,7 @@ class AgentMasterLoop:
                 {"workflow_id": self.state.workflow_id, "goal_id": self.state.current_leaf_goal_id}
             )
             if goal_res.get("success") and goal_res.get("data"):
-                return goal_res["data"].get("description", "Task")
+                return goal_res["data"]["goal"].get("description", "Task")
         except Exception:
             pass
         
