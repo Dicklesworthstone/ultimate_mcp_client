@@ -35,66 +35,11 @@ if TYPE_CHECKING:
 import networkx as nx
 
 ###############################################################################
-# SECTION 0.5 –  UMS server-side helper façade
+# SECTION 0.5 –  UMS server-side helper façade (REMOVED)
 ###############################################################################
 
-
-class UMSUtility:
-    """
-    Very thin wrapper around the official **ums:* server tools** so callers can
-    benefit from server-side indices & SIMD routines without re-implementing
-    them client-side.  Falls back gracefully if the util is unavailable (e.g.
-    during offline tests that use the raw SQLite mirror only).
-    """
-
-    def __init__(self, mcp_client):
-        self.mcp_client = mcp_client
-
-    # ------------------------------------------------------------------ vector
-
-    async def get_embedding(self, workflow_id: str, memory_id: str) -> Optional[list[float]]:
-        """Return the embedding vector or *None* if it doesn't exist server-side."""
-        try:
-            res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
-                "ums:get_embedding",
-                {"workflow_id": workflow_id, "memory_id": memory_id},
-            )
-            if res.get("success") and res.get("data"):
-                return res["data"].get("vector")
-            return None
-        except Exception:
-            return None
-
-    async def vector_similarity(self, vec_a: list[float], vec_b: list[float]) -> Optional[float]:
-        """Fast SIMD cosine similarity via the server; *None* on failure."""
-        try:
-            res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
-                "ums:vector_similarity",
-                {"vec_a": vec_a, "vec_b": vec_b},
-            )
-            if res.get("success") and res.get("data"):
-                return res["data"].get("cosine")
-            return None
-        except Exception:
-            return None
-
-    # ---------------------------------------------------------------- contradictions
-
-    async def get_contradictions(self, workflow_id: str, limit: int = 50) -> Optional[list[tuple[str, str]]]:
-        try:
-            res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
-                "ums:get_contradictions",
-                {"workflow_id": workflow_id, "limit": limit},
-            )
-            if res.get("success") and res.get("data"):
-                pairs_data = res["data"].get("pairs", [])
-                return [(p["a"], p["b"]) for p in pairs_data]
-            return None
-        except Exception:
-            return None
+# The UMSUtility class has been removed. All UMS operations are now handled
+# directly through MCPClient._execute_tool_and_parse_for_agent calls.
 
 ###############################################################################
 # SECTION 1. Global constants (tunable via config later)
@@ -174,37 +119,11 @@ class AMLState:
 ###############################################################################
 
 # ---------------------------------------------------------------------------
-# Graph-level buffered writer  ✧  small IO latency win (~0.3 s/turn)
+# Graph-level buffered writer  ✧  REMOVED (no longer needed)
 # ---------------------------------------------------------------------------
 
-class GraphWriteBuffer:
-    """
-    Accumulates mutating SQL statements and **commits once** at flush().
-    The buffer is thread-safe inside a single event-loop by design.
-    """
-
-    __slots__ = ("_conn", "_stmts")
-
-    def __init__(self, sqlite_conn: sqlite3.Connection):
-        self._conn = sqlite_conn
-        self._stmts: list[tuple[str, Sequence]] = []
-
-    def add(self, sql: str, params: Sequence) -> None:
-        self._stmts.append((sql, params))
-
-    def execute_read(self, sql: str, params: Sequence) -> list[sqlite3.Row]:
-        cur = self._conn.execute(sql, params)
-        return cur.fetchall()
-
-    def flush(self) -> None:
-        if not self._stmts:
-            return
-        cur = self._conn.cursor()
-        for sql, params in self._stmts:
-            cur.execute(sql, params)
-        self._conn.commit()
-        self._stmts.clear()
-
+# The GraphWriteBuffer class has been removed. All UMS operations are now
+# handled directly through MCPClient tool calls which have their own optimizations.
 
 class MemoryGraphManager:
     """Rich graph operations on the Unified Memory Store (UMS).
@@ -212,11 +131,8 @@ class MemoryGraphManager:
     *Only this class is fully implemented in this revision; the rest of the file
     remains an outline so that downstream work can continue incrementally.*
 
-    The implementation speaks *directly* to the UMS SQLite database the MCP
-    mounts in the sandbox (default path: `ums.db`).  A very small helper layer
-    does automatic connection handling so that callers never need to think
-    about DB cursors.  All public APIs are **async‑safe** but execute synchronously
-    inside the event‑loop (sqlite3 is thread‑safe when using the same loop).
+    The implementation speaks *directly* to the UMS server via MCPClient tool calls.
+    All public APIs are **async‑safe** and execute via the MCP infrastructure.
     """
 
     #############################################################
@@ -226,16 +142,8 @@ class MemoryGraphManager:
     def __init__(self, mcp_client, state: AMLState):
         self.mcp_client = mcp_client
         self.state = state
-        # Remove direct SQLite connection - use UMS tools via MCPClient instead
-        # self.db = sqlite3.connect(str(db_path), check_same_thread=False)
-        # self.db.execute("PRAGMA foreign_keys = ON;")
-        # self.db.execute("PRAGMA journal_mode  = WAL;")
-        # self.db.row_factory = sqlite3.Row
-        
-        # ← NEW: helpers
-        self.ums = UMSUtility(mcp_client)
-        # ← NEW: Remove buffered writes - use UMS tools directly
-        # self._buf = GraphWriteBuffer(self.db)
+        # UMS server name - matches what's used in mcp_client_multi.py
+        self.ums_server_name = "UMS_Server"
 
     # ----------------------------------------------------------- public API
 
@@ -266,7 +174,7 @@ class MemoryGraphManager:
         )).value
 
         await self.mcp_client._execute_tool_and_parse_for_agent(
-            "UMS_Server",
+            self.ums_server_name,
             "ums:create_memory_link",
             {
                 "workflow_id": self.state.workflow_id,
@@ -310,7 +218,7 @@ class MemoryGraphManager:
         try:
             # Use UMS tool to get memory links
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+                self.ums_server_name,
                 "ums:get_memory_links", 
                 {
                     "workflow_id": self.state.workflow_id,
@@ -336,23 +244,56 @@ class MemoryGraphManager:
         
     async def detect_inconsistencies(self) -> List[Tuple[str, str]]:
         """
-        Prefer the server-side `ums:get_contradictions` materialised view.
-        Fallback to the original local heuristic when the util is unavailable.
+        Use the server-side `ums:get_contradictions` tool.
+        Fallback to client-side analysis when the tool is unavailable.
         """
-        pairs = await self.ums.get_contradictions(self.state.workflow_id, 50)
-        if pairs is not None:
-            return pairs
-        # -- fallback to slow SQL heuristic ----------------------------------
-        return await self._detect_inconsistencies_sql_fallback()
+        try:
+            # Try using the server-side contradictions tool first
+            contradictions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:get_contradictions",
+                {"workflow_id": self.state.workflow_id, "limit": 50}
+            )
+            if contradictions_res.get("success") and contradictions_res.get("data"):
+                pairs_data = contradictions_res["data"].get("pairs", [])
+                pairs = [(p["a"], p["b"]) for p in pairs_data]
+                
+                # Filter out resolved contradictions
+                filtered_pairs = []
+                for src, tgt in pairs:
+                    try:
+                        link_meta_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                            self.ums_server_name,
+                            "ums:get_memory_link_metadata", 
+                            {
+                                "workflow_id": self.state.workflow_id,
+                                "source_memory_id": src,
+                                "target_memory_id": tgt,
+                                "link_type": "CONTRADICTS",
+                            }
+                        )
+                        if link_meta_res.get("success") and link_meta_res.get("data"):
+                            metadata = link_meta_res["data"].get("metadata", {})
+                            if "resolved_at" not in metadata:
+                                filtered_pairs.append((src, tgt))
+                        else:
+                            # If we can't check metadata, include it (fail-safe)
+                            filtered_pairs.append((src, tgt))
+                    except Exception:
+                        # If we can't check metadata, include it (fail-safe)
+                        filtered_pairs.append((src, tgt))
+                return filtered_pairs
+        except Exception:
+            pass  # Continue to fallback logic
+            
+        # Fallback to client-side contradiction detection
+        return await self._detect_inconsistencies_fallback()
 
-    # ↓ original heuristic moved verbatim under a new private name ----------
-    async def _detect_inconsistencies_sql_fallback(self) -> List[Tuple[str, str]]:
-        """Return list of (mem_a, mem_b) that appear in contradiction.
-
-        Heuristic rules:
-        1. Explicit `CONTRADICTS` links in either direction.
-        2. Newer memory that negates ("not", "no", "false", etc.) a fact
-           stored earlier → flagged.
+    async def _detect_inconsistencies_fallback(self) -> List[Tuple[str, str]]:
+        """
+        Client-side fallback for contradiction detection when server-side tools are unavailable.
+        
+        This replaces the original SQL-based detection with UMS tool calls.
         """
         result: Set[Tuple[str, str]] = set()
         
@@ -360,7 +301,7 @@ class MemoryGraphManager:
         try:
             # Get all CONTRADICTS links for this workflow
             contradicts_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+                self.ums_server_name,
                 "ums:query_graph_by_link_type",
                 {
                     "workflow_id": self.state.workflow_id,
@@ -371,13 +312,13 @@ class MemoryGraphManager:
             if contradicts_res.get("success") and contradicts_res.get("data"):
                 pairs = contradicts_res["data"].get("pairs", [])
                 
-                # ⇢ NEW: filter out resolved contradictions
+                # Filter out resolved contradictions
                 for pair in pairs:
                     src, tgt = pair["a"], pair["b"]
                     # Check if this contradiction has been marked as resolved
                     try:
                         link_meta_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                            "UMS_Server",
+                            self.ums_server_name,
                             "ums:get_memory_link_metadata", 
                             {
                                 "workflow_id": self.state.workflow_id,
@@ -402,7 +343,7 @@ class MemoryGraphManager:
         # Rule 2: naive negation check on recent memories ---------------------
         try:
             recent_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+                self.ums_server_name,
                 "ums:query_memories",
                 {
                     "workflow_id": self.state.workflow_id,
@@ -426,11 +367,11 @@ class MemoryGraphManager:
                             result.add((mem_j["memory_id"], mem_i["memory_id"]))
         except Exception:
             pass  # Continue if this rule fails
-         
+
         # Rule 3: Soft negative feedback loops (A→B→…→A via CAUSAL edges) ----
         try:
             causal_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+                self.ums_server_name,
                 "ums:query_graph_by_link_type",
                 {
                     "workflow_id": self.state.workflow_id,
@@ -456,64 +397,167 @@ class MemoryGraphManager:
         return list(result)
 
     async def consolidate_cluster(self, min_size: int = 6) -> None:
-        """Detect dense sub‑graphs and create summarising semantic memories.
-
-        Very simple implementation: find any memory that has ≥ `min_size` links
-        (of *any* type) and is still at `working` level.  Summarise those
-        neighbours into a new memory; link via `GENERALIZES`.
         """
-        hubs = self._exec(
-            """SELECT source_memory_id AS mid, COUNT(*) AS deg
-                   FROM memory_links GROUP BY source_memory_id HAVING deg >= ?""",
-            [min_size],
-        )
-        for hub in hubs:
-            hub_id = hub["mid"]
-            # gather neighbourhood ------------------------------------------------
-            neigh = self._exec("SELECT target_memory_id FROM memory_links WHERE source_memory_id = ? LIMIT 20", [hub_id])
-            if not neigh:
-                continue
-            neigh_ids = [n["target_memory_id"] for n in neigh]
-            texts = self._exec(f"SELECT content FROM memories WHERE memory_id IN ({','.join('?' * len(neigh_ids))})", neigh_ids)
-            combined = "\n".join(t["content"] for t in texts)
-            summary = textwrap.shorten(combined, 500, placeholder=" …")
-            new_id = self._insert_memory(
-                content=summary,
-                level="semantic",
-                mtype="SUMMARY",
-                description=f"Consolidated summary of {len(neigh_ids)} related memories around {hub_id}",
+        Detect dense sub‑graphs and create summarising semantic memories.
+        
+        Replaces direct SQL queries with UMS tool calls.
+        """
+        try:
+            # Get all memories with their link counts via UMS
+            memories_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:query_memories",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_level": "working",
+                    "include_link_counts": True,
+                    "limit": 100
+                }
             )
-            # average importance inheritance
-            if neigh_ids:
-                imp_rows = self._exec(
-                    f"SELECT importance FROM memories WHERE memory_id IN ({','.join('?' * len(neigh_ids))})",
-                    neigh_ids,
+            
+            if not memories_res.get("success") or not memories_res.get("data"):
+                return
+                
+            memories = memories_res["data"].get("memories", [])
+            
+            # Find hubs (memories with >= min_size links)
+            hubs = [mem for mem in memories if mem.get("link_count", 0) >= min_size]
+            
+            for hub in hubs:
+                hub_id = hub["memory_id"]
+                
+                # Get linked memories for this hub
+                links_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    self.ums_server_name,
+                    "ums:get_memory_links",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "memory_id": hub_id,
+                        "limit": 20
+                    }
                 )
-                if imp_rows:
-                    avg_importance = statistics.mean(r["importance"] for r in imp_rows)
-                    self._exec("UPDATE memories SET importance=? WHERE memory_id=?", [avg_importance, new_id])
-            # create GENERALIZES link hub -> summary -----------------------------
-            self._exec(
-                """INSERT OR IGNORE INTO memory_links
-                    (link_id, source_memory_id, target_memory_id, link_type, strength, created_at)
-                 VALUES (?, ?, ?, 'GENERALIZES', 1.0, strftime('%s','now'))""",
-                [self._uuid(), new_id, hub_id],
-            )
+                
+                if not links_res.get("success") or not links_res.get("data"):
+                    continue
+                    
+                links = links_res["data"].get("links", [])
+                if not links:
+                    continue
+                    
+                # Get content of linked memories
+                linked_memory_ids = [link["target_memory_id"] for link in links if link["target_memory_id"] != hub_id]
+                if not linked_memory_ids:
+                    continue
+                    
+                contents = []
+                importances = []
+                for mem_id in linked_memory_ids:
+                    mem_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                        self.ums_server_name,
+                        "ums:get_memory_by_id",
+                        {
+                            "workflow_id": self.state.workflow_id,
+                            "memory_id": mem_id
+                        }
+                    )
+                    if mem_res.get("success") and mem_res.get("data"):
+                        memory = mem_res["data"]
+                        contents.append(memory.get("content", ""))
+                        importances.append(memory.get("importance", 5.0))
+                
+                if not contents:
+                    continue
+                    
+                # Create summary using LLM
+                combined = "\n".join(contents)
+                summary_prompt = f"Summarize the following related memories into a concise overview (max 500 chars):\n\n{combined[:2000]}"
+                
+                try:
+                    summary_res = await self.mcp_client.query_llm_structured(
+                        prompt=summary_prompt,
+                        schema={
+                            "type": "object",
+                            "properties": {"summary": {"type": "string"}},
+                            "required": ["summary"]
+                        },
+                        use_cheap_model=True
+                    )
+                    summary = summary_res.get("summary", combined[:500])
+                except Exception:
+                    summary = textwrap.shorten(combined, 500, placeholder=" …")
+                
+                # Store summary memory
+                avg_importance = statistics.mean(importances) if importances else 5.0
+                summary_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    self.ums_server_name,
+                    "ums:store_memory",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "content": summary,
+                        "memory_level": "semantic",
+                        "memory_type": "SUMMARY",
+                        "importance": avg_importance,
+                        "description": f"Consolidated summary of {len(linked_memory_ids)} related memories around {hub_id}",
+                    }
+                )
+                
+                if summary_res.get("success") and summary_res.get("data"):
+                    new_id = summary_res["data"].get("memory_id")
+                    if new_id:
+                        # Create GENERALIZES link hub -> summary
+                        await self.auto_link(
+                            src_id=new_id,
+                            tgt_id=hub_id,
+                            context_snip="consolidated summary",
+                            kind_hint=LinkKind.GENERALISES
+                        )
+                        
+        except Exception as e:
+            # Log error but don't fail the entire operation
+            self.mcp_client.logger.warning(f"Error during cluster consolidation: {e}")
 
         # house-keeping: mild link-strength decay (optional, cheap)
         await self.decay_link_strengths()
 
     async def promote_hot_memories(self, importance_cutoff: float = 7.5, access_cutoff: int = 5) -> None:
         """Promote memories worth keeping long‑term from working → semantic."""
-        to_promote = self._exec(
-            """SELECT memory_id FROM memories
-                   WHERE workflow_id  = ?
-                     AND memory_level = 'working'
-                     AND (importance >= ? OR access_count >= ?)""",
-            [self.state.workflow_id, importance_cutoff, access_cutoff],
-        )
-        for row in to_promote:
-            self._exec("UPDATE memories SET memory_level = 'semantic', updated_at = strftime('%s','now') WHERE memory_id = ?", [row["memory_id"]])
+        try:
+            # Query for promotion candidates via UMS
+            candidates_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:query_memories",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_level": "working",
+                    "min_importance": importance_cutoff,
+                    "limit": 100
+                }
+            )
+            
+            if not candidates_res.get("success") or not candidates_res.get("data"):
+                return
+                
+            candidates = candidates_res["data"].get("memories", [])
+            
+            # Promote memories that meet criteria
+            for memory in candidates:
+                importance = memory.get("importance", 0.0)
+                access_count = memory.get("access_count", 0)
+                
+                if importance >= importance_cutoff or access_count >= access_cutoff:
+                    await self.mcp_client._execute_tool_and_parse_for_agent(
+                        self.ums_server_name,
+                        "ums:update_memory",
+                        {
+                            "workflow_id": self.state.workflow_id,
+                            "memory_id": memory["memory_id"],
+                            "memory_level": "semantic",
+                            "updated_at": int(time.time())
+                        }
+                    )
+                    
+        except Exception as e:
+            self.mcp_client.logger.warning(f"Error during memory promotion: {e}")
 
     async def snapshot_context_graph(self) -> Dict[str, Any]:
         """Return small adjacency list + node metadata for reasoning.
@@ -526,23 +570,74 @@ class MemoryGraphManager:
         nodes: Dict[str, Dict[str, Any]] = {}
         edges: List[Tuple[str, str, str]] = []
 
-        recent = self._exec(
-            """SELECT memory_id, content, memory_type FROM memories
-                   WHERE workflow_id = ? AND memory_level = 'working'
-                   ORDER BY created_at DESC LIMIT 25""",
-            [self.state.workflow_id],
-        )
-        for r in recent:
-            mid = r["memory_id"]
-            nodes[mid] = {"id": mid, "type": r["memory_type"], "snippet": r["content"][:200], "tags": list(self._get_tags_for_memory(mid))}
-            links = self._exec("SELECT target_memory_id, link_type FROM memory_links WHERE source_memory_id = ?", [mid])
-            for lk in links:
-                tgt = lk["target_memory_id"]
-                edges.append((mid, tgt, lk["link_type"]))
-                if tgt not in nodes:
-                    tgt_row = self._exec("SELECT content, memory_type FROM memories WHERE memory_id = ? LIMIT 1", [tgt])
-                    if tgt_row:
-                        nodes[tgt] = {"id": tgt, "type": tgt_row[0]["memory_type"], "snippet": tgt_row[0]["content"][:200], "tags": list(self._get_tags_for_memory(tgt))}
+        try:
+            # Get recent working memories
+            recent_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:query_memories",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "memory_level": "working",
+                    "limit": 25,
+                    "sort_by": "created_at",
+                    "sort_order": "desc"
+                }
+            )
+            
+            if not recent_res.get("success") or not recent_res.get("data"):
+                return {"nodes": nodes, "edges": edges}
+                
+            recent_memories = recent_res["data"].get("memories", [])
+            
+            for memory in recent_memories:
+                mem_id = memory["memory_id"]
+                nodes[mem_id] = {
+                    "id": mem_id,
+                    "type": memory.get("memory_type", "UNKNOWN"),
+                    "snippet": memory.get("content", "")[:200],
+                    "tags": await self._get_tags_for_memory(mem_id)
+                }
+                
+                # Get outgoing links for this memory
+                links_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    self.ums_server_name,
+                    "ums:get_memory_links",
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "memory_id": mem_id,
+                        "direction": "outgoing"
+                    }
+                )
+                
+                if links_res.get("success") and links_res.get("data"):
+                    links = links_res["data"].get("links", [])
+                    for link in links:
+                        tgt_id = link["target_memory_id"]
+                        link_type = link.get("link_type", "RELATED")
+                        edges.append((mem_id, tgt_id, link_type))
+                        
+                        # Add target node if not already present
+                        if tgt_id not in nodes:
+                            tgt_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                                self.ums_server_name,
+                                "ums:get_memory_by_id",
+                                {
+                                    "workflow_id": self.state.workflow_id,
+                                    "memory_id": tgt_id
+                                }
+                            )
+                            if tgt_res.get("success") and tgt_res.get("data"):
+                                tgt_memory = tgt_res["data"]
+                                nodes[tgt_id] = {
+                                    "id": tgt_id,
+                                    "type": tgt_memory.get("memory_type", "UNKNOWN"),
+                                    "snippet": tgt_memory.get("content", "")[:200],
+                                    "tags": await self._get_tags_for_memory(tgt_id)
+                                }
+                                
+        except Exception as e:
+            self.mcp_client.logger.warning(f"Error creating context graph snapshot: {e}")
+            
         return {"nodes": nodes, "edges": edges}
 
     #############################################################
@@ -557,12 +652,25 @@ class MemoryGraphManager:
         #    reciprocal cached type we trust that and return it instantly.
         # ------------------------------------------------------------------
         try:
-            meta_src = self._get_metadata(src_id).get("link_type_cache", {})
-            if tgt_id in meta_src:
-                return meta_src[tgt_id]
-            meta_tgt = self._get_metadata(tgt_id).get("link_type_cache", {})
-            if src_id in meta_tgt:
-                return meta_tgt[src_id]
+            meta_src_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:get_memory_metadata",
+                {"workflow_id": self.state.workflow_id, "memory_id": src_id}
+            )
+            if meta_src_res.get("success") and meta_src_res.get("data"):
+                meta_src = meta_src_res["data"].get("metadata", {}).get("link_type_cache", {})
+                if tgt_id in meta_src:
+                    return meta_src[tgt_id]
+                    
+            meta_tgt_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:get_memory_metadata",
+                {"workflow_id": self.state.workflow_id, "memory_id": tgt_id}
+            )
+            if meta_tgt_res.get("success") and meta_tgt_res.get("data"):
+                meta_tgt = meta_tgt_res["data"].get("metadata", {}).get("link_type_cache", {})
+                if src_id in meta_tgt:
+                    return meta_tgt[src_id]
         except Exception:
             # Any metadata hiccup → fall back to normal path
             pass
@@ -574,13 +682,12 @@ class MemoryGraphManager:
             return "CONTRADICTS"
         if any(c in ctx_lower for c in causal_cues):
             return "CAUSAL"
+            
         # 2. Embedding cosine shortcut  (saves ~40 % cheap-LLM calls)
-        src_vec = self._get_cached_embedding(src_id)
-        tgt_vec = self._get_cached_embedding(tgt_id)
+        src_vec = await self._get_cached_embedding(src_id)
+        tgt_vec = await self._get_cached_embedding(tgt_id)
         if src_vec is not None and tgt_vec is not None:
-            # direct await keeps us on the same event-loop and avoids the rare
-            # dead-lock risk of run_coroutine_threadsafe.
-            sim = await self.ums.vector_similarity(src_vec, tgt_vec)
+            sim = await self._cosine_similarity(src_vec, tgt_vec)
             if sim is not None and sim >= 0.80:
                 return "RELATED"
 
@@ -589,6 +696,7 @@ class MemoryGraphManager:
         tags_tgt = await self._get_tags_for_memory(tgt_id)
         if tags_src & tags_tgt:
             return "RELATED"
+            
         # 4. Fallback to cheap LLM structured call ----------------------------
         schema = {"type": "object", "properties": {"link_type": {"type": "string"}}, "required": ["link_type"]}
         prompt = (
@@ -603,11 +711,7 @@ class MemoryGraphManager:
         )
         try:
             # Use MCPClient's LLM infrastructure for cheap/fast calls
-            if hasattr(self.mcp_client, 'fast_llm_call'):
-                resp = await self.mcp_client.fast_llm_call(prompt, schema)
-            else:
-                # Fallback to a basic structured call - this would need to be implemented
-                resp = {"link_type": "RELATED"}  # Safe fallback
+            resp = await self.mcp_client.query_llm_structured(prompt, schema, use_cheap_model=True)
             t = resp.get("link_type", "RELATED").upper()
             inferred = t if t in {"RELATED", "CAUSAL", "SEQUENTIAL", "CONTRADICTS", "SUPPORTS", "GENERALIZES", "SPECIALIZES"} else "RELATED"
         except Exception:
@@ -617,7 +721,7 @@ class MemoryGraphManager:
         # 5)  **CACHE RESULT** for both memories so future calls are O(1)
         # ------------------------------------------------------------------
         try:
-            self._update_link_type_cache(src_id, tgt_id, inferred)
+            await self._update_link_type_cache(src_id, tgt_id, inferred)
         except Exception:
             pass
         return inferred
@@ -627,7 +731,7 @@ class MemoryGraphManager:
     async def _get_memory_content(self, memory_id: str) -> str:
         try:
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+                self.ums_server_name,
                 "ums:get_memory_by_id",
                 {
                     "workflow_id": self.state.workflow_id,
@@ -645,7 +749,7 @@ class MemoryGraphManager:
     async def _get_tags_for_memory(self, memory_id: str) -> Set[str]:
         try:
             res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+                self.ums_server_name,
                 "ums:get_memory_tags",
                 {
                     "workflow_id": self.state.workflow_id,
@@ -659,105 +763,113 @@ class MemoryGraphManager:
         except Exception:
             return set()
 
-    def _insert_memory(self, *, content: str, level: str, mtype: str, description: str | None = None) -> str:
-        new_id = self._uuid()
-        self._exec(
-            """INSERT INTO memories
-                    (memory_id, workflow_id, content, memory_level, memory_type,
-                     importance, confidence, description, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, 5.0, 1.0, ?, strftime('%s','now'), strftime('%s','now'))""",
-            [new_id, self.state.workflow_id, content, level, mtype, (description or "")],  # noqa: E501
-        )
-        return new_id
-
-    # expose for AgentMasterLoop._save_state
+    # expose for AgentMasterLoop._save_state (removed - no longer needed)
     def flush(self) -> None:
-        self._buf.flush()
+        """No-op since we no longer use buffered writes."""
+        pass
 
     # ----------------------- embedding helpers ------------------------------
 
-    def _get_cached_embedding(self, memory_id: str) -> Optional[list[float]]:
+    async def _get_cached_embedding(self, memory_id: str) -> Optional[list[float]]:
         """
-        1. Ask UMS server (fast, indexed, always fresh).
-        2. Else fall back to local SQLite mirror.
-        3. If still missing, create it server-side to avoid future cache misses.
+        Get embedding vector for a memory using UMS tools.
         """
-        # Step-1  server
-        vec = asyncio.run_coroutine_threadsafe(           # safe even in sync fn
-            self.ums.get_embedding(self.state.workflow_id, memory_id),
-            asyncio.get_event_loop(),
-        ).result()
-        if vec is not None:
-            return vec
-
-        # Step-2  local mirror
-        row = self._exec(
-            "SELECT vector FROM embeddings WHERE memory_id = ? LIMIT 1",
-            [memory_id],
-        )
-        if row:
-            return json.loads(row[0]["vector"])
-
-        # Step-3  generate once on server
         try:
-            res = self.mcp._execute_tool_and_parse_for_agent(
-                "UMS_Server",
-                "ums:create_embedding",
-                {"workflow_id": self.state.workflow_id, "memory_id": memory_id},
+            # Try to get embedding from UMS
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:get_embedding",
+                {"workflow_id": self.state.workflow_id, "memory_id": memory_id}
             )
-            return res["data"]["vector"]
+            if res.get("success") and res.get("data"):
+                return res["data"].get("vector")
+            
+            # If no embedding exists, try to create one
+            create_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:create_embedding",
+                {"workflow_id": self.state.workflow_id, "memory_id": memory_id}
+            )
+            if create_res.get("success") and create_res.get("data"):
+                return create_res["data"].get("vector")
+                
+            return None
         except Exception:
             return None
 
-    @staticmethod
-    def _cosine(a: list[float], b: list[float]) -> float:
-        dot = sum(x * y for x, y in zip(a, b, strict=False))
-        na = math.sqrt(sum(x * x for x in a))
-        nb = math.sqrt(sum(y * y for y in b))
-        return dot / (na * nb + 1e-9)
+    async def _cosine_similarity(self, vec_a: list[float], vec_b: list[float]) -> Optional[float]:
+        """Calculate cosine similarity, with fallback to local computation."""
+        try:
+            # Try server-side computation first
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:vector_similarity",
+                {"vec_a": vec_a, "vec_b": vec_b}
+            )
+            if res.get("success") and res.get("data"):
+                return res["data"].get("cosine")
+        except Exception:
+            pass
+            
+        # Fallback to local computation
+        try:
+            dot = sum(x * y for x, y in zip(vec_a, vec_b, strict=False))
+            na = math.sqrt(sum(x * x for x in vec_a))
+            nb = math.sqrt(sum(y * y for y in vec_b))
+            return dot / (na * nb + 1e-9)
+        except Exception:
+            return None
 
     # ----------------------- link-strength decay ----------------------------
 
     async def decay_link_strengths(self, half_life_days: int = 14) -> None:
         """Halve link strength for edges older than *half_life_days*."""
-        self._exec(
-            """
-            UPDATE memory_links
-               SET strength = strength * 0.5
-             WHERE julianday('now') - julianday(created_at, 'unixepoch') >= ?
-            """,
-            [half_life_days],
-        )
+        try:
+            # Use UMS tool if available, otherwise skip
+            await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
+                "ums:decay_link_strengths",
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "half_life_days": half_life_days
+                }
+            )
+        except Exception:
+            # If decay tool is not available, skip silently
+            pass
 
     # ----------------------- metadata helpers -----------------------------
 
-    def _get_metadata(self, memory_id: str) -> Dict[str, Any]:
+    async def _get_metadata(self, memory_id: str) -> Dict[str, Any]:
         """Fetch metadata JSON for *memory_id* (empty dict if none)."""
         try:
-            res = self.mcp._execute_tool_and_parse_for_agent(
-                "UMS_Server",
+            res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                self.ums_server_name,
                 "ums:get_memory_metadata",
                 {"workflow_id": self.state.workflow_id,
-                 "memory_id": memory_id},
+                 "memory_id": memory_id}
             )
-            return res["data"].get("metadata", {}) or {}
+            if res.get("success") and res.get("data"):
+                return res["data"].get("metadata", {}) or {}
+            return {}
         except Exception:
             return {}
 
-    def _update_link_type_cache(self, src_id: str, tgt_id: str, link_type: str) -> None:
+    async def _update_link_type_cache(self, src_id: str, tgt_id: str, link_type: str) -> None:
         """Persist reciprocal cache entries `src→tgt` and `tgt→src`."""
         for a, b in ((src_id, tgt_id), (tgt_id, src_id)):
-            meta = self._get_metadata(a)
-            cache = meta.get("link_type_cache", {})
-            cache[b] = link_type
-            meta["link_type_cache"] = cache
             try:
-                self.mcp._execute_tool_and_parse_for_agent(
-                    "UMS_Server",
+                meta = await self._get_metadata(a)
+                cache = meta.get("link_type_cache", {})
+                cache[b] = link_type
+                meta["link_type_cache"] = cache
+                
+                await self.mcp_client._execute_tool_and_parse_for_agent(
+                    self.ums_server_name,
                     "ums:update_memory_metadata",
                     {"workflow_id": self.state.workflow_id,
                      "memory_id": a,
-                     "metadata": meta},
+                     "metadata": meta}
                 )
             except Exception:
                 continue
@@ -770,8 +882,8 @@ class MemoryGraphManager:
         meta_flag = {"resolved_at": int(time.time())}
         for a, b in ((mem_a, mem_b), (mem_b, mem_a)):
             try:
-                self.mcp._execute_tool_and_parse_for_agent(
-                    "UMS_Server", 
+                await self.mcp_client._execute_tool_and_parse_for_agent(
+                    self.ums_server_name, 
                     "ums:update_memory_link_metadata",
                     {
                         "workflow_id": self.state.workflow_id,
@@ -779,7 +891,7 @@ class MemoryGraphManager:
                         "target_memory_id": b,
                         "link_type": "CONTRADICTS",
                         "metadata": meta_flag,
-                    },
+                    }
                 )
             except Exception:
                 pass
@@ -2572,3 +2684,4 @@ def pick_model(phase: Phase, *, cost_sensitive: bool = False) -> str:
         return SMART_MODEL_NAME
     # Fallback – should never happen but errs on the side of capability
     return SMART_MODEL_NAME
+
