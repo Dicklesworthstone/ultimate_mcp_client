@@ -46,7 +46,6 @@ dependencies = [
     "psutil",
     "typing-extensions",
     "zeroconf",
-    "networkx",
     "numpy",
     "scipy",
     "opentelemetry-sdk",

@@ -10,14 +10,11 @@ import asyncio
 import dataclasses
 import datetime as _dt
 import enum
-import heapq
 import json
 import math
 import os
 import re
 import sqlite3
-import statistics
-import textwrap
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -27,8 +24,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 import logging
-
-import networkx as nx
 
 ###############################################################################
 # SECTION 1. Agent configuration constants
@@ -295,125 +290,41 @@ class MemoryGraphManager:
 
     async def consolidate_cluster(self, min_size: int = 6) -> None:
         """
-        Detect dense sub‑graphs and create summarising semantic memories.
-        
-        Replaces direct SQL queries with UMS tool calls.
+        Consolidate related memories using UMS consolidate_memories tool.
         """
         try:
-            # Get all memories with their link counts via UMS
-            memories_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+            # Use UMS consolidate_memories tool instead of manual consolidation
+            consolidation_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 self.ums_server_name,
-                self._get_ums_tool_name("query_memories"),
+                self._get_ums_tool_name("consolidate_memories"),
                 {
                     "workflow_id": self.state.workflow_id,
-                    "memory_level": "working",
-                    "include_link_counts": True,
-                    "limit": 100
+                    "consolidation_type": "summary",  # Could be summary, insight, procedural, question
+                    "source_selection": {
+                        "method": "query_filter",
+                        "filters": {
+                            "memory_level": "working",
+                            "min_link_count": min_size,
+                            "limit": 50
+                        }
+                    },
+                    "target_memory_level": "semantic",
+                    "importance_threshold": 6.0,
+                    "max_source_memories": 20,
+                    "enable_clustering": True
                 }
             )
             
-            if not memories_res.get("success") or not memories_res.get("data"):
-                return
+            if consolidation_res.get("success"):
+                consolidated_count = consolidation_res.get("data", {}).get("consolidated_memories_count", 0)
+                self.mcp_client.logger.debug(f"Consolidated {consolidated_count} memory clusters")
+            else:
+                self.mcp_client.logger.warning(f"Memory consolidation failed: {consolidation_res.get('error_message', 'Unknown error')}")
                 
-            memories = memories_res["data"].get("memories", [])
-            
-            # Find hubs (memories with >= min_size links)
-            hubs = [mem for mem in memories if mem.get("link_count", 0) >= min_size]
-                
-            for hub in hubs:
-                hub_id = hub["memory_id"]
-                
-                # Get linked memories for this hub
-                links_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                    self.ums_server_name,
-                    self._get_ums_tool_name("get_linked_memories"),
-                    {
-                        "workflow_id": self.state.workflow_id,
-                        "memory_id": hub_id,
-                        "limit": 20
-                    }
-                )
-            
-                if not links_res.get("success") or not links_res.get("data"):
-                    continue
-                    
-                links = links_res["data"].get("links", [])
-                if not links:
-                    continue
-                    
-                # Get content of linked memories
-                linked_memory_ids = [link["target_memory_id"] for link in links if link["target_memory_id"] != hub_id]
-                if not linked_memory_ids:
-                    continue
-                    
-                contents = []
-                importances = []
-                for mem_id in linked_memory_ids:
-                    mem_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                        self.ums_server_name,
-                        self._get_ums_tool_name("get_memory_by_id"),
-                        {
-                            "workflow_id": self.state.workflow_id,
-                            "memory_id": mem_id
-                        }
-                    )
-                    if mem_res.get("success") and mem_res.get("data"):
-                        memory = mem_res["data"]
-                        contents.append(memory.get("content", ""))
-                        importances.append(memory.get("importance", 5.0))
-                
-                if not contents:
-                    continue
-                    
-                # Create summary using LLM
-                combined = "\n".join(contents)
-                summary_prompt = f"Summarize the following related memories into a concise overview (max 500 chars):\n\n{combined[:2000]}"
-                
-                try:
-                    summary_res = await self.mcp_client.query_llm_structured(
-                        prompt=summary_prompt,
-                        schema={
-                            "type": "object",
-                            "properties": {"summary": {"type": "string"}},
-                            "required": ["summary"]
-                        },
-                        use_cheap_model=True
-                    )
-                    summary = summary_res.get("summary", combined[:500])
-                except Exception:
-                    summary = textwrap.shorten(combined, 500, placeholder=" …")
-                
-                # Store summary memory
-                avg_importance = statistics.mean(importances) if importances else 5.0
-                summary_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                    self.ums_server_name,
-                    self._get_ums_tool_name("store_memory"),
-                    {
-                        "workflow_id": self.state.workflow_id,
-                        "content": summary,
-                        "memory_level": "semantic",
-                        "memory_type": "summary",
-                        "importance": avg_importance,
-                        "description": f"Consolidated summary of {len(linked_memory_ids)} related memories around {hub_id}",
-                    }
-                )
-                
-                if summary_res.get("success") and summary_res.get("data"):
-                    new_id = summary_res["data"].get("memory_id")
-                    if new_id:
-                        # Create GENERALIZES link hub -> summary
-                        await self.auto_link(
-                            src_id=new_id,
-                            tgt_id=hub_id,
-                            context_snip="consolidated summary",
-                            kind_hint=LinkKind.GENERALIZES
-                        )
-                        
         except Exception as e:
-            # Log error but don't fail the entire operation
-            self.mcp_client.logger.warning(f"Error during cluster consolidation: {e}")
+            self.mcp_client.logger.warning(f"Error during memory consolidation: {e}")
 
-        # house-keeping: mild link-strength decay (optional, cheap)
+        # Keep the existing decay call
         await self.decay_link_strengths()
 
     async def promote_hot_memories(self, importance_cutoff: float = 7.5, access_cutoff: int = 5) -> None:
@@ -457,85 +368,117 @@ class MemoryGraphManager:
             self.mcp_client.logger.warning(f"Error during memory promotion: {e}")
 
     async def snapshot_context_graph(self) -> Dict[str, Any]:
-        """Return small adjacency list + node metadata for reasoning.
-
-        We include:
-        * latest 25 working‑level memories
-        * their outgoing links (any type)
-        * each linked memory's content snippet (<= 200 chars)
         """
-        nodes: Dict[str, Dict[str, Any]] = {}
-        edges: List[Tuple[str, str, str]] = []
-
+        Get context graph using UMS NetworkX analysis.
+        """
         try:
-            # Get recent working memories
-            recent_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                self.ums_server_name,
-                self._get_ums_tool_name("query_memories"),
-                {
-                    "workflow_id": self.state.workflow_id,
-                    "memory_level": "working",
-                    "limit": 25,
-                    "sort_by": "created_at",
-                    "sort_order": "desc"
-                }
-            )
+            graph_res = await self.get_context_graph()  # Use preset!
             
-            if not recent_res.get("success") or not recent_res.get("data"):
-                return {"nodes": nodes, "edges": edges}
+            if graph_res.get("success") and graph_res.get("data"):
+                data = graph_res["data"]
                 
-            recent_memories = recent_res["data"].get("memories", [])
-            
-            for memory in recent_memories:
-                mem_id = memory["memory_id"]
-                nodes[mem_id] = {
-                    "id": mem_id,  # Make sure this key exists
-                    "type": memory.get("memory_type", "UNKNOWN"),
-                    "snippet": memory.get("content", "")[:200],
-                    "tags": await self._get_tags_for_memory(mem_id) or set()  # Ensure fallback
-                }
-                # Get outgoing links for this memory
-                links_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                    self.ums_server_name,
-                    self._get_ums_tool_name("get_linked_memories"),
-                    {
-                        "workflow_id": self.state.workflow_id,
-                        "memory_id": mem_id,
-                        "direction": "outgoing"
+                # Convert to expected format
+                nodes = {}
+                for node in data.get("nodes", []):
+                    node_id = node["memory_id"]
+                    nodes[node_id] = {
+                        "id": node_id,
+                        "type": node.get("memory_type", "UNKNOWN"),
+                        "snippet": node.get("content_preview", "")[:200],
+                        "tags": set()  # Could enhance this later
                     }
-                )
                 
-                if links_res.get("success") and links_res.get("data"):
-                    links = links_res["data"].get("links", [])
-                    for link in links:
-                        tgt_id = link["target_memory_id"]
-                        link_type = link.get("link_type", "RELATED")
-                        edges.append((mem_id, tgt_id, link_type))
-                        
-                        # Add target node if not already present
-                        if tgt_id not in nodes:
-                            tgt_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-                                self.ums_server_name,
-                                self._get_ums_tool_name("get_memory_by_id"),
-                                {
-                                    "workflow_id": self.state.workflow_id,
-                                    "memory_id": tgt_id
-                                }
-                            )
-                            if tgt_res.get("success") and tgt_res.get("data"):
-                                tgt_memory = tgt_res["data"]
-                                nodes[tgt_id] = {
-                                    "id": tgt_id,
-                                    "type": tgt_memory.get("memory_type", "UNKNOWN"),
-                                    "snippet": tgt_memory.get("content", "")[:200],
-                                    "tags": await self._get_tags_for_memory(tgt_id)
-                                }
-                                
+                edges = [(e["source"], e["target"], e["link_type"]) for e in data.get("edges", [])]
+                
+                return {"nodes": nodes, "edges": edges}
+            else:
+                return {"nodes": {}, "edges": []}
+                
         except Exception as e:
-            self.mcp_client.logger.warning(f"Error creating context graph snapshot: {e}")
-            
-        return {"nodes": nodes, "edges": edges}
+            self.mcp_client.logger.warning(f"Error getting context graph: {e}")
+            return {"nodes": {}, "edges": []}
 
+    async def get_context_graph(self, focus_node: str = None) -> Dict[str, Any]:
+        """Get lightweight graph for agent context."""
+        return await self.mcp_client._execute_tool_and_parse_for_agent(
+            self.ums_server_name,
+            self._get_ums_tool_name("get_subgraph"),
+            {
+                "workflow_id": self.state.workflow_id,
+                "start_node_id": focus_node,
+                "algorithm": "ego_graph" if focus_node else "full_graph",
+                "max_hops": 2,
+                "max_nodes": 25,
+                "compute_centrality": True,
+                "centrality_algorithms": ["pagerank"],
+                "include_node_content": False
+            }
+        )
+
+    async def get_analysis_graph(self) -> Dict[str, Any]:
+        """Get comprehensive graph analysis."""
+        return await self.mcp_client._execute_tool_and_parse_for_agent(
+            self.ums_server_name,
+            self._get_ums_tool_name("get_subgraph"),
+            {
+                "workflow_id": self.state.workflow_id,
+                "algorithm": "full_graph",
+                "max_nodes": 100,
+                "compute_centrality": True,
+                "centrality_algorithms": ["pagerank", "betweenness"],
+                "detect_communities": True,
+                "community_algorithm": "louvain",
+                "compute_graph_metrics": True
+            }
+        )
+
+    async def get_argument_graph(self, claim_id: str, depth: int = 2) -> Dict[str, Any]:
+        """Get argument tree around a claim."""
+        return await self.mcp_client._execute_tool_and_parse_for_agent(
+            self.ums_server_name,
+            self._get_ums_tool_name("get_subgraph"),
+            {
+                "workflow_id": self.state.workflow_id,
+                "start_node_id": claim_id,
+                "algorithm": "ego_graph",
+                "max_hops": depth,
+                "max_nodes": 20,
+                "link_type_filter": ["SUPPORTS", "CONTRADICTS", "CAUSAL", "REFERENCES"],
+                "include_node_content": False
+            }
+        )
+
+    async def get_relationship_graph(self, node_a: str, node_b: str) -> Dict[str, Any]:
+        """Get graph for analyzing relationships between nodes."""
+        return await self.mcp_client._execute_tool_and_parse_for_agent(
+            self.ums_server_name,
+            self._get_ums_tool_name("get_subgraph"),
+            {
+                "workflow_id": self.state.workflow_id,
+                "start_node_id": node_a,
+                "algorithm": "bfs_tree",
+                "max_hops": 3,
+                "max_nodes": 20,
+                "include_shortest_paths": True,
+                "shortest_path_targets": [node_b]
+            }
+        )            
+
+    async def get_summarization_graph(self, focus_node: str, max_nodes: int = 15) -> Dict[str, Any]:
+        """Get subgraph with content for summarization."""
+        return await self.mcp_client._execute_tool_and_parse_for_agent(
+            self.ums_server_name,
+            self._get_ums_tool_name("get_subgraph"),
+            {
+                "workflow_id": self.state.workflow_id,
+                "start_node_id": focus_node,
+                "algorithm": "ego_graph",
+                "max_hops": 2,
+                "max_nodes": max_nodes,
+                "include_node_content": True  # Key difference - includes content
+            }
+        )
+        
     #############################################################
     # Internal helpers
     #############################################################
@@ -1245,34 +1188,53 @@ class MetacognitionEngine:
             
             # Escalate persistent contradictions to BLOCKER goals
             await self._escalate_persistent_contradictions(contradictions)
-            
-        reflection_prompt = self._build_reflection_prompt(turn_ctx)
-                
-        # Add loop-specific prompt enhancement
+                    
+        # Determine reflection type based on context
+        reflection_type = "summary"  # default
         if loop_triggered:
-            reflection_prompt += f"""
+            reflection_type = "gaps"  # Focus on what's missing/wrong when looped
+        elif turn_ctx.get("has_contradictions"):
+            reflection_type = "strengths"  # Focus on what's working vs what conflicts
+        elif self.state.stuck_counter >= STALL_THRESHOLD:
+            reflection_type = "plan"  # Focus on next steps when stuck
+
+        # Use UMS generate_reflection tool
+        try:
+            reflection_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("generate_reflection"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "reflection_type": reflection_type,
+                    "recent_ops_limit": 30,
+                    "max_tokens": 800
+                }
+            )
             
-            CRITICAL: Action loop detected! Recent actions: {self.state.recent_action_signatures[-5:]}
-            
-            To break this loop, consider:
-            1. What assumption might be wrong?
-            2. What different approach could work?
-            3. Is there missing information needed?
-            4. Should we skip this and move to next goal?
-            
-            Be specific about the alternative approach."""
-            
-        schema = {
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string"},
-                "next_steps": {"type": "string"},
-                "confidence": {"type": "number"},
-            },
-            "required": ["summary", "next_steps", "confidence"],
-        }
-        result = await self.llm.fast_structured_call(reflection_prompt, schema)
-        await self._store_reflection(result)
+            if reflection_res.get("success"):
+                reflection_id = reflection_res.get("reflection_id")
+                self.mcp_client.logger.debug(f"Generated {reflection_type} reflection: {reflection_id}")
+                
+                # If loop detected, add specific guidance as a follow-up memory
+                if loop_triggered:
+                    loop_guidance = (
+                        f"LOOP DETECTED: Recent actions: {self.state.recent_action_signatures[-5:]}\n"
+                        "Consider: (1) What assumption is wrong? (2) Different approach? "
+                        "(3) Missing information? (4) Skip to next goal?"
+                    )
+                    await self._store_memory_with_auto_linking(
+                        content=loop_guidance,
+                        memory_type="loop_detection",
+                        memory_level="working", 
+                        importance=8.0,
+                        description="Action loop detected - needs intervention"
+                    )
+            else:
+                self.mcp_client.logger.warning(f"Reflection generation failed: {reflection_res.get('error_message', 'Unknown error')}")
+                
+        except Exception as e:
+            self.mcp_client.logger.warning(f"Failed to generate reflection: {e}")
+
         self.state.last_reflection_turn = self.state.loop_count
         # reset stuck counter after reflection
         self.state.stuck_counter = 0
@@ -1318,73 +1280,6 @@ class MetacognitionEngine:
             self.state.phase = Phase.REVIEW
 
     # ---------------------------------------------------------------- util
-
-    def _build_reflection_prompt(self, ctx: Dict[str, Any]) -> str:
-        """Compose a concise reflection prompt for the cheap LLM."""
-        # Use recent_actions_text instead of recent_actions (which is a list)
-        recent_actions = ctx.get("recent_actions_text", "")
-        # Use working_memory_summary instead of working_memory (which is a dict)
-        memory_snips = ctx.get("working_memory_summary", "")
-        prompt = textwrap.dedent(
-            f"""
-            You are the agent's inner voice tasked with reflection.
-            Current phase: {self.state.phase}
-            Loop: {self.state.loop_count}
-            Graph-health: {getattr(self.state, 'graph_health', 0.9):.2f}
-            Recent actions: {recent_actions[:800]}
-            Working memory highlights: {memory_snips[:800]}
-
-            1. Summarise progress in 2-3 sentences.
-            2. Recommend immediate next step.
-            3. Give numeric confidence 0-1.
-            Respond as JSON with keys summary, next_steps, confidence.
-            """
-        ).strip()
-        if ctx.get("has_contradictions"):
-            # Use contradictions instead of contradictions_list
-            contradictions = ctx.get("contradictions", [])
-            prompt += (
-                "\nDetected potential contradictions in working memory. "
-                f"IDs: {contradictions[:3]}.  Analyse whether one of them "
-                "blocks progress and propose a resolution strategy."
-            )
-        return prompt
-
-    async def _store_reflection(self, data: Dict[str, Any]) -> None:
-        """Persist reflection into UMS as both memory and thought."""
-        content = data["summary"] + "\nNEXT: " + data["next_steps"]
-        
-        # Access the AgentMasterLoop's auto-linking method through agent reference
-        if hasattr(self, 'agent') and hasattr(self.agent, '_store_memory_with_auto_linking'):
-            # Use auto-linking for better semantic connections
-            try:
-                await self.agent._store_memory_with_auto_linking(
-                    content=content,
-                    memory_type="reflection",
-                    memory_level="episodic",
-                    importance=min(max(float(data.get("confidence", 0.5)), 0.1), 1.0),
-                    description="Automated self-reflection"
-                )
-                return
-            except Exception as e:
-                self.logger.warning(f"Auto-linking reflection storage failed, using fallback: {e}")
-        
-        # Fallback to direct storage
-        try:
-            await self.mcp_client._execute_tool_and_parse_for_agent(
-                UMS_SERVER_NAME,
-                self._get_ums_tool_name("store_memory"),
-                {
-                    "workflow_id": self.state.workflow_id,
-                    "content": content,
-                    "memory_level": "episodic",
-                    "memory_type": "reflection",
-                    "importance": min(max(float(data.get("confidence", 0.5)), 0.1), 1.0),
-                    "description": "Automated self-reflection",
-                }
-            )
-        except Exception as e:
-            self.logger.warning(f"Failed to store reflection: {e}")
 
     def _infer_expected_artifact_type(self, goal_description: str) -> Optional[str]:
         """Infer what type of artifact a goal expects to create."""
@@ -1695,137 +1590,119 @@ class MetacognitionEngine:
 
 class GraphReasoner:
     """
-    Performs higher-order reasoning over the cognitive graph maintained in UMS.
-
-    Responsibilities
-    ----------------
-    • Convert adjacency snapshots into a `networkx` digraph for algorithmic metrics
-    • Compute node centrality / community clusters to surface salient memories
-    • Query the SMART or FAST LLMs (via `LLMOrchestrator`) for narrative and
-      decision-making that *ground* in the graph structure
-    • Suggest next actions, detect plan gaps, and provide human-readable
-      explanations of relationships
-
-    Parameters
-    ----------
-    mcp_client : MCPClient
-        Main interface to MCP for tool calls.
-    orchestrator : LLMOrchestrator
-        Dual-model orchestrator used for all LLM calls (big and structured).
-    mem_graph : MemoryGraphManager
-        Memory graph manager for UMS operations.
+    Simplified graph reasoning that leverages UMS NetworkX analysis.
+    
+    All heavy lifting is now done server-side by UMS get_subgraph tool.
     """
-
-    # --------------------------------------------------------------------- init
 
     def __init__(self, mcp_client, orchestrator, mem_graph):
         self.mcp_client = mcp_client
         self.llms = orchestrator
         self.mem_graph = mem_graph
 
-    # ----------------------------------------------------------------- builders
-
-    @staticmethod
-    def _snapshot_to_digraph(snapshot: Dict[str, Any]) -> nx.DiGraph:
-        """
-        Build a `networkx.DiGraph` out of the `snapshot_context_graph()` result.
-
-        The snapshot dict should use keys:
-            • 'nodes': List[{id, type, importance, tags, ...}]
-            • 'edges': List[{source, target, link_type, strength}]
-        Returns
-        -------
-        nx.DiGraph
-        """
-        g = nx.DiGraph()
-        for node in snapshot["nodes"]:
-            g.add_node(
-                node["id"],
-                **{k: v for k, v in node.items() if k != "id"},
-            )
-        for edge in snapshot["edges"]:
-            g.add_edge(
-                edge["source"],
-                edge["target"],
-                link_type=edge.get("link_type", "related"),
-                strength=edge.get("strength", 1.0),
-            )
-        return g
+    def _get_ums_tool_name(self, base_tool_name: str) -> str:
+        """Convert a base tool name to the UMS-prefixed version."""
+        return f"{UMS_SERVER_NAME}:{base_tool_name}"
 
     async def build_argument_tree(self, claim_id: str, depth: int = 2) -> str:
-        """
-        Produce a plantUML-compatible text diagram of the supports/contradicts chain
-        rooted at `claim_id` up to `depth` hops.
-        """
-        snap = await self.mem_graph.snapshot_context_graph()
-        g = self._snapshot_to_digraph(snap)
-        sub = nx.ego_graph(g, claim_id, radius=depth, directed=True)
-        lines = ["@startmindmap"]
-        for n in sub.nodes:
-            label = sub.nodes[n].get("snippet", "")[:60].replace("\n", " ")
-            lines.append(f"  * {n[:6]}: {label}")
-            for succ in sub.successors(n):
-                edge = sub[n][succ]["link_type"]
-                lines.append(f"    ** ({edge}) ➜ {succ[:6]}")
-        lines.append("@endmindmap")
-        return "\n".join(lines)
+        try:
+            subgraph_res = await self.mem_graph.get_argument_graph(claim_id, depth)  # Use preset!
+            
+            if not subgraph_res.get("success") or not subgraph_res.get("data"):
+                return "@startmindmap\n* Error: Could not retrieve argument tree\n@endmindmap"
                 
-
-    # --------------------------------------------------------- public services
+            data = subgraph_res["data"]
+            nodes = data.get("nodes", [])
+            edges = data.get("edges", [])
+            
+            # Build plantUML from UMS data
+            lines = ["@startmindmap"]
+            
+            # Find center node
+            center_node = next((n for n in nodes if n.get("memory_id") == claim_id), None)
+            if center_node:
+                label = center_node.get("content_preview", "")[:60].replace("\n", " ")
+                lines.append(f"* {claim_id[:6]}: {label}")
+                
+                # Add connected nodes
+                for edge in edges:
+                    if edge.get("source") == claim_id:
+                        target_id = edge.get("target")
+                        target_node = next((n for n in nodes if n.get("memory_id") == target_id), None)
+                        if target_node:
+                            target_label = target_node.get("content_preview", "")[:60].replace("\n", " ")
+                            edge_type = edge.get("link_type", "RELATED")
+                            lines.append(f"  ** ({edge_type}) ➜ {target_id[:6]}: {target_label}")
+                            
+            lines.append("@endmindmap")
+            return "\n".join(lines)
+            
+        except Exception as e:
+            return f"@startmindmap\n* Error: {str(e)}\n@endmindmap"
 
     async def analyse_graph(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Compute structural metrics & clusters.
+        try:
+            # Use preset for comprehensive analysis
+            analysis_res = await self.mem_graph.get_analysis_graph()  # Use preset!
+                
+            if analysis_res.get("success") and analysis_res.get("data"):
+                data = analysis_res["data"]
+                
+                # Extract pre-computed analysis
+                centrality = data.get("centrality", {})
+                communities = data.get("communities", {})
+                metrics = data.get("graph_metrics", {})
+                
+                # Convert to expected format
+                centrality_scores = {}
+                if "pagerank" in centrality:
+                    centrality_scores = centrality["pagerank"].get("top_nodes", {})
+                
+                community_list = []
+                if communities.get("communities"):
+                    community_list = [c["members"] for c in communities["communities"]]
+                
+                return {
+                    "centrality": centrality_scores,
+                    "communities": community_list,
+                    "summary_stats": {
+                        "node_count": metrics.get("node_count", 0),
+                        "edge_count": metrics.get("edge_count", 0),
+                        "density": metrics.get("density", 0.0),
+                        "avg_degree": metrics.get("degree_stats", {}).get("mean", 0.0)
+                    }
+                }
+            else:
+                return {
+                    "centrality": {},
+                    "communities": [],
+                    "summary_stats": {"node_count": 0, "edge_count": 0, "density": 0.0, "avg_degree": 0.0}
+                }
+                
+        except Exception as e:
+            self.mcp_client.logger.warning(f"UMS graph analysis failed: {e}")
+            return {
+                "centrality": {},
+                "communities": [],
+                "summary_stats": {"node_count": 0, "edge_count": 0, "density": 0.0, "avg_degree": 0.0}
+            }
 
-        Returns
-        -------
-        dict with:
-            • centrality: Dict[node_id, score]
-            • communities: List[List[node_id]]  (Louvain/top modular communities)
-            • summary_stats: Dict[str, Any]
+    async def evaluate_plan_progress(self, snapshot: Dict[str, Any], current_goal_id: str, max_tokens: int = 350) -> Dict[str, Any]:
         """
-        g = self._snapshot_to_digraph(snapshot)
-        centrality = nx.pagerank(g, alpha=0.85)
-        # Greedy modularity community detection
-        communities = list(nx.community.louvain_communities(g))
-        density = nx.density(g)
-        avg_deg = statistics.mean(dict(g.degree()).values()) if g.nodes else 0
-
-        return {
-            "centrality": centrality,
-            "communities": [list(c) for c in communities],
-            "summary_stats": {
-                "node_count": g.number_of_nodes(),
-                "edge_count": g.number_of_edges(),
-                "density": density,
-                "avg_degree": avg_deg,
-            },
-        }
-
-    async def evaluate_plan_progress(
-        self,
-        snapshot: Dict[str, Any],
-        current_goal_id: str,
-        max_tokens: int = 350,
-    ) -> Dict[str, Any]:
+        Evaluate plan progress using UMS analysis + fast LLM.
         """
-        Ask the SMART LLM to critique progress relative to current goal.
-
-        Combines graph metrics, linked memories, and embedded goal content.
-        """
+        # Get analysis from UMS instead of computing manually
         graph_info = await self.analyse_graph(snapshot)
-        # NEW graph-health score (simple proxy = 1-density*0.5)
-        health = 1.0 - graph_info["summary_stats"]["density"] * 0.5
-        self.llms.state.graph_health = max(0.0, min(1.0, health))
+        
         prompt = (
-            "You are a meta-reasoning assistant. Using the following memory graph "
-            "(with centrality scores and community clusters) evaluate how close "
-            f"the agent is to achieving the goal `{current_goal_id}` and list up "
+            "You are a meta-reasoning assistant. Using the following graph analysis "
+            "evaluate how close the agent is to achieving the goal and list up "
             "to 3 key blockers or missing steps.\n\n"
-            f"GRAPH_INFO:\n```json\n{graph_info}\n```\n"
-            "Respond as JSON: "
-            "{'progress_level': 'low|medium|high', 'blockers': [..]}."
+            f"GOAL_ID: {current_goal_id}\n"
+            f"GRAPH_ANALYSIS:\n```json\n{graph_info}\n```\n"
+            "Respond as JSON: {'progress_level': 'low|medium|high', 'blockers': [...]}."
         )
+        
         schema = {
             "type": "object",
             "properties": {
@@ -1834,37 +1711,23 @@ class GraphReasoner:
             },
             "required": ["progress_level", "blockers"],
         }
+        
         return await self.llms.fast_structured_call(prompt, schema)
 
-    async def suggest_next_actions(
-        self,
-        snapshot: Dict[str, Any],
-        current_goal_id: str,
-        limit: int = 3,
-    ) -> List[Dict[str, str]]:
+    async def suggest_next_actions(self, snapshot: Dict[str, Any], current_goal_id: str, limit: int = 3) -> List[Dict[str, str]]:
         """
-        Produce a ranked list of recommended next actions.
-
-        Returns
-        -------
-        List[{'title': str, 'tool_hint': str, 'rationale': str}]
+        Suggest actions using UMS graph analysis.
         """
-        # Hide memories tagged as BLOCKER to avoid redundant suggestions
-        snapshot["nodes"] = [
-            n for n in snapshot["nodes"]
-            if "tags" not in n or "BLOCKER" not in n["tags"]
-        ]
-        
         graph_info = await self.analyse_graph(snapshot)
+        
         prompt = (
-            "You are an autonomous agent strategist. Given the current memory "
-            f"graph and the active goal `{current_goal_id}`, suggest up to {limit} "
-            "next concrete actions. Each action should include a short title, an "
-            "MCP/UMS tool you recommend to achieve it, and a brief rationale.\n\n"
-            f"GRAPH_INFO:\n```json\n{graph_info}\n```\n"
-            f"Respond as JSON list of max {limit} objects with keys "
-            "title, tool_hint, rationale."
+            "You are an autonomous agent strategist. Using the graph analysis below, "
+            f"suggest up to {limit} next concrete actions for goal `{current_goal_id}`. "
+            "Focus on high-centrality nodes and community patterns.\n\n"
+            f"GRAPH_ANALYSIS:\n```json\n{graph_info}\n```\n"
+            f"Respond as JSON list of max {limit} objects with keys: title, tool_hint, rationale."
         )
+        
         schema = {
             "type": "array",
             "items": {
@@ -1876,81 +1739,65 @@ class GraphReasoner:
                 },
                 "required": ["title", "tool_hint", "rationale"],
             },
-            "minItems": 1,
             "maxItems": limit,
         }
+        
         return await self.llms.fast_structured_call(prompt, schema)
 
     async def explain_relationship(self, snapshot: Dict[str, Any], node_a: str, node_b: str) -> str:
         """
-        Use the SMART model to narratively explain how two memories/thoughts are
-        related, referencing link types and graph paths.
+        Explain relationship using UMS path analysis.
         """
-        g = self._snapshot_to_digraph(snapshot)
-        if not (g.has_node(node_a) and g.has_node(node_b)):
-            return f"No path because at least one node is missing."
-
         try:
-            path = nx.shortest_path(g, source=node_a, target=node_b)
-        except nx.NetworkXNoPath:
-            path = None
-
-        description = {
-            "node_a": g.nodes[node_a],
-            "node_b": g.nodes[node_b],
-            "path": path,
-            "edges": [g.get_edge_data(path[i], path[i + 1]) for i in range(len(path) - 1)] if path else None,
-        }
-        prompt = (
-            "Explain in plain language how the first memory relates to the second "
-            "based on the graph data below. Reference link types explicitly.\n\n"
-            f"REL_DATA:\n```json\n{description}\n```\n"
-            "Return a concise paragraph (max 120 words)."
-        )
-        messages = [
-            {"role": "system", "content": "You are an explanatory AI assistant."},
-            {"role": "user", "content": prompt},
-        ]
-        # Use big model for richer narrative
-        decision = await self.llms.big_reasoning_call(messages, tool_schemas=None)
-        return decision.get("content", "") if isinstance(decision, dict) else str(decision)
+            path_res = await self.mem_graph.get_relationship_graph(node_a, node_b)  # Use preset!
+            
+            if path_res.get("success") and path_res.get("data"):
+                paths = path_res["data"].get("shortest_paths", {})
+                if node_b in paths:
+                    path_info = paths[node_b]
+                    return f"Distance: {path_info.get('avg_distance_to', 'unknown')} hops. Reachable via graph connections."
+                else:
+                    return "No direct path found between these memories."
+            else:
+                return "Could not analyze relationship."
+                
+        except Exception as e:
+            return f"Error analyzing relationship: {e}"
 
     async def summarise_subgraph(self, snapshot: Dict[str, Any], focus_nodes: List[str], target_tokens: int = 250) -> str:
-        """
-        Compresses the subgraph centred on `focus_nodes` into a narrative summary.
-
-        Uses the UMS summarize_text tool for token control.
-        """
-        sub_nodes = set(focus_nodes)
-        for node in focus_nodes:
-            sub_nodes.update(n for n in snapshot["nodes"] if n["id"] == node)
-        # Build minimal snapshot
-        sub_snapshot = {
-            "nodes": [n for n in snapshot["nodes"] if n["id"] in sub_nodes],
-            "edges": [e for e in snapshot["edges"] if e["source"] in sub_nodes and e["target"] in sub_nodes],
-        }
-        text_blob = repr(sub_snapshot)
-        
+        if not focus_nodes:
+            return "No focus nodes provided"
+            
         try:
-            result = await self.mcp_client._execute_tool_and_parse_for_agent(
-            UMS_SERVER_NAME,
+            # Use specialized preset for summarization
+            subgraph_res = await self.mem_graph.get_summarization_graph(focus_nodes[0])  # Use new preset!
+            
+            if not subgraph_res.get("success"):
+                return "Could not retrieve subgraph for summarization"
+                
+            nodes = subgraph_res["data"].get("nodes", [])
+            content_texts = [node.get("content", node.get("content_preview", ""))[:200] for node in nodes]
+            combined_text = "\n".join(content_texts)
+            
+            # Use UMS summarization
+            summary_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
                 self._get_ums_tool_name("summarize_text"),
-            {
-                    "text": text_blob,
-                "target_tokens": target_tokens,
-                    "context": "graph_snapshot",
-                "workflow_id": self.llms.state.workflow_id,
+                {
+                    "text": combined_text,
+                    "target_tokens": target_tokens,
+                    "context": "subgraph_summary",
+                    "workflow_id": self.mem_graph.state.workflow_id
                 }
             )
-            if result.get("success") and result.get("data"):
-                return result["data"].get("summary", text_blob[:target_tokens])
+            
+            if summary_res.get("success") and summary_res.get("data"):
+                return summary_res["data"].get("summary", combined_text[:target_tokens])
             else:
-                # Fallback to simple truncation if UMS tool fails
-                return text_blob[:target_tokens] + ("..." if len(text_blob) > target_tokens else "")
-        except Exception:
-            # Fallback to simple truncation if UMS tool is unavailable
-            return text_blob[:target_tokens] + ("..." if len(text_blob) > target_tokens else "")
-
+                return combined_text[:target_tokens] + ("..." if len(combined_text) > target_tokens else "")
+                
+        except Exception as e:
+            return f"Summarization failed: {e}"
 
 ###############################################################################
 # SECTION 6. Orchestrators & ToolExecutor (outline)
@@ -1969,22 +1816,9 @@ class ToolExecutor:
 
     async def run(self, tool_name: str, tool_args: dict[str, Any]) -> Any:
         """
-        Execute a tool and handle memory creation/linking.
-        
-        Parameters
-        ----------
-        tool_name : str
-            The original MCP tool name (e.g., "store_memory")
-        tool_args : dict
-            Tool arguments
-            
-        Returns
-        -------
-        Any
-            The tool execution result
+        Execute a tool with proper UMS action lifecycle tracking.
         """
-        # Determine the server name - for UMS tools, use UMS_Server
-        # Common UMS tool names (without ums: prefix)
+        # Determine the server name for the tool
         ums_tools = {
             "store_memory", "get_memory_by_id", "update_memory", "query_memories",
             "create_memory_link", "get_linked_memories", "update_memory_link_metadata", 
@@ -1994,128 +1828,129 @@ class ToolExecutor:
             "create_workflow", "update_workflow_metadata", "get_workflow_metadata",
             "query_graph_by_link_type", "get_contradictions", "decay_link_strengths",
             "add_tag_to_memory", "summarize_context_block", "get_recent_memories_with_links",
-            "get_subgraph", "get_similar_memories", "update_workflow_status"
+            "get_similar_memories", "update_workflow_status"
         }
         
         if tool_name in ums_tools:
             server_name = UMS_SERVER_NAME
-            # For UMS tools, pass the tool name directly - MCPClient handles server:tool mapping
             actual_tool_name = tool_name
         else:
-            # For non-UMS tools, try to determine the server or use a default
-            server_name = "Unknown_Server"  # MCPClient should handle server resolution
+            server_name = "Unknown_Server"
             actual_tool_name = tool_name
         
-        # Execute the tool via MCPClient
-        result_envelope = await self.mcp_client._execute_tool_and_parse_for_agent(
-            server_name, actual_tool_name, tool_args
-        )
-        
-        # Check if the tool execution was successful
-        if not result_envelope.get("success", False):
-            error_msg = result_envelope.get("error_message", "Unknown tool execution error")
-            self.mcp_client.logger.error(f"Tool {tool_name} failed: {error_msg}")
-            
-            # Create an error memory for failed tool execution
-            try:
-                await self.mcp_client._execute_tool_and_parse_for_agent(
-                    UMS_SERVER_NAME, 
-                    self._get_ums_tool_name("store_memory"), 
-                    {
-                        'workflow_id': self.state.workflow_id,
-                        'content': f"TOOL ERROR: {tool_name} failed with: {error_msg}",
-                        'memory_type': 'ERROR_LOG',
-                        'memory_level': 'working',
-                        'importance': 3.0,
-                        'description': f"Tool execution error for {tool_name}",
-                    }
-                )
-            except Exception as memory_error:
-                self.mcp_client.logger.warning(f"Failed to create error memory: {memory_error}")
-            
-            # Return the error envelope for the caller to handle
-            return result_envelope
-
-        # ------------------------------------------------------------------
-        # After successful tool call → create an ACTION memory + link to goal
-        # ------------------------------------------------------------------
+        # Start action tracking
+        action_id = None
         try:
-            # Create ACTION memory using UMS tools
-            action_memory_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+            action_start_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
-                "store_memory",
+                self._get_ums_tool_name("record_action_start"),
                 {
-                    'workflow_id': self.state.workflow_id,
-                    'content': json.dumps({"tool": tool_name, "args": tool_args})[:1500],
-                    'memory_level': 'working',
-                    'memory_type': 'ACTION',
-                    'description': f"Tool call {tool_name}",
-                    'importance': 4.0,
+                    "workflow_id": self.state.workflow_id,
+                    "action_type": "tool_use",
+                    "reasoning": f"Executing tool {tool_name} to advance current goal",
+                    "tool_name": tool_name,
+                    "tool_args": tool_args,
+                    "title": f"Execute {tool_name}",
+                    "related_thought_id": None,  # Could link to current reasoning if available
+                    "idempotency_key": f"{tool_name}_{hash(str(tool_args))}_{self.state.loop_count}"
                 }
             )
             
-            if action_memory_res.get("success") and action_memory_res.get("data"):
-                action_mem_id = action_memory_res["data"].get("memory_id")
-                
-                if action_mem_id:
-                    # Link provenance: goal -> action
-                    await self.mem_graph.auto_link(
-                        src_id=self.state.current_leaf_goal_id,
-                        tgt_id=action_mem_id,
-                        context_snip="attempts to satisfy goal via tool",
-                    )
-
-            # Link inputs -> action (if args reference memory ids)
-            for val in tool_args.values():
-                if isinstance(val, str) and val.startswith("mem_"):  # crude check
-                    await self.mem_graph.auto_link(
-                        src_id=val,
-                        tgt_id=action_mem_id,
-                        context_snip="input to tool",
-                    )
-
-                    # Link action -> outputs (if result contains memory_ids)
-                    result_data = result_envelope.get("data", {})
-                    if isinstance(result_data, dict) and "memory" in result_data and "memory_id" in result_data["memory"]:
-                        output_id = result_data["memory"]["memory_id"]
-            await self.mem_graph.auto_link(
-                src_id=action_mem_id,
-                tgt_id=output_id,
-                context_snip="tool output",
-                kind_hint=LinkKind.SEQUENTIAL,
+            if action_start_res.get("success") and action_start_res.get("data"):
+                action_id = action_start_res["data"].get("action_id")
+                self.mcp_client.logger.debug(f"Started action tracking for {tool_name}: {action_id}")
+        except Exception as e:
+            self.mcp_client.logger.warning(f"Failed to start action tracking for {tool_name}: {e}")
+        
+        # Execute the actual tool
+        try:
+            result_envelope = await self.mcp_client._execute_tool_and_parse_for_agent(
+                server_name, actual_tool_name, tool_args
             )
-                        
-        except Exception as memory_error:
-            # Log memory creation/linking errors but don't fail the tool execution
-            self.mcp_client.logger.warning(f"Failed to create action memory or links for {tool_name}: {memory_error}")
-
-        # Return the actual tool result
-        return result_envelope
+            
+            success = result_envelope.get("success", False)
+            
+            # Complete action tracking
+            if action_id:
+                try:
+                    completion_status = "completed" if success else "failed"
+                    summary = f"Tool {tool_name} {'succeeded' if success else 'failed'}"
+                    if not success:
+                        error_msg = result_envelope.get("error_message", "Unknown error")
+                        summary += f": {error_msg}"
+                    
+                    await self.mcp_client._execute_tool_and_parse_for_agent(
+                        UMS_SERVER_NAME,
+                        self._get_ums_tool_name("record_action_completion"),
+                        {
+                            "action_id": action_id,
+                            "status": completion_status,
+                            "tool_result": result_envelope if success else None,
+                            "summary": summary,
+                            "conclusion_thought": None  # Could add reasoning about the result
+                        }
+                    )
+                    self.mcp_client.logger.debug(f"Completed action tracking for {tool_name}: {completion_status}")
+                except Exception as e:
+                    self.mcp_client.logger.warning(f"Failed to complete action tracking for {tool_name}: {e}")
+            
+            # Handle tool execution results
+            if not success:
+                error_msg = result_envelope.get("error_message", "Unknown tool execution error")
+                self.mcp_client.logger.error(f"Tool {tool_name} failed: {error_msg}")
+            
+            return result_envelope
+            
+        except Exception as e:
+            # Complete action tracking with error status
+            if action_id:
+                try:
+                    await self.mcp_client._execute_tool_and_parse_for_agent(
+                        UMS_SERVER_NAME,
+                        self._get_ums_tool_name("record_action_completion"),
+                        {
+                            "action_id": action_id,
+                            "status": "failed",
+                            "tool_result": None,
+                            "summary": f"Tool {tool_name} failed with exception: {str(e)}",
+                            "conclusion_thought": None
+                        }
+                    )
+                except Exception:
+                    pass  # Don't let action tracking errors mask the original error
+            
+            self.mcp_client.logger.error(f"Tool {tool_name} execution failed: {e}")
+            return {"success": False, "error_message": str(e)}
 
     async def run_parallel(self, tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Execute multiple independent tools in parallel.
-        
-        Parameters
-        ----------
-        tool_calls : List[Dict[str, Any]]
-            Each dict must have 'tool_name' and 'tool_args' keys.
-            Optional 'tool_id' key for tracking.
-        
-        Returns
-        -------
-        Dict[str, Any]
-            {
-                "success": bool,
-                "results": List[Dict[str, Any]],  # Ordered results matching input order
-                "timing": Dict[str, float],       # Execution times per tool
-                "batch_memory_id": str            # ID of the batch execution memory
-            }
+        Execute multiple independent tools in parallel with UMS action tracking.
         """
         if not tool_calls:
             return {"success": True, "results": [], "timing": {}, "batch_memory_id": None}
         
         start_time = time.time()
+        
+        # Start batch action tracking
+        batch_action_id = None
+        try:
+            batch_action_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("record_action_start"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "action_type": "parallel_tools",
+                    "reasoning": f"Executing {len(tool_calls)} tools in parallel",
+                    "tool_name": "parallel_execution",
+                    "tool_args": {"tool_count": len(tool_calls), "tools": [tc.get("tool_name") for tc in tool_calls]},
+                    "title": f"Parallel execution of {len(tool_calls)} tools"
+                }
+            )
+            
+            if batch_action_res.get("success") and batch_action_res.get("data"):
+                batch_action_id = batch_action_res["data"].get("action_id")
+        except Exception as e:
+            self.mcp_client.logger.warning(f"Failed to start batch action tracking: {e}")
         
         # Create tasks with proper error handling
         tasks = []
@@ -2126,7 +1961,7 @@ class ToolExecutor:
             tool_args = call.get('tool_args', {})
             tool_id = call.get('tool_id', f"{tool_name}_{i}")
             
-            # Create coroutine for this tool
+            # Create coroutine for this tool (using the updated run method)
             async def execute_with_timing(name=tool_name, args=tool_args, tid=tool_id):
                 t_start = time.time()
                 try:
@@ -2145,7 +1980,7 @@ class ToolExecutor:
                         "tool_id": tid,
                         "tool_name": name,
                         "success": False,
-                        "result": None,
+                        "result": {"success": False, "error_message": str(e)},
                         "execution_time": time.time() - t_start,
                         "error": str(e)
                     }
@@ -2156,44 +1991,30 @@ class ToolExecutor:
         # Execute all tasks concurrently
         task_results = await asyncio.gather(*tasks, return_exceptions=False)
         
-        # Create batch execution memory
+        # Complete batch action tracking
         total_time = time.time() - start_time
         successful_count = sum(1 for r in task_results if r["success"])
         
-        batch_summary = (
-            f"Parallel execution of {len(tool_calls)} tools in {total_time:.2f}s\n"
-            f"Success: {successful_count}/{len(tool_calls)}\n"
-            f"Tools: {', '.join(r['tool_name'] for r in task_results)}"
-        )
-        
-        batch_mem_res = await self.mcp_client._execute_tool_and_parse_for_agent(
-            UMS_SERVER_NAME,
-            self._get_ums_tool_name("store_memory"),
-            {
-                'workflow_id': self.state.workflow_id,
-                'content': batch_summary,
-                'memory_type': 'ACTION_BATCH',
-                'memory_level': 'working',
-                'importance': 5.0,
-                'metadata': {
-                    'tool_count': len(tool_calls),
-                    'total_time': total_time,
-                    'success_count': successful_count,
-                    'tool_times': {r['tool_id']: r['execution_time'] for r in task_results}
-                }
-            }
-        )
-        
-        batch_memory_id = batch_mem_res.get("data", {}).get("memory", {}).get("memory_id") if batch_mem_res.get("success") else None
-
-        # Link batch memory to current goal
-        if batch_memory_id and self.state.current_leaf_goal_id:
-            await self.mem_graph.auto_link(
-                src_id=self.state.current_leaf_goal_id,
-                tgt_id=batch_memory_id,
-                context_snip="parallel tool execution for goal",
-                kind_hint=LinkKind.SEQUENTIAL
-            )
+        if batch_action_id:
+            try:
+                batch_summary = f"Parallel execution completed: {successful_count}/{len(tool_calls)} tools succeeded in {total_time:.2f}s"
+                await self.mcp_client._execute_tool_and_parse_for_agent(
+                    UMS_SERVER_NAME,
+                    self._get_ums_tool_name("record_action_completion"),
+                    {
+                        "action_id": batch_action_id,
+                        "status": "completed" if successful_count > 0 else "failed",
+                        "tool_result": {
+                            "successful_count": successful_count,
+                            "total_count": len(tool_calls),
+                            "execution_time": total_time,
+                            "tool_results": [r["result"] for r in task_results]
+                        },
+                        "summary": batch_summary
+                    }
+                )
+            except Exception as e:
+                self.mcp_client.logger.warning(f"Failed to complete batch action tracking: {e}")
         
         # Build ordered results matching input order
         ordered_results = []
@@ -2202,18 +2023,15 @@ class ToolExecutor:
         for i, tool_id in enumerate(tool_identifiers):
             for result in task_results:
                 if result["tool_id"] == tool_id:
-                    ordered_results.append(result["result"] if result["result"] else {
-                        "success": False,
-                        "error": result["error"]
-                    })
+                    ordered_results.append(result["result"])
                     timing_info[tool_id] = result["execution_time"]
                     break
         
         return {
-            "success": successful_count > 0,  # At least one succeeded
+            "success": successful_count > 0,
             "results": ordered_results,
             "timing": timing_info,
-            "batch_memory_id": batch_memory_id
+            "batch_memory_id": batch_action_id  # Return action ID instead of memory ID
         }
 
 class LLMOrchestrator:
@@ -2577,7 +2395,6 @@ class AgentMasterLoop:
         """
         self.mcp_client = mcp_client
         self.default_llm_model = default_llm_model_string
-        self.agent_state_file = agent_state_file
         self.logger = logging.getLogger("AML")
         
         # Agent state - will be loaded/initialized in initialize()
@@ -2637,7 +2454,7 @@ class AgentMasterLoop:
         """
         try:
             # Load persistent state
-            await self._load_state_from_file()
+            await self._load_cognitive_state()
             
             # Validate loaded state against UMS
             await self._validate_and_reset_state()
@@ -2657,7 +2474,7 @@ class AgentMasterLoop:
                     self.logger.warning(f"Failed to load goals from UMS during initialization: {e}")
             
             # Save validated/updated state
-            await self._save_state_internal()
+            await self._save_cognitive_state()
             
             self.logger.info(f"AgentMasterLoop initialized with workflow_id: {self.state.workflow_id}")
             return True
@@ -2666,37 +2483,50 @@ class AgentMasterLoop:
             self.logger.error(f"AgentMasterLoop initialization failed: {e}", exc_info=True)
             return False
 
-    async def _load_state_from_file(self) -> None:
-        """Load agent state from persistent file using aiofiles."""
+    async def _load_cognitive_state(self) -> None:
+        """Load agent state using UMS cognitive state tools."""
         try:
-            import json
-
-            import aiofiles
+            # Try to load the latest cognitive state
+            load_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("load_cognitive_state"),
+                {
+                    "workflow_id": self.state.workflow_id if self.state.workflow_id else None,
+                    "state_type": "agent_master_loop",
+                    "version": "latest"  # Get the most recent state
+                }
+            )
             
-            if os.path.exists(self.agent_state_file):
-                async with aiofiles.open(self.agent_state_file, 'r') as f:
-                    state_data = json.loads(await f.read())
+            if load_res.get("success") and load_res.get("data"):
+                state_data = load_res["data"].get("state_data", {})
                 
-                # Reconstruct AMLState from saved data
-                # Convert datetime string back to datetime object
-                if 'created_at' in state_data:
-                    state_data['created_at'] = _dt.datetime.fromisoformat(state_data['created_at'])
-                
-                # Create new state with loaded data
-                # Convert phase string back to enum if present
-                if 'phase' in state_data and isinstance(state_data['phase'], str):
-                    try:
-                        state_data['phase'] = Phase(state_data['phase'])
-                    except ValueError:
-                        state_data['phase'] = Phase.UNDERSTAND  # fallback
-                loaded_state = AMLState(**{k: v for k, v in state_data.items() if hasattr(AMLState, k)})
-                self.state = loaded_state
-                self.logger.info(f"Loaded agent state from {self.agent_state_file}")
+                if state_data:
+                    # Reconstruct AMLState from cognitive state data
+                    if 'created_at' in state_data:
+                        state_data['created_at'] = _dt.datetime.fromisoformat(state_data['created_at'])
+                    
+                    # Convert phase string back to enum
+                    if 'phase' in state_data and isinstance(state_data['phase'], str):
+                        try:
+                            state_data['phase'] = Phase(state_data['phase'])
+                        except ValueError:
+                            state_data['phase'] = Phase.UNDERSTAND  # fallback
+                    
+                    # Create new state with loaded data, preserving defaults for missing fields
+                    loaded_state = AMLState()
+                    for key, value in state_data.items():
+                        if hasattr(loaded_state, key):
+                            setattr(loaded_state, key, value)
+                    
+                    self.state = loaded_state
+                    self.logger.info(f"Loaded cognitive state from UMS for workflow {self.state.workflow_id}")
+                else:
+                    self.logger.info("No cognitive state data found, using default state")
             else:
-                self.logger.info(f"No existing state file found at {self.agent_state_file}, using default state")
+                self.logger.info("No existing cognitive state found in UMS, using default state")
                 
         except Exception as e:
-            self.logger.warning(f"Failed to load agent state from {self.agent_state_file}: {e}")
+            self.logger.warning(f"Failed to load cognitive state from UMS: {e}")
             self.logger.info("Using default state")
 
     async def _validate_and_reset_state(self) -> None:
@@ -2953,29 +2783,54 @@ class AgentMasterLoop:
             }
         )
         
-    async def _save_state_internal(self) -> None:
-        """Save current agent state to persistent file."""
+    async def _save_cognitive_state(self) -> None:
+        """Save current agent state using UMS cognitive state tools."""
         try:
-            import json
-
-            import aiofiles
+            # Convert state to cognitive state format
+            cognitive_state = {
+                "workflow_id": self.state.workflow_id,
+                "root_goal_id": self.state.root_goal_id,
+                "current_leaf_goal_id": self.state.current_leaf_goal_id,
+                "phase": self.state.phase.value,
+                "loop_count": self.state.loop_count,
+                "cost_usd": self.state.cost_usd,
+                "stuck_counter": self.state.stuck_counter,
+                "last_reflection_turn": self.state.last_reflection_turn,
+                "last_graph_maint_turn": self.state.last_graph_maint_turn,
+                "graph_health": self.state.graph_health,
+                "pending_attachments": self.state.pending_attachments,
+                "current_plan": self.state.current_plan,
+                "goal_stack": self.state.goal_stack,
+                "current_thought_chain_id": self.state.current_thought_chain_id,
+                "last_action_summary": self.state.last_action_summary,
+                "last_error_details": self.state.last_error_details,
+                "consecutive_error_count": self.state.consecutive_error_count,
+                "needs_replan": self.state.needs_replan,
+                "goal_achieved_flag": self.state.goal_achieved_flag,
+                "recent_action_signatures": self.state.recent_action_signatures,
+                "created_at": self.state.created_at.isoformat()
+            }
             
-            # Convert state to serializable dict
-            state_dict = dataclasses.asdict(self.state)
-            # Convert datetime to string
-            if 'created_at' in state_dict:
-                state_dict['created_at'] = self.state.created_at.isoformat()
+            # Save using UMS cognitive state tool
+            save_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("save_cognitive_state"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "state_data": cognitive_state,
+                    "state_type": "agent_master_loop",
+                    "version_label": f"loop_{self.state.loop_count}",
+                    "checkpoint_reason": "periodic_save"
+                }
+            )
+            
+            if save_res.get("success"):
+                self.logger.debug(f"Saved cognitive state for loop {self.state.loop_count}")
+            else:
+                self.logger.warning(f"Failed to save cognitive state: {save_res.get('error_message', 'Unknown error')}")
                 
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(self.agent_state_file), exist_ok=True)
-            
-            async with aiofiles.open(self.agent_state_file, 'w') as f:
-                await f.write(json.dumps(state_dict, indent=2))
-                
-            self.logger.debug(f"Saved agent state to {self.agent_state_file}")
-            
         except Exception as e:
-            self.logger.warning(f"Failed to save agent state: {e}")
+            self.logger.warning(f"Failed to save cognitive state: {e}")
 
     async def _create_checkpoint(self, reason: str) -> Optional[str]:
         """
@@ -3270,7 +3125,7 @@ class AgentMasterLoop:
                 await self._create_checkpoint("periodic_save")
 
             # 7. Persist state -----------------------------------------------------
-            await self._save_state_internal()
+            await self._save_cognitive_state()
 
             # 8. Budget & termination checks --------------------------------------
             if self.state.phase == Phase.COMPLETE or self.state.goal_achieved_flag:
@@ -3806,7 +3661,7 @@ class AgentMasterLoop:
         # Try to save state with error details
         try:
             import asyncio
-            asyncio.create_task(self._save_state_internal())
+            asyncio.create_task(self._save_cognitive_state())
         except Exception:
             pass  # Don't let state saving errors mask the original failure
             
@@ -3882,7 +3737,7 @@ class AgentMasterLoop:
             
         # Save final state
         try:
-            await self._save_state_internal()
+            await self._save_cognitive_state()
         except Exception as e:
             self.logger.warning(f"[AML] Error saving state during shutdown: {e}")
             
