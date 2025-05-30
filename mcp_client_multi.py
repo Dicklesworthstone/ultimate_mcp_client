@@ -6831,7 +6831,7 @@ class MCPClient:
     TOOLS TO RATE:
     {chr(10).join(f"{i+1}. {tool['name']}: {tool['description']}" for i, tool in enumerate(tools_for_scoring))}
 
-    Return a JSON array of relevance scores (0-100) in the same order as the tools listed above."""
+    Return a JSON object with a 'scores' array containing relevance scores (0-100) in the same order as the tools listed above."""
 
             schema = {
                 "type": "object",

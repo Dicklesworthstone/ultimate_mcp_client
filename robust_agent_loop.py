@@ -724,6 +724,10 @@ class MetacognitionEngine:
         """Link the main agent for auto-linking capabilities."""
         self.agent = agent
 
+    def _get_ums_tool_name(self, base_tool_name: str) -> str:
+        """Construct the full MCP tool name for UMS tools."""
+        return f"{UMS_SERVER_NAME}:{base_tool_name}"
+
     # ---------------------------------------------------------------- public
 
     async def maybe_reflect(self, turn_ctx: Dict[str, Any]) -> None:
@@ -1670,6 +1674,14 @@ class LLMOrchestrator:
                     if tool_name:
                         valid_tool_names.append(tool_name)
         
+        # Safety check: ensure we have valid tools
+        if not valid_tool_names:
+            self.mcp_client.logger.error(f"[LLMOrch] No valid tool names extracted from {len(tool_schemas)} schemas")
+            return {
+                "decision_type": "THOUGHT_PROCESS",
+                "content": "No valid tools available. Cannot proceed with tool-based actions."
+            }
+        
         self.mcp_client.logger.info(f"[LLMOrch] Extracted {len(valid_tool_names)} valid tool names from schemas")
         self.mcp_client.logger.debug(f"[LLMOrch] Valid tool names: {valid_tool_names[:5]}...")  # Show first 5
         
@@ -1685,28 +1697,29 @@ class LLMOrchestrator:
                 "tool_name": {
                     "type": "string",
                     "enum": valid_tool_names if valid_tool_names else ["no_tools_available"],
-                    "description": "Name of the tool to call (required for TOOL_SINGLE)"
+                    "description": "CRITICAL: Must use EXACT tool name from the enum list. Tool names include full server prefix like 'Ultimate_MCP_Server_browse'."
                 },
                 "tool_args": {
                     "type": "object",
                     "description": "Arguments for the tool call (required for TOOL_SINGLE)"
                 },
-                "tool_calls": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "tool_name": {
-                                "type": "string",
-                                "enum": valid_tool_names if valid_tool_names else ["no_tools_available"]
+                                        "tool_calls": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool_name": {
+                                        "type": "string",
+                                        "enum": valid_tool_names if valid_tool_names else ["no_tools_available"],
+                                        "description": "CRITICAL: Must use EXACT tool name from the enum list."
+                                    },
+                                    "tool_args": {"type": "object"},
+                                    "tool_id": {"type": "string", "description": "Unique identifier for this tool call"}
+                                },
+                                "required": ["tool_name", "tool_args", "tool_id"]
                             },
-                            "tool_args": {"type": "object"},
-                            "tool_id": {"type": "string", "description": "Unique identifier for this tool call"}
+                            "description": "List of tools for TOOL_MULTIPLE execution"
                         },
-                        "required": ["tool_name", "tool_args", "tool_id"]
-                    },
-                    "description": "List of tools for TOOL_MULTIPLE execution"
-                },
                 "content": {
                     "type": "string", 
                     "description": "Content for THOUGHT_PROCESS or DONE decisions"
@@ -1736,18 +1749,50 @@ class LLMOrchestrator:
             if isinstance(resp, dict) and "decision_type" in resp:
                 self.mcp_client.logger.info(f"[LLMOrch] Decision type: {resp.get('decision_type')}")
                 return resp
-            else:
-                self.mcp_client.logger.error(f"[LLMOrch] Invalid response format: {resp}")
-                return {
-                    "decision_type": "ERROR",
-                    "reasoning": f"LLM returned invalid response format: {type(resp)}"
-                }
+            
+            # Try to repair common response format issues
+            if isinstance(resp, dict):
+                # Check if it's in the old tool format and convert it
+                if "tool" in resp and "tool_input" in resp:
+                    tool_name = resp.get("tool", "")
+                    tool_args = resp.get("tool_input", {})
+                    
+                    # Validate tool name exists in our valid tools
+                    if tool_name not in valid_tool_names:
+                        self.mcp_client.logger.error(f"[LLMOrch] LLM returned invalid tool name: {tool_name}. Valid tools: {valid_tool_names[:5]}...")
+                        return {
+                            "decision_type": "THOUGHT_PROCESS",
+                            "content": f"LLM attempted to use non-existent tool '{tool_name}'. Available tools: {', '.join(valid_tool_names[:5])}... Need to select from these valid options."
+                        }
+                    
+                    # Convert to expected format
+                    self.mcp_client.logger.warning(f"[LLMOrch] Converting old tool format to new format")
+                    return {
+                        "decision_type": "TOOL_SINGLE",
+                        "tool_name": tool_name,
+                        "tool_args": tool_args
+                    }
+                
+                # Check if it's a planning response
+                if "plan" in resp:
+                    self.mcp_client.logger.warning(f"[LLMOrch] LLM returned planning response, converting to thought")
+                    return {
+                        "decision_type": "THOUGHT_PROCESS",
+                        "content": f"Planning response received: {resp}"
+                    }
+            
+            # If we can't repair it, return a thought process instead of ERROR
+            self.mcp_client.logger.error(f"[LLMOrch] Invalid response format: {resp}")
+            return {
+                "decision_type": "THOUGHT_PROCESS",
+                "content": f"LLM returned unexpected format. Need to analyze the goal and determine next steps. Response was: {str(resp)[:200]}"
+            }
                 
         except Exception as e:
             self.mcp_client.logger.error(f"[LLMOrch] Error in structured LLM call: {e}")
             return {
-                "decision_type": "ERROR", 
-                "reasoning": f"LLM call failed: {str(e)}"
+                "decision_type": "THOUGHT_PROCESS", 
+                "content": f"LLM call failed with error: {str(e)}. Need to proceed with basic reasoning to determine next steps."
             }
 
 ###############################################################################
@@ -2567,6 +2612,18 @@ class AgentMasterLoop:
             self.state.last_error_details = {"error": str(e), "turn": loop_idx}
             self.state.consecutive_error_count += 1
             
+            # Store error details in memory for learning
+            try:
+                await self._store_memory_with_auto_linking(
+                    content=f"Agent error on turn {loop_idx}: {str(e)}. Will attempt recovery.",
+                    memory_type="correction",
+                    memory_level="working", 
+                    importance=7.0,
+                    description="Error details for debugging and recovery"
+                )
+            except Exception:
+                pass  # Don't let memory storage errors block recovery
+            
             # Fail after too many consecutive errors
             if self.state.consecutive_error_count >= 3:
                 return self._record_failure("consecutive_errors")
@@ -3368,16 +3425,26 @@ class AgentMasterLoop:
                 }
 
                 async def _on_contradiction(res: Dict[str, str], aid: str = a_id, bid: str = b_id) -> None:
-                    # Store memory and add to working memory
-                    await self._store_memory_with_auto_linking(
-                        content=f"{res['summary']}\n\nCLARIFY: {res['question']}",
-                        memory_type="contradiction_analysis",
-                        memory_level="working",
-                        importance=7.0,
-                        description="Automated contradiction analysis",
-                        link_to_goal=True
-                    )
-                    # Memory is automatically added to working memory by the revised method
+                    try:
+                        if res is None or not isinstance(res, dict):
+                            self.logger.warning("Fast LLM call returned invalid result for contradiction analysis")
+                            return
+                        
+                        summary = res.get('summary', 'Contradiction detected')
+                        question = res.get('question', 'What additional information is needed?')
+                        
+                        # Store memory and add to working memory
+                        await self._store_memory_with_auto_linking(
+                            content=f"{summary}\n\nCLARIFY: {question}",
+                            memory_type="contradiction_analysis",
+                            memory_level="working",
+                            importance=7.0,
+                            description="Automated contradiction analysis",
+                            link_to_goal=True
+                        )
+                        # Memory is automatically added to working memory by the revised method
+                    except Exception as e:
+                        self.logger.warning(f"Error processing contradiction analysis: {e}")
                 
                 coro = self.llms.fast_structured_call(prompt, schema)
                 task_name = f"contradict_{a_id[:4]}_{b_id[:4]}"
@@ -3420,23 +3487,31 @@ class AgentMasterLoop:
                 }
 
                 async def _on_insight(res: Dict[str, str]) -> None:
-                    if res is None or "insight" not in res:
-                        self.logger.warning("Fast LLM call returned invalid result for insight generation")
-                        return
-        
-                    # Store and add to working memory
-                    mem_id = await self._store_memory_with_auto_linking(
-                        content=res["insight"],
-                        memory_type="insight",
-                        memory_level="working",
-                        importance=6.5,
-                        description="Proactive insight from working memory analysis",
-                        link_to_goal=True
-                    )
-                    
-                    # Make it focal since it's a new insight
-                    if mem_id and self.state.context_id:
-                        await self._add_to_working_memory(mem_id, make_focal=True)
+                    try:
+                        if res is None or not isinstance(res, dict) or "insight" not in res:
+                            self.logger.warning("Fast LLM call returned invalid result for insight generation")
+                            return
+                        
+                        insight_content = res.get("insight", "").strip()
+                        if not insight_content:
+                            self.logger.warning("Fast LLM returned empty insight")
+                            return
+            
+                        # Store and add to working memory
+                        mem_id = await self._store_memory_with_auto_linking(
+                            content=insight_content,
+                            memory_type="insight",
+                            memory_level="working",
+                            importance=6.5,
+                            description="Proactive insight from working memory analysis",
+                            link_to_goal=True
+                        )
+                        
+                        # Make it focal since it's a new insight
+                        if mem_id and self.state.context_id:
+                            await self._add_to_working_memory(mem_id, make_focal=True)
+                    except Exception as e:
+                        self.logger.warning(f"Error processing insight: {e}")
                 
                 coro = self.llms.fast_structured_call(prompt, schema)
                 self.async_queue.spawn(AsyncTask("working_memory_insight", coro, callback=_on_insight))
@@ -3465,6 +3540,12 @@ IMPORTANT: You must make concrete progress each turn by:
 2. Creating tangible outputs (write files, record artifacts, execute code)
 3. Storing key findings in memory (store memories, record thoughts)
 4. Breaking down complex goals (create goals)
+
+CRITICAL TOOL USAGE RULES:
+- You MUST use ONLY the exact tool names provided in the function schema
+- Tool names have server prefixes like "Ultimate_MCP_Server_browse" 
+- NEVER invent tool names like "agent:update_plan" - they don't exist
+- Check the available tools list carefully before selecting
 
 EFFICIENCY: Use TOOL_MULTIPLE when possible! Use the EXACT tool names from the schema provided.
 
@@ -3853,6 +3934,18 @@ Avoid circular reasoning. Each action should move closer to the goal."""
         else:
             # Log the unexpected decision type for debugging
             self.logger.error(f"[AML] Unexpected decision type: {decision_type}, full decision: {decision}")
+            # Convert unknown decision types to thought process to avoid complete failure
+            if decision.get("content") or decision.get("reasoning"):
+                content = decision.get("content") or decision.get("reasoning")
+                mem_id = await self._store_memory_with_auto_linking(
+                    content=f"Unexpected decision type '{decision_type}': {content}",
+                    memory_type="reasoning_step",
+                    memory_level="working",
+                    importance=5.0,
+                    description="Recovered from unexpected decision format"
+                )
+                self.state.last_action_summary = "Processed unexpected decision format"
+                return bool(content.strip()) if content else False
             return False
 
     # ----------------------------------------------------- after-turn misc
