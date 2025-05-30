@@ -1440,7 +1440,7 @@ def robust_parse_mcp_tool_content(content_from_call_tool_result: Any) -> Dict[st
     # Log the string that will be attempted for JSON parsing
     log.info(
         f"ROBUST_PARSE_V_FINAL: Attempting to parse JSON from extracted string (length: {len(extracted_json_string)}): "
-        f"'{extracted_json_string[:200]}{'...[TRUNCATED PREVIEW]' if len(extracted_json_string) > 200 else ''}'"
+        f"'{extracted_json_string[:400]}{'...[TRUNCATED PREVIEW]' if len(extracted_json_string) > 200 else ''}'"
     )
     # If this log shows `{"wo...` with a very short length, the problem is upstream (MCP server/library).
 
@@ -6747,6 +6747,219 @@ class MCPClient:
         else:
             safe_console.print(tool_table)
 
+    async def rank_tools_for_goal(self, goal_desc: str, phase: str, limit: int = 15) -> List[Dict[str, Any]]:
+        """
+        Intelligently rank tools using fast LLM to score relevance.
+        
+        Parameters
+        ----------
+        goal_desc : str
+            Description of the goal
+        phase : str  
+            Current phase (understand, plan, execute, review)
+        limit : int
+            Maximum number of tools to return
+            
+        Returns
+        -------
+        List[Dict[str, Any]]
+            List of ranked tool schemas
+        """
+        try:
+            # Get all available tools
+            if not hasattr(self, "server_manager") or not self.server_manager:
+                self.logger.error("No server manager available for tool ranking")
+                return []
+                
+            sm = self.server_manager
+            if not sm.tools:
+                self.logger.error("No tools available for ranking")
+                return []
+                
+            # Get provider for fast model
+            fast_model = getattr(self.config, 'default_cheap_and_fast_model', 'gemini-2.5-flash-preview-05-20')
+            provider = self.get_provider_from_model(fast_model)
+            if not provider:
+                self.logger.error(f"Cannot determine provider for fast model {fast_model}")
+                return []
+                
+            # Format tools for this provider
+            all_llm_formatted = self._format_tools_for_provider(provider)
+            if not all_llm_formatted:
+                self.logger.warning(f"No formatted tools available for provider {provider}")
+                return []
+                
+            # Extract tool information for LLM scoring
+            tools_for_scoring = []
+            for i, schema in enumerate(all_llm_formatted):
+                if "function" in schema:
+                    tool_name = schema["function"].get("name", f"tool_{i}")
+                    tool_desc = schema["function"].get("description", "No description available")
+                else:
+                    tool_name = schema.get("name", f"tool_{i}")
+                    tool_desc = schema.get("description", "No description available")
+                
+                # Truncate very long descriptions
+                if len(tool_desc) > 200:
+                    tool_desc = tool_desc[:197] + "..."
+                
+                tools_for_scoring.append({
+                    "name": tool_name,
+                    "description": tool_desc,
+                    "index": i
+                })
+            
+            # Create LLM prompt for scoring
+            prompt = f"""You are an AI assistant helping to select the most relevant tools for a specific goal and phase.
+
+    GOAL: {goal_desc}
+    PHASE: {phase}
+
+    PHASE CONTEXT:
+    - understand: Research, gather information, analyze existing data
+    - plan: Break down goals, create strategies, organize approach  
+    - execute: Create outputs, run code, build artifacts, take actions
+    - review: Validate results, check quality, verify completion
+
+    Rate each tool's relevance for this goal and phase on a scale of 0-100:
+    - 90-100: Essential/Perfect match for this goal and phase
+    - 70-89: Highly relevant and useful
+    - 50-69: Moderately relevant, could be helpful
+    - 30-49: Somewhat relevant in specific cases
+    - 10-29: Low relevance, unlikely to be needed
+    - 0-9: Not relevant for this goal/phase
+
+    TOOLS TO RATE:
+    {chr(10).join(f"{i+1}. {tool['name']}: {tool['description']}" for i, tool in enumerate(tools_for_scoring))}
+
+    Return a JSON array of relevance scores (0-100) in the same order as the tools listed above."""
+
+            schema = {
+                "type": "object",
+                "properties": {
+                    "scores": {
+                        "type": "array",
+                        "items": {"type": "number", "minimum": 0, "maximum": 100},
+                        "minItems": len(tools_for_scoring),
+                        "maxItems": len(tools_for_scoring)
+                    }
+                },
+                "required": ["scores"],
+                "additionalProperties": False,
+                "strict": True
+            }
+            
+            # Call LLM for scoring
+            try:
+                result = await self.query_llm_structured(
+                    prompt_messages=[{"role": "user", "content": prompt}],
+                    response_schema=schema,
+                    model_override=fast_model,
+                    use_cheap_model=True
+                )
+                scores = result.get("scores", [])
+                
+                if len(scores) != len(tools_for_scoring):
+                    self.logger.warning(f"LLM returned {len(scores)} scores for {len(tools_for_scoring)} tools")
+                    # Pad or truncate to match
+                    if len(scores) < len(tools_for_scoring):
+                        scores.extend([50.0] * (len(tools_for_scoring) - len(scores)))
+                    else:
+                        scores = scores[:len(tools_for_scoring)]
+                        
+            except Exception as e:
+                self.logger.warning(f"Fast LLM scoring failed: {e}, using fallback scoring")
+                # Fallback: simple heuristic scoring
+                scores = []
+                for tool in tools_for_scoring:
+                    score = 50.0  # Default moderate relevance
+                    tool_name_lower = tool["name"].lower()
+                    tool_desc_lower = tool["description"].lower()
+                    goal_lower = goal_desc.lower()
+                    
+                    # Phase-based scoring
+                    if phase == "understand":
+                        if any(keyword in tool_name_lower or keyword in tool_desc_lower 
+                            for keyword in ["search", "browse", "read", "query", "get", "analyze"]):
+                            score += 30
+                    elif phase == "plan":
+                        if any(keyword in tool_name_lower or keyword in tool_desc_lower 
+                            for keyword in ["goal", "plan", "create", "store", "memory"]):
+                            score += 30
+                    elif phase == "execute":
+                        if any(keyword in tool_name_lower or keyword in tool_desc_lower 
+                            for keyword in ["write", "execute", "create", "generate", "build"]):
+                            score += 30
+                    elif phase == "review":
+                        if any(keyword in tool_name_lower or keyword in tool_desc_lower 
+                            for keyword in ["get", "review", "analyze", "check", "validate"]):
+                            score += 30
+                    
+                    # Goal keyword matching
+                    goal_keywords = goal_lower.split()
+                    for keyword in goal_keywords:
+                        if len(keyword) > 3 and (keyword in tool_name_lower or keyword in tool_desc_lower):
+                            score += 10
+                    
+                    scores.append(min(score, 100.0))
+            
+            # Create scored tools list
+            scored_tools = []
+            for i, (tool_info, score) in enumerate(zip(tools_for_scoring, scores, strict=False)):
+                scored_tools.append({
+                    "schema": all_llm_formatted[tool_info["index"]],
+                    "name": tool_info["name"],
+                    "score": score,
+                    "description": tool_info["description"][:100]
+                })
+            
+            # Sort by score (highest first)
+            scored_tools.sort(key=lambda x: x["score"], reverse=True)
+            
+            # Filter by relevance threshold and limit
+            relevance_threshold = 40.0
+            high_relevance_threshold = 70.0
+            
+            highly_relevant = [tool for tool in scored_tools if tool["score"] >= high_relevance_threshold]
+            moderately_relevant = [tool for tool in scored_tools if relevance_threshold <= tool["score"] < high_relevance_threshold]
+            
+            # Strategy: prioritize highly relevant tools, fill remaining slots with moderately relevant
+            selected_tools = []
+            selected_tools.extend(highly_relevant[:limit])
+            
+            # Fill remaining slots with moderately relevant tools
+            remaining_slots = limit - len(selected_tools)
+            if remaining_slots > 0:
+                selected_tools.extend(moderately_relevant[:remaining_slots])
+            
+            # If we still don't have enough tools, lower the threshold
+            if len(selected_tools) < min(8, limit):
+                additional_needed = min(8, limit) - len(selected_tools)
+                lower_relevance = [tool for tool in scored_tools if tool["score"] < relevance_threshold]
+                selected_tools.extend(lower_relevance[:additional_needed])
+            
+            # Extract just the schemas for return
+            final_schemas = [tool["schema"] for tool in selected_tools]
+            
+            self.logger.info(f"Tool ranking: selected {len(final_schemas)} tools from {len(all_llm_formatted)} available")
+            
+            # FINAL SAFETY CHECK: Never return empty
+            if not final_schemas:
+                self.logger.error("Tool ranking returned empty - using fallback")
+                return all_llm_formatted[:limit]
+            
+            return final_schemas
+            
+        except Exception as e:
+            self.logger.error(f"Error in tool ranking: {e}")
+            # Fallback on error
+            if hasattr(self, "server_manager") and self.server_manager and self.server_manager.tools:
+                provider = self.get_provider_from_model(getattr(self.config, 'default_cheap_and_fast_model', 'gemini-2.5-flash-preview-05-20'))
+                if provider:
+                    all_tools = self._format_tools_for_provider(provider)
+                    return all_tools[:limit] if all_tools else []
+            return []
+            
     async def cmd_discover(self, args: str):
         """Discover MCP servers on the network and filesystem."""
         safe_console = get_safe_console()
@@ -8028,7 +8241,6 @@ class MCPClient:
                     server_tools = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
                     self.safe_print(f"[green]✓[/] {name} ({server.type.value}) - {server_tools} tools")
         self.safe_print("[green]Ready to process queries![/green]")
-        # Inside class MCPClient:
 
     def _stringify_content(self, content: Any) -> str:
         """Converts complex content (dict, list) to string, otherwise returns string."""
@@ -12311,65 +12523,76 @@ class MCPClient:
             # --- Formulate the final decision for AgentMasterLoop ---
             if llm_error_message:
                 final_decision = {"decision": "error", "message": llm_error_message, "error_type_for_agent": "LLMError"}
-            elif executed_tool_details_for_agent or llm_requested_tool_calls:
-                # PARALLEL TOOL DETECTION - Check for multiple independent tools
-                if len(llm_requested_tool_calls) > 1:
-                    # Check if tools are independent (no arg dependencies)
-                    independent = True
-                    tool_names = [tc["name"] for tc in llm_requested_tool_calls]
-                    
-                    # Simple heuristic: if tools are different types and don't reference each other
-                    for i, tc in enumerate(llm_requested_tool_calls):
-                        for arg_value in tc.get("input", {}).values():
-                            if isinstance(arg_value, str):
-                                # Check if this references another tool's output
-                                for j, other_tc in enumerate(llm_requested_tool_calls):
-                                    if i != j and (
-                                        f"result_{j}" in arg_value or 
-                                        f"output_{j}" in arg_value or
-                                        "previous" in arg_value.lower()
-                                    ):
-                                        independent = False
-                                        break
+            else:
+                # AGENT FORMAT DETECTION - Check if LLM returned agent-formatted response
+                try:
+                    potential_json = json.loads(full_text_response_accumulated.strip())
+                    # Check if it's an agent-formatted response
+                    if isinstance(potential_json, dict) and "decision_type" in potential_json:
+                        logger_to_use.info(f"MCPC (Agent Turn): Detected agent-formatted response with decision_type='{potential_json.get('decision_type')}', returning raw")
+                        return potential_json
+                except json.JSONDecodeError:
+                    pass
+                except Exception as e:
+                    logger_to_use.debug(f"MCPC (Agent Turn): Error checking for agent format: {e}")
+
+                # Continue with existing MCPClient parsing logic if not agent format
+                if executed_tool_details_for_agent or llm_requested_tool_calls:
+                    # PARALLEL TOOL DETECTION - Check for multiple independent tools
+                    if len(llm_requested_tool_calls) > 1:
+                        # Check if tools are independent (no arg dependencies)
+                        independent = True
+                        tool_names = [tc["name"] for tc in llm_requested_tool_calls]
+                        
+                        # Simple heuristic: if tools are different types and don't reference each other
+                        for i, tc in enumerate(llm_requested_tool_calls):
+                            for arg_value in tc.get("input", {}).values():
+                                if isinstance(arg_value, str):
+                                    # Check if this references another tool's output
+                                    for j, other_tc in enumerate(llm_requested_tool_calls):
+                                        if i != j and (
+                                            f"result_{j}" in arg_value or 
+                                            f"output_{j}" in arg_value or
+                                            "previous" in arg_value.lower()
+                                        ):
+                                            independent = False
+                                            break
+                                if not independent:
+                                    break
                             if not independent:
                                 break
-                        if not independent:
-                            break
-                    
-                    if independent:
-                        # Return special decision type for parallel execution
-                        final_decision = {
-                            "decision": "PARALLEL_TOOLS",
-                            "tool_calls": [
-                                {
-                                    "tool_name": tc["name"],
-                                    "tool_args": tc["input"],
-                                    "tool_id": tc.get("id", f"tool_{i}")
-                                }
-                                for i, tc in enumerate(llm_requested_tool_calls)
-                            ]
-                        }
-                        logger_to_use.info(f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} independent tools for parallel execution: {tool_names}")
+                        
+                        if independent:
+                            # Return special decision type for parallel execution
+                            final_decision = {
+                                "decision": "PARALLEL_TOOLS",
+                                "tool_calls": [
+                                    {
+                                        "tool_name": tc["name"],
+                                        "tool_args": tc["input"],
+                                        "tool_id": tc.get("id", f"tool_{i}")
+                                    }
+                                    for i, tc in enumerate(llm_requested_tool_calls)
+                                ]
+                            }
+                            logger_to_use.info(f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} independent tools for parallel execution: {tool_names}")
+                        else:
+                            # ATOMIC TOOL CALL PROCESSING - handles multiple tool calls properly (sequential)
+                            final_decision = self._process_multiple_tool_calls_atomically(
+                                llm_requested_tool_calls, executed_tool_details_for_agent
+                            )
+                            logger_to_use.info(f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} dependent tools for sequential execution: {tool_names}")
                     else:
-                        # ATOMIC TOOL CALL PROCESSING - handles multiple tool calls properly (sequential)
+                        # ATOMIC TOOL CALL PROCESSING - handles single tool call
                         final_decision = self._process_multiple_tool_calls_atomically(
                             llm_requested_tool_calls, executed_tool_details_for_agent
                         )
-                        logger_to_use.info(f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} dependent tools for sequential execution: {tool_names}")
                 else:
-                    # ATOMIC TOOL CALL PROCESSING - handles single tool call
-                    final_decision = self._process_multiple_tool_calls_atomically(
-                        llm_requested_tool_calls, executed_tool_details_for_agent
+                    # UNIFIED PLAN PARSING - for text-based content only
+                    final_decision = self._parse_agent_plan_unified(
+                        full_text_response_accumulated, llm_requested_tool_calls, 
+                        force_structured_output, force_tool_choice, llm_stop_reason
                     )
-            else:
-                # UNIFIED PLAN PARSING - for text-based content only
-                final_decision = self._parse_agent_plan_unified(
-                    full_text_response_accumulated, llm_requested_tool_calls, 
-                    force_structured_output, force_tool_choice, llm_stop_reason
-                )
-                
-
-                
 
         except asyncio.CancelledError:
             logger_to_use.warning("MCPC (Agent Turn): LLM turn processing stream was cancelled by MCPClient or external signal.")
