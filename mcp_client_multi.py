@@ -2543,7 +2543,7 @@ class Config:
         and applying environment variable overrides for simple settings.
         """
         log.debug("Initializing Config object...")
-        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.2_direct_mcp_names.json")  # Default agent state file
+
         self._set_defaults()
         self.dotenv_path = find_dotenv(raise_error_if_not_found=False, usecwd=True)
         if self.dotenv_path:
@@ -2614,7 +2614,7 @@ class Config:
         self.port_scan_concurrency: int = 50
         self.port_scan_timeout: float = 4.5
         self.port_scan_targets: List[str] = ["127.0.0.1"]
-        self.agent_state_file_path: str = str(CONFIG_DIR / "agent_loop_state_v4.2_direct_mcp_names.json")
+
 
         # Complex structures
         self.servers: Dict[str, ServerConfig] = {}
@@ -5326,8 +5326,7 @@ class MCPClient:
             try:
                 self.agent_loop_instance = ActualAgentMasterLoopClass(
                     mcp_client=self,
-                    default_llm_model_string=model_to_use,
-                    agent_state_file=self.config.agent_state_file_path
+                    default_llm_model_string=model_to_use
                 )
                 log.info(f"MCPC: AgentMasterLoop instance created. Model: {model_to_use}")
             except Exception as e:
@@ -12668,8 +12667,7 @@ class MCPClient:
                 agent_model_to_use = default_llm_model_override or self.current_model
                 self.agent_loop_instance = ActualAgentMasterLoopClass(
                     mcp_client=self,  # Pass self (MCPClient instance)
-                    default_llm_model_string=agent_model_to_use,
-                    agent_state_file=self.config.agent_state_file_path,  # Pass state file path
+                    default_llm_model_string=agent_model_to_use
                 )
                 log.info(f"MCPC: AgentMasterLoop instance created. Model: {agent_model_to_use}")
             except Exception as e:  # Catch errors during instantiation
