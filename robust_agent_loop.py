@@ -114,8 +114,6 @@ class AMLState:
     consecutive_error_count: int = 0
     needs_replan: bool = True
     goal_achieved_flag: bool = False
-    recent_action_signatures: List[str] = dataclasses.field(default_factory=list)
-    max_action_history: int = 10
 
 UMS_SERVER_NAME = "Ultimate MCP Server"
 
@@ -1158,13 +1156,9 @@ class MetacognitionEngine:
     async def maybe_reflect(self, turn_ctx: Dict[str, Any]) -> None:
         """Generate a reflection memory when cadence or stuckness criteria hit."""
         
-        # Check if reflection triggered by loop detection
-        loop_triggered = turn_ctx.get("loop_detected", False)
-        
         conditions = [
             self.state.loop_count - self.state.last_reflection_turn >= REFLECTION_INTERVAL,
             self.state.stuck_counter >= STALL_THRESHOLD,
-            loop_triggered  # New condition
         ]
         
         if not any(conditions):
@@ -1190,10 +1184,7 @@ class MetacognitionEngine:
             await self._escalate_persistent_contradictions(contradictions)
                     
         # Determine reflection type based on context
-        reflection_type = "summary"  # default
-        if loop_triggered:
-            reflection_type = "gaps"  # Focus on what's missing/wrong when looped
-        elif turn_ctx.get("has_contradictions"):
+        if turn_ctx.get("has_contradictions"):
             reflection_type = "strengths"  # Focus on what's working vs what conflicts
         elif self.state.stuck_counter >= STALL_THRESHOLD:
             reflection_type = "plan"  # Focus on next steps when stuck
@@ -1214,21 +1205,6 @@ class MetacognitionEngine:
             if reflection_res.get("success"):
                 reflection_id = reflection_res.get("reflection_id")
                 self.mcp_client.logger.debug(f"Generated {reflection_type} reflection: {reflection_id}")
-                
-                # If loop detected, add specific guidance as a follow-up memory
-                if loop_triggered:
-                    loop_guidance = (
-                        f"LOOP DETECTED: Recent actions: {self.state.recent_action_signatures[-5:]}\n"
-                        "Consider: (1) What assumption is wrong? (2) Different approach? "
-                        "(3) Missing information? (4) Skip to next goal?"
-                    )
-                    await self._store_memory_with_auto_linking(
-                        content=loop_guidance,
-                        memory_type="loop_detection",
-                        memory_level="working", 
-                        importance=8.0,
-                        description="Action loop detected - needs intervention"
-                    )
             else:
                 self.mcp_client.logger.warning(f"Reflection generation failed: {reflection_res.get('error_message', 'Unknown error')}")
                 
@@ -2051,7 +2027,7 @@ class LLMOrchestrator:
 
     async def big_reasoning_call(self, messages: list[dict], tool_schemas=None, model_name: str = None):
         """
-        Single entry for SMART model calls; automatically uses MCPClient infrastructure.
+        Single entry for SMART model calls with ENFORCED structured output.
         
         Parameters
         ----------
@@ -2065,18 +2041,60 @@ class LLMOrchestrator:
         # Use the passed model_name or fall back to MCPClient's current model
         target_model = model_name or self.mcp_client.current_model
         
+        # Define the EXACT response schema we expect
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "decision_type": {
+                    "type": "string",
+                    "enum": ["TOOL_SINGLE", "TOOL_MULTIPLE", "THOUGHT_PROCESS", "DONE"]
+                },
+                "tool_name": {
+                    "type": "string",
+                    "description": "Required if decision_type is TOOL_SINGLE"
+                },
+                "tool_args": {
+                    "type": "object",
+                    "description": "Required if decision_type is TOOL_SINGLE"
+                },
+                "tool_calls": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool_name": {"type": "string"},
+                            "tool_args": {"type": "object"},
+                            "tool_id": {"type": "string", "description": "Unique identifier for this tool call"}
+                        },
+                        "required": ["tool_name", "tool_args", "tool_id"]
+                    },
+                    "description": "Required if decision_type is TOOL_MULTIPLE"
+                },
+                "content": {
+                    "type": "string", 
+                    "description": "Required if decision_type is THOUGHT_PROCESS or DONE"
+                }
+            },
+            "required": ["decision_type"],
+            "additionalProperties": False
+        }
+        
         try:
-            # Use MCPClient's process_agent_llm_turn method which handles the full agent interaction
-            resp = await self.mcp_client.process_agent_llm_turn(
-                prompt_messages=messages, 
-                tool_schemas=tool_schemas, 
-                model_name=target_model
+            # Use MCPClient's structured query method to enforce the schema
+            resp = await self.mcp_client.query_llm_structured(
+                prompt_messages=messages,
+                response_schema=response_schema,
+                model_override=target_model,
+                use_cheap_model=False  # This is a big reasoning call
             )
-            # Cost tracking is automatically handled by MCPClient.process_streaming_query
+            
+            # The response should now be exactly what we expect
+            self.mcp_client.logger.debug(f"[LLMOrch] Structured response: {resp}")
             return resp
+            
         except Exception as e:
-            # If process_agent_llm_turn doesn't exist or has different signature, 
-            # fall back to basic query_llm
+            self.mcp_client.logger.error(f"[LLMOrch] Structured call failed: {e}")
+            # If structured call fails, try regular call as fallback
             try:
                 # Convert messages to a simple prompt for basic query_llm
                 if messages and len(messages) > 0:
@@ -2088,11 +2106,26 @@ class LLMOrchestrator:
                 resp = await self.mcp_client.query_llm(
                     prompt_text, 
                     model_override=target_model,
-                    max_tokens=2000  # reasonable default for reasoning calls
+                    max_tokens=2000
                 )
-                return {"content": resp}
+                
+                # Try to parse as JSON, fallback to thought process
+                try:
+                    import json
+                    parsed = json.loads(resp)
+                    if "decision_type" in parsed:
+                        return parsed
+                except Exception:
+                    pass
+                
+                # Return as thought process if parsing fails
+                return {
+                    "decision_type": "THOUGHT_PROCESS",
+                    "content": resp
+                }
+                
             except Exception as fallback_e:
-                raise RuntimeError(f"Failed to call MCPClient LLM methods: {e}, fallback also failed: {fallback_e}") from e
+                raise RuntimeError(f"Both structured and fallback LLM calls failed: {e}, fallback: {fallback_e}") from e
 
 ###############################################################################
 # SECTION 7. Procedural Agenda & Planner helpers (outline)
@@ -2453,9 +2486,6 @@ class AgentMasterLoop:
             True if initialization succeeded, False if it failed
         """
         try:
-            # Load persistent state
-            await self._load_cognitive_state()
-            
             # Validate loaded state against UMS
             await self._validate_and_reset_state()
             
@@ -2474,8 +2504,11 @@ class AgentMasterLoop:
                     self.logger.warning(f"Failed to load goals from UMS during initialization: {e}")
             
             # Save validated/updated state
-            await self._save_cognitive_state()
-            
+            if self.state.workflow_id:
+                await self._save_cognitive_state()
+            else:
+                self.logger.debug("No workflow_id available, skipping state save during initialization")
+
             self.logger.info(f"AgentMasterLoop initialized with workflow_id: {self.state.workflow_id}")
             return True
             
@@ -2485,45 +2518,37 @@ class AgentMasterLoop:
 
     async def _load_cognitive_state(self) -> None:
         """Load agent state using UMS cognitive state tools."""
+        # Early return if no workflow_id
+        if not self.state.workflow_id:
+            self.logger.info("No workflow_id available, skipping cognitive state loading")
+            return
+            
         try:
-            # Try to load the latest cognitive state
+            # Call UMS load_cognitive_state tool with correct parameters
             load_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
                 self._get_ums_tool_name("load_cognitive_state"),
                 {
-                    "workflow_id": self.state.workflow_id if self.state.workflow_id else None,
-                    "state_type": "agent_master_loop",
-                    "version": "latest"  # Get the most recent state
+                    "workflow_id": self.state.workflow_id,  # Remove the conditional here since we checked above
+                    "state_id": None  # Get the latest state
                 }
             )
-            
-            if load_res.get("success") and load_res.get("data"):
-                state_data = load_res["data"].get("state_data", {})
+            if load_res.get("success") and load_res.get("state_id"):
+                # We have actual state data - update our state from it
+                self.state.workflow_id = load_res.get("workflow_id")
                 
-                if state_data:
-                    # Reconstruct AMLState from cognitive state data
-                    if 'created_at' in state_data:
-                        state_data['created_at'] = _dt.datetime.fromisoformat(state_data['created_at'])
-                    
-                    # Convert phase string back to enum
-                    if 'phase' in state_data and isinstance(state_data['phase'], str):
-                        try:
-                            state_data['phase'] = Phase(state_data['phase'])
-                        except ValueError:
-                            state_data['phase'] = Phase.UNDERSTAND  # fallback
-                    
-                    # Create new state with loaded data, preserving defaults for missing fields
-                    loaded_state = AMLState()
-                    for key, value in state_data.items():
-                        if hasattr(loaded_state, key):
-                            setattr(loaded_state, key, value)
-                    
-                    self.state = loaded_state
-                    self.logger.info(f"Loaded cognitive state from UMS for workflow {self.state.workflow_id}")
-                else:
-                    self.logger.info("No cognitive state data found, using default state")
+                # Update state fields that we can restore from cognitive state
+                focus_areas = load_res.get("focus_areas", [])
+                if focus_areas and len(focus_areas) > 0:
+                    # Assume first focus area is current goal
+                    self.state.current_leaf_goal_id = focus_areas[0]
+                
+                # Could also restore other fields if the cognitive state format expands
+                # For now, just keep the current agent state but update the restorable parts
+                
+                self.logger.info(f"Loaded cognitive state from UMS: {load_res.get('title', 'Unknown')}")
             else:
-                self.logger.info("No existing cognitive state found in UMS, using default state")
+                self.logger.info("No cognitive state data found, using default state")
                 
         except Exception as e:
             self.logger.warning(f"Failed to load cognitive state from UMS: {e}")
@@ -2584,8 +2609,6 @@ class AgentMasterLoop:
         # Initialize core components
         self.mem_graph = MemoryGraphManager(self.mcp_client, self.state)
         self.async_queue = AsyncTaskQueue(max_concurrency=6)
-        # auto-flush graph after each drain so turns see consistent graph state
-        self.async_queue.inject_flush_cb(self.mem_graph.flush)
 
         # Create orchestrators / engines
         self.llms = LLMOrchestrator(self.mcp_client, self.state)
@@ -2598,6 +2621,55 @@ class AgentMasterLoop:
         self.metacog.set_planner(self.planner)
         self.metacog.set_agent(self)
 
+    async def _create_bootstrap_memories(self, overall_goal: str) -> None:
+        """Create initial memories to bootstrap the context system."""
+        if not self.state.workflow_id:
+            return
+            
+        try:
+            # Create initial context memory with valid memory_type
+            initial_memory = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("store_memory"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "content": f"Starting work on goal: {overall_goal}\n\nThis is the beginning of the agent's reasoning process. The goal will be approached systematically through research, planning, and execution phases.",
+                    "memory_type": "observation",  # Changed to valid type
+                    "memory_level": "working",
+                    "importance": 6.0,
+                    "description": "Initial context memory to bootstrap working memory",
+                    "suggest_links": False,
+                    "generate_embedding": True
+                }
+            )
+            
+            if initial_memory.get("success"):
+                self.logger.info("Created initial bootstrap memory")
+                
+            # Create a planning memory instead of using non-existent thought chain tool
+            planning_content = f"I need to complete this goal: {overall_goal}\n\nMy approach will be:\n1. Understand the requirements thoroughly\n2. Research relevant information\n3. Plan the execution strategy\n4. Create the required outputs\n\nI should start by analyzing what this goal requires and gathering necessary information."
+            
+            planning_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("store_memory"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "content": planning_content,
+                    "memory_type": "plan",  # Use valid type
+                    "memory_level": "working",
+                    "importance": 7.0,
+                    "description": "Initial planning thought to establish approach",
+                    "suggest_links": False,
+                    "generate_embedding": True
+                }
+            )
+            
+            if planning_res.get("success"):
+                self.logger.info("Created initial planning memory")
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to create bootstrap memories: {e}")
+            
     async def _refresh_tool_schemas(self) -> None:
         """Refresh tool schemas from MCPClient for LLM calls."""
         try:
@@ -2637,125 +2709,267 @@ class AgentMasterLoop:
         return f"{UMS_SERVER_NAME}:{base_tool_name}"        
 
     async def _rank_tools_for_goal(self, goal_desc: str, phase: Phase, limit: int = 10) -> List[Dict[str, Any]]:
-        """
-        Intelligently select the most relevant tools for the current goal and phase.
+        """Filter tools based on current phase and goal keywords."""
+        if not self.tool_schemas:
+            return []
         
-        Returns tools sorted by relevance score.
-        """
-        # Start with phase-appropriate categories
-        phase_categories = {
-            Phase.UNDERSTAND: ["search", "file", "analysis"],
-            Phase.PLAN: ["goal", "memory"],
-            Phase.EXECUTE: ["file", "document", "analysis", "search"],
-            Phase.REVIEW: ["memory", "goal"],
+        goal_lower = goal_desc.lower()
+        
+        # Phase-specific tool priorities
+        phase_tools = {
+            Phase.UNDERSTAND: [
+                # Research & Information Gathering
+                "browse", "search", "download", "autopilot", "collect_documentation",
+                # File Analysis
+                "read_file", "read_multiple_files", "search_files", "directory_tree", "get_file_info",
+                # Document Processing
+                "convert_document", "analyze_pdf_structure", "extract_tables", "ocr_image", "detect_content_type",
+                # Memory & Context
+                "query_memories", "search_semantic_memories", "get_recent_memories_with_links", "hybrid_search_memories",
+                # Text Analysis
+                "run_ripgrep", "run_awk", "run_jq", "analyze_business_sentiment", "extract_entities",
+                # AI Analysis
+                "generate_completion", "chat_completion", "analyze_business_text_batch"
+            ],
+            Phase.PLAN: [
+                # Goal Management
+                "create_goal", "update_goal_status", "get_goals", "query_goals", "get_goal_details", "get_goal_stack",
+                # Memory & Planning
+                "store_memory", "create_memory_link", "get_working_memory", "focus_memory", "create_thought_chain",
+                # Workflow Management
+                "create_workflow", "update_workflow_metadata", "get_workflow_details", "record_action_start",
+                # Analysis & Planning
+                "estimate_cost", "recommend_model", "get_subgraph"
+            ],
+            Phase.EXECUTE: [
+                # File Creation & Editing
+                "write_file", "edit_file", "create_directory", "move_file", "get_unique_filepath",
+                # Code Execution
+                "execute_python", "repl_python",
+                # Document Creation & Processing
+                "convert_document", "clean_and_format_text_as_markdown", "batch_format_texts", "chunk_document",
+                # Web Actions
+                "browse", "click", "type_text", "download", "parallel", "run_macro",
+                # Memory & Artifacts
+                "store_memory", "record_artifact", "record_action_completion", "record_thought",
+                # AI Generation
+                "generate_completion", "chat_completion", "single_shot_synthesis", "multi_completion",
+                # Text Processing
+                "run_sed", "run_awk", "optimize_markdown_formatting", "enhance_ocr_text"
+            ],
+            Phase.REVIEW: [
+                # Artifact Review
+                "get_artifacts", "get_artifact_by_id", "record_artifact",
+                # Action Review
+                "get_recent_actions", "get_action_details", "generate_workflow_report",
+                # Quality Check
+                "analyze_business_sentiment", "extract_metrics", "flag_risks", "analyze_pdf_structure",
+                # Memory & Reflection
+                "generate_reflection", "consolidate_memories", "visualize_reasoning_chain", "visualize_memory_network",
+                # File Validation
+                "read_file", "get_file_info", "directory_tree", "search_files",
+                # Final Processing
+                "summarize_document", "compute_memory_statistics", "get_contradictions"
+            ],
         }
         
-        relevant_categories = phase_categories.get(phase, ["search", "file", "memory"])
-        
-        # Quick filter by category
-        category_tools = []
-        other_tools = []
-        
-        for tool in self.tool_schemas:
-            # Handle both flat and nested tool schema structures
-            if "function" in tool:
-                tool_name = tool["function"].get("name", "unknown").lower()
-            else:
-                tool_name = tool.get("name", "unknown").lower()  
-            in_category = False
-            
-            for cat, patterns in self._tool_category_map.items():
-                if cat in relevant_categories:
-                    if any(pattern in tool_name for pattern in patterns):
-                        category_tools.append(tool)
-                        in_category = True
-                        break
-            
-            if not in_category:
-                other_tools.append(tool)
-        
-        # If we have few enough tools, just return them
-        if len(category_tools) <= limit:
-            return category_tools + other_tools[:limit - len(category_tools)]
-        
-        # Use fast LLM to rank within category
-        tool_summaries = []
-        for i, tool in enumerate(category_tools[:20]):  # Cap at 20 for context
-            # Use the same extraction logic as above
-            if "function" in tool:
-                name = tool["function"].get("name", f"tool_{i}")
-                desc = tool["function"].get("description", "")[:100]
-            else:
-                name = tool.get("name", f"tool_{i}")
-                desc = tool.get("description", "")[:100]
-            tool_summaries.append(f"{i}: {name} - {desc}")
-        
-        ranking_prompt = f"""Current goal: {goal_desc}
-    Current phase: {phase.value}
-
-    Rank the top {limit} most useful tools for achieving this goal.
-    Consider:
-    1. Direct relevance to the goal
-    2. Appropriate for current phase ({phase.value})
-    3. Likely to produce concrete progress
-
-    Tools:
-    {chr(10).join(tool_summaries)}
-
-    Return indices of top {limit} tools in order of usefulness."""
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "ranked_indices": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "minItems": 1,
-                    "maxItems": limit
-                },
-                "reasoning": {"type": "string"}  # For debugging
-            },
-            "required": ["ranked_indices"]
+        # Keywords to tool mapping
+        keyword_tools = {
+            "search": ["browse", "search", "search_files", "run_ripgrep", "search_semantic_memories"],
+            "web": ["browse", "search", "download", "autopilot", "click", "type_text"],
+            "browse": ["browse", "search", "download", "collect_documentation", "autopilot"],
+            "write": ["write_file", "edit_file", "create_directory", "record_artifact"],
+            "create": ["write_file", "create_directory", "record_artifact", "create_goal"],
+            "file": ["read_file", "write_file", "edit_file", "move_file", "search_files"],
+            "read": ["read_file", "read_multiple_files", "get_memory_by_id", "query_memories"],
+            "analyze": ["analyze_business_sentiment", "extract_metrics", "get_subgraph", "get_contradictions"],
+            "document": ["convert_document", "analyze_pdf_structure", "extract_tables", "chunk_document"],
+            "pdf": ["convert_document", "analyze_pdf_structure", "extract_tables", "ocr_image"],
+            "code": ["execute_python", "repl_python", "write_file", "edit_file"],
+            "python": ["execute_python", "repl_python"],
+            "text": ["run_ripgrep", "run_awk", "run_sed", "run_jq", "clean_and_format_text_as_markdown"],
+            "memory": ["store_memory", "query_memories", "get_working_memory", "focus_memory"],
+            "goal": ["create_goal", "update_goal_status", "get_goals", "query_goals"],
+            "download": ["download", "download_site_pdfs", "browse"],
+            "ai": ["generate_completion", "chat_completion", "single_shot_synthesis", "analyze_business_sentiment"],
+            "llm": ["generate_completion", "chat_completion", "multi_completion", "single_shot_synthesis"],
+            "report": ["write_file", "record_artifact", "convert_document", "generate_completion"],
+            "html": ["write_file", "record_artifact", "browse", "click", "type_text"],
+            "interactive": ["browse", "click", "type_text", "parallel", "run_macro"],
+            "data": ["extract_tables", "run_jq", "run_awk", "extract_entities"],
+            "image": ["ocr_image", "enhance_ocr_text", "convert_document"],
+            "research": ["browse", "search", "query_memories", "store_memory", "generate_completion"],
         }
+        
+        relevant_tool_names = set()
+        
+        # Add phase-specific tools
+        if phase in phase_tools:
+            relevant_tool_names.update(phase_tools[phase])
+        
+        # Add keyword-based tools
+        for keyword, tools in keyword_tools.items():
+            if keyword in goal_lower:
+                relevant_tool_names.update(tools)
+        
+        # Filter schemas
+        filtered_schemas = []
+        for schema in self.tool_schemas:
+            tool_name = schema.get("function", {}).get("name", "") if "function" in schema else schema.get("name", "")
+            if tool_name in relevant_tool_names or not relevant_tool_names:  # Include if relevant or no filter
+                filtered_schemas.append(schema)
+        
+        # Always include essential UMS tools
+        essential_ums = ["store_memory", "get_working_memory", "create_goal"]
+        for schema in self.tool_schemas:
+            tool_name = schema.get("function", {}).get("name", "") if "function" in schema else schema.get("name", "")
+            if tool_name in essential_ums and schema not in filtered_schemas:
+                filtered_schemas.append(schema)
+        
+        # Add complementary tools that work well together in parallel
+        complementary_pairs = {
+            # Research workflows
+            "browse": ["store_memory", "record_artifact", "download"],
+            "search": ["store_memory", "create_goal", "record_thought"],
+            "download": ["convert_document", "store_memory", "record_artifact"],
+            
+            # File operations
+            "read_file": ["store_memory", "analyze_business_sentiment", "extract_entities"],
+            "write_file": ["record_artifact", "store_memory", "get_file_info"],
+            "edit_file": ["record_artifact", "store_memory"],
+            
+            # Document processing
+            "convert_document": ["store_memory", "record_artifact", "extract_tables"],
+            "analyze_pdf_structure": ["extract_tables", "store_memory", "ocr_image"],
+            "ocr_image": ["enhance_ocr_text", "store_memory", "extract_entities"],
+            
+            # Code execution
+            "execute_python": ["store_memory", "record_artifact", "write_file"],
+            "repl_python": ["store_memory", "record_thought"],
+            
+            # Goal and memory management
+            "create_goal": ["store_memory", "record_action_start"],
+            "store_memory": ["create_memory_link", "focus_memory"],
+            "query_memories": ["store_memory", "create_memory_link"],
+            
+            # AI generation
+            "generate_completion": ["store_memory", "record_artifact", "write_file"],
+            "chat_completion": ["store_memory", "record_thought"],
+            "single_shot_synthesis": ["store_memory", "record_artifact"],
+            
+            # Analysis and extraction
+            "extract_tables": ["store_memory", "record_artifact", "run_jq"],
+            "extract_entities": ["store_memory", "create_memory_link"],
+            "analyze_business_sentiment": ["store_memory", "record_thought"],
+            
+            # Review and reflection
+            "get_artifacts": ["store_memory", "generate_reflection"],
+            "get_recent_actions": ["generate_reflection", "store_memory"],
+            "generate_reflection": ["store_memory", "consolidate_memories"],
+            
+            # Web automation
+            "click": ["type_text", "browse", "download"],
+            "type_text": ["click", "browse"],
+            "parallel": ["store_memory", "record_artifact"],
+        }
+        
+        # If we have any tool from a complementary pair, include its partners
+        current_tool_names = {
+            schema.get("function", {}).get("name", "") if "function" in schema else schema.get("name", "")
+            for schema in filtered_schemas
+        }
+        
+        for tool_name, partners in complementary_pairs.items():
+            if tool_name in current_tool_names:
+                for partner in partners:
+                    # Find and add partner tool schema if not already included
+                    for schema in self.tool_schemas:
+                        schema_name = schema.get("function", {}).get("name", "") if "function" in schema else schema.get("name", "")
+                        if schema_name == partner and schema not in filtered_schemas:
+                            filtered_schemas.append(schema)
+                            break
+        
+        return filtered_schemas[:limit]
+
+    async def _rank_tools_with_llm_scoring(self, goal_desc: str, phase: Phase, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Alternative implementation using cheap LLM to score tool relevance.
+        Not used yet - keeping simple for now.
+        """
+        if not self.tool_schemas:
+            return []
+            
+        # Use a class-level flag to prevent recursion
+        if getattr(self, '_currently_ranking_tools', False):
+            return self.tool_schemas[:limit]
         
         try:
-            result = await self.llms.fast_structured_call(ranking_prompt, schema)
-            indices = result.get("ranked_indices", [])
+            self._currently_ranking_tools = True
             
-            # Get tools by indices
-            ranked_tools = []
-            for idx in indices:
-                if 0 <= idx < len(category_tools):
-                    ranked_tools.append(category_tools[idx])
-            
-            # Add effectiveness scores from cache
-            for tool in ranked_tools:
-                # Use consistent extraction logic
+            # Build tool list for LLM scoring
+            tool_names = []
+            tool_descriptions = []
+            for tool in self.tool_schemas:
                 if "function" in tool:
-                    tool_name = tool["function"].get("name", "unknown")
+                    name = tool["function"].get("name", "unknown")
+                    desc = tool["function"].get("description", "")
                 else:
-                    tool_name = tool.get("name", "unknown")
-                    
-                cache_key = f"{goal_desc[:50]}:{tool_name}"
-                
-                if cache_key in self._tool_effectiveness_cache:
-                    stats = self._tool_effectiveness_cache[cache_key]
-                    if stats['total'] > 0:
-                        tool['effectiveness_score'] = stats['success'] / stats['total']
-                
-            # Fill remaining slots with other tools
-            remaining = limit - len(ranked_tools)
-            if remaining > 0:
-                ranked_tools.extend(other_tools[:remaining])
-                
-            return ranked_tools
+                    name = tool.get("name", "unknown") 
+                    desc = tool.get("description", "")
+                tool_names.append(name)
+                tool_descriptions.append(f"{name}: {desc[:100]}")
             
+            # Ask cheap LLM to score tools
+            prompt = f"""Rate each tool's relevance for this goal and phase.
+Goal: {goal_desc}
+Phase: {phase.value}
+
+Tools:
+{chr(10).join(f"{i+1}. {desc}" for i, desc in enumerate(tool_descriptions))}
+
+Rate each tool 0-100 for relevance. Return JSON array of scores in same order."""
+            
+            schema = {
+                "type": "object",
+                "properties": {
+                    "scores": {
+                        "type": "array",
+                        "items": {"type": "number", "minimum": 0, "maximum": 100},
+                        "minItems": len(tool_names),
+                        "maxItems": len(tool_names)
+                    }
+                },
+                "required": ["scores"]
+            }
+            
+            result = await self.llms.fast_structured_call(prompt, schema)
+            scores = result.get("scores", [])
+            
+            if len(scores) == len(self.tool_schemas):
+                # Score and sort tools
+                scored_tools = list(zip(scores, self.tool_schemas, strict=False))
+                scored_tools.sort(key=lambda x: x[0], reverse=True)
+                
+                # Return tools above threshold (75.0) or top N
+                good_tools = [tool for score, tool in scored_tools if score >= 75.0]
+                return good_tools[:limit] if good_tools else [tool for _, tool in scored_tools[:limit]]
+            else:
+                # Fallback if scoring failed
+                return self.tool_schemas[:limit]
+                
         except Exception as e:
-            self.logger.warning(f"Tool ranking failed, using category defaults: {e}")
-            return category_tools[:limit]
+            self.logger.warning(f"LLM tool scoring failed: {e}")
+            return self.tool_schemas[:limit]
+        finally:
+            self._currently_ranking_tools = False
 
     async def record_tool_effectiveness(self, goal_desc: str, tool_name: str, success: bool):
         """Track tool effectiveness for future ranking."""
+        # Early return if no workflow_id
+        if not self.state.workflow_id:
+            self.logger.debug("No workflow_id available, skipping tool effectiveness recording")
+            return
+                    
         cache_key = f"{goal_desc[:50]}:{tool_name}"
         
         if cache_key not in self._tool_effectiveness_cache:
@@ -2785,42 +2999,65 @@ class AgentMasterLoop:
         
     async def _save_cognitive_state(self) -> None:
         """Save current agent state using UMS cognitive state tools."""
-        try:
-            # Convert state to cognitive state format
-            cognitive_state = {
-                "workflow_id": self.state.workflow_id,
-                "root_goal_id": self.state.root_goal_id,
-                "current_leaf_goal_id": self.state.current_leaf_goal_id,
-                "phase": self.state.phase.value,
-                "loop_count": self.state.loop_count,
-                "cost_usd": self.state.cost_usd,
-                "stuck_counter": self.state.stuck_counter,
-                "last_reflection_turn": self.state.last_reflection_turn,
-                "last_graph_maint_turn": self.state.last_graph_maint_turn,
-                "graph_health": self.state.graph_health,
-                "pending_attachments": self.state.pending_attachments,
-                "current_plan": self.state.current_plan,
-                "goal_stack": self.state.goal_stack,
-                "current_thought_chain_id": self.state.current_thought_chain_id,
-                "last_action_summary": self.state.last_action_summary,
-                "last_error_details": self.state.last_error_details,
-                "consecutive_error_count": self.state.consecutive_error_count,
-                "needs_replan": self.state.needs_replan,
-                "goal_achieved_flag": self.state.goal_achieved_flag,
-                "recent_action_signatures": self.state.recent_action_signatures,
-                "created_at": self.state.created_at.isoformat()
-            }
+        # Early return if no workflow_id
+        if not self.state.workflow_id:
+            self.logger.debug("No workflow_id available, skipping cognitive state saving")
+            return
             
-            # Save using UMS cognitive state tool
+        try:
+            # Get current working memory IDs from UMS
+            working_memory_ids = []
+            try:
+                working_memory_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    UMS_SERVER_NAME,
+                    self._get_ums_tool_name("get_working_memory"),
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "focus_goal_id": self.state.current_leaf_goal_id,
+                        "limit": 20
+                    }
+                )
+                
+                if working_memory_res.get("success") and working_memory_res.get("data"):
+                    memories = working_memory_res["data"].get("memories", [])
+                    working_memory_ids = [mem.get("memory_id") for mem in memories if mem.get("memory_id")]
+            except Exception as e:
+                self.logger.debug(f"Could not get working memory IDs: {e}")
+                # Continue with empty list
+            
+            # Get recent action IDs  
+            context_action_ids = []
+            try:
+                actions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                    UMS_SERVER_NAME,
+                    self._get_ums_tool_name("get_recent_actions"),
+                    {
+                        "workflow_id": self.state.workflow_id,
+                        "limit": 10
+                    }
+                )
+                
+                if actions_res.get("success") and actions_res.get("data"):
+                    actions = actions_res["data"].get("actions", [])
+                    context_action_ids = [action.get("action_id") for action in actions if action.get("action_id")]
+            except Exception as e:
+                self.logger.debug(f"Could not get recent action IDs: {e}")
+                # Continue with empty list
+
+            # Create title for the cognitive state
+            title = f"Agent state at loop {self.state.loop_count} - Phase: {self.state.phase.value}"
+            
+            # Call UMS save_cognitive_state tool with correct parameters
             save_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
                 self._get_ums_tool_name("save_cognitive_state"),
                 {
                     "workflow_id": self.state.workflow_id,
-                    "state_data": cognitive_state,
-                    "state_type": "agent_master_loop",
-                    "version_label": f"loop_{self.state.loop_count}",
-                    "checkpoint_reason": "periodic_save"
+                    "title": title,
+                    "working_memory_ids": working_memory_ids,
+                    "focus_area_ids": [self.state.current_leaf_goal_id] if self.state.current_leaf_goal_id else [],
+                    "context_action_ids": context_action_ids,
+                    "current_goal_thought_ids": []  # Could be populated from thought chains if available
                 }
             )
             
@@ -2951,14 +3188,7 @@ class AgentMasterLoop:
             messages = self._build_messages(context)
             tool_schemas = await self._get_tool_schemas()
 
-            # 4. Check for loops and add to context if detected
-            if len(self.state.recent_action_signatures) >= 3:
-                loop_detected, loop_info = self._detect_action_loops()
-                if loop_detected:
-                    context["loop_detected"] = True
-                    context["loop_info"] = loop_info
-
-            # 5. Return parameters for MCPClient to handle
+            # 4. Return parameters for MCPClient to handle
             return {
                 "prompt_messages": messages,
                 "tool_schemas": tool_schemas or [],
@@ -2986,20 +3216,27 @@ class AgentMasterLoop:
         if not self.state.workflow_id:
             self.logger.info("Creating new workflow for goal")
             await self._create_workflow_and_goal(overall_goal)
-        elif self.state.needs_replan:
-            self.logger.info("Workflow exists but needs replanning")
-            # Could update the goal description or create sub-goals here
-            self.state.needs_replan = False
+            # Create bootstrap memories only after workflow creation
+            await self._create_bootstrap_memories(overall_goal)
+        else:
+            # We have a workflow_id - try to load previous cognitive state
+            self.logger.info("Workflow exists, attempting to load previous cognitive state")
+            await self._load_cognitive_state()
+            
+            if self.state.needs_replan:
+                self.logger.info("Workflow exists but needs replanning")
+                self.state.needs_replan = False
 
         # Create goal if workflow exists but no root goal
         if self.state.workflow_id and not self.state.root_goal_id:
             self.logger.info("Workflow exists but no root goal - creating root goal")
             await self._create_root_goal_only(overall_goal)
+            # DON'T call bootstrap memories again here - remove this line
 
         # Ensure we have a current leaf goal if we have a root goal
         if self.state.root_goal_id and not self.state.current_leaf_goal_id:
             self.state.current_leaf_goal_id = self.state.root_goal_id
-            self.logger.info(f"Set current_leaf_goal_id to root_goal_id: {self.state.root_goal_id}")            
+            self.logger.info(f"Set current_leaf_goal_id to root_goal_id: {self.state.root_goal_id}")
 
     async def _create_workflow_and_goal(self, overall_goal: str) -> None:
         """Create a new UMS workflow and root goal for the current task."""
@@ -3160,47 +3397,247 @@ class AgentMasterLoop:
     async def _gather_context(self) -> Dict[str, Any]:
         """Collects all information using the rich context package tool."""
         
+        if not self.state.workflow_id:
+            self.logger.error("No workflow_id - cannot gather context")
+            raise RuntimeError("Cannot gather context without workflow_id")
+        
         try:
+            # Build proper parameters for the rich context package
+            params = {
+                "workflow_id": self.state.workflow_id,
+                "context_id": self.state.workflow_id,  # Use workflow_id as context_id if not set separately
+                "current_plan_step_description": (
+                    self.state.current_plan[0].description 
+                    if self.state.current_plan 
+                    else "Working on primary goal"
+                ),
+                "focal_memory_id_hint": None,
+                "fetch_limits": {
+                    "recent_actions": 10,
+                    "important_memories": 15,
+                    "key_thoughts": 8,
+                    "proactive_memories": 5,
+                    "procedural_memories": 3,
+                    "link_traversal": 3,
+                },
+                "show_limits": {
+                    "working_memory": 15,
+                    "link_traversal": 5,
+                },
+                "include_core_context": True,
+                "include_working_memory": True,
+                "include_proactive_memories": True,
+                "include_relevant_procedures": True,
+                "include_contextual_links": True,
+                "compression_token_threshold": 4000,
+                "compression_target_tokens": 2500
+            }
+            
+            self.logger.debug(f"Calling get_rich_context_package with params: {params}")
+            
             rich_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
                 self._get_ums_tool_name("get_rich_context_package"),
-                {
-                    "workflow_id": self.state.workflow_id,
-                    "focus_goal_id": self.state.current_leaf_goal_id,
-                    "include_graph": True,
-                    "include_recent_actions": True,
-                    "include_contradictions": True,
-                    "max_memories": 20,
-                    "compression_token_threshold": 4000,
-                    "compression_target_tokens": 2500
-                }
+                params
             )
             
-            if rich_res.get("success") and rich_res.get("data"):
-                context_package = rich_res["data"]["context_package"]
-                
-                # Extract contradictions for metacognition
-                contradictions = context_package.get("contradictions", {}).get("contradictions_found", [])
-                
-                # Return the rich context with minimal transformation
-                return {
-                    "rich_context_package": context_package,
-                    "contradictions": contradictions,
-                    "has_contradictions": len(contradictions) > 0,
-                    "context_retrieval_timestamp": context_package.get("retrieval_timestamp_ums_package"),
-                    "context_sources": {
-                        "rich_package": True,
-                        "compression_applied": "ums_compression_details" in context_package
-                    }
+            if not rich_res.get("success"):
+                error_msg = rich_res.get("error_message", "Unknown error")
+                self.logger.error(f"Rich context package failed: {error_msg}")
+                raise RuntimeError(f"Rich context package failed: {error_msg}")
+            
+            raw_data = rich_res.get("data", {})
+            context_package = raw_data.get("context_package", {})
+            
+            if not context_package:
+                self.logger.error(f"Rich context package returned empty context_package. Raw data: {raw_data}")
+                raise RuntimeError("Rich context package returned empty context_package")
+            
+            # Log what we actually got for debugging
+            working_memory = context_package.get("current_working_memory", {})
+            recent_actions = context_package.get("recent_actions", [])
+            core_context = context_package.get("core_context", {})
+            
+            self.logger.info(
+                f"Rich context retrieved: "
+                f"working_memory={len(working_memory.get('working_memories', []))} items, "
+                f"recent_actions={len(recent_actions)} items, "
+                f"core_context={bool(core_context)}"
+            )
+            
+            # Extract contradictions for metacognition
+            contradictions = context_package.get("contradictions", {}).get("contradictions_found", [])
+            
+            # Return the rich context with minimal transformation
+            return {
+                "rich_context_package": context_package,
+                "contradictions": contradictions,
+                "has_contradictions": len(contradictions) > 0,
+                "context_retrieval_timestamp": context_package.get("retrieval_timestamp_ums_package"),
+                "context_sources": {
+                    "rich_package": True,
+                    "compression_applied": "ums_compression_details" in context_package
                 }
-            else:
-                self.logger.warning(f"Rich context package failed: {rich_res.get('error_message', 'Unknown error')}")
-                return {"rich_context_package": None, "contradictions": [], "has_contradictions": False}
+            }
                 
         except Exception as e:
             self.logger.error(f"Failed to get rich context package: {e}")
-            return {"rich_context_package": None, "contradictions": [], "has_contradictions": False}
+            raise RuntimeError(f"Context gathering failed: {e}") from e
+
+    async def _ensure_working_memory_exists(self) -> None:
+        """
+        Ensure we have some working memory by creating contextual memories if needed.
+        """
+        if not self.state.workflow_id:
+            return
             
+        try:
+            # Check if we have any working memory
+            working_memory_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("get_working_memory"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "limit": 5
+                }
+            )
+            
+            has_working_memory = (
+                working_memory_res.get("success") and 
+                working_memory_res.get("data", {}).get("memories")
+            )
+            
+            if not has_working_memory:
+                self.logger.info("No working memory found, creating initial context memories")
+                
+                # Create initial context memory
+                current_goal_desc = await self._get_current_goal_description()
+                initial_context = (
+                    f"Starting work on goal: {current_goal_desc}\n"
+                    f"Current phase: {self.state.phase.value}\n"
+                    f"Loop count: {self.state.loop_count}\n"
+                    f"This is the beginning of the agent's reasoning process."
+                )
+                
+                await self._store_memory_with_auto_linking(
+                    content=initial_context,
+                    memory_type="context_initialization",
+                    memory_level="working",
+                    importance=6.0,
+                    description="Initial context memory created to bootstrap working memory"
+                )
+                
+                # Create current state memory
+                state_memory = (
+                    f"Agent state at loop {self.state.loop_count}:\n"
+                    f"- Phase: {self.state.phase.value}\n"
+                    f"- Workflow ID: {self.state.workflow_id}\n"
+                    f"- Current goal: {self.state.current_leaf_goal_id}\n"
+                    f"- Last action: {self.state.last_action_summary or 'None'}\n"
+                    f"Agent is actively working toward the goal."
+                )
+                
+                await self._store_memory_with_auto_linking(
+                    content=state_memory,
+                    memory_type="state_snapshot", 
+                    memory_level="working",
+                    importance=5.5,
+                    description="Current agent state for context"
+                )
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to ensure working memory exists: {e}")
+
+    async def _get_working_memory_manually(self) -> str:
+        """Get working memory through individual UMS calls."""
+        try:
+            working_memory_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("get_working_memory"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "limit": 10
+                }
+            )
+            
+            if working_memory_res.get("success") and working_memory_res.get("data"):
+                memories = working_memory_res["data"].get("memories", [])
+                if memories:
+                    summaries = []
+                    for mem in memories[-5:]:  # Last 5 memories
+                        content = mem.get("content", "")[:150]
+                        mem_type = mem.get("memory_type", "unknown")
+                        importance = mem.get("importance", 0.0)
+                        summaries.append(f"[{mem_type}, {importance:.1f}] {content}")
+                    return f"{len(memories)} working memories:\n" + "\n".join(summaries)
+                else:
+                    return "Working memory exists but is empty"
+            else:
+                return "Could not retrieve working memory"
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to get working memory manually: {e}")
+            return f"Working memory retrieval failed: {e}"
+
+    async def _get_recent_actions_manually(self) -> str:
+        """Get recent actions through individual UMS calls."""
+        try:
+            actions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("get_recent_actions"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "limit": 5
+                }
+            )
+            
+            if actions_res.get("success") and actions_res.get("data"):
+                actions = actions_res["data"].get("actions", [])
+                if actions:
+                    summaries = []
+                    for action in actions:
+                        action_type = action.get("action_type", "unknown")
+                        status = action.get("status", "unknown")
+                        title = action.get("title", "No title")[:50]
+                        summaries.append(f"• {action_type}: {title} ({status})")
+                    return f"{len(actions)} recent actions:\n" + "\n".join(summaries)
+                else:
+                    return "No recent actions found"
+            else:
+                return "Could not retrieve recent actions"
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to get recent actions manually: {e}")
+            return f"Recent actions retrieval failed: {e}"
+
+    async def _get_contradictions_manually(self) -> List[Tuple[str, str]]:
+        """Get contradictions through individual UMS calls."""
+        try:
+            contradictions_res = await self.mcp_client._execute_tool_and_parse_for_agent(
+                UMS_SERVER_NAME,
+                self._get_ums_tool_name("get_contradictions"),
+                {
+                    "workflow_id": self.state.workflow_id,
+                    "limit": 10
+                }
+            )
+            
+            if contradictions_res.get("success") and contradictions_res.get("data"):
+                contradictions_found = contradictions_res["data"].get("contradictions_found", [])
+                pairs = []
+                for contradiction in contradictions_found:
+                    mem_a = contradiction.get("memory_id_a")
+                    mem_b = contradiction.get("memory_id_b")
+                    if mem_a and mem_b:
+                        pairs.append((mem_a, mem_b))
+                return pairs
+            else:
+                return []
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to get contradictions manually: {e}")
+            return []
+
     # -------------------------------- helper: spawn background fast tasks
 
     async def _maybe_spawn_fast_tasks(self, ctx: Dict[str, Any]) -> None:
@@ -3292,13 +3729,66 @@ class AgentMasterLoop:
     # -------------------------------- helper: build SMART-model prompt
 
     def _build_messages(self, ctx: Dict[str, Any]) -> List[Dict[str, str]]:
-        """Compose chat-completion messages fed into SMART model."""
-        sys_msg = (
-            "You are the high-level reasoning engine of an autonomous agent. "
-            "You have access to planning context, working memories, and can "
-            "call tools. Return a JSON instruction with a 'decision_type' key."
-        )
+        """Compose chat-completion messages with clear action guidance."""
         
+        # Phase-specific instructions
+        phase_instructions = {
+            Phase.UNDERSTAND: "Analyze the goal and search for relevant information. Use web_search if needed.",
+            Phase.PLAN: "Break down the goal into concrete sub-tasks. Create specific, actionable goals.",
+            Phase.EXECUTE: "Execute the planned tasks using appropriate tools. Create artifacts as needed.",
+            Phase.REVIEW: "Review what has been accomplished and verify goal completion.",
+        }
+        
+        sys_msg = f"""You are an autonomous agent with access to tools and a memory system.
+
+Current Phase: {self.state.phase.value} - {phase_instructions.get(self.state.phase, "Process the current task")}
+
+IMPORTANT: You must make concrete progress each turn by:
+1. Using tools to gather information (browse, search, read_file, query_memories)
+2. Creating tangible outputs (write_file, record_artifact, execute_python)
+3. Storing key findings in memory (store_memory, record_thought)
+4. Breaking down complex goals (create_goal)
+
+EFFICIENCY: Use TOOL_MULTIPLE when possible! Examples:
+- Research: [browse, store_memory] or [search, download, store_memory]
+- File analysis: [read_file, analyze_business_sentiment, store_memory]
+- Document processing: [convert_document, extract_tables, record_artifact]
+- Code work: [execute_python, write_file, record_artifact]
+- Web automation: [click, type_text, download]
+- Data extraction: [extract_tables, run_jq, store_memory]
+
+Response Format - EXACTLY this JSON structure:
+
+For SINGLE tool:
+{{
+    "decision_type": "TOOL_SINGLE",
+    "tool_name": "tool_name_here",
+    "tool_args": {{...}}
+}}
+
+For MULTIPLE tools (PREFERRED when possible):
+{{
+    "decision_type": "TOOL_MULTIPLE", 
+    "tool_calls": [
+        {{"tool_name": "web_search", "tool_args": {{"query": "..."}}, "tool_id": "search_1"}},
+        {{"tool_name": "store_memory", "tool_args": {{"content": "..."}}, "tool_id": "store_1"}}
+    ]
+}}
+
+For thinking:
+{{
+    "decision_type": "THOUGHT_PROCESS",
+    "content": "reasoning here"
+}}
+
+For completion:
+{{
+    "decision_type": "DONE", 
+    "content": "completion summary"
+}}
+
+Avoid circular reasoning. Each action should move closer to the goal."""
+
         # Use rich context package if available
         rich_package = ctx.get("rich_context_package")
         if rich_package:
@@ -3306,45 +3796,49 @@ class AgentMasterLoop:
             recent_actions = rich_package.get("recent_actions", [])
             working_memory = rich_package.get("current_working_memory", {})
             
-            # Format recent actions
+            # Format recent actions concisely
             if recent_actions:
                 actions_text = "\n".join([
-                    f"- {action.get('action_type', 'unknown')}: {action.get('title', 'No title')} ({action.get('status', 'unknown')})"
-                    for action in recent_actions[-5:]
+                    f"- {action.get('action_type', 'unknown')}: {action.get('title', 'No title')[:50]} ({action.get('status', 'unknown')})"
+                    for action in recent_actions[-3:]  # Only last 3 for brevity
                 ])
             else:
                 actions_text = "No recent actions"
             
             # Format working memory
-            memory_summary = working_memory.get("workflow_id", "No working memory available")
+            memory_summary = "No working memory available"
             if working_memory.get("working_memories"):
                 memory_count = len(working_memory["working_memories"])
-                memory_summary = f"{memory_count} active working memories available"
+                memory_summary = f"{memory_count} active working memories with recent insights"
             
             user_msg = (
-                f"**Phase**: {self.state.phase}\n"
-                f"**Workflow**: {core_context.get('workflow_title', 'Unknown')}\n"
+                f"**Phase**: {self.state.phase.value}\n"
                 f"**Goal**: {core_context.get('workflow_goal', 'No goal set')}\n"
-                f"**Recent actions**:\n{actions_text}\n"
-                f"**Working memory**: {memory_summary}\n"
-                f"**Graph status**: {rich_package.get('graph_snapshot', {}).get('node_count', 0)} nodes, "
-                f"{rich_package.get('graph_snapshot', {}).get('edge_count', 0)} edges\n\n"
+                f"**Last 3 actions**:\n{actions_text}\n"
+                f"**Working memory**: {memory_summary}\n\n"
             )
             
             if ctx.get("has_contradictions"):
-                user_msg += "⚠️ Contradictions detected in working memory\n"
+                user_msg += "⚠️ **Contradictions detected** - address these or work around them\n\n"
             
-            user_msg += (
-                "What should be the next step? If a tool call is required, specify "
-                "tool name and arguments. Else, think in prose."
-            )
+            # Add phase-specific guidance
+            if self.state.phase == Phase.UNDERSTAND:
+                user_msg += "Focus: Research and gather information about your goal. EFFICIENT: Use [browse, store_memory] or [search, download, store_memory] together."
+            elif self.state.phase == Phase.PLAN:
+                user_msg += "Focus: Break down your goal into concrete, actionable sub-tasks. EFFICIENT: Use [create_goal, store_memory] or [create_goal] together."
+            elif self.state.phase == Phase.EXECUTE:
+                user_msg += "Focus: Create the required outputs and deliverables. EFFICIENT: Use [write_file, record_artifact] or [execute_python, store_memory] together."
+            elif self.state.phase == Phase.REVIEW:
+                user_msg += "Focus: Verify all outputs exist and meet requirements. EFFICIENT: Use [get_artifacts, store_memory] or [analyze_business_sentiment, generate_reflection] together."
+            
+            user_msg += "\n\nWhat specific action will you take next?"
         else:
             # Fallback for when rich context is unavailable
             user_msg = (
-                f"**Phase**: {self.state.phase}\n"
+                f"**Phase**: {self.state.phase.value}\n"
                 f"**Loop**: {self.state.loop_count}\n"
-                "Context unavailable - please proceed with basic reasoning.\n"
-                "What should be the next step?"
+                "Context unavailable - proceed with basic reasoning.\n"
+                "What specific action will you take next?"
             )
         
         return [
@@ -3388,94 +3882,9 @@ class AgentMasterLoop:
 
     # -------------------------------- helper: enact decision from model
 
-    def _create_action_signature(self, decision: Any) -> str:
-        """Create a comparable signature for an action/decision."""
-        if isinstance(decision, dict):
-            dtype = decision.get("decision_type", "unknown")
-            
-            if "tool" in dtype.lower():
-                # For tool calls, signature is tool_name + key args
-                tool_name = decision.get("tool_name", "unknown")
-                tool_args = decision.get("tool_args", {})
-                
-                # Extract key arguments (ignore IDs, timestamps)
-                key_args = []
-                for k, v in sorted(tool_args.items()):
-                    if k not in {"workflow_id", "memory_id", "timestamp", "created_at"}:
-                        if isinstance(v, str) and len(v) > 50:
-                            key_args.append(f"{k}={v[:50]}...")
-                        else:
-                            key_args.append(f"{k}={v}")
-                
-                return f"{tool_name}({','.join(key_args[:3])})"  # First 3 key args
-                
-            elif dtype == "THOUGHT_PROCESS":
-                # For thoughts, use first 50 chars
-                content = str(decision.get("content", ""))[:50]
-                return f"think:{content}"
-                
-            else:
-                return f"{dtype}"
-        else:
-            # Plain text response
-            return f"text:{str(decision)[:30]}"
-
-
-    def _detect_action_loops(self) -> Tuple[bool, str]:
-        """
-        Detect various types of action loops.
-        
-        Returns (is_loop_detected, description_of_loop)
-        """
-        if len(self.state.recent_action_signatures) < 3:
-            return False, ""
-        
-        recent = self.state.recent_action_signatures
-        
-        # Pattern 1: Exact repetition (A-A-A)
-        if len(set(recent[-3:])) == 1:
-            return True, f"Repeating same action 3x: {recent[-1]}"
-        
-        # Pattern 2: Binary loop (A-B-A-B)
-        if len(recent) >= 4 and recent[-1] == recent[-3] and recent[-2] == recent[-4]:
-            return True, f"Alternating between: {recent[-2]} and {recent[-1]}"
-        
-        # Pattern 3: Triple loop (A-B-C-A-B-C)
-        if len(recent) >= 6:
-            pattern = recent[-3:]
-            if recent[-6:-3] == pattern:
-                return True, f"Repeating pattern: {' -> '.join(pattern)}"
-        
-        # Pattern 4: Majority repetition (same action appears 5+ times in last 8)
-        if len(recent) >= 8:
-            from collections import Counter
-            counts = Counter(recent[-8:])
-            most_common, count = counts.most_common(1)[0]
-            if count >= 5:
-                return True, f"Action '{most_common}' repeated {count}/8 times"
-        
-        # Pattern 5: Semantic similarity (same intent, different form)
-        if len(recent) >= 4:
-            # Check for repeated memory operations that might indicate confusion
-            memory_ops = [sig for sig in recent[-4:] if any(op in sig for op in ['store_memory', 'get_memory', 'query_memories'])]
-            if len(memory_ops) >= 3:
-                return True, f"Repeated memory operations: {', '.join(set(memory_ops))}"
-            
-            # Check for repeated search/retrieval operations
-            search_ops = [sig for sig in recent[-4:] if any(op in sig for op in ['search', 'get_', 'query_', 'fetch'])]
-            if len(search_ops) >= 3:
-                return True, f"Repeated search/retrieval operations: {', '.join(set(search_ops))}"
-                
-            # Check for repeated creation attempts
-            create_ops = [sig for sig in recent[-4:] if any(op in sig for op in ['create_', 'store_', 'add_'])]
-            if len(create_ops) >= 3:
-                return True, f"Repeated creation attempts: {', '.join(set(create_ops))}"
-        
-        return False, ""
-        
     async def _enact(self, decision: Any) -> bool:
         """
-        Execute the SMART-model output (simplified since MCPClient handles most tool execution).
+        Execute the SMART-model output with guaranteed structure.
 
         Returns
         -------
@@ -3484,142 +3893,125 @@ class AgentMasterLoop:
         """
         self.logger.debug("[AML] decision raw: %s", decision)
 
-        # Create action signature for loop detection
-        action_signature = self._create_action_signature(decision)
+        # With structured output, we guarantee this is a dict with decision_type
+        if not isinstance(decision, dict) or "decision_type" not in decision:
+            self.logger.error(f"[AML] Invalid decision format: {decision}")
+            return False
+
+        decision_type = decision["decision_type"]
         
-        # Update recent actions (keep last N)
-        self.state.recent_action_signatures.append(action_signature)
-        if len(self.state.recent_action_signatures) > self.state.max_action_history:
-            self.state.recent_action_signatures.pop(0)
-        
-        # Check for loops
-        loop_detected, loop_info = self._detect_action_loops()
-        if loop_detected:
-            self.logger.warning(f"[AML] Loop detected: {loop_info}")
+        if decision_type == "TOOL_SINGLE":
+            # Execute the specified tool
+            tool_name = decision["tool_name"]
+            tool_args = decision["tool_args"]
             
-            # Force reflection
-            self.state.stuck_counter = STALL_THRESHOLD
+            self.logger.info("[AML] → executing tool %s with args %s", tool_name, tool_args)
+            result = await self.tool_exec.run(tool_name, tool_args)
+            success = result.get("success", False)
             
-            # Store loop detection as a memory with auto-linking
-            await self._store_memory_with_auto_linking(
-                content=f"LOOP DETECTED: {loop_info}. Recent actions: {self.state.recent_action_signatures[-5:]}",
-                memory_type="warning",
-                memory_level="working",
-                importance=8.0,
-                description="Action loop detected - forcing reflection"
-            )
+            # Record tool effectiveness for learning
+            if self.state.current_leaf_goal_id:
+                goal_desc = await self._get_current_goal_description()
+                await self.record_tool_effectiveness(goal_desc, tool_name, success)
             
-        # If model produced a dict, we expect certain keys
-        if isinstance(decision, dict):
-            dtype = decision.get("decision_type", "").upper()
-            
-            if dtype == "TOOL_EXECUTED_BY_MCP":
-                # MCPClient already executed the tool via process_agent_llm_turn, process the result
-                tool_name = decision.get("tool_name", "unknown")
-                tool_result = decision.get("result", {})
-                success = tool_result.get("success", False)
-                
-                if success:
-                    self.state.last_action_summary = f"Successfully executed {tool_name}"
-                    # The tool result is already parsed by MCPClient's _execute_tool_and_parse_for_agent
-                    return True
-                else:
-                    error_msg = tool_result.get("error_message", "Unknown error")
-                    self.state.last_action_summary = f"Failed to execute {tool_name}: {error_msg}"
-                    return False
-                    
-            elif dtype in {"CALL_TOOL", "TOOL_SINGLE"}:
-                # MCPClient didn't handle this tool - execute it directly
-                tool_name = decision["tool_name"]
-                tool_args = decision.get("tool_args", {})
-                self.logger.info("[AML] → executing tool %s", tool_name)
-                result = await self.tool_exec.run(tool_name, tool_args)
-                success = result.get("success", False)
-                self.state.last_action_summary = f"Executed {tool_name}: {'success' if success else 'failed'}"
-                return success
-                
-            elif dtype == "MULTIPLE_TOOLS_EXECUTED_BY_MCP":
-                # MCPClient handled multiple tools in parallel
-                results = decision.get("results", [])
-                successful_count = sum(1 for r in results if r.get("success", False))
-                total_count = len(results)
-                
-                self.state.last_action_summary = f"Parallel execution: {successful_count}/{total_count} tools succeeded"
-                return successful_count > 0
-            elif dtype == "THOUGHT_PROCESS":
-                thought = decision.get("content", "")
-                mem_id = await self._store_memory_with_auto_linking(
-                    content=thought,
-                    memory_type="reasoning_step",
-                    memory_level="working",
-                    importance=6.0,  # Slightly higher importance for explicit thoughts
-                    description="Thought from SMART model"
-                )
-                if mem_id:
-                    # Link any referenced memories as supporting evidence
-                    evid_ids = re.findall(r"mem_[0-9a-f]{8}", thought)
-                    if evid_ids:
-                        await self.mem_graph.register_reasoning_trace(
-                            thought_mem_id=mem_id,
-                            evidence_ids=evid_ids,
-                        )
-                    self.state.last_action_summary = "Generated reasoning thought"
-                    return bool(thought.strip())
-            elif dtype == "DONE":
-                # Before marking complete, validate
-                is_valid = await self.metacog._goal_completed()
-                
-                if is_valid:
-                    self.state.phase = Phase.COMPLETE
-                    self.state.goal_achieved_flag = True
-                    self.state.last_action_summary = "Task completed and validated"
-                    return True
-                else:
-                    # Not actually done
-                    self.logger.warning("Agent claimed completion but validation failed")
-                    
-                    # Create a corrective memory with auto-linking
-                    await self._store_memory_with_auto_linking(
-                        content="Premature completion attempt - validation failed. Need to create expected outputs.",
-                        memory_type="correction",
-                        memory_level="working",
-                        importance=8.0,
-                        description="Completion validation failed"
-                    )
-                    
-                    self.state.last_action_summary = "Completion validation failed - continuing work"
-                    self.state.stuck_counter += 1  # Mild penalty to encourage different approach
-                    
-                    return False
-            elif dtype == "UPDATE_PLAN":
-                # Handle agent internal planning updates
-                new_plan = decision.get("plan", [])
-                self.state.current_plan = new_plan
-                self.state.last_action_summary = f"Updated plan with {len(new_plan)} steps"
+            if success:
+                self.state.last_action_summary = f"Successfully executed {tool_name}"
                 return True
             else:
-                # Unknown decision -> still treat as progress
-                self.state.last_action_summary = f"Processed unknown decision type: {dtype}"
+                error_msg = result.get("error_message", "Unknown error")
+                self.state.last_action_summary = f"Failed to execute {tool_name}: {error_msg}"
+                return False
+                
+        elif decision_type == "TOOL_MULTIPLE":
+            # Execute multiple tools in parallel - much more efficient!
+            tool_calls = decision["tool_calls"]
+            
+            self.logger.info("[AML] → executing %d tools in parallel", len(tool_calls))
+            
+            # Use the existing run_parallel method from ToolExecutor
+            parallel_result = await self.tool_exec.run_parallel(tool_calls)
+            
+            success = parallel_result.get("success", False)
+            results = parallel_result.get("results", [])
+            timing_info = parallel_result.get("timing", {})
+            
+            # Count successes and failures
+            successful_count = sum(1 for r in results if r.get("success", False))
+            total_count = len(results)
+            
+            # Record effectiveness for each tool
+            if self.state.current_leaf_goal_id:
+                goal_desc = await self._get_current_goal_description()
+                for i, tool_call in enumerate(tool_calls):
+                    tool_name = tool_call["tool_name"]
+                    if i < len(results):
+                        tool_success = results[i].get("success", False)
+                        await self.record_tool_effectiveness(goal_desc, tool_name, tool_success)
+            
+            # Log timing information
+            if timing_info:
+                timing_summary = ", ".join([f"{tid}: {time:.2f}s" for tid, time in timing_info.items()])
+                self.logger.debug(f"[AML] Parallel execution timing: {timing_summary}")
+            
+            if successful_count > 0:
+                self.state.last_action_summary = f"Parallel execution: {successful_count}/{total_count} tools succeeded"
                 return True
-        else:
-            # If it's plain text, store as a reasoning step with auto-linking
-            text = str(decision)
+            else:
+                self.state.last_action_summary = f"Parallel execution failed: 0/{total_count} tools succeeded"
+                return False
+                
+        elif decision_type == "THOUGHT_PROCESS":
+            # Store reasoning as memory
+            thought = decision["content"]
             mem_id = await self._store_memory_with_auto_linking(
-                content=text,
+                content=thought,
                 memory_type="reasoning_step",
                 memory_level="working",
-                importance=5.0,
-                description="Unstructured reasoning output"
+                importance=6.0,
+                description="Reasoning from SMART model"
             )
+            
             if mem_id:
-                evid_ids = re.findall(r"mem_[0-9a-f]{8}", text)
+                # Link any referenced memories as supporting evidence
+                evid_ids = re.findall(r"mem_[0-9a-f]{8}", thought)
                 if evid_ids:
                     await self.mem_graph.register_reasoning_trace(
                         thought_mem_id=mem_id,
                         evidence_ids=evid_ids,
                     )
-                self.state.last_action_summary = "Processed unstructured response"
-                return bool(text.strip())
+            
+            self.state.last_action_summary = "Generated reasoning thought"
+            return bool(thought.strip())
+            
+        elif decision_type == "DONE":
+            # Validate completion before accepting
+            is_valid = await self.metacog._goal_completed()
+            
+            if is_valid:
+                self.state.phase = Phase.COMPLETE
+                self.state.goal_achieved_flag = True
+                self.state.last_action_summary = "Task completed and validated"
+                return True
+            else:
+                # Not actually done
+                self.logger.warning("Agent claimed completion but validation failed")
+                
+                # Create a corrective memory
+                await self._store_memory_with_auto_linking(
+                    content="Premature completion attempt - validation failed. Need to create expected outputs.",
+                    memory_type="correction",
+                    memory_level="working",
+                    importance=8.0,
+                    description="Completion validation failed"
+                )
+                
+                self.state.last_action_summary = "Completion validation failed - continuing work"
+                self.state.stuck_counter += 1
+                return False
+        else:
+            # This should never happen with structured output
+            self.logger.error(f"[AML] Unexpected decision type: {decision_type}")
+            return False
 
     # ----------------------------------------------------- after-turn misc
 
@@ -3817,18 +4209,26 @@ class AgentMasterLoop:
             if store_res.get("success") and store_res.get("data"):
                 memory_id = store_res["data"].get("memory_id")
                 
-                # If requested, create explicit link to current goal
+                # If requested, associate memory with current goal using proper UMS goal tools
                 if link_to_goal and self.state.current_leaf_goal_id and memory_id:
                     try:
-                        await self.mem_graph.auto_link(
-                            src_id=self.state.current_leaf_goal_id,
-                            tgt_id=memory_id,
-                            context_snip="goal-related memory",
-                            kind_hint=LinkKind.SUPPORTS
+                        # Use a goal-specific tool or metadata to associate memory with goal
+                        # For now, we'll store this relationship in memory metadata
+                        current_meta = await self.mem_graph._get_metadata(memory_id)
+                        current_meta["associated_goal_id"] = self.state.current_leaf_goal_id
+                        
+                        await self.mcp_client._execute_tool_and_parse_for_agent(
+                            UMS_SERVER_NAME,
+                            self._get_ums_tool_name("update_memory_metadata"),
+                            {
+                                "workflow_id": self.state.workflow_id,
+                                "memory_id": memory_id,
+                                "metadata": current_meta
+                            }
                         )
                     except Exception as e:
-                        self.logger.debug(f"Goal linking failed (non-critical): {e}")
-                
+                        self.logger.debug(f"Goal association failed (non-critical): {e}")
+                        
                 return memory_id
             else:
                 self.logger.warning(f"Memory storage failed: {store_res.get('error_message', 'Unknown error')}")
