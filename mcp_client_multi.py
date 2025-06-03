@@ -161,7 +161,7 @@ import textwrap
 import time
 import traceback
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -432,21 +432,22 @@ AGENT_UPDATE_PLAN_ARGUMENT_SCHEMA = {
                     "depends_on": {"type": "array", "items": {"type": "string"}, "default": []},
                     "assigned_tool": {"type": ["string", "null"]},
                     "tool_args": {
-                        "type": ["object", "null"], 
-                        "description": "Arguments for the assigned tool. Can be any valid JSON object."
-                        # No "properties" and no "additionalProperties: False" here means it accepts any object.
+                        "type": "object",
+                        "description": "Arguments for the assigned tool. Must be a valid JSON object.",
+                        "properties": {},
+                        "additionalProperties": True,
                     },
                     "result_summary": {"type": ["string", "null"]},
-                    "is_parallel_group": {"type": ["string", "null"]}
+                    "is_parallel_group": {"type": ["string", "null"]},
                 },
                 "required": ["id", "description"],
-                "additionalProperties": False # For the PlanStep object itself
+                "additionalProperties": False,  # For the PlanStep object itself
             },
-            "description": "The new complete list of plan steps for the agent."
+            "description": "The new complete list of plan steps for the agent.",
         }
     },
     "required": ["plan"],
-    "additionalProperties": False # For the top-level arguments object
+    "additionalProperties": False,  # For the top-level arguments object
 }
 
 
@@ -1372,9 +1373,9 @@ def robust_parse_mcp_tool_content(content_from_call_tool_result: Any) -> Dict[st
         elif (
             dataclasses.is_dataclass(first_block)
             and hasattr(first_block, "type")
-            and getattr(first_block, "type") == "text" # noqa: B009
+            and getattr(first_block, "type") == "text"  # noqa: B009
             and hasattr(first_block, "text")
-            and isinstance(getattr(first_block, "text"), str) # noqa: B009
+            and isinstance(getattr(first_block, "text"), str)  # noqa: B009
         ):  # noqa: B009
             extracted_json_string = getattr(first_block, "text")  # noqa: B009
             log.debug(
@@ -1460,23 +1461,51 @@ def robust_parse_mcp_tool_content(content_from_call_tool_result: Any) -> Dict[st
     try:
         parsed_data = json.loads(candidate_for_json)
 
-        if not isinstance(parsed_data, dict):
+        if isinstance(parsed_data, dict):
+            # Check if the UMS tool payload itself signals an error
+            ums_payload_success_value = parsed_data.get("success")
+            ums_tool_reported_error = (
+                (ums_payload_success_value is False) or "error" in parsed_data or "error_message" in parsed_data or "error_code" in parsed_data
+            )  # Common error indicators from UMS tools
+
+            if ums_tool_reported_error:
+                log.warning(
+                    f"ROBUST_PARSE_V_FINAL: UMS tool payload indicates an application-level error. "
+                    f"UMS Success Flag: {ums_payload_success_value}, UMS Error Keys Present: "
+                    f"{ {k: v for k, v in parsed_data.items() if k in ['error', 'error_message', 'error_code']} }"
+                )
+                # Ensure the final dict from this parser signals the error
+                parsed_data["success"] = False  # CRITICAL: Override/ensure this is false
+                if "error_message" not in parsed_data and "error" in parsed_data:
+                    parsed_data["error_message"] = parsed_data["error"]  # Prefer error_message
+                if "error_type" not in parsed_data:
+                    # Use a specific type, or one from the tool if available
+                    parsed_data["error_type"] = parsed_data.get("error_type", "UMSToolReportedError_MCPC")
+                log.debug(f"ROBUST_PARSE_V_FINAL: Returning UMS tool's error structure. Success: {parsed_data.get('success')}")
+                return parsed_data  # Return the error structure from the tool directly
+            else:
+                # If UMS tool payload does not indicate error, AND 'success' key was absent
+                if ums_payload_success_value is None:  # 'success' key was not present
+                    log.warning(  # Changed to warning as this is less ideal
+                        f"ROBUST_PARSE_V_FINAL: Parsed dict has no 'success' key from UMS tool. "
+                        f"Assuming UMS tool success or non-UMS payload. Adding 'success: True'. Keys: {list(parsed_data.keys())}"
+                    )
+                    parsed_data["success"] = True
+                # If 'success' was explicitly true from UMS tool, it's already set.
+                log.debug(f"ROBUST_PARSE_V_FINAL: Successfully parsed to dict. Success key from payload: {parsed_data.get('success', 'N/A')}")
+                return parsed_data
+
+        # Handle non-dictionary JSON (e.g., string from summarize_text tool)
+        elif parsed_data is not None:  # Could be string, number, list, bool from valid JSON
             log.info(f"ROBUST_PARSE_V_FINAL: Parsed to valid non-dictionary JSON (type: {type(parsed_data)}). Wrapping.")
             return {
                 "success": True,
-                "data": parsed_data,
+                "data": parsed_data,  # Store the non-dict data here
                 "_mcp_client_non_dict_payload_note": "Original tool payload was valid JSON but not a dictionary.",
             }
-
-        if "success" not in parsed_data:
-            log.warning(
-                f"ROBUST_PARSE_V_FINAL: Parsed dict has no 'success' key. Assuming UMS tool success or non-UMS payload. Adding 'success: True'. Keys: {list(parsed_data.keys())}"
-            )
-            if not ("error" in parsed_data and "error_type" in parsed_data):
-                parsed_data["success"] = True
-
-        log.debug(f"ROBUST_PARSE_V_FINAL: Successfully parsed to dict. Success key from payload: {parsed_data.get('success', 'N/A')}")
-        return parsed_data
+        else:  # parsed_data is None (e.g. json.loads("null"))
+            log.warning("ROBUST_PARSE_V_FINAL: JSON parsed to None. Treating as empty success.")
+            return {"success": True, "data": None}
 
     except json.JSONDecodeError as e:
         error_msg = f"JSONDecodeError: {e}. Input to json.loads (first 200 chars): '{candidate_for_json[:200]}...'"
@@ -2615,11 +2644,9 @@ class Config:
         self.port_scan_timeout: float = 4.5
         self.port_scan_targets: List[str] = ["127.0.0.1"]
 
-
         # Complex structures
         self.servers: Dict[str, ServerConfig] = {}
         self.cache_ttl_mapping: Dict[str, int] = {}
-
 
     def _apply_env_overrides(self):
         """Overrides simple config values with environment variables if they are set."""
@@ -3028,7 +3055,7 @@ class ServerMonitor:
                 # Just check if we can send a basic request - using ping-like mechanism
                 # Since most MCP implementations don't have a ping, we'll just verify the session is responsive
                 # by checking internal state rather than making network calls
-                if hasattr(session, '_is_active') and not getattr(session, '_is_active', True):
+                if hasattr(session, "_is_active") and not getattr(session, "_is_active", True):
                     raise ConnectionAbortedError(f"Session {server_name} is not active")
                 log.debug(f"[{server_name}] Lightweight health check passed")
             except Exception as e:
@@ -4032,6 +4059,32 @@ class ServerManager:
             log.debug(f"[{server_name}] Cleaning up process context...")
             await self.terminate_process(server_name, process)  # Use helper
 
+    async def terminate_process(self, server_name: str, process: Optional[asyncio.subprocess.Process]):
+        """Helper to terminate a process gracefully with fallback to kill."""
+        if process is None or process.returncode is not None:
+            log.debug(f"Process {server_name} already terminated or is None.")
+            return  # Already exited or None
+        log.info(f"Terminating process {server_name} (PID {process.pid})")
+        try:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+            log.info(f"Process {server_name} terminated gracefully.")
+        except asyncio.TimeoutError:
+            log.warning(f"Process {server_name} did not terminate gracefully, killing.")
+            if process.returncode is None:  # Check again before killing
+                try:
+                    process.kill()
+                    await process.wait()  # Wait for kill to complete
+                    log.info(f"Process {server_name} killed.")
+                except ProcessLookupError:
+                    log.info(f"Process {server_name} already exited before kill.")
+                except Exception as kill_err:
+                    log.error(f"Error killing process {server_name}: {kill_err}")
+        except ProcessLookupError:
+            log.info(f"Process {server_name} already exited before termination attempt.")
+        except Exception as e:
+            log.error(f"Error terminating process {server_name}: {e}")
+
     async def _connect_stdio_server(
         self, server_config: ServerConfig, current_server_name: str, retry_count: int
     ) -> Tuple[Optional[ClientSession], Optional[Dict[str, Any]], Optional[asyncio.subprocess.Process]]:
@@ -4343,314 +4396,334 @@ class ServerManager:
         Handles server renaming based on InitializeResult BEFORE loading capabilities.
         """
         initial_server_name = server_config.name
-        # Use a mutable copy for potential renaming within the loop
-        current_server_config = dataclasses.replace(server_config)
-        current_server_name = initial_server_name
+        current_server_config = dataclasses.replace(server_config)  # Use mutable copy
+        current_server_name = initial_server_name  # Will be updated on rename
 
         retry_count = 0
         config_updated_by_rename = False
         max_retries = current_server_config.retry_policy.get("max_attempts", 3)
         backoff_factor = current_server_config.retry_policy.get("backoff_factor", 0.5)
         timeout_increment = current_server_config.retry_policy.get("timeout_increment", 5.0)
-
-        # process_to_use is scoped outside the loop to track the *running* process if reused
         process_to_use: Optional[asyncio.subprocess.Process] = self.processes.get(current_server_name)
 
-        with safe_stdout():  # Protect stdout during connection attempts
-            while retry_count <= max_retries:
-                start_time = time.time()
-                session: Optional[ClientSession] = None
-                initialize_result_obj: Optional[Union[MCPInitializeResult, Dict[str, Any]]] = None
-                # process_this_attempt tracks if a *new* process was started in this specific attempt
-                process_this_attempt: Optional[asyncio.subprocess.Process] = None
-                connection_error: Optional[BaseException] = None
-                span = None
-                span_context_manager = None
-                attempt_exit_stack = AsyncExitStack()  # Stack for THIS attempt's resources
+        # Span for the entire connection process (including retries) for this server
+        span_for_server_connection_process: Optional[trace.Span] = None
+        span_cm_for_server_connection_process: Optional[Any] = None  # type: ignore
 
-                try:  # Trace span setup
-                    if tracer:
-                        span_context_manager = tracer.start_as_current_span(
-                            f"connect_server.{current_server_name}",
-                            attributes={"server.name": initial_server_name, "server.type": current_server_config.type.value, "retry": retry_count},
+        if tracer:
+            try:
+                span_cm_for_server_connection_process = tracer.start_as_current_span(
+                    f"mcpclient.connect_to_server_with_retries.{initial_server_name}",
+                    attributes={
+                        "server.name_initial": initial_server_name,  # Log initial name
+                        "server.type": current_server_config.type.value,
+                        "server.max_retries_config": max_retries,
+                    },
+                )
+                if span_cm_for_server_connection_process:
+                    span_for_server_connection_process = span_cm_for_server_connection_process.__enter__()
+            except Exception as e_span_outer:
+                log.warning(f"Failed to start outer trace span for {initial_server_name} connection: {e_span_outer}")
+
+        try:  # This try covers the whole retry loop
+            with safe_stdout():  # Protect stdout during connection attempts
+                while retry_count <= max_retries:
+                    start_time_this_attempt = time.time()  # For logging/metrics, not span
+                    session: Optional[ClientSession] = None
+                    initialize_result_obj: Optional[Union[MCPInitializeResult, Dict[str, Any]]] = None
+                    # process_this_attempt tracks if a *new* process was started in this specific attempt
+                    process_this_attempt: Optional[asyncio.subprocess.Process] = None
+                    connection_error_this_attempt: Optional[BaseException] = None
+                    attempt_exit_stack = AsyncExitStack()  # Stack for THIS attempt's resources
+
+                    if span_for_server_connection_process:
+                        span_for_server_connection_process.add_event(
+                            f"connect_attempt_started",
+                            attributes={"attempt_number": retry_count + 1, "current_server_name_for_attempt": current_server_name},
                         )
-                        if span_context_manager:
-                            span = span_context_manager.__enter__()
-                except Exception as e:
-                    log.warning(f"Failed to start trace span: {e}")
-                    span = span_context_manager = None
-                finally:
-                    if span_context_manager and hasattr(span_context_manager, "__exit__"):
-                        with suppress(Exception):
-                            span_context_manager.__exit__(*sys.exc_info())
 
-                try:
-                    # --- Main Connection Attempt ---
-                    self._safe_printer(
-                        f"[cyan]Connecting to {initial_server_name} (as '{current_server_name}', Attempt {retry_count + 1}/{max_retries + 1})...[/]"
-                    )
-
-                    # --- Connection & Handshake ---
-                    if current_server_config.type == ServerType.STDIO:
-                        # Helper handles process start/reuse and handshake
-                        # _connect_stdio_server returns the active session, the initialize result, and the process *if* it started a new one
-                        session, initialize_result_obj, process_this_attempt = await self._connect_stdio_server(
-                            current_server_config, current_server_name, retry_count
+                    try:
+                        # --- Main Connection Attempt ---
+                        self._safe_printer(
+                            f"[cyan]Connecting to {initial_server_name} (as '{current_server_name}', Attempt {retry_count + 1}/{max_retries + 1})...[/]"
                         )
-                        # If a new process was started, manage its lifetime for this attempt
-                        if process_this_attempt:
-                            await attempt_exit_stack.enter_async_context(
-                                self._manage_process_lifetime(process_this_attempt, f"attempt-{current_server_name}-{retry_count}")
+
+                        # --- Connection & Handshake ---
+                        if current_server_config.type == ServerType.STDIO:
+                            # Helper handles process start/reuse and handshake
+                            # _connect_stdio_server returns the active session, the initialize result, and the process *if* it started a new one
+                            session, initialize_result_obj, process_this_attempt = await self._connect_stdio_server(
+                                current_server_config, current_server_name, retry_count
                             )
-                            process_to_use = process_this_attempt  # Track the newly started process for later use
-                        # Manage session lifetime for this attempt
-                        if session:
+                            # If a new process was started, manage its lifetime for this attempt
+                            if process_this_attempt:
+                                await attempt_exit_stack.enter_async_context(
+                                    self._manage_process_lifetime(process_this_attempt, f"attempt-{current_server_name}-{retry_count}")
+                                )
+                                process_to_use = process_this_attempt  # Track the newly started process for later use
+                            # Manage session lifetime for this attempt
+                            if session:
+                                await attempt_exit_stack.enter_async_context(session)
+
+                        elif current_server_config.type == ServerType.SSE:
+                            connect_url = current_server_config.path
+                            parsed_connect_url = urlparse(connect_url)
+                            if not parsed_connect_url.scheme:
+                                connect_url = f"http://{connect_url}"
+
+                            connect_timeout = current_server_config.timeout + (retry_count * timeout_increment)
+                            # Use a very long read timeout for persistent SSE streams
+                            persistent_read_timeout_secs = timedelta(days=1).total_seconds()  # Effectively infinite
+                            handshake_timeout = connect_timeout + 15.0  # Allow extra time for handshake
+
+                            log.info(f"[{current_server_name}] Creating persistent SSE context for {connect_url}...")
+                            sse_ctx = sse_client(
+                                url=connect_url, headers=None, timeout=connect_timeout, sse_read_timeout=persistent_read_timeout_secs
+                            )
+                            # Manage SSE streams within the attempt stack first
+                            read_stream, write_stream = await attempt_exit_stack.enter_async_context(sse_ctx)
+                            log.debug(f"[{current_server_name}] SSE streams obtained.")
+
+                            # Use standard ClientSession, also managed by attempt stack initially
+                            session_read_timeout = timedelta(seconds=persistent_read_timeout_secs + 10.0)
+                            session = ClientSession(read_stream=read_stream, write_stream=write_stream, read_timeout_seconds=session_read_timeout)
                             await attempt_exit_stack.enter_async_context(session)
+                            log.info(f"[{current_server_name}] Persistent SSE ClientSession created.")
 
-                    elif current_server_config.type == ServerType.SSE:
-                        connect_url = current_server_config.path
-                        parsed_connect_url = urlparse(connect_url)
-                        if not parsed_connect_url.scheme:
-                            connect_url = f"http://{connect_url}"
+                            # Perform handshake
+                            log.info(f"[{current_server_name}] Performing MCP handshake (initialize) via SSE...")
+                            initialize_result_obj = await asyncio.wait_for(session.initialize(), timeout=handshake_timeout)
+                            log.info(
+                                f"[{current_server_name}] Initialize successful (SSE). Server reported: {getattr(initialize_result_obj, 'serverInfo', 'N/A')}"
+                            )
+                            process_this_attempt = None  # No process for SSE
 
-                        connect_timeout = current_server_config.timeout + (retry_count * timeout_increment)
-                        # Use a very long read timeout for persistent SSE streams
-                        persistent_read_timeout_secs = timedelta(days=1).total_seconds()  # Effectively infinite
-                        handshake_timeout = connect_timeout + 15.0  # Allow extra time for handshake
-
-                        log.info(f"[{current_server_name}] Creating persistent SSE context for {connect_url}...")
-                        sse_ctx = sse_client(url=connect_url, headers=None, timeout=connect_timeout, sse_read_timeout=persistent_read_timeout_secs)
-                        # Manage SSE streams within the attempt stack first
-                        read_stream, write_stream = await attempt_exit_stack.enter_async_context(sse_ctx)
-                        log.debug(f"[{current_server_name}] SSE streams obtained.")
-
-                        # Use standard ClientSession, also managed by attempt stack initially
-                        session_read_timeout = timedelta(seconds=persistent_read_timeout_secs + 10.0)
-                        session = ClientSession(read_stream=read_stream, write_stream=write_stream, read_timeout_seconds=session_read_timeout)
-                        await attempt_exit_stack.enter_async_context(session)
-                        log.info(f"[{current_server_name}] Persistent SSE ClientSession created.")
-
-                        # Perform handshake
-                        log.info(f"[{current_server_name}] Performing MCP handshake (initialize) via SSE...")
-                        initialize_result_obj = await asyncio.wait_for(session.initialize(), timeout=handshake_timeout)
-                        log.info(
-                            f"[{current_server_name}] Initialize successful (SSE). Server reported: {getattr(initialize_result_obj, 'serverInfo', 'N/A')}"
-                        )
-                        process_this_attempt = None  # No process for SSE
-
-                    else:
-                        raise RuntimeError(f"Unknown server type: {current_server_config.type}")
-
-                    # Check if session was successfully created
-                    if not session:
-                        raise RuntimeError(f"Session object is None after connection attempt for {current_server_name}")
-
-                    # --- Rename Logic (Start - Placed *after* initialize_result_obj is obtained) ---
-                    original_name_before_rename = current_server_name
-                    actual_server_name_from_init: Optional[str] = None
-
-                    # CORRECTED: Check the type of the result object before accessing
-                    if isinstance(initialize_result_obj, dict):  # STDIO Result (raw dict)
-                        server_info = initialize_result_obj.get("serverInfo", {})
-                        if isinstance(server_info, dict):
-                            actual_server_name_from_init = server_info.get("name")
                         else:
-                            log.warning(f"[{current_server_name}] STDIO initialize result 'serverInfo' is not a dict: {server_info}")
-                        # Capabilities handled by _load_server_capabilities using the dict
+                            raise RuntimeError(f"Unknown server type: {current_server_config.type}")
 
-                    elif isinstance(initialize_result_obj, MCPInitializeResult):  # Standard Result (Pydantic model)
-                        if initialize_result_obj.serverInfo:
-                            actual_server_name_from_init = initialize_result_obj.serverInfo.name
-                        # Capabilities handled by _load_server_capabilities using the Pydantic model
+                        # Check if session was successfully created
+                        if not session:
+                            raise RuntimeError(f"Session object is None after connection attempt for {current_server_name}")
 
-                    else:
-                        # Handle case where initialize_result_obj is None or unexpected type
-                        log.warning(
-                            f"[{current_server_name}] Unexpected type or None for initialize_result_obj: {type(initialize_result_obj)}. Cannot extract server name."
-                        )
+                        # --- Rename Logic (Start - Placed *after* initialize_result_obj is obtained) ---
+                        original_name_before_rename = current_server_name
+                        actual_server_name_from_init: Optional[str] = None
 
-                    # Perform rename if needed
-                    if actual_server_name_from_init and actual_server_name_from_init != current_server_name:
-                        if actual_server_name_from_init in self.config.servers and actual_server_name_from_init != initial_server_name:
+                        # CORRECTED: Check the type of the result object before accessing
+                        if isinstance(initialize_result_obj, dict):  # STDIO Result (raw dict)
+                            server_info = initialize_result_obj.get("serverInfo", {})
+                            if isinstance(server_info, dict):
+                                actual_server_name_from_init = server_info.get("name")
+                            else:
+                                log.warning(f"[{current_server_name}] STDIO initialize result 'serverInfo' is not a dict: {server_info}")
+                            # Capabilities handled by _load_server_capabilities using the dict
+
+                        elif isinstance(initialize_result_obj, MCPInitializeResult):  # Standard Result (Pydantic model)
+                            if initialize_result_obj.serverInfo:
+                                actual_server_name_from_init = initialize_result_obj.serverInfo.name
+                            # Capabilities handled by _load_server_capabilities using the Pydantic model
+
+                        else:
+                            # Handle case where initialize_result_obj is None or unexpected type
                             log.warning(
-                                f"Server '{initial_server_name}' reported name '{actual_server_name_from_init}', which conflicts with another existing server. Keeping original name '{current_server_name}'."
+                                f"[{current_server_name}] Unexpected type or None for initialize_result_obj: {type(initialize_result_obj)}. Cannot extract server name."
                             )
-                            # Keep current_server_name, do not rename
+
+                        # Perform rename if needed
+                        if actual_server_name_from_init and actual_server_name_from_init != current_server_name:
+                            if actual_server_name_from_init in self.config.servers and actual_server_name_from_init != initial_server_name:
+                                log.warning(
+                                    f"Server '{initial_server_name}' reported name '{actual_server_name_from_init}', which conflicts with another existing server. Keeping original name '{current_server_name}'."
+                                )
+                                # Keep current_server_name, do not rename
+                            else:
+                                log.info(f"Server '{initial_server_name}' identified as '{actual_server_name_from_init}'. Renaming config.")
+                                self._safe_printer(
+                                    f"[yellow]Server '{initial_server_name}' identified as '{actual_server_name_from_init}', updating config.[/]"
+                                )
+                                try:
+                                    if initial_server_name in self.config.servers:
+                                        # Remove old entry, update config object, add new entry
+                                        original_config_entry = self.config.servers.pop(initial_server_name)
+                                        original_config_entry.name = actual_server_name_from_init  # Update the object itself
+                                        self.config.servers[actual_server_name_from_init] = original_config_entry  # Add with new key
+
+                                        # Update process mapping if STDIO
+                                        if current_server_config.type == ServerType.STDIO:
+                                            existing_proc_for_old_name = self.processes.pop(original_name_before_rename, None)
+                                            if existing_proc_for_old_name:
+                                                self.processes[actual_server_name_from_init] = existing_proc_for_old_name
+                                                # Ensure process_to_use reflects the final name mapping
+                                                process_to_use = existing_proc_for_old_name
+                                            else:
+                                                log.warning(
+                                                    f"Could not find process entry for old name '{original_name_before_rename}' during rename."
+                                                )
+
+                                        # Update the current loop variables
+                                        current_server_name = actual_server_name_from_init
+                                        current_server_config = original_config_entry  # Use the updated config object
+                                        config_updated_by_rename = True
+                                        if span_for_server_connection_process:
+                                            span_for_server_connection_process.set_attribute("server.name", current_server_name)
+                                        # Update session's internal name if it's the custom type
+                                        if isinstance(session, RobustStdioSession):
+                                            session._server_name = current_server_name
+                                        log.info(f"Renamed config entry '{initial_server_name}' -> '{current_server_name}'.")
+                                    else:
+                                        log.warning(
+                                            f"Cannot rename: Original name '{initial_server_name}' no longer in config (maybe already renamed?)."
+                                        )
+                                except Exception as rename_err:
+                                    log.error(
+                                        f"Failed rename '{initial_server_name}' to '{actual_server_name_from_init}': {rename_err}", exc_info=True
+                                    )
+                                    raise RuntimeError(f"Failed during server rename: {rename_err}") from rename_err
+                        # --- Rename Logic (End) ---
+
+                        # --- Load Capabilities (Uses the *final* current_server_name) ---
+                        await self._load_server_capabilities(current_server_name, session, initialize_result_obj)
+
+                        # --- Success Path ---
+                        connection_time_ms = (time.time() - start_time_this_attempt) * 1000
+                        # Use the potentially updated server name to find the config entry for metrics
+                        server_config_in_dict = self.config.servers.get(current_server_name)
+                        if server_config_in_dict:
+                            metrics = server_config_in_dict.metrics
+                            metrics.request_count += 1  # Count connection attempt
+                            metrics.update_response_time(connection_time_ms / 1000.0)
+                            metrics.update_status()
                         else:
-                            log.info(f"Server '{initial_server_name}' identified as '{actual_server_name_from_init}'. Renaming config.")
-                            self._safe_printer(
-                                f"[yellow]Server '{initial_server_name}' identified as '{actual_server_name_from_init}', updating config.[/]"
-                            )
+                            # This should ideally not happen if rename logic is correct
+                            log.error(f"Could not find server config '{current_server_name}' after connection success for metrics.")
+
+                        if latency_histogram:
                             try:
-                                if initial_server_name in self.config.servers:
-                                    # Remove old entry, update config object, add new entry
-                                    original_config_entry = self.config.servers.pop(initial_server_name)
-                                    original_config_entry.name = actual_server_name_from_init  # Update the object itself
-                                    self.config.servers[actual_server_name_from_init] = original_config_entry  # Add with new key
+                                latency_histogram.record(connection_time_ms, {"server.name": current_server_name})
+                            except Exception as histo_err:
+                                log.warning(f"Failed to record latency histogram for {current_server_name}: {histo_err}")
+                        if span_for_server_connection_process:
+                            span_for_server_connection_process.set_attribute(f"attempt.{retry_count + 1}.status", "success")
+                            span_for_server_connection_process.set_attribute(f"attempt.{retry_count + 1}.final_name_used", current_server_name)
+                            span_for_server_connection_process.set_attribute("server.name_final", current_server_name)  # Update final name on span
+                            span_for_server_connection_process.set_status(trace.StatusCode.OK)
 
-                                    # Update process mapping if STDIO
-                                    if current_server_config.type == ServerType.STDIO:
-                                        existing_proc_for_old_name = self.processes.pop(original_name_before_rename, None)
-                                        if existing_proc_for_old_name:
-                                            self.processes[actual_server_name_from_init] = existing_proc_for_old_name
-                                            # Ensure process_to_use reflects the final name mapping
-                                            process_to_use = existing_proc_for_old_name
-                                        else:
-                                            log.warning(f"Could not find process entry for old name '{original_name_before_rename}' during rename.")
+                        tools_loaded_count = len([t for t in self.tools.values() if t.server_name == current_server_name])
+                        log.info(
+                            f"Connected & loaded capabilities for {current_server_name} ({tools_loaded_count} tools) in {connection_time_ms:.0f}ms"
+                        )
+                        self._safe_printer(f"[green]{EMOJI_MAP['success']} Connected & loaded: {current_server_name} ({tools_loaded_count} tools)[/]")
 
-                                    # Update the current loop variables
-                                    current_server_name = actual_server_name_from_init
-                                    current_server_config = original_config_entry  # Use the updated config object
-                                    config_updated_by_rename = True
-                                    if span:
-                                        span.set_attribute("server.name", current_server_name)
-                                    # Update session's internal name if it's the custom type
-                                    if isinstance(session, RobustStdioSession):
-                                        session._server_name = current_server_name
-                                    log.info(f"Renamed config entry '{initial_server_name}' -> '{current_server_name}'.")
-                                else:
-                                    log.warning(f"Cannot rename: Original name '{initial_server_name}' no longer in config (maybe already renamed?).")
-                            except Exception as rename_err:
-                                log.error(f"Failed rename '{initial_server_name}' to '{actual_server_name_from_init}': {rename_err}", exc_info=True)
-                                raise RuntimeError(f"Failed during server rename: {rename_err}") from rename_err
-                    # --- Rename Logic (End) ---
+                        # *** Success: Adopt resources into main exit stack ***
+                        # This moves session, and potentially sse_client context manager
+                        await self.exit_stack.enter_async_context(attempt_exit_stack.pop_all())
+                        # Add session to active list *after* adopting to main stack
+                        self.active_sessions[current_server_name] = session
 
-                    # --- Load Capabilities (Uses the *final* current_server_name) ---
-                    await self._load_server_capabilities(current_server_name, session, initialize_result_obj)
+                        # Track the *persistent* process object under the final name
+                        # process_to_use holds the reference to the process that was actually used (reused or newly started)
+                        if process_to_use and current_server_config.type == ServerType.STDIO:
+                            # Ensure it's tracked under the potentially renamed server name
+                            if current_server_name not in self.processes or self.processes[current_server_name] != process_to_use:
+                                self.processes[current_server_name] = process_to_use
 
-                    # --- Success Path ---
-                    connection_time_ms = (time.time() - start_time) * 1000
-                    # Use the potentially updated server name to find the config entry for metrics
-                    server_config_in_dict = self.config.servers.get(current_server_name)
-                    if server_config_in_dict:
-                        metrics = server_config_in_dict.metrics
-                        metrics.request_count += 1  # Count connection attempt
-                        metrics.update_response_time(connection_time_ms / 1000.0)
-                        metrics.update_status()
+                        # Save config YAML if rename occurred
+                        if config_updated_by_rename:
+                            log.info(f"Saving configuration YAML after server rename to {current_server_name}...")
+                            await self.config.save_async()
+
+                        # Advertise via Zeroconf if it's a newly connected STDIO server
+                        if current_server_config.type == ServerType.STDIO:
+                            # Pass the potentially updated server config object
+                            await self.register_local_server(current_server_config)
+
+                        # Do NOT exit the outer span_cm_for_server_connection_process here.
+                        return session  # Return successful session
+
+                    # --- Outer Exception Handling for Connection Attempt ---
+                    except (
+                        McpError,
+                        RuntimeError,
+                        ConnectionAbortedError,
+                        httpx.RequestError,
+                        subprocess.SubprocessError,
+                        OSError,
+                        FileNotFoundError,
+                        asyncio.TimeoutError,
+                        BaseExceptionGroup,
+                    ) as e:
+                        connection_error_this_attempt = e
+                        error_type_name = type(e).__name__
+                        log.warning(
+                            f"[{initial_server_name}] Connection attempt {retry_count + 1} failed (current name '{current_server_name}'): {error_type_name} - {e}",
+                            exc_info=False,
+                        )  # Log less verbosely initially
+                        log.debug(f"Traceback for {initial_server_name} connection error:", exc_info=True)  # Full traceback at debug level
+                        if span_for_server_connection_process:
+                            span_for_server_connection_process.add_event(
+                                f"connect_attempt_failed",
+                                attributes={"attempt_number": retry_count + 1, "error_type": type(e).__name__, "error_message": str(e)[:200]},
+                            )
+                    # --- End Connection Attempt Try/Except ---
+                    finally:
+                        # Ensure attempt-specific resources are cleaned up *before* retry/failure
+                        # This will close the session and terminate the process *if* it was started in this attempt
+                        await attempt_exit_stack.aclose()
+
+                    # --- Shared Error Handling & Retry Logic ---
+                    retry_count += 1
+                    # Update metrics even on failure attempt
+                    config_for_metrics = self.config.servers.get(current_server_name)  # Use potentially renamed server
+                    if config_for_metrics:
+                        config_for_metrics.metrics.error_count += 1
+                        config_for_metrics.metrics.update_status()
                     else:
-                        # This should ideally not happen if rename logic is correct
-                        log.error(f"Could not find server config '{current_server_name}' after connection success for metrics.")
+                        # Log error if config entry cannot be found (should not happen after rename logic fix)
+                        log.error(f"Could not find server config '{current_server_name}' for error metric update after failed attempt.")
 
-                    if latency_histogram:
-                        try:
-                            latency_histogram.record(connection_time_ms, {"server.name": current_server_name})
-                        except Exception as histo_err:
-                            log.warning(f"Failed to record latency histogram for {current_server_name}: {histo_err}")
-                    if span:
-                        span.set_status(trace.StatusCode.OK)
-
-                    tools_loaded_count = len([t for t in self.tools.values() if t.server_name == current_server_name])
-                    log.info(f"Connected & loaded capabilities for {current_server_name} ({tools_loaded_count} tools) in {connection_time_ms:.0f}ms")
-                    self._safe_printer(f"[green]{EMOJI_MAP['success']} Connected & loaded: {current_server_name} ({tools_loaded_count} tools)[/]")
-
-                    # *** Success: Adopt resources into main exit stack ***
-                    # This moves session, and potentially sse_client context manager
-                    await self.exit_stack.enter_async_context(attempt_exit_stack.pop_all())
-                    # Add session to active list *after* adopting to main stack
-                    self.active_sessions[current_server_name] = session
-
-                    # Track the *persistent* process object under the final name
-                    # process_to_use holds the reference to the process that was actually used (reused or newly started)
-                    if process_to_use and current_server_config.type == ServerType.STDIO:
-                        # Ensure it's tracked under the potentially renamed server name
-                        if current_server_name not in self.processes or self.processes[current_server_name] != process_to_use:
-                            self.processes[current_server_name] = process_to_use
-
-                    # Save config YAML if rename occurred
-                    if config_updated_by_rename:
-                        log.info(f"Saving configuration YAML after server rename to {current_server_name}...")
-                        await self.config.save_async()
-
-                    # Advertise via Zeroconf if it's a newly connected STDIO server
-                    if current_server_config.type == ServerType.STDIO:
-                        # Pass the potentially updated server config object
-                        await self.register_local_server(current_server_config)
-
-                    # Exit span context if it exists
-                    if span_context_manager and hasattr(span_context_manager, "__exit__"):
-                        span_context_manager.__exit__(None, None, None)
-
-                    return session  # Return the successful session
-
-                # --- Outer Exception Handling for Connection Attempt ---
-                except (
-                    McpError,
-                    RuntimeError,
-                    ConnectionAbortedError,
-                    httpx.RequestError,
-                    subprocess.SubprocessError,
-                    OSError,
-                    FileNotFoundError,
-                    asyncio.TimeoutError,
-                    BaseExceptionGroup,
-                ) as e:
-                    connection_error = e
-                    error_type_name = type(e).__name__
-                    log.warning(
-                        f"[{initial_server_name}] Connection attempt {retry_count + 1} failed: {error_type_name} - {e}", exc_info=False
-                    )  # Log less verbosely initially
-                    log.debug(f"Traceback for {initial_server_name} connection error:", exc_info=True)  # Full traceback at debug level
-                # --- End Connection Attempt Try/Except ---
-                finally:
-                    # Ensure attempt-specific resources are cleaned up *before* retry/failure
-                    # This will close the session and terminate the process *if* it was started in this attempt
-                    await attempt_exit_stack.aclose()
-                    # Close the OpenTelemetry span if connection failed within the attempt
-                    if span_context_manager and hasattr(span_context_manager, "__exit__"):
-                        try:
-                            exc_type, exc_val, exc_tb = sys.exc_info()
-                            # Only exit if it wasn't already exited successfully
-                            if session is None:  # Check if success path was reached
-                                span_context_manager.__exit__(exc_type, exc_val, exc_tb)
-                        except Exception as span_exit_err:
-                            log.warning(f"Error closing OpenTelemetry span context on failure: {span_exit_err}")
-
-                # --- Shared Error Handling & Retry Logic ---
-                retry_count += 1
-                # Update metrics even on failure attempt
-                config_for_metrics = self.config.servers.get(current_server_name)  # Use potentially renamed server
-                if config_for_metrics:
-                    config_for_metrics.metrics.error_count += 1
-                    config_for_metrics.metrics.update_status()
-                else:
-                    # Log error if config entry cannot be found (should not happen after rename logic fix)
-                    log.error(f"Could not find server config '{current_server_name}' for error metric update after failed attempt.")
-
-                if span:
-                    # Set span status to error if an error occurred in this attempt
-                    if connection_error:
-                        span.set_status(trace.StatusCode.ERROR, f"Attempt {retry_count - 1} failed: {type(connection_error).__name__}")
-                        # Optionally record the exception details
-                        if hasattr(span, "record_exception"):
-                            span.record_exception(connection_error)
-
-                if retry_count <= max_retries:
-                    delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.1, 10.0)
-                    error_msg_display = str(connection_error or "Unknown error")[:150] + "..."
-                    self._safe_printer(
-                        f"[yellow]{EMOJI_MAP['warning']} Error connecting {initial_server_name} (as '{current_server_name}'): {error_msg_display}[/]"
-                    )
-                    self._safe_printer(f"[cyan]Retrying connection in {delay:.2f}s...[/]")
-                    await asyncio.sleep(delay)
-                    # Continue main while loop
-                else:  # Max retries exceeded
-                    final_error_msg = str(connection_error or "Unknown connection error")
-                    log.error(
-                        f"Failed to connect to {initial_server_name} (as '{current_server_name}') after {max_retries + 1} attempts. Final error: {final_error_msg}"
-                    )
-                    self._safe_printer(
-                        f"[red]{EMOJI_MAP['error']} Failed to connect: {initial_server_name} (as '{current_server_name}') after {max_retries + 1} attempts.[/]"
-                    )
-                    if span:
-                        span.set_status(trace.StatusCode.ERROR, f"Max retries exceeded. Final: {type(connection_error).__name__}")
-                    if config_updated_by_rename:  # Save config if rename happened but connection ultimately failed
-                        log.info(f"Saving configuration YAML after failed connection for renamed server {current_server_name}...")
-                        await self.config.save_async()
-                    return None  # Connection failed
+                    if retry_count <= max_retries:
+                        delay = min(backoff_factor * (2 ** (retry_count - 1)) + random.random() * 0.1, 10.0)
+                        error_msg_display = str(connection_error_this_attempt or "Unknown error")[:150] + "..."
+                        self._safe_printer(
+                            f"[yellow]{EMOJI_MAP['warning']} Error connecting {initial_server_name} (as '{current_server_name}'): {error_msg_display}[/]"
+                        )
+                        self._safe_printer(f"[cyan]Retrying connection in {delay:.2f}s...[/]")
+                        await asyncio.sleep(delay)
+                        # process_to_use might need to be reset if process_this_attempt failed and was cleaned up
+                        if process_this_attempt and process_this_attempt.returncode is not None:
+                            process_to_use = None  # Force new process on next retry if this one died
+                        continue  # To next iteration of while loop
+                    else:  # Max retries exceeded for this server
+                        final_error_msg = str(connection_error_this_attempt or "Unknown connection error after retries")
+                        log.error(
+                            f"Failed to connect to {initial_server_name} (as '{current_server_name}') after {max_retries + 1} attempts. Final error: {final_error_msg}"
+                        )
+                        self._safe_printer(
+                            f"[red]{EMOJI_MAP['error']} Failed to connect: {initial_server_name} (as '{current_server_name}') after {max_retries + 1} attempts.[/]"
+                        )
+                        if span_for_server_connection_process:
+                            final_error_type_name = type(connection_error_this_attempt).__name__ if connection_error_this_attempt else "UnknownError"
+                            span_for_server_connection_process.set_status(
+                                trace.StatusCode.ERROR, f"Max retries ({max_retries + 1}) exceeded. Final error: {final_error_type_name}"
+                            )
+                            if connection_error_this_attempt and hasattr(span_for_server_connection_process, "record_exception"):
+                                span_for_server_connection_process.record_exception(connection_error_this_attempt)  # type: ignore
+                        if config_updated_by_rename:
+                            await self.config.save_async()
+                        return None  # Connection failed after all retries
+                    # End of while loop
 
             # Should only reach here if loop completes unexpectedly (should break or return)
             log.error(f"Connection loop for {initial_server_name} exited unexpectedly.")
+            if span_for_server_connection_process and span_for_server_connection_process.is_recording():
+                current_status = span_for_server_connection_process.status
+                if current_status.status_code == trace.StatusCode.UNSET or current_status.is_ok:  # If not already set to error
+                    span_for_server_connection_process.set_status(trace.StatusCode.ERROR, "Loop exited unexpectedly")
             return None
+        finally:  # Finally for the outer try that covers all retries and the span
+            if span_cm_for_server_connection_process and hasattr(span_cm_for_server_connection_process, "__exit__"):
+                with suppress(Exception):  # Suppress errors during span exit itself
+                    span_cm_for_server_connection_process.__exit__(*sys.exc_info())
 
     async def connect_to_server_by_name(self, server_name: str) -> bool:
         """Connects to a server specified by its name."""
@@ -4890,12 +4963,6 @@ class ServerManager:
 
         # Start server monitoring *after* initial connection attempts
         await self.monitor.start_monitoring()
-        # Print status after connection attempts
-        # Ensure MCPClient instance exists before calling print_status
-        if hasattr(app, "mcp_client"):
-            await app.mcp_client.print_status()
-        else:
-            log.warning("Cannot print status, MCPClient instance not found on app.")
 
     async def disconnect_server(self, server_name: str):
         """Disconnects from a specific server and cleans up resources."""
@@ -5210,7 +5277,7 @@ class MCPClient:
         self.cache_hit_count = 0
         self.cache_miss_count = 0
         self.tokens_saved_by_cache = 0
-        
+
         # Token and cost tracking for cheap/fast requests
         self.cheap_request_count = 0
         self.cheap_input_tokens = 0
@@ -5221,7 +5288,9 @@ class MCPClient:
         self.agent_loop_instance: Optional[AgentMasterLoop] = None
         self.agent_task: Optional[asyncio.Task] = None
         self.agent_goal: Optional[str] = None
-        self.agent_status: str = "idle"  # possible values: "idle", "starting", "running", "stopping", "stopped", "completed", "failed", "error_initializing_agent"
+        self.agent_status: str = (
+            "idle"  # possible values: "idle", "starting", "running", "stopping", "stopped", "completed", "failed", "error_initializing_agent"
+        )
         self.agent_last_message: Optional[str] = None
         self.agent_current_loop: int = 0
         self.agent_max_loops: int = 0
@@ -5298,36 +5367,34 @@ class MCPClient:
     async def _initialize_agent_if_needed(self, default_llm_model_override: Optional[str] = None) -> bool:
         """
         Instantiate or re-initialize the AgentMasterLoop instance.
-        
+
         Args:
             default_llm_model_override: Optional model string to override the default
-            
+
         Returns:
             bool: True if initialization was successful, False otherwise
         """
         if self.agent_loop_instance is None:
             log.info("MCPC: Initializing AgentMasterLoop instance for the first time...")
             ActualAgentMasterLoopClass = None
-            
+
             try:
                 from robust_agent_loop import AgentMasterLoop as AMLClass
+
                 ActualAgentMasterLoopClass = AMLClass
                 log.debug(f"MCPC: Successfully imported AgentMasterLoop as AMLClass: {type(ActualAgentMasterLoopClass)}")
             except ImportError as ie:
                 log.critical(f"MCPC: CRITICAL - Failed to import AgentMasterLoop class from 'robust_agent_loop.py': {ie}", exc_info=True)
                 return False
-                
+
             if not callable(ActualAgentMasterLoopClass):  # Check if it's a class
                 log.critical(f"MCPC: CRITICAL - AgentMasterLoop is not a callable class after import. Type: {type(ActualAgentMasterLoopClass)}")
                 return False
-                
+
             model_to_use = default_llm_model_override or self.config.default_model
-            
+
             try:
-                self.agent_loop_instance = ActualAgentMasterLoopClass(
-                    mcp_client=self,
-                    default_llm_model_string=model_to_use
-                )
+                self.agent_loop_instance = ActualAgentMasterLoopClass(mcp_client=self, default_llm_model_string=model_to_use)
                 log.info(f"MCPC: AgentMasterLoop instance created. Model: {model_to_use}")
             except Exception as e:
                 log.critical(f"MCPC: CRITICAL - Error instantiating AgentMasterLoop: {e}", exc_info=True)
@@ -5335,11 +5402,13 @@ class MCPClient:
                 return False
         else:
             log.info("MCPC: Reusing existing AgentMasterLoop instance for new task. Will re-initialize its state.")
-            
+
             if default_llm_model_override is not None and self.agent_loop_instance.agent_llm_model != default_llm_model_override:
-                log.info(f"MCPC: Updating agent's LLM model for new task from '{self.agent_loop_instance.agent_llm_model}' to '{default_llm_model_override}'.")
+                log.info(
+                    f"MCPC: Updating agent's LLM model for new task from '{self.agent_loop_instance.agent_llm_model}' to '{default_llm_model_override}'."
+                )
                 self.agent_loop_instance.agent_llm_model = default_llm_model_override
-        
+
         # Initialize/re-initialize the agent state
         log.info("MCPC: Calling .initialize() on AgentMasterLoop instance to prepare for new task...")
         try:
@@ -5352,10 +5421,12 @@ class MCPClient:
             log.error(f"MCPC: Exception during AgentMasterLoop .initialize(): {e}", exc_info=True)
             self.agent_status = "error_initializing_agent"
             return False
-            
-        log.info(f"MCPC: AgentMasterLoop initialized/re-initialized successfully for new task. Effective WF ID: {_fmt_id(self.agent_loop_instance.state.workflow_id)}")
+
+        log.info(
+            f"MCPC: AgentMasterLoop initialized/re-initialized successfully for new task. Effective WF ID: {_fmt_id(self.agent_loop_instance.state.workflow_id)}"
+        )
         return True
-        
+
     def _initialize_commands(self):
         """Populates the command dictionary."""
         # Map command strings to their corresponding async methods
@@ -6748,217 +6819,254 @@ class MCPClient:
 
     async def rank_tools_for_goal(self, goal_desc: str, phase: str, limit: int = 15) -> List[Dict[str, Any]]:
         """
-        Intelligently rank tools using fast LLM to score relevance.
-        
+        Intelligently rank tools using a fast LLM to score relevance.
+        If the number of tools is large, it breaks them into overlapping chunks,
+        scores each chunk in parallel, normalizes scores, and then combines them.
+
         Parameters
         ----------
         goal_desc : str
             Description of the goal
-        phase : str  
+        phase : str
             Current phase (understand, plan, execute, review)
         limit : int
-            Maximum number of tools to return
-            
+            Maximum number of tools to return in the final ranked list
+
         Returns
         -------
         List[Dict[str, Any]]
-            List of ranked tool schemas
+            List of ranked tool schemas (the actual full schema objects)
         """
         try:
-            # Get all available tools
             if not hasattr(self, "server_manager") or not self.server_manager:
-                self.logger.error("No server manager available for tool ranking")
+                self.logger.error("Tool ranking: ServerManager not available.")
                 return []
-                
-            sm = self.server_manager
-            if not sm.tools:
-                self.logger.error("No tools available for ranking")
+            if not self.server_manager.tools:
+                self.logger.error("Tool ranking: No tools available in ServerManager.")
                 return []
-                
-            # Get provider for fast model
-            fast_model = getattr(self.config, 'default_cheap_and_fast_model', 'gemini-2.5-flash-preview-05-20')
+
+            fast_model = getattr(self.config, "default_cheap_and_fast_model", "gemini-2.5-flash-preview-05-20")
             provider = self.get_provider_from_model(fast_model)
             if not provider:
-                self.logger.error(f"Cannot determine provider for fast model {fast_model}")
+                self.logger.error(f"Tool ranking: Cannot determine provider for fast model {fast_model}.")
                 return []
-                
-            # Format tools for this provider
-            all_llm_formatted = self._format_tools_for_provider(provider)
-            if not all_llm_formatted:
-                self.logger.warning(f"No formatted tools available for provider {provider}")
+
+            all_llm_formatted_tools: List[Dict[str, Any]] = self._format_tools_for_provider(provider)
+            if not all_llm_formatted_tools:
+                self.logger.warning(f"Tool ranking: No formatted tools available for provider {provider}.")
                 return []
-                
-            # Extract tool information for LLM scoring
-            tools_for_scoring = []
-            for i, schema in enumerate(all_llm_formatted):
-                if "function" in schema:
-                    tool_name = schema["function"].get("name", f"tool_{i}")
-                    tool_desc = schema["function"].get("description", "No description available")
+
+            self.logger.info(f"Tool ranking: Starting for {len(all_llm_formatted_tools)} tools. Goal: '{goal_desc[:50]}...', Phase: {phase}.")
+
+            # --- Configuration for Chunking and Scoring ---
+            # Max tools to send to LLM in a single scoring request
+            CHUNK_SIZE = getattr(self.config, "tool_ranking_chunk_size", 30)
+            # Overlap between chunks to help with score normalization context
+            CHUNK_OVERLAP = getattr(self.config, "tool_ranking_chunk_overlap", 5)
+            # Max parallel LLM calls for scoring chunks
+            MAX_PARALLEL_SCORING_CALLS = getattr(self.config, "tool_ranking_parallel_calls", 3)
+
+            # This dictionary will store the original schema and all scores received for it.
+            # Key: tuple(schema.items()) to make dicts hashable for use as dict keys, or use tool name if unique enough
+            # For simplicity, we'll map by index in all_llm_formatted_tools and handle potential duplicates if LLM returns tool names.
+            # Better: use a unique identifier if schemas have one, or map by index.
+            # Let's use (original_index, tool_name_from_schema) as key for robustness.
+
+            # We need a way to uniquely identify each tool schema object.
+            # Assign a temporary unique ID to each schema for tracking.
+            tools_with_ids = []
+            for i, schema in enumerate(all_llm_formatted_tools):
+                temp_id = f"temp_tool_id_{i}"
+                tools_with_ids.append({"temp_id": temp_id, "schema": schema})
+
+            all_scores_by_temp_id: Dict[str, List[float]] = defaultdict(list)
+
+            if len(tools_with_ids) <= CHUNK_SIZE:
+                # If few enough tools, score them all in one go
+                chunks_to_process = [tools_with_ids]
+            else:
+                # Create overlapping chunks
+                chunks_to_process = []
+                step = CHUNK_SIZE - CHUNK_OVERLAP
+                for i in range(0, len(tools_with_ids), step):
+                    chunk = tools_with_ids[i : i + CHUNK_SIZE]
+                    if chunk:  # Ensure chunk is not empty
+                        chunks_to_process.append(chunk)
+                # Ensure the last few tools are included if step doesn't cover them
+                if len(tools_with_ids) % step != 0 and len(tools_with_ids) > CHUNK_SIZE:
+                    last_chunk_start = max(0, len(tools_with_ids) - CHUNK_SIZE)
+                    last_chunk = tools_with_ids[last_chunk_start:]
+                    if last_chunk and (not chunks_to_process or chunks_to_process[-1] != last_chunk):  # Avoid duplicate last chunk
+                        chunks_to_process.append(last_chunk)
+
+            self.logger.info(
+                f"Tool ranking: Processing {len(tools_with_ids)} tools in {len(chunks_to_process)} chunks (size ~{CHUNK_SIZE}, overlap ~{CHUNK_OVERLAP})."
+            )
+
+            async def score_chunk(chunk_of_tools_with_ids: List[Dict[str, Any]]) -> List[Tuple[str, float]]:
+                # chunk_of_tools_with_ids is List[{"temp_id": str, "schema": Dict}]
+
+                tools_for_llm_prompt_in_chunk = []
+                for tool_item in chunk_of_tools_with_ids:
+                    schema_obj = tool_item["schema"]
+                    tool_name = schema_obj.get("function", {}).get("name", schema_obj.get("name", "unknown_tool"))
+                    tool_desc = schema_obj.get("function", {}).get("description", schema_obj.get("description", "No description"))
+                    if len(tool_desc) > 200:
+                        tool_desc = tool_desc[:197] + "..."
+                    tools_for_llm_prompt_in_chunk.append({"name": tool_name, "description": tool_desc, "temp_id": tool_item["temp_id"]})
+
+                prompt = f"""You are an AI assistant helping to select the most relevant tools for a specific goal and phase.
+Goal: {goal_desc}
+Phase: {phase}
+
+Rate each of the following tools for its relevance to this goal and phase on a scale of 0-100.
+A score of 100 means essential/perfect match. A score of 0 means not relevant.
+
+TOOLS TO RATE:
+{chr(10).join(f"- Name: {tool['name']}\\n  Description: {tool['description']}" for tool in tools_for_llm_prompt_in_chunk)}
+
+Return a JSON object with a 'scores' key. 'scores' should be an array of numbers (0-100),
+corresponding to the tools in the order they were listed above.
+The array must have exactly {len(tools_for_llm_prompt_in_chunk)} scores.
+"""
+                scoring_response_schema = {
+                    "type": "object",
+                    "properties": {
+                        "scores": {
+                            "type": "array",
+                            "items": {"type": "number", "minimum": 0, "maximum": 100},
+                            "minItems": len(tools_for_llm_prompt_in_chunk),
+                            "maxItems": len(tools_for_llm_prompt_in_chunk),
+                        }
+                    },
+                    "required": ["scores"],
+                    "additionalProperties": False,
+                }
+
+                chunk_scores_list: List[float] = []
+                try:
+                    result = await self.query_llm_structured(
+                        prompt_messages=[{"role": "user", "content": prompt}],
+                        response_schema=scoring_response_schema,
+                        schema_name=f"tool_relevance_scoring_chunk_{len(tools_for_llm_prompt_in_chunk)}",
+                        model_override=fast_model,
+                        use_cheap_model=True,
+                    )
+                    chunk_scores_list = result.get("scores", [])
+                    if len(chunk_scores_list) != len(tools_for_llm_prompt_in_chunk):
+                        self.logger.warning(
+                            f"LLM returned {len(chunk_scores_list)} scores for {len(tools_for_llm_prompt_in_chunk)} tools in chunk. Padding/truncating."
+                        )
+                        # Pad or truncate
+                        if len(chunk_scores_list) < len(tools_for_llm_prompt_in_chunk):
+                            chunk_scores_list.extend([0.0] * (len(tools_for_llm_prompt_in_chunk) - len(chunk_scores_list)))  # Pad with 0 for missing
+                        else:
+                            chunk_scores_list = chunk_scores_list[: len(tools_for_llm_prompt_in_chunk)]
+                except Exception as e:
+                    self.logger.error(f"Tool ranking: LLM scoring for a chunk failed: {e}", exc_info=False)
+                    # Fallback: assign a low score (e.g., 0 or 5) to all tools in this failed chunk
+                    chunk_scores_list = [5.0] * len(tools_for_llm_prompt_in_chunk)
+
+                # Return list of (temp_id, score)
+                return [(tools_for_llm_prompt_in_chunk[i]["temp_id"], chunk_scores_list[i]) for i in range(len(tools_for_llm_prompt_in_chunk))]
+
+            # --- Execute scoring for all chunks in parallel ---
+            semaphore = asyncio.Semaphore(MAX_PARALLEL_SCORING_CALLS)
+            tasks = []
+
+            async def bound_score_chunk(chunk_data: List[Dict[str, Any]]):
+                async with semaphore:
+                    return await score_chunk(chunk_data)
+
+            for chunk_to_score in chunks_to_process:
+                tasks.append(bound_score_chunk(chunk_to_score))
+
+            chunk_results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for chunk_result in chunk_results_list:
+                if isinstance(chunk_result, Exception):
+                    self.logger.error(f"Tool ranking: A scoring chunk task failed: {chunk_result}")
+                    continue  # Skip this chunk's results
+                if isinstance(chunk_result, list):
+                    for temp_id, score in chunk_result:
+                        all_scores_by_temp_id[temp_id].append(score)
+
+            # --- Aggregate and Normalize Scores ---
+            final_tool_scores: List[Dict[str, Any]] = []
+            if not all_scores_by_temp_id:
+                self.logger.warning("Tool ranking: No scores were collected from any chunk. Falling back to all tools (unranked).")
+                return all_llm_formatted_tools[:limit]
+
+            # Find global min and max scores across all tools for normalization (if needed)
+            # For now, let's use averaging for overlapping tools.
+            # More sophisticated normalization (e.g., z-score per chunk then combine) could be added if simple averaging isn't good.
+
+            for tool_item in tools_with_ids:  # Iterate in original order
+                temp_id = tool_item["temp_id"]
+                scores_for_this_tool = all_scores_by_temp_id.get(temp_id, [])
+
+                if scores_for_this_tool:
+                    # Simple average for now. Could also do max, or weighted average.
+                    final_score = sum(scores_for_this_tool) / len(scores_for_this_tool)
                 else:
-                    tool_name = schema.get("name", f"tool_{i}")
-                    tool_desc = schema.get("description", "No description available")
-                
-                # Truncate very long descriptions
-                if len(tool_desc) > 200:
-                    tool_desc = tool_desc[:197] + "..."
-                
-                tools_for_scoring.append({
-                    "name": tool_name,
-                    "description": tool_desc,
-                    "index": i
-                })
-            
-            # Create LLM prompt for scoring
-            prompt = f"""You are an AI assistant helping to select the most relevant tools for a specific goal and phase.
+                    # Tool was in a chunk that failed or LLM didn't return score for it
+                    final_score = 5.0  # Default low score for tools that couldn't be scored
+                    self.logger.debug(f"Tool ranking: No LLM score for tool with temp_id {temp_id}, assigning default {final_score}.")
 
-    GOAL: {goal_desc}
-    PHASE: {phase}
+                original_schema = tool_item["schema"]
+                tool_name = original_schema.get("function", {}).get("name", original_schema.get("name", "unknown_tool"))
+                tool_desc = original_schema.get("function", {}).get("description", original_schema.get("description", "No description"))
 
-    PHASE CONTEXT:
-    - understand: Research, gather information, analyze existing data
-    - plan: Break down goals, create strategies, organize approach  
-    - execute: Create outputs, run code, build artifacts, take actions
-    - review: Validate results, check quality, verify completion
-
-    Rate each tool's relevance for this goal and phase on a scale of 0-100:
-    - 90-100: Essential/Perfect match for this goal and phase
-    - 70-89: Highly relevant and useful
-    - 50-69: Moderately relevant, could be helpful
-    - 30-49: Somewhat relevant in specific cases
-    - 10-29: Low relevance, unlikely to be needed
-    - 0-9: Not relevant for this goal/phase
-
-    TOOLS TO RATE:
-    {chr(10).join(f"{i+1}. {tool['name']}: {tool['description']}" for i, tool in enumerate(tools_for_scoring))}
-
-    Return a JSON object with a 'scores' array containing relevance scores (0-100) in the same order as the tools listed above."""
-
-            schema = {
-                "type": "object",
-                "properties": {
-                    "scores": {
-                        "type": "array",
-                        "items": {"type": "number", "minimum": 0, "maximum": 100},
-                        "minItems": len(tools_for_scoring),
-                        "maxItems": len(tools_for_scoring)
+                final_tool_scores.append(
+                    {
+                        "schema": original_schema,  # The full schema object
+                        "name": tool_name,
+                        "score": final_score,
+                        "description": tool_desc[:100],  # For logging or brief display
                     }
-                },
-                "required": ["scores"],
-                "additionalProperties": False,
-                "strict": True
-            }
-            
-            # Call LLM for scoring
-            try:
-                result = await self.query_llm_structured(
-                    prompt_messages=[{"role": "user", "content": prompt}],
-                    response_schema=schema,
-                    model_override=fast_model,
-                    use_cheap_model=True
                 )
-                scores = result.get("scores", [])
-                
-                if len(scores) != len(tools_for_scoring):
-                    self.logger.warning(f"LLM returned {len(scores)} scores for {len(tools_for_scoring)} tools")
-                    # Pad or truncate to match
-                    if len(scores) < len(tools_for_scoring):
-                        scores.extend([50.0] * (len(tools_for_scoring) - len(scores)))
-                    else:
-                        scores = scores[:len(tools_for_scoring)]
-                        
-            except Exception as e:
-                self.logger.warning(f"Fast LLM scoring failed: {e}, using fallback scoring")
-                # Fallback: simple heuristic scoring
-                scores = []
-                for tool in tools_for_scoring:
-                    score = 50.0  # Default moderate relevance
-                    tool_name_lower = tool["name"].lower()
-                    tool_desc_lower = tool["description"].lower()
-                    goal_lower = goal_desc.lower()
-                    
-                    # Phase-based scoring
-                    if phase == "understand":
-                        if any(keyword in tool_name_lower or keyword in tool_desc_lower 
-                            for keyword in ["search", "browse", "read", "query", "get", "analyze"]):
-                            score += 30
-                    elif phase == "plan":
-                        if any(keyword in tool_name_lower or keyword in tool_desc_lower 
-                            for keyword in ["goal", "plan", "create", "store", "memory"]):
-                            score += 30
-                    elif phase == "execute":
-                        if any(keyword in tool_name_lower or keyword in tool_desc_lower 
-                            for keyword in ["write", "execute", "create", "generate", "build"]):
-                            score += 30
-                    elif phase == "review":
-                        if any(keyword in tool_name_lower or keyword in tool_desc_lower 
-                            for keyword in ["get", "review", "analyze", "check", "validate"]):
-                            score += 30
-                    
-                    # Goal keyword matching
-                    goal_keywords = goal_lower.split()
-                    for keyword in goal_keywords:
-                        if len(keyword) > 3 and (keyword in tool_name_lower or keyword in tool_desc_lower):
-                            score += 10
-                    
-                    scores.append(min(score, 100.0))
-            
-            # Create scored tools list
-            scored_tools = []
-            for i, (tool_info, score) in enumerate(zip(tools_for_scoring, scores, strict=False)):
-                scored_tools.append({
-                    "schema": all_llm_formatted[tool_info["index"]],
-                    "name": tool_info["name"],
-                    "score": score,
-                    "description": tool_info["description"][:100]
-                })
-            
-            # Sort by score (highest first)
-            scored_tools.sort(key=lambda x: x["score"], reverse=True)
-            
-            # Filter by relevance threshold and limit
-            relevance_threshold = 40.0
+
+            # Sort by final aggregated score
+            final_tool_scores.sort(key=lambda x: x["score"], reverse=True)
+
+            # --- Select top 'limit' tools based on aggregated scores ---
+            # (The existing relevance_threshold logic can be applied here too if desired)
+
+            relevance_threshold = 40.0  # Default, can be configured
             high_relevance_threshold = 70.0
-            
-            highly_relevant = [tool for tool in scored_tools if tool["score"] >= high_relevance_threshold]
-            moderately_relevant = [tool for tool in scored_tools if relevance_threshold <= tool["score"] < high_relevance_threshold]
-            
-            # Strategy: prioritize highly relevant tools, fill remaining slots with moderately relevant
-            selected_tools = []
-            selected_tools.extend(highly_relevant[:limit])
-            
-            # Fill remaining slots with moderately relevant tools
-            remaining_slots = limit - len(selected_tools)
+
+            highly_relevant = [tool for tool in final_tool_scores if tool["score"] >= high_relevance_threshold]
+            moderately_relevant = [tool for tool in final_tool_scores if relevance_threshold <= tool["score"] < high_relevance_threshold]
+
+            selected_tools_data = []
+            selected_tools_data.extend(highly_relevant[:limit])
+
+            remaining_slots = limit - len(selected_tools_data)
             if remaining_slots > 0:
-                selected_tools.extend(moderately_relevant[:remaining_slots])
-            
-            # If we still don't have enough tools, lower the threshold
-            if len(selected_tools) < min(8, limit):
-                additional_needed = min(8, limit) - len(selected_tools)
-                lower_relevance = [tool for tool in scored_tools if tool["score"] < relevance_threshold]
-                selected_tools.extend(lower_relevance[:additional_needed])
-            
-            # Extract just the schemas for return
-            final_schemas = [tool["schema"] for tool in selected_tools]
-            
-            self.logger.info(f"Tool ranking: selected {len(final_schemas)} tools from {len(all_llm_formatted)} available")
-            
-            # FINAL SAFETY CHECK: Never return empty
-            if not final_schemas:
-                self.logger.error("Tool ranking returned empty - using fallback")
-                return all_llm_formatted[:limit]
-            
-            return final_schemas
-            
+                selected_tools_data.extend(moderately_relevant[:remaining_slots])
+
+            # If still not enough, take from lower scores (or from original list if all scores were low)
+            if len(selected_tools_data) < min(max(1, limit // 2), limit):  # Ensure we get at least a few if limit is small
+                additional_needed = limit - len(selected_tools_data)
+                lower_scored_tools = [tool for tool in final_tool_scores if tool["score"] < relevance_threshold and tool not in selected_tools_data]
+                selected_tools_data.extend(lower_scored_tools[:additional_needed])
+
+            final_selected_schemas = [tool_data["schema"] for tool_data in selected_tools_data]
+
+            self.logger.info(f"Tool ranking: Selected {len(final_selected_schemas)} tools after parallel chunk scoring & aggregation.")
+
+            if not final_selected_schemas and all_llm_formatted_tools:
+                self.logger.warning("Tool ranking returned empty after aggregation, using fallback (first 'limit' tools from all).")
+                return all_llm_formatted_tools[:limit]
+
+            return final_selected_schemas
+
         except Exception as e:
-            self.logger.error(f"Error in tool ranking: {e}")
-            # Fallback on error
-            if hasattr(self, "server_manager") and self.server_manager and self.server_manager.tools:
-                provider = self.get_provider_from_model(getattr(self.config, 'default_cheap_and_fast_model', 'gemini-2.5-flash-preview-05-20'))
-                if provider:
-                    all_tools = self._format_tools_for_provider(provider)
-                    return all_tools[:limit] if all_tools else []
+            self.logger.error(f"Tool ranking: Unexpected error in main logic: {e}", exc_info=True)
+            if all_llm_formatted_tools:  # Fallback on any unexpected error
+                return all_llm_formatted_tools[:limit]
             return []
-            
+
     async def cmd_discover(self, args: str):
         """Discover MCP servers on the network and filesystem."""
         safe_console = get_safe_console()
@@ -8045,18 +8153,18 @@ class MCPClient:
             #    - On successful parsing of UMS JSON: {"success": True, "actual_ums_key1": ..., "actual_ums_key2": ...}
             #    - On successful parsing of non-dict JSON (e.g. string from summarize_text): {"success": True, "_raw_non_dict_data": "string_content"}
             #    - On parsing failure: {"success": False, "error": "parse error msg", "error_type": "ParseErrorType", ...}
-            
+
             # ===== STREAMLINED RESPONSE LOGGING =====
             import json as json_lib
 
             from rich.console import Console
             from rich.panel import Panel
             from rich.syntax import Syntax
-            
+
             debug_console = Console()
-            
+
             parsed_dict_from_robust_parse = robust_parse_mcp_tool_content(raw_call_tool_result_obj.content)
-            
+
             # Only log the parsed result (since raw and final are nearly identical)
             try:
                 if isinstance(parsed_dict_from_robust_parse, dict):
@@ -8064,19 +8172,13 @@ class MCPClient:
                     syntax = Syntax(parsed_json, "json", theme="monokai", line_numbers=True)
                 else:
                     syntax = f"Non-dict result: {type(parsed_dict_from_robust_parse)} = {parsed_dict_from_robust_parse}"
-                
-                debug_console.print(Panel(
-                    syntax,
-                    title="🧩 Tool Result",
-                    border_style="green"
-                ))
+
+                debug_console.print(Panel(syntax, title="🧩 Tool Result", border_style="green"))
             except Exception as e:
-                debug_console.print(Panel(
-                    f"Failed to format result: {e}\nRaw: {parsed_dict_from_robust_parse}",
-                    title="🧩 Tool Result (Raw)",
-                    border_style="yellow"
-                ))
-            
+                debug_console.print(
+                    Panel(f"Failed to format result: {e}\nRaw: {parsed_dict_from_robust_parse}", title="🧩 Tool Result (Raw)", border_style="yellow")
+                )
+
             self.logger.debug(
                 f"MCPC._exec_tool_and_parse_FOR_AGENT: Result from robust_parse for '{tool_name_mcp}': "
                 f"Success Flag in Parsed: {parsed_dict_from_robust_parse.get('success', 'N/A')}, "
@@ -8087,50 +8189,39 @@ class MCPClient:
             if raw_call_tool_result_obj.isError:
                 # MCP transport layer reported an error (e.g., server unavailable after retries).
                 standard_agent_envelope["success"] = False
-                # The `parsed_dict_from_robust_parse` might be an error dict itself if content was an error message.
-                if isinstance(parsed_dict_from_robust_parse, dict) and not parsed_dict_from_robust_parse.get("success", True):
+                # Try to get more specific error from parsed content if available
+                if isinstance(parsed_dict_from_robust_parse, dict) and parsed_dict_from_robust_parse.get("success") is False:
                     standard_agent_envelope["error_message"] = parsed_dict_from_robust_parse.get(
-                        "error", f"Tool '{tool_name_mcp}' failed at MCP layer AND content parsing."
+                        "error", f"Tool '{tool_name_mcp}' failed at MCP layer and content parsing."
                     )
                     standard_agent_envelope["error_type"] = parsed_dict_from_robust_parse.get("error_type", "MCPTransportAndContentError_MCPC")
                     standard_agent_envelope["details"] = parsed_dict_from_robust_parse.get("details")
-                else:  # MCP error, but content parsing itself didn't yield a specific error struct.
-                    error_content_str = (
-                        str(raw_call_tool_result_obj.content) if raw_call_tool_result_obj.content is not None else "No content from MCP error"
-                    )
-                    standard_agent_envelope["error_message"] = (
-                        f"Tool '{tool_name_mcp}' failed at MCP transport layer. Error content: {error_content_str[:150]}"
-                    )
+                else:
+                    error_content_str = str(raw_call_tool_result_obj.content)[:150] if raw_call_tool_result_obj.content is not None else "No content"
+                    standard_agent_envelope["error_message"] = f"Tool '{tool_name_mcp}' failed at MCP transport layer. Content: {error_content_str}"
                     standard_agent_envelope["error_type"] = "MCPTransportError_MCPC"
-                # `data` might still contain the (potentially unparsed or error) content from MCP
-                standard_agent_envelope["data"] = (
-                    parsed_dict_from_robust_parse
-                    if isinstance(parsed_dict_from_robust_parse, dict)
-                    else {"_raw_content_on_mcp_error": str(raw_call_tool_result_obj.content)}
-                )
+                standard_agent_envelope["data"] = parsed_dict_from_robust_parse  # Still provide the (potentially error) data
 
             elif isinstance(parsed_dict_from_robust_parse, dict):
-                # MCP transport OK. The result of robust_parse dictates the envelope.
-                if parsed_dict_from_robust_parse.get("success") and "data" not in parsed_dict_from_robust_parse:
-                    # This is a successful UMS tool payload that needs to be wrapped in the data field
-                    standard_agent_envelope["success"] = True
-                    standard_agent_envelope["data"] = parsed_dict_from_robust_parse
-                    standard_agent_envelope["error_type"] = None
-                    standard_agent_envelope["error_message"] = None
-                else:
-                    # This is already in the standard envelope format (either error dict or already has data field)
+                # Case 1: robust_parse_mcp_tool_content itself returned a structured error envelope
+                if (
+                    parsed_dict_from_robust_parse.get("success") is False and "error_message" in parsed_dict_from_robust_parse
+                ):  # Check for error_message
                     standard_agent_envelope = parsed_dict_from_robust_parse.copy()
+                # Case 2: Successful parsing. The `parsed_dict_from_robust_parse` is the UMS tool's direct output.
+                # We need to wrap this into the standard agent envelope's "data" field.
+                else:
+                    standard_agent_envelope = {
+                        "success": True,  # This is the envelope's success
+                        "data": parsed_dict_from_robust_parse,  # The entire UMS tool's output goes here
+                        "error_type": None,
+                        "error_message": None,
+                    }
+                    # If parsed_dict_from_robust_parse *also* had its own "success" key (from UMS tool),
+                    # it will now be nested under "data". This is what AML expects.
 
-                # If UMS payload had success=True, but robust_parse had to wrap non-dict JSON,
-                # ensure `data` field holds the actual data.
-                if standard_agent_envelope.get("success") and "_raw_non_dict_data" in standard_agent_envelope:
-                    standard_agent_envelope["data"] = standard_agent_envelope.pop("_raw_non_dict_data")
-
-            elif parsed_dict_from_robust_parse is not None:  # Parsed to non-dict (e.g. string summary) and robust_parse didn't make it an error.
-                standard_agent_envelope["success"] = True
-                standard_agent_envelope["data"] = parsed_dict_from_robust_parse
-                standard_agent_envelope["error_type"] = None
-                standard_agent_envelope["error_message"] = None
+            elif parsed_dict_from_robust_parse is not None:  # Parsed to non-dict (e.g string summary)
+                standard_agent_envelope = {"success": True, "data": parsed_dict_from_robust_parse, "error_type": None, "error_message": None}
                 self.logger.debug(
                     f"MCPC._exec_tool_and_parse_FOR_AGENT: Tool '{tool_name_mcp}' returned non-dict success payload. Type: {type(parsed_dict_from_robust_parse)}"
                 )
@@ -8148,14 +8239,16 @@ class MCPClient:
             # ===== LOG PROCESSING SUMMARY =====
             try:
                 # Just log a concise summary since we already showed the tool result above
-                debug_console.print(Panel(
-                    f"[bold]Tool:[/] {tool_name_mcp}\n"
-                    f"[bold]Success:[/] {standard_agent_envelope.get('success', 'N/A')}\n"
-                    f"[bold]Error:[/] {standard_agent_envelope.get('error_message', 'None')}\n"
-                    f"[bold]Data Type:[/] {type(standard_agent_envelope.get('data', None)).__name__}",
-                    title="📊 Processing Summary",
-                    border_style="cyan"
-                ))
+                debug_console.print(
+                    Panel(
+                        f"[bold]Tool:[/] {tool_name_mcp}\n"
+                        f"[bold]Success:[/] {standard_agent_envelope.get('success', 'N/A')}\n"
+                        f"[bold]Error:[/] {standard_agent_envelope.get('error_message', 'None')}\n"
+                        f"[bold]Data Type:[/] {type(standard_agent_envelope.get('data', None)).__name__}",
+                        title="📊 Processing Summary",
+                        border_style="cyan",
+                    )
+                )
             except Exception as e:
                 self.logger.warning(f"Failed to log processing summary: {e}")
 
@@ -8289,86 +8382,59 @@ class MCPClient:
                 else:
                     delattr(self, "_current_safe_console")
 
-    @ensure_safe_console
     async def print_status(self):
-        """Print current status of servers, tools, and capabilities with progress bars"""
-        # Use the stored safe console instance to prevent multiple calls
-        safe_console = self._current_safe_console
+        """Print current status of servers, tools, and capabilities."""
+        safe_console = get_safe_console()  # Get console directly
 
-        # Helper function using the pre-compiled pattern (still needed for progress bar)
-        def apply_emoji_spacing(text: str) -> str:
-            if isinstance(text, str) and text and hasattr(self, "_emoji_space_pattern"):
-                try:  # Add try-except for robustness
-                    return self._emoji_space_pattern.sub(r"\1 \2", text)
-                except Exception as e:
-                    log.warning(f"Failed to apply emoji spacing regex in helper: {e}")
-            return text  # Return original text if not string, empty, pattern missing, or error
-
-        # Count connected servers, available tools/resources
         connected_servers = len(self.server_manager.active_sessions)
-        total_servers = len(self.config.servers)
+        total_servers = len(self.config.servers)  # Total configured servers
         total_tools = len(self.server_manager.tools)
         total_resources = len(self.server_manager.resources)
         total_prompts = len(self.server_manager.prompts)
 
-        # Print basic info table
-        status_table = Table(title="MCP Client Status", box=box.ROUNDED)  # Use a box style
-        status_table.add_column("Item", style="dim")  # Apply style to column
+        status_table = Table(title="MCP Client Status", box=box.ROUNDED)
+        status_table.add_column("Item", style="dim")
         status_table.add_column("Status", justify="right")
 
-        # --- Use Text.assemble for the first column ---
-        status_table.add_row(
-            Text.assemble(str(EMOJI_MAP["model"]), "Model"),  # Note the space before "Model"
-            self.current_model,
-        )
-        status_table.add_row(
-            Text.assemble(str(EMOJI_MAP["server"]), "Servers"),  # Note the space before "Servers"
-            f"{connected_servers}/{total_servers} connected",
-        )
-        status_table.add_row(
-            Text.assemble(str(EMOJI_MAP["tool"]), "Tools"),  # Note the space before "Tools"
-            str(total_tools),
-        )
-        status_table.add_row(
-            Text.assemble(str(EMOJI_MAP["resource"]), "Resources"),  # Note the space before "Resources"
-            str(total_resources),
-        )
-        status_table.add_row(
-            Text.assemble(str(EMOJI_MAP["prompt"]), "Prompts"),  # Note the space before "Prompts"
-            str(total_prompts),
-        )
-        # --- End Text.assemble usage ---
+        # Helper to apply emoji spacing
+        def apply_emoji_spacing(text: str) -> str:
+            if hasattr(self, "_emoji_space_pattern") and self._emoji_space_pattern and isinstance(text, str):
+                return self._emoji_space_pattern.sub(r"\1 \2", text)
+            return text
 
-        safe_console.print(status_table)  # Use the regular safe_print
+        status_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['model']} Model"), self.current_model)
+        status_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['server']} Servers"), f"{connected_servers}/{total_servers} connected")
+        status_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['tool']} Tools"), str(total_tools))
+        status_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['resource']} Resources"), str(total_resources))
+        status_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['prompt']} Prompts"), str(total_prompts))
+
+        safe_console.print(status_table)
 
         if hasattr(self, "cache_hit_count") and (self.cache_hit_count + self.cache_miss_count) > 0:
             cache_table = Table(title="Prompt Cache Statistics", box=box.ROUNDED)
             cache_table.add_column("Metric", style="dim")
             cache_table.add_column("Value", justify="right")
-
             hit_rate = self.cache_hit_count / (self.cache_hit_count + self.cache_miss_count) * 100
-
-            cache_table.add_row(Text.assemble(str(EMOJI_MAP["package"]), "Cache Hits"), str(self.cache_hit_count))
-            cache_table.add_row(Text.assemble(str(EMOJI_MAP["warning"]), "Cache Misses"), str(self.cache_miss_count))
-            cache_table.add_row(Text.assemble(str(EMOJI_MAP["success"]), "Hit Rate"), f"{hit_rate:.1f}%")
-            cache_table.add_row(Text.assemble(str(EMOJI_MAP["speech_balloon"]), "Tokens Saved"), f"{self.tokens_saved_by_cache:,}")
-
+            cache_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['package']} Cache Hits"), str(self.cache_hit_count))
+            cache_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['warning']} Cache Misses"), str(self.cache_miss_count))
+            cache_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['success']} Hit Rate"), f"{hit_rate:.1f}%")
+            cache_table.add_row(apply_emoji_spacing(f"{EMOJI_MAP['speech_balloon']} Tokens Saved"), f"{self.tokens_saved_by_cache:,}")
             safe_console.print(cache_table)
 
-        # Only show server progress if we have servers
-        if total_servers > 0:
-            server_tasks = []
-            for name, server in self.config.servers.items():
+        if connected_servers > 0:
+            safe_console.print("\n[bold]Connected Servers:[/]")
+            for name, server_config_obj in self.config.servers.items():  # Use a different variable name
                 if name in self.server_manager.active_sessions:
-                    # Apply spacing to progress description (keep using helper here)
-                    task_description = apply_emoji_spacing(f"{EMOJI_MAP['server']} {name} ({server.type.value})")
-                    server_tasks.append((self._display_server_status, task_description, (name, server)))
+                    server_tools_count = sum(1 for t in self.server_manager.tools.values() if t.server_name == name)
+                    metrics = server_config_obj.metrics
+                    health_status = metrics.status
+                    health_emoji = EMOJI_MAP.get(f"status_{health_status.value}", EMOJI_MAP["question_mark"])
+                    health_style = f"status.{health_status.value}" if health_status != ServerStatus.UNKNOWN else "dim"
+                    health_display = Text.assemble((health_emoji, health_style), f" {health_status.value.capitalize()}")
 
-            if server_tasks:
-                await self._run_with_progress(server_tasks, "Server Status", transient=False, use_health_scores=True)
+                    safe_console.print(f"[green]✓[/] {name} ({server_config_obj.type.value}) - {server_tools_count} tools - Health: {health_display}")
 
-        # Use safe_print for this final message too, in case emojis are added later
-        self.safe_print("[green]Ready to process queries![/green]")
+        self.safe_print("[green]Ready to process queries![/green]")  # Use the class's safe_print
 
     def _calculate_and_log_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
         """
@@ -9057,7 +9123,7 @@ class MCPClient:
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
         cost_usd: Optional[float] = None,
-        error: Optional[str] = None
+        error: Optional[str] = None,
     ) -> None:
         """
         Log cheap/fast LLM request with rich formatting and comprehensive details.
@@ -9066,10 +9132,10 @@ class MCPClient:
         from rich.panel import Panel
         from rich.table import Table
         from rich.text import Text
-        
+
         # Create a rich console for this specific log message
         safe_console = get_safe_console()
-        
+
         # Get request content (truncated)
         request_text = ""
         if prompt_messages:
@@ -9081,7 +9147,7 @@ class MCPClient:
                     request_text += f"[{msg.get('role', 'unknown')}] {content}"
                 request_text += "\n"
         request_text = request_text.strip()
-        
+
         # Get response content (truncated)
         response_text = ""
         if response_data:
@@ -9090,23 +9156,23 @@ class MCPClient:
                 response_text = f"{response_str[:200]}..."
             else:
                 response_text = response_str
-        
+
         # Create the main table
         info_table = Table(show_header=False, box=None, padding=(0, 1))
         info_table.add_column("Label", style="dim cyan", width=12)
         info_table.add_column("Value", style="white")
-        
+
         # Add rows
         info_table.add_row("🏷️ Schema", schema_name)
         info_table.add_row("🧠 Model", f"[green]{model_used}[/green]")
-        
+
         if input_tokens is not None:
             info_table.add_row("📥 Input", f"{input_tokens:,} tokens")
         if output_tokens is not None:
             info_table.add_row("📤 Output", f"{output_tokens:,} tokens")
         if cost_usd is not None:
             info_table.add_row("💰 Cost", f"${cost_usd:.6f}")
-        
+
         # Update totals
         self.cheap_request_count += 1
         if input_tokens:
@@ -9115,53 +9181,31 @@ class MCPClient:
             self.cheap_output_tokens += output_tokens
         if cost_usd:
             self.cheap_total_cost += cost_usd
-            
+
         info_table.add_row("📊 Session", f"{self.cheap_request_count} requests, ${self.cheap_total_cost:.4f} total")
-        
+
         # Show request content
         if request_text:
-            request_panel = Panel(
-                Text(request_text, style="dim white"),
-                title="📤 Request",
-                border_style="blue",
-                padding=(0, 1)
-            )
+            request_panel = Panel(Text(request_text, style="dim white"), title="📤 Request", border_style="blue", padding=(0, 1))
         else:
             request_panel = Panel("[dim]No request content[/dim]", title="📤 Request", border_style="dim")
-        
+
         # Show response content or error
         if error:
-            response_panel = Panel(
-                Text(error, style="red"),
-                title="❌ Error",
-                border_style="red",
-                padding=(0, 1)
-            )
+            response_panel = Panel(Text(error, style="red"), title="❌ Error", border_style="red", padding=(0, 1))
         elif response_text:
-            response_panel = Panel(
-                Text(response_text, style="green"),
-                title="📥 Response",
-                border_style="green",
-                padding=(0, 1)
-            )
+            response_panel = Panel(Text(response_text, style="green"), title="📥 Response", border_style="green", padding=(0, 1))
         else:
             response_panel = Panel("[dim]No response content[/dim]", title="📥 Response", border_style="dim")
-        
+
         # Create columns layout
-        columns = Columns([
-            Panel(info_table, title="ℹ️ Details", border_style="cyan", padding=(0, 1)),
-            request_panel,
-            response_panel
-        ], equal=True, expand=True)
-        
-        # Main panel with icon
-        main_panel = Panel(
-            columns,
-            title="⚡ Cheap & Fast LLM Request",
-            border_style="cyan",
-            padding=(1, 1)
+        columns = Columns(
+            [Panel(info_table, title="ℹ️ Details", border_style="cyan", padding=(0, 1)), request_panel, response_panel], equal=True, expand=True
         )
-        
+
+        # Main panel with icon
+        main_panel = Panel(columns, title="⚡ Cheap & Fast LLM Request", border_style="cyan", padding=(1, 1))
+
         # Print with proper spacing
         safe_console.print()
         safe_console.print(main_panel)
@@ -9172,10 +9216,10 @@ class MCPClient:
         Calculate the cost in USD for a given model and token usage.
         """
         model_costs = COST_PER_MILLION_TOKENS.get(model_name, {"input": 0, "output": 0})
-        
+
         input_cost = (input_tokens / 1_000_000) * model_costs["input"]
         output_cost = (output_tokens / 1_000_000) * model_costs["output"]
-        
+
         return input_cost + output_cost
 
     def _extract_token_usage(self, response: Any) -> tuple[Optional[int], Optional[int]]:
@@ -9185,29 +9229,29 @@ class MCPClient:
         """
         try:
             # Handle different response structures
-            if hasattr(response, 'usage'):
+            if hasattr(response, "usage"):
                 # OpenAI-style response
                 usage = response.usage
-                if hasattr(usage, 'prompt_tokens') and hasattr(usage, 'completion_tokens'):
+                if hasattr(usage, "prompt_tokens") and hasattr(usage, "completion_tokens"):
                     return usage.prompt_tokens, usage.completion_tokens
-                elif hasattr(usage, 'input_tokens') and hasattr(usage, 'output_tokens'):
+                elif hasattr(usage, "input_tokens") and hasattr(usage, "output_tokens"):
                     return usage.input_tokens, usage.output_tokens
-            
+
             # Handle dict-style response
             if isinstance(response, dict):
-                usage = response.get('usage', {})
-                if 'prompt_tokens' in usage and 'completion_tokens' in usage:
-                    return usage['prompt_tokens'], usage['completion_tokens']
-                elif 'input_tokens' in usage and 'output_tokens' in usage:
-                    return usage['input_tokens'], usage['output_tokens']
-            
+                usage = response.get("usage", {})
+                if "prompt_tokens" in usage and "completion_tokens" in usage:
+                    return usage["prompt_tokens"], usage["completion_tokens"]
+                elif "input_tokens" in usage and "output_tokens" in usage:
+                    return usage["input_tokens"], usage["output_tokens"]
+
             # Handle Anthropic-style response
-            if hasattr(response, 'input_tokens') and hasattr(response, 'output_tokens'):
+            if hasattr(response, "input_tokens") and hasattr(response, "output_tokens"):
                 return response.input_tokens, response.output_tokens
-            
+
         except Exception as e:
             log.debug(f"Could not extract token usage: {e}")
-        
+
         return None, None
 
     def get_session_stats(self) -> Dict[str, Any]:
@@ -9218,7 +9262,7 @@ class MCPClient:
         cheap_total_tokens = self.cheap_input_tokens + self.cheap_output_tokens
         grand_total_tokens = total_tokens + cheap_total_tokens
         grand_total_cost = self.session_total_cost + self.cheap_total_cost
-        
+
         return {
             "regular_requests": {
                 "input_tokens": self.session_input_tokens,
@@ -9227,20 +9271,20 @@ class MCPClient:
                 "total_cost": self.session_total_cost,
                 "cache_hits": self.cache_hit_count,
                 "cache_misses": self.cache_miss_count,
-                "tokens_saved": self.tokens_saved_by_cache
+                "tokens_saved": self.tokens_saved_by_cache,
             },
             "cheap_requests": {
                 "request_count": self.cheap_request_count,
                 "input_tokens": self.cheap_input_tokens,
                 "output_tokens": self.cheap_output_tokens,
                 "total_tokens": cheap_total_tokens,
-                "total_cost": self.cheap_total_cost
+                "total_cost": self.cheap_total_cost,
             },
             "grand_totals": {
                 "total_tokens": grand_total_tokens,
                 "total_cost": grand_total_cost,
-                "total_requests": self.cache_hit_count + self.cache_miss_count + self.cheap_request_count
-            }
+                "total_requests": self.cache_hit_count + self.cache_miss_count + self.cheap_request_count,
+            },
         }
 
     def print_session_stats(self) -> None:
@@ -9249,10 +9293,10 @@ class MCPClient:
         """
         from rich.panel import Panel
         from rich.table import Table
-        
+
         stats = self.get_session_stats()
         safe_console = get_safe_console()
-        
+
         # Create main stats table
         stats_table = Table(show_header=True, box=box.ROUNDED)
         stats_table.add_column("Category", style="cyan", width=15)
@@ -9261,7 +9305,7 @@ class MCPClient:
         stats_table.add_column("Output Tokens", justify="right", style="green")
         stats_table.add_column("Total Tokens", justify="right", style="yellow")
         stats_table.add_column("Cost (USD)", justify="right", style="red")
-        
+
         # Regular requests
         reg = stats["regular_requests"]
         stats_table.add_row(
@@ -9270,9 +9314,9 @@ class MCPClient:
             f"{reg['input_tokens']:,}",
             f"{reg['output_tokens']:,}",
             f"{reg['total_tokens']:,}",
-            f"${reg['total_cost']:.4f}"
+            f"${reg['total_cost']:.4f}",
         )
-        
+
         # Cheap requests
         cheap = stats["cheap_requests"]
         stats_table.add_row(
@@ -9281,9 +9325,9 @@ class MCPClient:
             f"{cheap['input_tokens']:,}",
             f"{cheap['output_tokens']:,}",
             f"{cheap['total_tokens']:,}",
-            f"${cheap['total_cost']:.4f}"
+            f"${cheap['total_cost']:.4f}",
         )
-        
+
         # Totals
         total = stats["grand_totals"]
         stats_table.add_row(
@@ -9293,9 +9337,9 @@ class MCPClient:
             f"{reg['output_tokens'] + cheap['output_tokens']:,}",
             f"{total['total_tokens']:,}",
             f"${total['total_cost']:.4f}",
-            style="bold"
+            style="bold",
         )
-        
+
         # Cache stats
         cache_table = Table(show_header=False, box=None)
         cache_table.add_column("Metric", style="dim")
@@ -9303,7 +9347,7 @@ class MCPClient:
         cache_table.add_row("Cache Hits", f"{reg['cache_hits']:,}")
         cache_table.add_row("Cache Misses", f"{reg['cache_misses']:,}")
         cache_table.add_row("Tokens Saved", f"{reg['tokens_saved']:,}")
-        
+
         # Print results
         safe_console.print(Panel(stats_table, title="📈 Session Statistics", border_style="green"))
         safe_console.print(Panel(cache_table, title="💾 Cache Statistics", border_style="blue"))
@@ -9316,15 +9360,15 @@ class MCPClient:
         temperature: Optional[float] = None,
         stream: bool = False,
         use_cheap_model: bool = True,
-        response_format: Optional[Dict[str, Any]] = None
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Optional[Any]:
         """
         Execute a lightweight LLM query without MCP tools, optimized for simple classification/scoring tasks.
-        
+
         This method is designed for simple LLM requests that don't need the full MCP tool payload,
         such as classification, scoring, semantic analysis, etc. It uses a cheaper, faster model
         by default to optimize costs for these simple operations.
-        
+
         Args:
             prompt_messages: List of message dictionaries with 'role' and 'content' keys
             model_override: Specific model to use (overrides cheap model selection)
@@ -9333,7 +9377,7 @@ class MCPClient:
             stream: Whether to stream the response (currently not supported, always False)
             use_cheap_model: Whether to use the cheap model (True by default)
             response_format: Optional structured output format (e.g., JSON schema)
-            
+
         Returns:
             Response object with .content attribute containing the generated text
         """
@@ -9343,7 +9387,7 @@ class MCPClient:
             target_model = model_override
         elif use_cheap_model:
             # Get cheap model from config (which handles environment variables via decouple)
-            cheap_model = getattr(self.config, 'default_cheap_and_fast_model', None)
+            cheap_model = getattr(self.config, "default_cheap_and_fast_model", None)
             if cheap_model:
                 target_model = cheap_model
                 log.debug(f"query_llm: Using cheap model from config: {cheap_model}")
@@ -9352,18 +9396,15 @@ class MCPClient:
                 log.debug(f"query_llm: No cheap model configured, using current model: {target_model}")
         else:
             target_model = self.current_model
-            
+
         # Set defaults optimized for simple queries
         max_tokens_to_use = max_tokens or 500  # Cap at 500 for cheap requests
         temperature_to_use = temperature if temperature is not None else 0.1  # Lower temp for classification
-        
+
         # Convert to internal message format
         internal_messages = []
         for msg in prompt_messages:
-            internal_messages.append({
-                "role": msg.get("role", "user"),
-                "content": msg.get("content", "")
-            })
+            internal_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
 
         log.debug(f"query_llm: Model='{target_model}', Use Cheap={use_cheap_model}, Max Tokens={max_tokens_to_use}")
 
@@ -9372,7 +9413,7 @@ class MCPClient:
             accumulated_text = ""
             had_error = False
             error_message = ""
-            
+
             # Collect the streamed response
             async for chunk_type, chunk_data in self.process_streaming_query(
                 query="",  # Empty since we're using messages_override
@@ -9381,8 +9422,8 @@ class MCPClient:
                 temperature=temperature_to_use,
                 messages_override=internal_messages,
                 tools_override=[],  # Disable all tools for lightweight queries
-                force_structured_output=bool(response_format),
-                ums_tool_schemas=None  # No UMS tools needed
+                response_format=response_format,  # Pass response_format
+                ums_tool_schemas=None,  # No UMS tools needed
             ):
                 if chunk_type == "text_chunk":
                     accumulated_text += str(chunk_data)
@@ -9392,7 +9433,7 @@ class MCPClient:
                     log.error(f"query_llm error: {error_message}")
                     break
                 # Ignore other chunk types (status, tool_call_*, final_usage, etc.)
-            
+
             if had_error:
                 log.error(f"query_llm failed: {error_message}")
                 return None
@@ -9408,7 +9449,7 @@ class MCPClient:
             else:
                 log.warning("query_llm: No content received from LLM")
                 return None
-                
+
         except Exception as e:
             log.error(f"query_llm unexpected error: {e}", exc_info=True)
             return None
@@ -9421,23 +9462,23 @@ class MCPClient:
         model_override: Optional[str] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
-        use_cheap_model: bool = True
+        use_cheap_model: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """
         Execute a structured LLM query that returns JSON according to a schema.
-        
+
         This method uses proper OpenAI-compatible structured output formatting
         for reliable JSON schema adherence.
-        
+
         Args:
             prompt_messages: List of message dictionaries
             response_schema: JSON schema for the expected response structure
             schema_name: Name for the schema (used by OpenAI structured output)
             model_override: Specific model to use
-            max_tokens: Maximum tokens for response  
+            max_tokens: Maximum tokens for response
             temperature: Temperature for generation
             use_cheap_model: Whether to use the cheap model
-            
+
         Returns:
             Parsed JSON response as a dictionary, or None if failed
         """
@@ -9446,24 +9487,24 @@ class MCPClient:
         if model_override:
             target_model = model_override
         elif use_cheap_model:
-            cheap_model = getattr(self.config, 'default_cheap_and_fast_model', None)
+            cheap_model = getattr(self.config, "default_cheap_and_fast_model", None)
             target_model = cheap_model if cheap_model else self.current_model
         else:
             target_model = self.current_model
-            
+
         provider_name = self.get_provider_from_model(target_model)
-        
+
         # Prepare structured output format based on provider and model capabilities
         structured_format = None
-        
+
         # Check if model supports json_schema format (OpenAI structured outputs)
         actual_model_name = target_model
         providers_to_strip = [Provider.OPENROUTER.value, Provider.GROQ.value, Provider.CEREBRAS.value]
         if provider_name in providers_to_strip:
             prefix_to_strip = f"{provider_name}/"
             if target_model.lower().startswith(prefix_to_strip):
-                actual_model_name = target_model[len(prefix_to_strip):]
-        
+                actual_model_name = target_model[len(prefix_to_strip) :]
+
         if actual_model_name in MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT:
             # Use full JSON Schema with strict mode
             structured_format = {
@@ -9472,128 +9513,173 @@ class MCPClient:
                     "name": schema_name,
                     "description": f"Structured response for {schema_name}",
                     "strict": True,
-                    "schema": response_schema
-                }
+                    "schema": response_schema,
+                },
             }
         elif actual_model_name in MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT or provider_name in [
-            Provider.DEEPSEEK.value, Provider.GEMINI.value, Provider.GROK.value, 
-            Provider.GROQ.value, Provider.CEREBRAS.value, Provider.OPENROUTER.value
+            Provider.DEEPSEEK.value,
+            Provider.GEMINI.value,
+            Provider.GROK.value,
+            Provider.GROQ.value,
+            Provider.CEREBRAS.value,
+            Provider.OPENROUTER.value,
         ]:
             # Fallback to json_object mode
             structured_format = {"type": "json_object"}
         else:
             # No structured output support, will rely on prompt instructions
             structured_format = None
-            
+
         log.debug(f"query_llm_structured: Using format {structured_format} for model {target_model}")
-        
+
+        # Call _stream_wrapper, passing all structured output related parameters
+        # This will use the passed `response_format` and `structured_format` if provided.
+        stream_response_generator = self._stream_wrapper(
+            query="",  # No direct query text, messages_override is the source
+            model=target_model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages_override=prompt_messages,  # The messages to send
+            tools_override=[],  # No tools for structured calls, only JSON
+            response_format=structured_format,  # This is the key for structured output
+            ums_tool_schemas=None,  # No UMS tools for these calls
+        )
+
+        # Consume the stream to get the full content
+        accumulated_text = ""
+        final_stop_reason = "unknown"
+        final_input_tokens = None
+        final_output_tokens = None
+
+        async for chunk_type, chunk_data in stream_response_generator:
+            if chunk_type == "text_chunk":
+                accumulated_text += str(chunk_data)
+            elif chunk_type == "stop_reason":
+                final_stop_reason = str(chunk_data)
+            elif chunk_type == "final_usage":
+                final_input_tokens = chunk_data.get("input_tokens")
+                final_output_tokens = chunk_data.get("output_tokens")
+
+        # Extract token usage and calculate cost
+        cost_usd = None
+        if final_input_tokens is not None and final_output_tokens is not None:
+            cost_usd = self._calculate_token_cost(target_model, final_input_tokens, final_output_tokens)
+
+        # Rich logging of LLM call details
+        import json
+
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.syntax import Syntax
+        from rich.traceback import Traceback, install
+
+        # Install rich traceback handling globally for beautiful error display
+        install(show_locals=True)
+
+        console = Console()
+
+        # Log the LLM call input with rich formatting
         try:
-            # Use the basic query_llm with structured format
-            response = await self.query_llm(
-                prompt_messages=prompt_messages,
-                model_override=target_model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                use_cheap_model=False,  # We already determined the model above
-                response_format=structured_format
+            prompt_preview = (
+                json.dumps(prompt_messages, indent=2)[:500] + "..." if len(str(prompt_messages)) > 500 else json.dumps(prompt_messages, indent=2)
             )
-            
-            # Extract token usage and calculate cost
-            input_tokens, output_tokens = self._extract_token_usage(response)
-            cost_usd = None
-            if input_tokens and output_tokens:
-                cost_usd = self._calculate_token_cost(target_model, input_tokens, output_tokens)
-            
-            if response and hasattr(response, 'content') and response.content:
-                # Try to parse as JSON
-                import json
-                try:
-                    parsed_json = json.loads(response.content.strip())
-                    
-                    # Log successful cheap request
-                    self._log_cheap_request(
-                        prompt_messages=prompt_messages,
-                        schema_name=schema_name,
-                        model_used=target_model,
-                        response_data=parsed_json,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cost_usd=cost_usd
-                    )
-                    
-                    return parsed_json
-                except json.JSONDecodeError as e:
-                    error_msg = f"Failed to parse JSON response: {e}"
-                    log.warning(f"query_llm_structured: {error_msg}")
-                    log.debug(f"Raw response: {response.content}")
-                    
-                    # Try to extract JSON from markdown or repair it
-                    try:
-                        from mcp_client_multi import extract_json_from_markdown
-                        repaired_json = extract_json_from_markdown(response.content)
-                        if repaired_json:
-                            try:
-                                parsed_json = json.loads(repaired_json)
-                                
-                                # Log successful repair
-                                self._log_cheap_request(
-                                    prompt_messages=prompt_messages,
-                                    schema_name=schema_name,
-                                    model_used=target_model,
-                                    response_data=parsed_json,
-                                    input_tokens=input_tokens,
-                                    output_tokens=output_tokens,
-                                    cost_usd=cost_usd
-                                )
-                                
-                                return parsed_json
-                            except json.JSONDecodeError:
-                                log.warning(f"query_llm_structured: JSON repair also failed")
-                    except ImportError:
-                        log.debug("extract_json_from_markdown not available")
-                    
-                    # Log failed request
-                    self._log_cheap_request(
-                        prompt_messages=prompt_messages,
-                        schema_name=schema_name,
-                        model_used=target_model,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        cost_usd=cost_usd,
-                        error=error_msg
-                    )
-                    
-                    return None
-            else:
-                error_msg = "No content received from LLM"
-                log.warning(f"query_llm_structured: {error_msg}")
-                
-                # Log failed request
-                self._log_cheap_request(
-                    prompt_messages=prompt_messages,
-                    schema_name=schema_name,
-                    model_used=target_model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cost_usd=cost_usd,
-                    error=error_msg
+            console.print(
+                Panel(
+                    Syntax(prompt_preview, "json", theme="monokai"),
+                    title=f"🤖 LLM Structured Call: {target_model} | Schema: {schema_name}",
+                    border_style="blue",
                 )
-                
-                return None
-                
-        except Exception as e:
-            error_msg = f"query_llm_structured error: {e}"
-            log.error(error_msg, exc_info=True)
-            
-            # Log failed request
+            )
+        except Exception:
+            console.print(f"🤖 LLM Structured Call: {target_model} | Schema: {schema_name}")
+
+        if not accumulated_text:
+            error_msg = f"No content received from LLM model {target_model}. Stop reason: {final_stop_reason}"
+            console.print(
+                Panel(
+                    f"❌ [bold red]FAILED[/bold red]: {error_msg}\n"
+                    f"Model: {target_model}\n"
+                    f"Schema: {schema_name}\n"
+                    f"Response content: {accumulated_text}",
+                    title="🚨 LLM No Content Error",
+                    border_style="red",
+                )
+            )
             self._log_cheap_request(
                 prompt_messages=prompt_messages,
                 schema_name=schema_name,
                 model_used=target_model,
-                error=error_msg
+                input_tokens=final_input_tokens,
+                output_tokens=final_output_tokens,
+                cost_usd=cost_usd,
+                error=error_msg,
             )
-            
-            return None
+            raise RuntimeError(error_msg)
+
+        # Parse as JSON - no fallbacks, no repair attempts
+        try:
+            parsed_json = json.loads(accumulated_text.strip())
+
+            # Log successful response with rich formatting
+            try:
+                response_preview = (
+                    json.dumps(parsed_json, indent=2)[:300] + "..." if len(str(parsed_json)) > 300 else json.dumps(parsed_json, indent=2)
+                )
+                console.print(
+                    Panel(
+                        Syntax(response_preview, "json", theme="monokai"),
+                        title=f"✅ LLM Success: {target_model} | Tokens: {final_input_tokens}→{final_output_tokens}",
+                        border_style="green",
+                    )
+                )
+            except Exception:
+                console.print(f"✅ LLM Success: {target_model} | Response length: {len(str(parsed_json))}")
+
+        except json.JSONDecodeError as e:
+            error_msg = f"Model {target_model} returned invalid JSON for schema {schema_name}: {e}. Raw response: {accumulated_text[:500]}..."
+
+            # Rich error display with full context
+            console.print(
+                Panel(
+                    f"❌ [bold red]JSON DECODE FAILED[/bold red]\n"
+                    f"Model: {target_model}\n"
+                    f"Schema: {schema_name}\n"
+                    f"Error: {e}\n"
+                    f"Error location: line {e.lineno}, col {e.colno}\n"
+                    f"Raw response length: {len(accumulated_text)} chars\n\n"
+                    f"[yellow]Raw Response:[/yellow]\n{accumulated_text[:500]}{'...' if len(accumulated_text) > 500 else ''}",
+                    title="🚨 JSON Parse Error",
+                    border_style="red",
+                )
+            )
+
+            # Also show the rich traceback
+            console.print(Traceback.from_exception(type(e), e, e.__traceback__, show_locals=True))
+
+            # Log the error to the cheap request log
+            self._log_cheap_request(
+                prompt_messages=prompt_messages,
+                schema_name=schema_name,
+                model_used=target_model,
+                input_tokens=final_input_tokens,
+                output_tokens=final_output_tokens,
+                cost_usd=cost_usd,
+                error=error_msg,
+            )
+            raise ValueError(error_msg) from e
+
+        # Log successful request
+        self._log_cheap_request(
+            prompt_messages=prompt_messages,
+            schema_name=schema_name,
+            model_used=target_model,
+            response_data=parsed_json,
+            input_tokens=final_input_tokens,
+            output_tokens=final_output_tokens,
+            cost_usd=cost_usd,
+        )
+
+        return parsed_json
 
     async def summarize_conversation(self, target_tokens: Optional[int] = None, model: Optional[str] = None) -> Optional[str]:
         """
@@ -10249,37 +10335,10 @@ class MCPClient:
         await self.start_local_discovery_monitoring()
 
         # --- 9. Connect to Enabled MCP Servers ---
-        servers_to_connect = {name: cfg for name, cfg in self.config.servers.items() if cfg.enabled}
-        if servers_to_connect:
-            self.safe_print(f"[bold blue]Connecting to {len(servers_to_connect)} MCP servers...[/]")
-            connection_results = {}
-            for name, server_config in list(servers_to_connect.items()):
-                self.safe_print(f"[cyan]Connecting to MCP server {name}...[/]")
-                try:
-                    session = await self.server_manager.connect_to_server(server_config)
-                    # Name might have changed during connection due to identification
-                    final_name = server_config.name
-                    connection_results[name] = session is not None
-                    if session:
-                        self.safe_print(f"  {EMOJI_MAP['success']} Connected to {final_name}")
-                    else:
-                        log.warning(f"Failed connect MCP server: {name}")
-                        self.safe_print(f"  {EMOJI_MAP['warning']} Failed connect {name}")
-                except Exception as e:
-                    log.error(f"Exception connecting MCP server {name}", exc_info=True)
-                    self.safe_print(f"  {EMOJI_MAP['error']} Error connect {name}: {e}")
-                    connection_results[name] = False
+        log.info("MCPClient.setup: Calling ServerManager.connect_to_servers() to connect enabled/configured servers.")
+        await self.server_manager.connect_to_servers()  # This method will also start the server_monitor
 
-        # --- 10. Start Server Monitoring ---
-        try:
-            with Status(f"{EMOJI_MAP['server']} Starting server monitoring...", spinner="dots", console=safe_console) as status:
-                await self.server_monitor.start_monitoring()
-                status.update(f"{EMOJI_MAP['success']} Server monitoring started")
-        except Exception as monitor_error:
-            log.error("Failed start server monitor", exc_info=True)
-            self.safe_print(f"[red]Error starting monitor: {monitor_error}[/red]")
-
-        # --- 11. Display Final Status ---
+        # --- 10. Display Final Status ---
         try:
             log.info("Displaying simple status at end of setup...")
             await self.print_simple_status()
@@ -10960,18 +11019,16 @@ class MCPClient:
             log.warning(f"MCPC: Error relaying agent LLM event '{prefixed_event_type}' to UI: {e}", exc_info=False)
 
     def _detect_ums_tool_in_request(
-        self, 
-        formatted_tools_for_api: List[Dict[str, Any]], 
-        ums_tool_schemas: Dict[str, Dict[str, Any]]
+        self, formatted_tools_for_api: List[Dict[str, Any]], ums_tool_schemas: Dict[str, Dict[str, Any]]
     ) -> Optional[str]:
         """
         Detect if exactly one UMS tool is available for structured output.
-        
+
         Returns the LLM-seen tool name if exactly one UMS tool is available,
         None otherwise (to avoid schema conflicts with multiple UMS tools).
         """
         ums_tools_found = []
-        
+
         for tool_def in formatted_tools_for_api:
             tool_name = None
             if isinstance(tool_def, dict):
@@ -10979,10 +11036,10 @@ class MCPClient:
                     tool_name = tool_def["function"].get("name")
                 else:
                     tool_name = tool_def.get("name")
-            
+
             if tool_name and tool_name in ums_tool_schemas:
                 ums_tools_found.append(tool_name)
-        
+
         # Only apply structured output if exactly one UMS tool is available
         # This avoids schema conflicts and ensures the right schema is used
         if len(ums_tools_found) == 1:
@@ -10995,11 +11052,7 @@ class MCPClient:
             return None
 
     def _apply_ums_structured_output(
-        self, 
-        completion_params: Dict[str, Any], 
-        schema_for_tool: Dict[str, Any], 
-        model_name: str, 
-        provider_name: str
+        self, completion_params: Dict[str, Any], schema_for_tool: Dict[str, Any], model_name: str, provider_name: str
     ) -> None:
         """
         Apply structured output for UMS tools using OpenAI-compatible providers.
@@ -11013,7 +11066,7 @@ class MCPClient:
             elif provider_name == Provider.MISTRAL.value:
                 if model_name.lower() in MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA:
                     use_json_schema_format = True
-            
+
             if use_json_schema_format:
                 completion_params["response_format"] = {
                     "type": "json_schema",
@@ -11021,13 +11074,18 @@ class MCPClient:
                         "name": f"ums_tool_structured_output",
                         "description": "Structured output for UMS tool call",
                         "strict": True,
-                        "schema": schema_for_tool
-                    }
+                        "schema": schema_for_tool,
+                    },
                 }
                 log.info(f"[{provider_name}] Applied json_schema structured output for UMS tool on model {model_name}")
-            elif any(prefix in model_name.lower() for prefix in MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT) or \
-                 provider_name in [Provider.DEEPSEEK.value, Provider.GEMINI.value, Provider.GROK.value, 
-                                  Provider.GROQ.value, Provider.CEREBRAS.value, Provider.OPENROUTER.value]:
+            elif any(prefix in model_name.lower() for prefix in MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT) or provider_name in [
+                Provider.DEEPSEEK.value,
+                Provider.GEMINI.value,
+                Provider.GROK.value,
+                Provider.GROQ.value,
+                Provider.CEREBRAS.value,
+                Provider.OPENROUTER.value,
+            ]:
                 completion_params["response_format"] = {"type": "json_object"}
                 log.info(f"[{provider_name}] Applied json_object structured output for UMS tool on model {model_name}")
             else:
@@ -11036,25 +11094,22 @@ class MCPClient:
             log.error(f"[{provider_name}] Error applying UMS structured output: {e}", exc_info=False)
             # Continue without structured output rather than failing the request
 
-    def _apply_ums_structured_output_anthropic(
-        self, 
-        stream_params: Dict[str, Any], 
-        schema_for_tool: Dict[str, Any], 
-        tool_name: str
-    ) -> None:
+    def _apply_ums_structured_output_anthropic(self, stream_params: Dict[str, Any], schema_for_tool: Dict[str, Any], tool_name: str) -> None:
         """
         Apply structured output for UMS tools using Anthropic by modifying the system prompt.
         """
         try:
-            structured_instruction = f"\n\nVERY IMPORTANT: When calling the tool '{tool_name}', you MUST respond with valid JSON that exactly matches this schema:\n"
+            structured_instruction = (
+                f"\n\nVERY IMPORTANT: When calling the tool '{tool_name}', you MUST respond with valid JSON that exactly matches this schema:\n"
+            )
             structured_instruction += f"```json\n{json.dumps(schema_for_tool, indent=2)}\n```\n"
             structured_instruction += "Ensure all required fields are included and follow the exact structure shown above."
-            
+
             if stream_params.get("system"):
                 stream_params["system"] = stream_params["system"] + structured_instruction
             else:
                 stream_params["system"] = structured_instruction
-            
+
             log.info(f"[anthropic] Applied structured output instruction for UMS tool: {tool_name}")
         except Exception as e:
             log.error(f"[anthropic] Error applying UMS structured output: {e}", exc_info=False)
@@ -11069,31 +11124,38 @@ class MCPClient:
         messages_override: Optional[InternalMessageList] = None,
         tools_override: Optional[List[Dict[str, Any]]] = None,
         ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
-        force_structured_output: bool = False,
+        response_format: Optional[Dict[str, Any]] = None,
         force_tool_choice: Optional[str] = None,
-        ums_tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,  # NEW: For UMS structured outputs
+        ums_tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,  # For UMS structured outputs
+        # These are now passed from _stream_wrapper
+        span: Optional[trace.Span] = None,
+        is_agent_llm_turn: bool = False,
+        final_response_text_for_chat_history_log: str = "",
+        servers_used_this_query_session: Optional[Set[str]] = None,
+        tools_used_this_query_session: Optional[List[str]] = None,
+        start_time_overall_query: Optional[float] = None,
     ) -> AsyncGenerator[Tuple[str, Any], None]:
-        span: Optional[trace.Span] = None
-        span_context_manager = None
+        # span is now passed as parameter from _stream_wrapper
         current_task = asyncio.current_task()
         overall_query_stop_reason: Optional[str] = "processing"
         overall_query_error_occurred = False
         retrying_without_tools = False
-        is_agent_llm_turn = messages_override is not None
+        closed_by_generator_exit = False  # Add this flag
 
-        if not hasattr(self, "session_input_tokens") or is_agent_llm_turn:
-            self.session_input_tokens = 0
-            self.session_output_tokens = 0
-            self.session_total_cost = 0.0
-            self.cache_hit_count = 0
-            self.tokens_saved_by_cache = 0
+        # Initialize accumulator variables with defaults if not provided
+        if servers_used_this_query_session is None:
+            servers_used_this_query_session = set()
+        if tools_used_this_query_session is None:
+            tools_used_this_query_session = []
+        if start_time_overall_query is None:
+            start_time_overall_query = time.time()
 
         cache_hits_this_query_for_tools: int = 0
         tokens_saved_by_tool_cache_this_query: int = 0
         tool_execution_details_for_client_log: List[Dict] = []
+        current_llm_turn_api_error: Optional[str] = None  # Moved to higher scope for finally block access
 
         with safe_stdout():
-            start_time_overall_query = time.time()
             internal_model_name_for_cost_lookup = model or self.current_model
             if not max_tokens:
                 max_tokens = self.config.default_max_tokens
@@ -11125,21 +11187,6 @@ class MCPClient:
                 f"MCPC Streaming Query: Provider='{provider_name}', Model (Display/Cost)='{internal_model_name_for_cost_lookup}', Model (API)='{actual_model_name_string_for_api}'"
             )
 
-            if tracer:
-                try:
-                    span_attributes = {
-                        "llm.model_name": internal_model_name_for_cost_lookup,
-                        "llm.provider": provider_name,
-                        "query_length": len(query),
-                        "streaming": True,
-                        "is_agent_turn": is_agent_llm_turn,
-                    }
-                    span_context_manager = tracer.start_as_current_span("mcpclient.process_streaming_query", attributes=span_attributes)
-                    if span_context_manager:
-                        span = span_context_manager.__enter__()
-                except Exception as e:
-                    log.warning(f"Failed to start trace span: {e}")
-
             messages_to_use_for_api: InternalMessageList
             if messages_override is not None:
                 messages_to_use_for_api = messages_override
@@ -11156,9 +11203,8 @@ class MCPClient:
                 except Exception as e:
                     log.warning(f"Span attr error for conversation_length_initial: {e}")
 
-            final_response_text_for_chat_history_log: str = ""
-            servers_used_this_query_session: Set[str] = set()
-            tools_used_this_query_session: List[str] = []
+            # These variables are now passed as parameters from _stream_wrapper
+            # No longer redeclare them here
 
         try:
             turn_count = 0
@@ -11175,7 +11221,7 @@ class MCPClient:
                 current_llm_turn_input_tokens = 0
                 current_llm_turn_output_tokens = 0
                 current_llm_turn_stop_reason: Optional[str] = "unknown_llm_stop_reason"
-                current_llm_turn_api_error: Optional[str] = None
+                current_llm_turn_api_error = None  # Reset for each turn, but declared at method scope
 
                 messages_to_send_to_llm_api = self._filter_faulty_client_tool_results(messages_to_use_for_api)
                 if span:
@@ -11246,7 +11292,7 @@ class MCPClient:
                     break
 
                 stream_start_time_llm_api_call = time.time()
-                
+
                 try:
                     stream_iterator: Optional[AsyncGenerator[Tuple[str, Any], None]] = None
                     api_client_for_call: Any = provider_client
@@ -11269,45 +11315,14 @@ class MCPClient:
                             ums_tool_being_called = self._detect_ums_tool_in_request(formatted_tools_for_api, ums_tool_schemas)
                             if ums_tool_being_called:
                                 schema_for_ums_tool = ums_tool_schemas[ums_tool_being_called]
-                                self._apply_ums_structured_output_anthropic(
-                                    stream_params_anthropic, schema_for_ums_tool, ums_tool_being_called
-                                )
+                                self._apply_ums_structured_output_anthropic(stream_params_anthropic, schema_for_ums_tool, ums_tool_being_called)
                                 log.info(f"[{provider_name}] Applied structured output for UMS tool: {ums_tool_being_called}")
 
-                        # Add structured output forcing for Anthropic
-                        if force_structured_output:
-                            # For Anthropic, we use the system prompt to enforce JSON response with specific format
-                            plan_example = [
-                                {
-                                    "id": "step-1",
-                                    "description": "Research the impact of exercise on mental health using scientific studies",
-                                    "status": "planned",
-                                    "depends_on": [],
-                                },
-                                {
-                                    "id": "step-2",
-                                    "description": "Analyze and summarize key findings about exercise benefits",
-                                    "status": "planned",
-                                    "depends_on": [],
-                                },
-                            ]
-
-                            json_instruction = "\nVERY IMPORTANT: You MUST respond with valid JSON in EXACTLY this format (with your plan steps):\n"
-                            json_instruction += (
-                                f'```json\n{{"tool": "agent_update_plan", "tool_input": {{"plan": {json.dumps(plan_example, indent=2)}}}}}```\n'
-                            )
-                            json_instruction += (
-                                "\nDo not include any text outside the JSON structure. Make sure to include all required fields for each step."
-                            )
-
-                            if force_tool_choice:
-                                json_instruction += f"\nMust use the tool named: {force_tool_choice}"
-
-                            if system_prompt_for_api:
-                                stream_params_anthropic["system"] = system_prompt_for_api + json_instruction
-                            else:
-                                stream_params_anthropic["system"] = json_instruction
-                            log.info(f"[{provider_name}] Forcing JSON response format via system prompt with detailed example")
+                        # Apply response_format if provided for Anthropic
+                        if response_format:
+                            # For Anthropic, apply the response format as needed
+                            stream_params_anthropic["response_format"] = response_format
+                            log.info(f"[{provider_name}] Applied response format for Anthropic")
 
                         # Add tool choice for Anthropic
                         if force_tool_choice and formatted_tools_for_api:
@@ -11350,82 +11365,17 @@ class MCPClient:
                                 )
                                 log.info(f"[{provider_name}] Applied structured output for UMS tool: {ums_tool_being_called}")
 
-                        if force_structured_output:
-                            llm_seen_agent_update_plan_name = AGENT_TOOL_UPDATE_PLAN 
-                            if formatted_tools_for_api:
-                                for tool_schema_item in formatted_tools_for_api:
-                                    if isinstance(tool_schema_item, dict) and tool_schema_item.get("type") == "function":
-                                        func_details = tool_schema_item.get("function", {})
-                                        if isinstance(func_details, dict) and \
-                                        self.server_manager.sanitized_to_original.get(func_details.get("name")) == AGENT_TOOL_UPDATE_PLAN:
-                                            llm_seen_agent_update_plan_name = func_details.get("name")
-                                            break
-                            
-                            # This schema describes the desired direct JSON output from the LLM when it's asked to provide a plan.
-                            # It should match the structure of a tool call to agent:update_plan.
-                            agent_plan_direct_output_schema = {
-                                "type": "object",
-                                "properties": {
-                                    "tool": {"type": "string", "const": llm_seen_agent_update_plan_name},
-                                    "tool_input": AGENT_UPDATE_PLAN_ARGUMENT_SCHEMA 
-                                },
-                                "required": ["tool", "tool_input"],
-                                "additionalProperties": False
-                            }
-                            
-                            # Check if the current MODEL (actual_model_name_string_for_api) supports "json_schema" type.
-                            # actual_model_name_string_for_api is the name sent to the API (e.g. "gpt-4o", "mistral-large-latest" if using Mistral native)
-                            
-                            use_json_schema_format = False
-                            if provider_name == Provider.OPENAI.value:
-                                if any(prefix in actual_model_name_string_for_api.lower() for prefix in MODELS_CONFIRMED_FOR_OPENAI_JSON_SCHEMA_FORMAT):
-                                    use_json_schema_format = True
-                            elif provider_name == Provider.MISTRAL.value: # Assuming native Mistral API if provider is Mistral
-                                if actual_model_name_string_for_api.lower() in MISTRAL_NATIVE_MODELS_SUPPORTING_SCHEMA:
-                                    use_json_schema_format = True
-                            # Add elif for other providers if they explicitly support json_schema type in response_format
+                        # Apply response_format if provided
+                        if response_format:
+                            completion_params_openai["response_format"] = response_format
+                            log.info(
+                                f"[{provider_name}] Applied response format for model {actual_model_name_string_for_api}. Type: {response_format.get('type')}"
+                            )
 
-                            if use_json_schema_format:
-                                completion_params_openai["response_format"] = {
-                                    "type": "json_schema",
-                                    "json_schema": { # This is the new OpenAI API structure for response_format json_schema
-                                        "name": "agent_plan_update_direct_output", 
-                                        "description": "Strict schema for the agent's plan update, structured as a tool call to agent:update_plan.",
-                                        "strict": False, 
-                                        "schema": agent_plan_direct_output_schema
-                                    }
-                                }
-                                log.info(f"[{provider_name}] Forcing response_format={{'type': 'json_schema', strict:true}} with agent_plan_tool_call_schema for model {actual_model_name_string_for_api}.")
-                            elif any(prefix in actual_model_name_string_for_api.lower() for prefix in MODELS_SUPPORTING_OPENAI_JSON_OBJECT_FORMAT) or \
-                                provider_name in [Provider.DEEPSEEK.value, Provider.GEMINI.value, Provider.GROK.value, Provider.GROQ.value, Provider.CEREBRAS.value, Provider.OPENROUTER.value]:
-                                # Fallback to json_object for broader compatibility if json_schema not confirmed
-                                completion_params_openai["response_format"] = {"type": "json_object"}
-                                log.info(f"[{provider_name}] Forcing response_format={{'type': 'json_object'}} for model {actual_model_name_string_for_api}.")
-                            else:
-                                log.warning(f"[{provider_name}] Model {actual_model_name_string_for_api} not explicitly listed for json_schema or json_object support when force_structured_output=True. Not setting response_format. Relaying on prompt.")
-                        
                         if force_tool_choice and formatted_tools_for_api:
-                            # Ensure force_tool_choice is the LLM-seen name for agent:update_plan if that's the intent
-                            if force_structured_output: # If forcing structure, assume it's for the plan tool
-                                llm_seen_agent_update_plan_name_for_choice = AGENT_TOOL_UPDATE_PLAN
-                                for tool_schema_item_choice in formatted_tools_for_api:
-                                    if isinstance(tool_schema_item_choice, dict) and tool_schema_item_choice.get("type") == "function":
-                                        func_details_choice = tool_schema_item_choice.get("function", {})
-                                        if isinstance(func_details_choice, dict) and \
-                                            self.server_manager.sanitized_to_original.get(func_details_choice.get("name")) == AGENT_TOOL_UPDATE_PLAN:
-                                            llm_seen_agent_update_plan_name_for_choice = func_details_choice.get("name")
-                                            break
-                                # Only set tool_choice to agent_update_plan if that was the original intent of force_tool_choice
-                                if force_tool_choice == llm_seen_agent_update_plan_name_for_choice:
-                                    completion_params_openai["tool_choice"] = {"type": "function", "function": {"name": force_tool_choice}}
-                                    log.info(f"[{provider_name}] Forcing OpenAI-compatible tool choice: {force_tool_choice} (for agent:update_plan)")
-                                elif force_tool_choice: # If some other tool was forced by the caller
-                                    completion_params_openai["tool_choice"] = {"type": "function", "function": {"name": force_tool_choice}}
-                                    log.info(f"[{provider_name}] Forcing OpenAI-compatible tool choice (non-plan): {force_tool_choice}")
-                            elif force_tool_choice: # force_tool_choice set, but not necessarily for structured plan output
-                                completion_params_openai["tool_choice"] = {"type": "function", "function": {"name": force_tool_choice}}
-                                log.info(f"[{provider_name}] Forcing OpenAI-compatible tool choice: {force_tool_choice}")
-                            
+                            completion_params_openai["tool_choice"] = {"type": "function", "function": {"name": force_tool_choice}}
+                            log.info(f"[{provider_name}] Forcing OpenAI-compatible tool choice: {force_tool_choice}")
+
                         providers_not_supporting_stream_options = {Provider.MISTRAL.value, Provider.CEREBRAS.value}
                         if provider_name not in providers_not_supporting_stream_options:
                             completion_params_openai["stream_options"] = {"include_usage": True}
@@ -11439,6 +11389,11 @@ class MCPClient:
                     if stream_iterator:
                         async for std_event_type, std_event_data in stream_iterator:
                             if current_task and current_task.cancelled():
+                                # If the query is cancelled, ensure to update span status before raising
+                                if span:
+                                    span.set_status(trace.StatusCode.CANCELLED, "Query cancelled during LLM stream consumption")
+                                    if hasattr(span, "record_exception"):
+                                        span.record_exception(asyncio.CancelledError("Query cancelled"))
                                 log.info(f"[{provider_name}] Query cancelled by client during LLM stream consumption in turn {turn_count}.")
                                 raise asyncio.CancelledError("Query cancelled during LLM stream consumption")
                             yield std_event_type, std_event_data  # Pass through all standardized events
@@ -11474,7 +11429,12 @@ class MCPClient:
                 except OpenAIBadRequestError as e_br_openai:
                     error_detail_br_openai = str(e_br_openai)
                     is_tool_error_br_openai = (
-                        "tool" in error_detail_br_openai.lower()
+                        # The following checks are heuristics. Tool-related errors can be very varied.
+                        # If the model explicitly returns a 'tool_error' or similar, it's more reliable.
+                        # For now, these heuristics work.
+                        "response_format" in error_detail_br_openai.lower()  # Common for schema violations
+                        or "format" in error_detail_br_openai.lower()
+                        or "tool" in error_detail_br_openai.lower()
                         or "function" in error_detail_br_openai.lower()
                         or "parameter" in error_detail_br_openai.lower()
                     )
@@ -11612,6 +11572,8 @@ class MCPClient:
 
                     for tool_call_request_obj_from_llm in llm_requested_tool_calls_this_turn:
                         if current_task and current_task.cancelled():
+                            if span:
+                                span.set_status(trace.StatusCode.CANCELLED, "Query cancelled during tool execution")
                             log.info(f"[{provider_name}] Query cancelled during tool execution phase in turn {turn_count}.")
                             raise asyncio.CancelledError("Cancelled during tool processing phase")
 
@@ -11796,30 +11758,33 @@ class MCPClient:
                     log.info(f"[{provider_name}] LLM interaction finished (turn {turn_count}). LLM Stop Reason: {overall_query_stop_reason}")
                     break
 
+        except GeneratorExit:  # Catch GeneratorExit specifically
+            closed_by_generator_exit = True
+            overall_query_stop_reason = "generator_exited"  # Set a reason
+            log.info(f"[{provider_name}] GeneratorExit received in process_streaming_query. Stream explicitly closed.")
+            # Span status should be handled by _stream_wrapper's finally
+            raise  # CRITICAL: Re-raise GeneratorExit
+
         except asyncio.CancelledError:
-            log.info(f"[{provider_name}] Query processing was cancelled by client (asyncio.CancelledError).")
             overall_query_stop_reason = "cancelled"
-            overall_query_error_occurred = True
-            yield "status", "[yellow]Request cancelled by user.[/]"
+            overall_query_error_occurred = True  # Mark as error for history saving logic
+            # Span status handled by _stream_wrapper's finally
+            log.info(f"[{provider_name}] Query processing cancelled by client (asyncio.CancelledError caught in process_streaming_query).")
+            # Do not yield here. Re-raise to propagate.
+            raise  # Re-raise
         except Exception as e_outer_loop:
             error_msg_outer_loop = f"Unexpected error during MCPClient query processing loop: {str(e_outer_loop)}"
             log.error(error_msg_outer_loop, exc_info=True)
             if span:
                 span.set_status(trace.StatusCode.ERROR, description=error_msg_outer_loop)
-            if hasattr(span, "record_exception"):
-                span.record_exception(e_outer_loop)  # type: ignore
+                if hasattr(span, "record_exception"):
+                    span.record_exception(e_outer_loop)  # type: ignore
             yield "error", f"Unexpected Error: {error_msg_outer_loop}"
             overall_query_stop_reason = "error_outer_loop"
             overall_query_error_occurred = True
         finally:
+            # Set final span attributes only if status hasn't been set yet in exception handlers
             if span:
-                final_span_status_code = trace.StatusCode.ERROR if overall_query_error_occurred else trace.StatusCode.OK
-                final_span_description = (
-                    f"Query failed/cancelled: {overall_query_stop_reason}"
-                    if overall_query_error_occurred
-                    else f"Query finished: {overall_query_stop_reason or 'completed'}"
-                )
-                span.set_status(final_span_status_code, description=final_span_description)
                 try:
                     span.set_attribute("final_llm_stop_reason_overall", overall_query_stop_reason or "unknown")
                     span.set_attribute("total_input_tokens_session_accumulated", self.session_input_tokens)
@@ -11829,175 +11794,251 @@ class MCPClient:
                     span.set_attribute("tokens_saved_by_tool_cache_this_query_total", tokens_saved_by_tool_cache_this_query)
                 except Exception as span_final_attr_err:
                     log.warning(f"Failed to set final span attributes: {span_final_attr_err}")
-            if span_context_manager and hasattr(span_context_manager, "__exit__"):
-                with suppress(Exception):
-                    span_context_manager.__exit__(*sys.exc_info())
 
-            if not is_agent_llm_turn and not overall_query_error_occurred and not (current_task and current_task.cancelled()):
-                try:
-                    self.conversation_graph.current_node.messages = messages_to_use_for_api
-                    self.conversation_graph.current_node.model = internal_model_name_for_cost_lookup
-                    await self.conversation_graph.save(str(self.conversation_graph_file))
-                    end_time_for_chat_history_log = time.time()
-                    latency_ms_for_chat_history_log = (end_time_for_chat_history_log - start_time_overall_query) * 1000
-                    tokens_used_for_chat_history_log = self.session_input_tokens + self.session_output_tokens
-                    timestamp_for_chat_history_log = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    if hasattr(self, "history") and hasattr(self.history, "add_async"):
-                        history_entry_for_log = ChatHistory(
-                            query=query,
-                            response=final_response_text_for_chat_history_log,
-                            model=internal_model_name_for_cost_lookup,
-                            timestamp=timestamp_for_chat_history_log,
-                            server_names=list(servers_used_this_query_session),
-                            tools_used=tools_used_this_query_session,
-                            conversation_id=self.conversation_graph.current_node.id,
-                            latency_ms=latency_ms_for_chat_history_log,
-                            tokens_used=tokens_used_for_chat_history_log,
-                            streamed=True,
-                            cached=(cache_hits_this_query_for_tools > 0),
-                        )
-                        await self.history.add_async(history_entry_for_log)
-                except Exception as final_update_error:
-                    log.error(f"Error during final graph/history update for user query: {final_update_error}", exc_info=True)
-                    yield "error", f"Failed to save history for user query: {final_update_error}"
+            # Only yield final_usage and stop_reason if not exited via GeneratorExit
+            # AND if no CancelledError is currently being handled for THIS task context.
+            # The `closed_by_generator_exit` flag is the most reliable here.
 
-            final_usage_payload_to_yield_overall = {
-                "input_tokens": self.session_input_tokens,
-                "output_tokens": self.session_output_tokens,
-                "total_cost": self.session_total_cost,
-                "tool_cache_hits_this_query": cache_hits_this_query_for_tools,
-                "tokens_saved_by_tool_cache_this_query": tokens_saved_by_tool_cache_this_query,
-            }
-            yield "final_usage", final_usage_payload_to_yield_overall
-            yield "stop_reason", overall_query_stop_reason or "unknown_overall_stop"
-        log.info(
-            f"MCPC Streaming Query processing finished. Overall Stop Reason: {overall_query_stop_reason}. Overall Query Latency: {(time.time() - start_time_overall_query) * 1000:.0f}ms"
-        )
+            if not closed_by_generator_exit:
+                # If an API error occurred and we have a websocket, send it
+                if overall_query_error_occurred and current_llm_turn_api_error and ui_websocket_sender:
+                    with suppress(Exception):
+                        await ui_websocket_sender("error", current_llm_turn_api_error)
 
-    async def _stream_wrapper(self, stream_generator: AsyncGenerator[Any, None]) -> AsyncGenerator[Tuple[str, Any], None]:
-        """Wraps the query generator to extract specific event types and final stats."""
-        final_stats = {}
+                # Save graph/history (only for user queries, no errors, and not cancelled by this task itself)
+                if not is_agent_llm_turn and not overall_query_error_occurred and not (current_task and current_task.cancelled()):
+                    try:
+                        self.conversation_graph.current_node.messages = messages_to_use_for_api
+                        self.conversation_graph.current_node.model = internal_model_name_for_cost_lookup
+                        await self.conversation_graph.save(str(self.conversation_graph_file))
+                        end_time_for_chat_history_log = time.time()
+                        latency_ms_for_chat_history_log = (end_time_for_chat_history_log - start_time_overall_query) * 1000
+                        tokens_used_for_chat_history_log = self.session_input_tokens + self.session_output_tokens
+                        timestamp_for_chat_history_log = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        if hasattr(self, "history") and hasattr(self.history, "add_async"):
+                            history_entry_for_log = ChatHistory(
+                                query=query,
+                                response=final_response_text_for_chat_history_log,
+                                model=internal_model_name_for_cost_lookup,
+                                timestamp=timestamp_for_chat_history_log,
+                                server_names=list(servers_used_this_query_session),
+                                tools_used=tools_used_this_query_session,
+                                conversation_id=self.conversation_graph.current_node.id,
+                                latency_ms=latency_ms_for_chat_history_log,
+                                tokens_used=tokens_used_for_chat_history_log,
+                                streamed=True,
+                                cached=(cache_hits_this_query_for_tools > 0),
+                            )
+                            await self.history.add_async(history_entry_for_log)
+                    except Exception as final_update_error:
+                        log.error(f"Error during final graph/history update for user query: {final_update_error}", exc_info=True)
+                        # Avoid yielding if we are already in a problematic state for yielding
+                        if ui_websocket_sender:
+                            with suppress(Exception):
+                                await ui_websocket_sender("error", f"Failed to save history for user query: {final_update_error}")
+
+                # Yield final stats only if the generator is not being forcibly closed
+                # and has not been cancelled in a way that prevents further yields.
+                # The `overall_query_stop_reason` check helps determine if it was a "natural" end.
+                if overall_query_stop_reason not in ["generator_exited", "cancelled"]:
+                    try:
+                        final_usage_payload_to_yield_overall = {
+                            "input_tokens": self.session_input_tokens,  # These are now query-specific
+                            "output_tokens": self.session_output_tokens,
+                            "total_cost": self.session_total_cost,
+                            "tool_cache_hits_this_query": cache_hits_this_query_for_tools,
+                            "tokens_saved_by_tool_cache_this_query": tokens_saved_by_tool_cache_this_query,
+                        }
+                        yield "final_usage", final_usage_payload_to_yield_overall
+                        yield "stop_reason", overall_query_stop_reason or "unknown_overall_stop"
+                    except Exception as final_yield_err:
+                        log.warning(f"Error yielding final stats/stop_reason (consumer likely gone): {final_yield_err}")
+
+            log.info(
+                f"MCPC Streaming Query processing finished. Overall Stop: {overall_query_stop_reason}. Latency: {(time.time() - start_time_overall_query) * 1000:.0f}ms"
+            )
+
+    async def _stream_wrapper(
+        self,
+        query: str,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        messages_override: Optional[InternalMessageList] = None,
+        tools_override: Optional[List[Dict[str, Any]]] = None,
+        ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        force_tool_choice: Optional[str] = None,
+        ums_tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
+        """
+        Wrapper that handles span management and state initialization, then calls process_streaming_query.
+        """
+        span_context_manager = None
+        span = None
+
+        # Initialize for this specific query interaction
+        is_agent_llm_turn = messages_override is not None
+        if not is_agent_llm_turn:  # Only reset for user-initiated queries, not agent's turns
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_total_cost = 0.0
+            self.cache_hit_count = 0
+            self.tokens_saved_by_cache = 0
+
+        # Initialize query accumulators for this specific call (not session-wide)
+        final_response_text_for_chat_history_log: str = ""
+        servers_used_this_query_session: Set[str] = set()
+        tools_used_this_query_session: List[str] = []
+        start_time_overall_query = time.time()
+
+        # Initialize span if tracer is available
+        if tracer:
+            try:
+                span_attributes = {
+                    "llm.model_name": model or self.current_model,
+                    "llm.provider": self.get_provider_from_model(model or self.current_model),
+                    "query_length": len(query) if query else 0,
+                    "streaming": True,
+                    "is_agent_turn": is_agent_llm_turn,
+                }
+                span_context_manager = tracer.start_as_current_span("mcpclient.process_streaming_query_span", attributes=span_attributes)
+                if span_context_manager:
+                    span = span_context_manager.__enter__()
+            except Exception as e:
+                log.warning(f"Failed to start trace span: {e}")
+
         try:
-            async for chunk in stream_generator:
-                if isinstance(chunk, tuple) and len(chunk) == 2:
-                    event_type, event_data = chunk
-                    if event_type == "text_chunk":
-                        yield "text", event_data
-                    elif event_type == "status":
-                        yield "status", event_data
-                    elif event_type == "tool_call_start":
-                        yield (
-                            "status",
-                            f"{EMOJI_MAP['tool']} Preparing tool: [bold]{event_data.get('name', 'unknown').split(':')[-1]}[/] (ID: {event_data.get('id', '?')[:8]})...",
-                        )
-                    elif event_type == "tool_call_input_chunk":
-                        pass  # UI might want this, for now, pass
-                    elif event_type == "tool_call_end":
-                        tool_name = event_data.get("name", "unknown")
-                        tool_short_name = tool_name.split(":")[-1]
-                        yield "status", f"{EMOJI_MAP['tool']} Executing tool: [bold]{tool_short_name}[/]"
-                    # START ADDED BLOCK
-                    elif event_type == "mcp_tool_executed_for_agent":
-                        # This event is for internal processing by process_agent_llm_turn.
-                        # Pass it through directly.
-                        yield "mcp_tool_executed_for_agent", event_data
-                    # END ADDED BLOCK
-                    elif event_type == "error":
-                        log.error(f"Stream wrapper received error event: {event_data}")
-                        yield "error", str(event_data)
-                    elif event_type == "final_usage":
-                        final_stats.update(event_data)
-                        log.debug(f"Stream wrapper captured final usage: {event_data}")
-                    elif event_type == "stop_reason":
-                        final_stats["stop_reason"] = event_data
-                        log.debug(f"Stream wrapper captured stop reason: {event_data}")
-                    else:
-                        # This is where the original warning came from
-                        log.warning(f"Stream wrapper: Unhandled standardized event tuple type: {event_type}. Data: {str(event_data)[:100]}")
-                        # Optionally, yield it as a generic event if some consumer might handle it
-                        # yield event_type, event_data
+            # Call process_streaming_query with all the parameters
+            async for event_type, event_data in self.process_streaming_query(
+                query=query,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages_override=messages_override,
+                tools_override=tools_override,
+                ui_websocket_sender=ui_websocket_sender,
+                response_format=response_format,
+                force_tool_choice=force_tool_choice,
+                ums_tool_schemas=ums_tool_schemas,
+                span=span,
+                is_agent_llm_turn=is_agent_llm_turn,
+                final_response_text_for_chat_history_log=final_response_text_for_chat_history_log,
+                servers_used_this_query_session=servers_used_this_query_session,
+                tools_used_this_query_session=tools_used_this_query_session,
+                start_time_overall_query=start_time_overall_query,
+            ):
+                yield event_type, event_data
 
-                elif isinstance(chunk, str) and chunk.startswith("@@STATUS@@"):
-                    yield "status", chunk[len("@@STATUS@@") :].strip()
-                elif isinstance(chunk, str):
-                    yield "text", chunk
-                else:
-                    log.warning(f"Unexpected chunk type from stream generator: {type(chunk)} Data: {repr(chunk)[:100]}")
-
-        except asyncio.CancelledError:
-            log.debug("Stream wrapper detected cancellation during iteration.")
-            raise  # Propagate cancellation
-        except Exception as e:
-            log.error(f"Error in stream wrapper iteration: {e}", exc_info=True)
-            yield "error", str(e)  # Yield error message
+        except Exception:
+            # Span status and exception already recorded in process_streaming_query's handler
+            raise
         finally:
-            # Yield the combined stats at the very end
-            if final_stats:
-                yield "final_stats", final_stats  # Yield collected stats
-            else:
-                log.warning("Stream wrapper did not capture final stats/reason.")
+            # Get current exception info *before* trying to exit the span context manager
+            current_exc_type, current_exc_val, current_exc_tb = sys.exc_info()
 
-    def _should_attempt_plan_parsing(self, full_text_response: str, llm_requested_tool_calls: List[Dict[str, Any]], 
-                                     force_structured_output: bool, force_tool_choice: Optional[str], llm_stop_reason: str) -> bool:
+            if span and span.is_recording():  # Ensure span is valid and recording
+                # Determine span status based on the exception that caused the `try` block to exit
+                if current_exc_type is GeneratorExit or current_exc_type is asyncio.CancelledError:
+                    span.set_status(trace.StatusCode.ERROR, f"Stream aborted by {current_exc_type.__name__}")  # OTEL uses ERROR for cancelled
+                    if current_exc_val and hasattr(span, "record_exception"):
+                        span.record_exception(current_exc_val)
+                elif current_exc_type is not None:  # Any other exception
+                    span.set_status(trace.StatusCode.ERROR, str(current_exc_val))
+                    if current_exc_val and hasattr(span, "record_exception"):
+                        span.record_exception(current_exc_val)
+                else:  # No exception, normal completion of the `async for` loop
+                    # If status wasn't set by process_streaming_query (e.g. early exit without error status)
+                    if span.status.status_code == trace.StatusCode.UNSET:
+                        span.set_status(trace.StatusCode.OK)
+
+            if span_context_manager and hasattr(span_context_manager, "__exit__"):
+                try:
+                    # Pass the original exception info so the context manager can see it if it needs to
+                    span_context_manager.__exit__(current_exc_type, current_exc_val, current_exc_tb)
+                except ValueError as ve_otel:
+                    if "was created in a different Context" in str(ve_otel):
+                        log.warning(f"OpenTelemetry context error during detach, suppressing: {ve_otel}. Span: {span.context if span else 'N/A'}")
+                    else:
+                        raise  # Re-raise other ValueErrors
+                except Exception as e_otel_exit:  # Catch other potential errors from __exit__
+                    log.warning(f"Error during OpenTelemetry span manager __exit__: {e_otel_exit}")
+
+    def _should_attempt_plan_parsing(
+        self,
+        full_text_response: str,
+        llm_requested_tool_calls: List[Dict[str, Any]],
+        force_structured_output: bool,
+        force_tool_choice: Optional[str],
+        llm_stop_reason: str,
+    ) -> bool:
         """Determine if we should attempt plan parsing based on various signals."""
-        return (force_structured_output or llm_requested_tool_calls or 
-                llm_stop_reason == "agent_internal_tool_request" or
-                any(keyword in full_text_response.lower() for keyword in ["plan", "steps", "```json", "agent_update_plan"]) or
-                full_text_response.lower().strip().startswith("goal achieved")) and full_text_response.strip()
+        return (
+            force_structured_output
+            or llm_requested_tool_calls
+            or llm_stop_reason == "agent_internal_tool_request"
+            or any(keyword in full_text_response.lower() for keyword in ["plan", "steps", "```json", "agent_update_plan"])
+            or full_text_response.lower().strip().startswith("goal achieved")
+        ) and full_text_response.strip()
 
     def _validate_plan_steps(self, steps) -> bool:
         """Validate that plan steps have the required structure."""
-        return (isinstance(steps, list) and len(steps) > 0 and 
-               all(isinstance(step, dict) and "description" in step and step.get("description", "").strip() 
-                   for step in steps))
+        return (
+            isinstance(steps, list)
+            and len(steps) > 0
+            and all(isinstance(step, dict) and "description" in step and step.get("description", "").strip() for step in steps)
+        )
 
-    def _process_multiple_tool_calls_atomically(self, llm_requested_tool_calls: List[Dict[str, Any]], 
-                                               executed_tool_details_for_agent: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _process_multiple_tool_calls_atomically(
+        self, llm_requested_tool_calls: List[Dict[str, Any]], executed_tool_details_for_agent: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         """
         Process multiple tool calls from a single LLM turn atomically.
-        
+
         This handles the case where LLMs (especially Anthropic) make multiple tool calls
         in a single turn. We need to process them all consistently or fail atomically.
         """
         logger_to_use = self.logger
-        
+
         if not llm_requested_tool_calls and not executed_tool_details_for_agent:
             return {"decision": "error", "message": "No tool calls to process", "error_type_for_agent": "NoToolCalls"}
-        
+
         # Categorize tool calls
         plan_update_calls = []
         other_tool_calls = []
         executed_tools = executed_tool_details_for_agent  # Already a list
-        
+
         # Get LLM-seen name for agent:update_plan
         agent_llm_seen_name = None
         for llm_name, original_name in self.server_manager.sanitized_to_original.items():
             if original_name == AGENT_TOOL_UPDATE_PLAN:
                 agent_llm_seen_name = llm_name
                 break
-        
+
         # Categorize requested tool calls
         for tool_call in llm_requested_tool_calls:
             if not isinstance(tool_call, dict):
                 continue
             tool_name = tool_call.get("name", "")
-            
+
             if tool_name in [AGENT_TOOL_UPDATE_PLAN, agent_llm_seen_name]:
                 plan_update_calls.append(tool_call)
             else:
                 other_tool_calls.append(tool_call)
-        
-        logger_to_use.info(f"MCPC Atomic Processing: Plan updates: {len(plan_update_calls)}, Other tools: {len(other_tool_calls)}, Executed: {len(executed_tools)}")
-        
+
+        logger_to_use.info(
+            f"MCPC Atomic Processing: Plan updates: {len(plan_update_calls)}, Other tools: {len(other_tool_calls)}, Executed: {len(executed_tools)}"
+        )
+
         # RULE 1: Multiple plan updates in one turn is invalid
         if len(plan_update_calls) > 1:
             logger_to_use.warning(f"MCPC Atomic Processing: Multiple plan updates detected ({len(plan_update_calls)}). Invalid.")
             return {
                 "decision": "thought_process",
                 "content": f"LLM Error: Multiple plan updates in one turn ({len(plan_update_calls)} calls). Only one allowed.",
-                "_mcp_client_force_replan_after_thought_": True
+                "_mcp_client_force_replan_after_thought_": True,
             }
-        
+
         # RULE 2: If executed tools AND requested tools, prefer executed (already happened)
         if executed_tools and (plan_update_calls or other_tool_calls):
             logger_to_use.info(f"MCPC Atomic Processing: Both executed and requested tools found. Prioritizing executed.")
@@ -12009,7 +12050,7 @@ class MCPClient:
                     "arguments": executed_tools[0]["arguments"],
                     "result": executed_tools[0]["result"],
                     "deferred_tool_calls": plan_update_calls + other_tool_calls,
-                    "total_tools_this_turn": len(executed_tools) + len(plan_update_calls) + len(other_tool_calls)
+                    "total_tools_this_turn": len(executed_tools) + len(plan_update_calls) + len(other_tool_calls),
                 }
             else:
                 # Multiple executed tools - return as multi-tool execution
@@ -12018,14 +12059,14 @@ class MCPClient:
                     "executed_tools": executed_tools,
                     "deferred_tool_calls": plan_update_calls + other_tool_calls,
                     "total_tools_this_turn": len(executed_tools) + len(plan_update_calls) + len(other_tool_calls),
-                    "agent_message": f"MCP executed {len(executed_tools)} tools: {', '.join(t['tool_name'] for t in executed_tools)}"
+                    "agent_message": f"MCP executed {len(executed_tools)} tools: {', '.join(t['tool_name'] for t in executed_tools)}",
                 }
-        
+
         # RULE 3: Process plan update if present (highest priority)
         if plan_update_calls:
             plan_call = plan_update_calls[0]
             plan_steps = plan_call.get("input", {}).get("plan")
-            
+
             if self._validate_plan_steps(plan_steps):
                 decision = {
                     "decision": "call_tool",
@@ -12033,27 +12074,27 @@ class MCPClient:
                     "arguments": {"plan": plan_steps},
                     "tool_use_id": plan_call.get("id"),
                     "deferred_tool_calls": other_tool_calls,
-                    "total_tools_this_turn": len(plan_update_calls) + len(other_tool_calls)
+                    "total_tools_this_turn": len(plan_update_calls) + len(other_tool_calls),
                 }
-                
+
                 if other_tool_calls:
                     logger_to_use.info(f"MCPC Atomic Processing: Processing plan update, deferring {len(other_tool_calls)} other tools")
                     decision["agent_message"] = f"Plan updated. {len(other_tool_calls)} other tool calls deferred to next turn."
-                
+
                 return decision
             else:
                 logger_to_use.warning(f"MCPC Atomic Processing: Plan update call had invalid structure")
                 return {
-                    "decision": "thought_process", 
+                    "decision": "thought_process",
                     "content": f"LLM Error: Plan update call had invalid structure. Plan: {plan_steps}",
-                    "_mcp_client_force_replan_after_thought_": True
+                    "_mcp_client_force_replan_after_thought_": True,
                 }
-        
+
         # RULE 4: Enhanced multi-tool processing for other tool calls
         if other_tool_calls:
             # Check if we can execute multiple tools efficiently in this turn
             can_execute_multiple = self._can_execute_multiple_tools(other_tool_calls)
-            
+
             if can_execute_multiple and len(other_tool_calls) <= 3:  # Cap at 3 tools per turn for safety
                 # Execute multiple tools in sequence for this turn
                 logger_to_use.info(f"MCPC Atomic Processing: Executing {len(other_tool_calls)} tools in sequence this turn")
@@ -12061,37 +12102,37 @@ class MCPClient:
                     "decision": "call_multiple_tools",
                     "tool_calls": other_tool_calls,
                     "total_tools_this_turn": len(other_tool_calls),
-                    "agent_message": f"Executing {len(other_tool_calls)} tools in sequence for efficiency."
+                    "agent_message": f"Executing {len(other_tool_calls)} tools in sequence for efficiency.",
                 }
             else:
                 # Original single-tool processing with deferral
                 first_tool = other_tool_calls[0]
                 deferred_tools = other_tool_calls[1:]
-                
+
                 decision = {
                     "decision": "call_tool",
                     "tool_name": first_tool.get("name"),
                     "arguments": first_tool.get("input", {}),
                     "tool_use_id": first_tool.get("id"),
                     "deferred_tool_calls": deferred_tools,
-                    "total_tools_this_turn": len(other_tool_calls)
+                    "total_tools_this_turn": len(other_tool_calls),
                 }
-                
+
                 if deferred_tools:
                     logger_to_use.info(f"MCPC Atomic Processing: Processing '{first_tool.get('name')}', deferring {len(deferred_tools)} tools")
                     decision["agent_message"] = f"Processed {first_tool.get('name')}. {len(deferred_tools)} other calls deferred."
-                
+
                 return decision
-        
+
         # RULE 5: Only executed tools
         if executed_tools:
             if len(executed_tools) == 1:
                 # Single executed tool
                 return {
                     "decision": "tool_executed_by_mcp",
-                    "tool_name": executed_tools[0]["tool_name"], 
+                    "tool_name": executed_tools[0]["tool_name"],
                     "arguments": executed_tools[0]["arguments"],
-                    "result": executed_tools[0]["result"]
+                    "result": executed_tools[0]["result"],
                 }
             else:
                 # Multiple executed tools
@@ -12099,16 +12140,16 @@ class MCPClient:
                     "decision": "multiple_tools_executed_by_mcp",
                     "executed_tools": executed_tools,
                     "total_tools_this_turn": len(executed_tools),
-                    "agent_message": f"MCP executed {len(executed_tools)} tools: {', '.join(t['tool_name'] for t in executed_tools)}"
+                    "agent_message": f"MCP executed {len(executed_tools)} tools: {', '.join(t['tool_name'] for t in executed_tools)}",
                 }
-        
+
         # RULE 6: Fallback
         return {"decision": "error", "message": "No valid tool calls found", "error_type_for_agent": "NoValidToolCalls"}
 
     def _can_execute_multiple_tools(self, tool_calls: List[Dict[str, Any]]) -> bool:
         """
         Determine if multiple tools can be executed efficiently in one turn.
-        
+
         ENHANCED CRITERIA for more aggressive multi-tool execution:
         1. Exclude only the most disruptive meta/planning tools
         2. Allow most productive tools to be batched together
@@ -12116,35 +12157,50 @@ class MCPClient:
         """
         if not tool_calls or len(tool_calls) > 5:  # Increased limit to 5 tools
             return False
-            
+
         # Explicitly prohibited patterns (tools that must run alone)
         prohibited_patterns = [
-            "update_plan", "create_workflow", "update_workflow_status", 
-            "record_action_start", "record_action_completion", 
-            "save_cognitive_state", "get_rich_context_package"
+            "update_plan",
+            "create_workflow",
+            "update_workflow_status",
+            "record_action_start",
+            "record_action_completion",
+            "save_cognitive_state",
+            "get_rich_context_package",
         ]
-        
+
         # Highly encouraged patterns for multi-execution (artifact creation focus)
         encouraged_patterns = [
-            "search", "browse", "write_file", "read_file", "record_artifact",
-            "record_thought", "create_goal", "store_memory", "query_memories",
-            "smart_browser", "filesystem", "artifact", "mcp_browser", "web_search"
+            "search",
+            "browse",
+            "write_file",
+            "read_file",
+            "record_artifact",
+            "record_thought",
+            "create_goal",
+            "store_memory",
+            "query_memories",
+            "smart_browser",
+            "filesystem",
+            "artifact",
+            "mcp_browser",
+            "web_search",
         ]
-        
+
         prohibited_count = 0
         encouraged_count = 0
-        
+
         for tool_call in tool_calls:
             tool_name = tool_call.get("name", "").lower()
-            
+
             # Count prohibited patterns
             if any(prohibited in tool_name for prohibited in prohibited_patterns):
                 prohibited_count += 1
-            
-            # Count encouraged patterns  
+
+            # Count encouraged patterns
             if any(encouraged in tool_name for encouraged in encouraged_patterns):
                 encouraged_count += 1
-        
+
         # Allow multi-execution if:
         # 1. No prohibited tools, OR
         # 2. Mostly encouraged tools (at least 60% are encouraged)
@@ -12155,90 +12211,83 @@ class MCPClient:
         else:
             return False
 
-    def _parse_agent_plan_unified(self, full_text_response: str, llm_requested_tool_calls: List[Dict[str, Any]], 
-                                 force_structured_output: bool, force_tool_choice: Optional[str], llm_stop_reason: str) -> Dict[str, Any]:
+    def _parse_agent_plan_unified(
+        self,
+        full_text_response: str,
+        llm_requested_tool_calls: List[Dict[str, Any]],
+        force_structured_output: bool,
+        force_tool_choice: Optional[str],
+        llm_stop_reason: str,
+    ) -> Dict[str, Any]:
         """
         Simplified, robust plan parsing focused on the most common cases.
-        
-        Priority: 
+
+        Priority:
         1. Formal tool calls (highest confidence)
-        2. Well-formed JSON in text (medium confidence) 
+        2. Well-formed JSON in text (medium confidence)
         3. Everything else is a thought (lowest complexity)
         """
         logger_to_use = self.logger
-        
+
         # Get LLM-seen name for agent:update_plan
         agent_llm_seen_name = None
         for llm_name, original_name in self.server_manager.sanitized_to_original.items():
             if original_name == AGENT_TOOL_UPDATE_PLAN:
                 agent_llm_seen_name = llm_name
                 break
-        
+
         logger_to_use.debug(f"MCPC Unified Parser: Looking for plan updates using names: '{AGENT_TOOL_UPDATE_PLAN}' or '{agent_llm_seen_name}'")
-        
+
         def create_plan_decision(plan_steps: List[Dict[str, Any]], source: str) -> Dict[str, Any]:
             logger_to_use.info(f"MCPC Plan Parser: ✅ Found valid plan from {source} with {len(plan_steps)} steps")
-            return {"decision": "call_tool", "tool_name": AGENT_TOOL_UPDATE_PLAN, 
-                   "arguments": {"plan": plan_steps}, "tool_use_id": str(uuid.uuid4())}
-        
+            return {"decision": "call_tool", "tool_name": AGENT_TOOL_UPDATE_PLAN, "arguments": {"plan": plan_steps}, "tool_use_id": str(uuid.uuid4())}
+
         def create_thought_decision(content: str, force_replan: bool = False) -> Dict[str, Any]:
             decision = {"decision": "thought_process", "content": content}
             if force_replan:
                 decision["_mcp_client_force_replan_after_thought_"] = True
             return decision
-            
+
         def extract_plan_from_dict(data: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
             """Extract plan steps from various dict formats."""
             # Direct plan key
             if "plan" in data and self._validate_plan_steps(data["plan"]):
                 return data["plan"]
-                
+
             # Tool call format: {"tool": "agent_update_plan", "tool_input": {"plan": [...]}}
             tool_name = data.get("tool") or data.get("name")
             if tool_name in [AGENT_TOOL_UPDATE_PLAN, agent_llm_seen_name]:
                 tool_args = data.get("tool_input") or data.get("arguments") or {}
                 if isinstance(tool_args, dict) and self._validate_plan_steps(tool_args.get("plan")):
                     return tool_args["plan"]
-                    
+
             return None
 
         def extract_tool_call_from_dict(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             """Extract a general tool call from JSON response."""
             if not isinstance(data, dict):
                 return None
-                
+
             # Standard tool call format: {"name": "tool_name", "arguments": {...}}
             tool_name = data.get("name")
-            tool_args = data.get("arguments") 
-            
+            tool_args = data.get("arguments")
+
             if tool_name and isinstance(tool_args, dict):
                 # Convert LLM-seen name back to original MCP name
                 original_mcp_name = self.server_manager.sanitized_to_original.get(tool_name, tool_name)
-                return {
-                    "decision": "call_tool",
-                    "tool_name": original_mcp_name,
-                    "arguments": tool_args,
-                    "tool_use_id": str(uuid.uuid4())
-                }
-                
+                return {"decision": "call_tool", "tool_name": original_mcp_name, "arguments": tool_args, "tool_use_id": str(uuid.uuid4())}
+
             # Alternative format: {"tool": "tool_name", "tool_input": {...}}
             tool_name = data.get("tool")
             tool_args = data.get("tool_input")
-            
+
             if tool_name and isinstance(tool_args, dict):
                 # Convert LLM-seen name back to original MCP name
                 original_mcp_name = self.server_manager.sanitized_to_original.get(tool_name, tool_name)
-                return {
-                    "decision": "call_tool", 
-                    "tool_name": original_mcp_name,
-                    "arguments": tool_args,
-                    "tool_use_id": str(uuid.uuid4())
-                }
-                
-            return None
-        
+                return {"decision": "call_tool", "tool_name": original_mcp_name, "arguments": tool_args, "tool_use_id": str(uuid.uuid4())}
 
-        
+            return None
+
         # Check formal tool calls first
         if llm_requested_tool_calls:
             for tool_call in llm_requested_tool_calls:
@@ -12247,48 +12296,52 @@ class MCPClient:
                     if self._validate_plan_steps(plan_steps):
                         return create_plan_decision(plan_steps, "formal tool call")
                     return create_thought_decision(f"LLM attempted formal plan update but invalid structure", True)
-        
+
         # Handle forced structured output (highest reliability expected)
         if force_structured_output and force_tool_choice:
             logger_to_use.debug(f"MCPC Plan Parser: Processing forced structured output for tool: {force_tool_choice}")
-            
-            if (force_tool_choice == agent_llm_seen_name or 
-                self.server_manager.sanitized_to_original.get(force_tool_choice) == AGENT_TOOL_UPDATE_PLAN):
-                
+
+            if force_tool_choice == agent_llm_seen_name or self.server_manager.sanitized_to_original.get(force_tool_choice) == AGENT_TOOL_UPDATE_PLAN:
                 # Strategy 1: Try direct JSON parsing first
                 try:
                     response_stripped = full_text_response.strip()
                     parsed = json.loads(response_stripped)
-                    plan_steps = extract_plan_from_dict(parsed) if isinstance(parsed, dict) else (parsed if self._validate_plan_steps(parsed) else None)
+                    plan_steps = (
+                        extract_plan_from_dict(parsed) if isinstance(parsed, dict) else (parsed if self._validate_plan_steps(parsed) else None)
+                    )
                     if plan_steps:
                         logger_to_use.info(f"MCPC Plan Parser: ✅ Forced structured output parsed successfully (direct JSON)")
                         return create_plan_decision(plan_steps, "forced_structured_direct")
                 except json.JSONDecodeError:
                     logger_to_use.debug("MCPC Plan Parser: Direct JSON parsing failed for forced output")
-                
+
                 # Strategy 2: Try extracting from markdown
                 try:
                     json_content = extract_json_from_markdown(full_text_response)
                     if json_content.strip():
                         parsed = json.loads(json_content)
-                        plan_steps = extract_plan_from_dict(parsed) if isinstance(parsed, dict) else (parsed if self._validate_plan_steps(parsed) else None)
+                        plan_steps = (
+                            extract_plan_from_dict(parsed) if isinstance(parsed, dict) else (parsed if self._validate_plan_steps(parsed) else None)
+                        )
                         if plan_steps:
                             logger_to_use.info(f"MCPC Plan Parser: ✅ Forced structured output parsed successfully (markdown extraction)")
                             return create_plan_decision(plan_steps, "forced_structured_markdown")
                 except (json.JSONDecodeError, AttributeError):
                     logger_to_use.debug("MCPC Plan Parser: Markdown JSON extraction failed for forced output")
-                
+
                 # If forced structured output fails, this is a serious issue
-                logger_to_use.error(f"MCPC Plan Parser: 🚨 Forced structured output completely failed to parse! Response: {full_text_response[:200]}...")
+                logger_to_use.error(
+                    f"MCPC Plan Parser: 🚨 Forced structured output completely failed to parse! Response: {full_text_response[:200]}..."
+                )
                 return create_thought_decision(f"LLM forced structured output failed - response was: {full_text_response[:100]}...", True)
-        
+
         # Parse from text content - simplified approach
         if full_text_response:
             response_stripped = full_text_response.strip()
             logger_to_use.debug(f"MCPC Plan Parser: Checking text response (length: {len(response_stripped)})")
-            
+
             # Strategy 1: Whole response is JSON
-            if response_stripped.startswith('{') and response_stripped.endswith('}'):
+            if response_stripped.startswith("{") and response_stripped.endswith("}"):
                 try:
                     parsed = json.loads(response_stripped)
                     # First check for plan updates
@@ -12302,8 +12355,8 @@ class MCPClient:
                         return tool_call_result
                 except json.JSONDecodeError:
                     logger_to_use.debug("MCPC Plan Parser: Whole response is not valid JSON")
-            
-            # Strategy 2: Extract from code blocks  
+
+            # Strategy 2: Extract from code blocks
             code_block_match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", response_stripped)
             if code_block_match:
                 try:
@@ -12319,24 +12372,24 @@ class MCPClient:
                         return tool_call_result
                 except json.JSONDecodeError:
                     logger_to_use.debug("MCPC Plan Parser: Code block content is not valid JSON")
-            
+
             # Strategy 3: Find balanced JSON objects
             def find_first_json_object(text: str) -> Optional[str]:
                 """Find the first complete JSON object in text."""
                 brace_count = 0
                 start_pos = None
-                
+
                 for i, char in enumerate(text):
-                    if char == '{':
+                    if char == "{":
                         if brace_count == 0:
                             start_pos = i
                         brace_count += 1
-                    elif char == '}':
+                    elif char == "}":
                         brace_count -= 1
                         if brace_count == 0 and start_pos is not None:
-                            return text[start_pos:i+1]
+                            return text[start_pos : i + 1]
                 return None
-            
+
             json_obj = find_first_json_object(response_stripped)
             if json_obj:
                 try:
@@ -12352,25 +12405,31 @@ class MCPClient:
                         return tool_call_result
                 except json.JSONDecodeError:
                     logger_to_use.debug("MCPC Plan Parser: Extracted JSON object is not valid")
-            
+
             logger_to_use.debug("MCPC Plan Parser: No valid plan found in text response")
-            
+
             # Handle special cases
             if llm_stop_reason == "agent_internal_tool_request":
                 return create_thought_decision(f"LLM indicated plan update but no valid structure found", True)
-            
+
             if full_text_response.lower().strip().startswith("goal achieved"):
-                summary = full_text_response.split(":", 1)[1].strip() if ":" in full_text_response else full_text_response[len("goal achieved"):].strip()
+                summary = (
+                    full_text_response.split(":", 1)[1].strip() if ":" in full_text_response else full_text_response[len("goal achieved") :].strip()
+                )
                 return {"decision": "complete", "summary": summary}
-            
+
             # Check for other tool calls
             if llm_requested_tool_calls:
                 first_tool = llm_requested_tool_calls[0]
-                return {"decision": "call_tool", "tool_name": first_tool.get("name"),
-                       "arguments": first_tool.get("input", {}), "tool_use_id": first_tool.get("id")}
-            
+                return {
+                    "decision": "call_tool",
+                    "tool_name": first_tool.get("name"),
+                    "arguments": first_tool.get("input", {}),
+                    "tool_use_id": first_tool.get("id"),
+                }
+
             return create_thought_decision(full_text_response)
-        
+
         return {"decision": "error", "message": "No actionable content from LLM", "error_type_for_agent": "LLMOutputError"}
 
     async def process_agent_llm_turn(
@@ -12379,8 +12438,10 @@ class MCPClient:
         tool_schemas: List[Dict[str, Any]],  # LLM-formatted schemas
         model_name: str,  # User-facing model name
         ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
-        force_structured_output: bool = False,
-        force_tool_choice: Optional[str] = None,
+        # force_structured_output is no longer needed here, LLMOrchestrator handles the schema
+        # Pass response_format directly as the specific schema for the LLM call
+        response_format: Optional[Dict[str, Any]] = None,  # The specific schema for this call
+        force_tool_choice: Optional[str] = None,  # To force a specific tool choice
         ums_tool_schemas: Optional[Dict[str, Dict[str, Any]]] = None,  # NEW: For UMS structured outputs
     ) -> Dict[str, Any]:
         self.safe_print(f"MCPC: Processing LLM turn for Agent. Model: {model_name}. Provided Tools: {len(tool_schemas) if tool_schemas else 'None'}")
@@ -12456,16 +12517,14 @@ class MCPClient:
 
         try:
             async for event_type, event_data in self._stream_wrapper(
-                self.process_streaming_query(
-                    query="",
-                    model=model_name,
-                    messages_override=cast("InternalMessageList", prompt_messages),
-                    tools_override=tool_schemas,
-                    ui_websocket_sender=ui_websocket_sender,
-                    force_structured_output=force_structured_output,
-                    force_tool_choice=force_tool_choice,
-                    ums_tool_schemas=ums_tool_schemas,  # NEW: Pass UMS tool schemas
-                )
+                query="",
+                model=model_name,
+                messages_override=cast("InternalMessageList", prompt_messages),
+                tools_override=tool_schemas,
+                ui_websocket_sender=ui_websocket_sender,
+                response_format=response_format,  # Pass the specific response_format from big_reasoning_call
+                force_tool_choice=force_tool_choice,
+                ums_tool_schemas=ums_tool_schemas,  # Pass UMS tool schemas
             ):
                 if ui_websocket_sender:
                     await self._relay_agent_llm_event_to_ui(ui_websocket_sender, event_type, event_data)
@@ -12528,7 +12587,9 @@ class MCPClient:
                     potential_json = json.loads(full_text_response_accumulated.strip())
                     # Check if it's an agent-formatted response
                     if isinstance(potential_json, dict) and "decision_type" in potential_json:
-                        logger_to_use.info(f"MCPC (Agent Turn): Detected agent-formatted response with decision_type='{potential_json.get('decision_type')}', returning raw")
+                        logger_to_use.info(
+                            f"MCPC (Agent Turn): Detected agent-formatted response with decision_type='{potential_json.get('decision_type')}', returning raw"
+                        )
                         return potential_json
                 except json.JSONDecodeError:
                     pass
@@ -12542,55 +12603,46 @@ class MCPClient:
                         # Check if tools are independent (no arg dependencies)
                         independent = True
                         tool_names = [tc["name"] for tc in llm_requested_tool_calls]
-                        
+
                         # Simple heuristic: if tools are different types and don't reference each other
                         for i, tc in enumerate(llm_requested_tool_calls):
                             for arg_value in tc.get("input", {}).values():
                                 if isinstance(arg_value, str):
                                     # Check if this references another tool's output
                                     for j, other_tc in enumerate(llm_requested_tool_calls):
-                                        if i != j and (
-                                            f"result_{j}" in arg_value or 
-                                            f"output_{j}" in arg_value or
-                                            "previous" in arg_value.lower()
-                                        ):
+                                        if i != j and (f"result_{j}" in arg_value or f"output_{j}" in arg_value or "previous" in arg_value.lower()):
                                             independent = False
                                             break
                                 if not independent:
                                     break
                             if not independent:
                                 break
-                        
+
                         if independent:
                             # Return special decision type for parallel execution
                             final_decision = {
                                 "decision": "PARALLEL_TOOLS",
                                 "tool_calls": [
-                                    {
-                                        "tool_name": tc["name"],
-                                        "tool_args": tc["input"],
-                                        "tool_id": tc.get("id", f"tool_{i}")
-                                    }
+                                    {"tool_name": tc["name"], "tool_args": tc["input"], "tool_id": tc.get("id", f"tool_{i}")}
                                     for i, tc in enumerate(llm_requested_tool_calls)
-                                ]
+                                ],
                             }
-                            logger_to_use.info(f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} independent tools for parallel execution: {tool_names}")
+                            logger_to_use.info(
+                                f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} independent tools for parallel execution: {tool_names}"
+                            )
                         else:
                             # ATOMIC TOOL CALL PROCESSING - handles multiple tool calls properly (sequential)
-                            final_decision = self._process_multiple_tool_calls_atomically(
-                                llm_requested_tool_calls, executed_tool_details_for_agent
+                            final_decision = self._process_multiple_tool_calls_atomically(llm_requested_tool_calls, executed_tool_details_for_agent)
+                            logger_to_use.info(
+                                f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} dependent tools for sequential execution: {tool_names}"
                             )
-                            logger_to_use.info(f"MCPC (Agent Turn): Detected {len(llm_requested_tool_calls)} dependent tools for sequential execution: {tool_names}")
                     else:
                         # ATOMIC TOOL CALL PROCESSING - handles single tool call
-                        final_decision = self._process_multiple_tool_calls_atomically(
-                            llm_requested_tool_calls, executed_tool_details_for_agent
-                        )
+                        final_decision = self._process_multiple_tool_calls_atomically(llm_requested_tool_calls, executed_tool_details_for_agent)
                 else:
                     # UNIFIED PLAN PARSING - for text-based content only
                     final_decision = self._parse_agent_plan_unified(
-                        full_text_response_accumulated, llm_requested_tool_calls, 
-                        force_structured_output, force_tool_choice, llm_stop_reason
+                        full_text_response_accumulated, llm_requested_tool_calls, bool(response_format), force_tool_choice, llm_stop_reason
                     )
 
         except asyncio.CancelledError:
@@ -12667,7 +12719,7 @@ class MCPClient:
                 agent_model_to_use = default_llm_model_override or self.current_model
                 self.agent_loop_instance = ActualAgentMasterLoopClass(
                     mcp_client=self,  # Pass self (MCPClient instance)
-                    default_llm_model_string=agent_model_to_use
+                    default_llm_model_string=agent_model_to_use,
                 )
                 log.info(f"MCPC: AgentMasterLoop instance created. Model: {agent_model_to_use}")
             except Exception as e:  # Catch errors during instantiation
@@ -12961,21 +13013,23 @@ class MCPClient:
             if agent_state.current_leaf_goal_id and agent_state.goal_stack:
                 # Find the current operational goal object in the stack
                 current_op_goal_obj_from_stack = next(
-                    (g for g in reversed(agent_state.goal_stack) if isinstance(g, dict) and g.get("goal_id") == agent_state.current_leaf_goal_id), None
+                    (g for g in reversed(agent_state.goal_stack) if isinstance(g, dict) and g.get("goal_id") == agent_state.current_leaf_goal_id),
+                    None,
                 )
                 if current_op_goal_obj_from_stack:
                     agent_current_ums_goal_desc = current_op_goal_obj_from_stack.get("description", "Unnamed UMS Operational Goal")
                 else:
                     agent_current_ums_goal_desc = f"UMS Goal ID '{_fmt_id(agent_state.current_leaf_goal_id)}' (Details not in local stack)"
-                    
+
                     # Throttle this warning to prevent log spam - only warn once per 30 seconds per goal ID
                     warning_key = f"goal_sync_warning_{agent_state.current_leaf_goal_id}"
                     import time
+
                     current_time = time.time()
-                    
-                    if not hasattr(self, '_last_warning_times'):
+
+                    if not hasattr(self, "_last_warning_times"):
                         self._last_warning_times = {}
-                    
+
                     last_warning_time = self._last_warning_times.get(warning_key, 0)
                     if current_time - last_warning_time > 30:  # Only warn every 30 seconds
                         log.warning(
@@ -12984,7 +13038,9 @@ class MCPClient:
                         )
                         self._last_warning_times[warning_key] = current_time
                     else:
-                        log.debug(f"MCPC: Goal sync mismatch (throttled warning) - current_leaf_goal_id {_fmt_id(agent_state.current_leaf_goal_id)} not in local stack")
+                        log.debug(
+                            f"MCPC: Goal sync mismatch (throttled warning) - current_leaf_goal_id {_fmt_id(agent_state.current_leaf_goal_id)} not in local stack"
+                        )
 
                 # Summarize the agent's local view of the UMS goal stack for the API
                 # The stack in agent_state.goal_stack is already ordered root-to-leaf
@@ -13045,243 +13101,119 @@ class MCPClient:
         agent_loop: AgentMasterLoop,  # Type hint AgentMasterLoop correctly
         overall_goal: str,
         max_agent_loops: int,
-        ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,
+        ui_websocket_sender: Optional[Callable[[str, Any], Coroutine]] = None,  # Used to relay agent's internal events
     ):
         self.safe_print(f"\n[bold cyan]{EMOJI_MAP.get('robot', '🤖')} MCPC Driving Agent...[/]")
         self.safe_print(f"Overall Goal (from MCPC): [yellow]{overall_goal}[/]")
         self.safe_print(f"Max Loops (from MCPC): {max_agent_loops}")
         log.info(f"MCPC: Orchestrating self-driving agent. Goal: '{overall_goal}', Max Loops: {max_agent_loops}")
 
-        # Main loop for agent turns, managed by MCPClient
-        for loop_num_mcp_managed in range(max_agent_loops):
-            # Check agent's internal shutdown/completion flags first
-            if agent_loop._shutdown_event.is_set():
-                self.safe_print(f"MCPC: Agent shutdown signal detected at start of turn {loop_num_mcp_managed + 1}. Stopping agent.")
-                log.info(f"MCPC: Agent shutdown signal detected. Loop {loop_num_mcp_managed + 1}/{max_agent_loops}.")
-                self.agent_status = "stopped"
-                self.agent_last_message = "Agent shutdown signal."
-                break
-            if agent_loop.state.goal_achieved_flag:
-                self.safe_print(f"MCPC: Agent signaled overall goal achievement at start of turn {loop_num_mcp_managed + 1}. Stopping agent.")
-                log.info(f"MCPC: Agent goal_achieved_flag is true. Loop {loop_num_mcp_managed + 1}/{max_agent_loops}.")
-                self.agent_status = "completed"
-                self.agent_last_message = "Agent achieved overall goal."
-                break
+        # Main loop for agent turns, managed by MCPClient.
+        # Each call to agent_loop.run_main_loop represents one full turn internally.
+        while True:
+            current_aml_loop = agent_loop.state.loop_count + 1  # Use AML's internal loop counter
+            self.agent_current_loop = current_aml_loop  # Sync MCPC's view
 
-            self.agent_current_loop = loop_num_mcp_managed
-            current_aml_loop = agent_loop.state.loop_count + 1
-            self.safe_print(
-                f"\n--- MCPC: Starting Agent Turn {loop_num_mcp_managed + 1}/{max_agent_loops} (AML Internal Loop: {current_aml_loop}) ---"
-            )
-            log.info(f"MCPC: Beginning agent turn {loop_num_mcp_managed + 1}. AML Internal Loop: {current_aml_loop}.")
-            self.agent_status = "running"
-            self.agent_last_message = f"Executing turn {current_aml_loop}."
-
-            # 1. Agent prepares data for the LLM turn by calling run_main_loop
-            turn_data_for_llm: Optional[Dict[str, Any]] = None
+            self.safe_print(f"\n--- MCPC: Starting Agent Turn {current_aml_loop}/{max_agent_loops} (AML Internal Loop: {current_aml_loop}) ---")
+            log.info(f"MCPC: Orchestrating AML Turn {current_aml_loop}. Passing control to AgentMasterLoop.run_main_loop.")
+            self.agent_status = "running"  # Set status here before AML starts its turn
+            self.agent_last_message = f"Agent working on turn {current_aml_loop}."
 
             try:
-                turn_data_for_llm = await agent_loop.run_main_loop(overall_goal, max_agent_loops)
-                
-                # Handle agent signals stop (return None)
-                if turn_data_for_llm is None:
-                    self.safe_print("MCPC: Agent signaled termination during its data preparation phase (run_main_loop returned None).")
-                    log.info("MCPC: AgentMasterLoop.run_main_loop returned None, signaling stop.")
-                    self.agent_status = "stopped"
-                    self.agent_last_message = "Agent run_main_loop phase signaled stop."
-                    break
+                # Call the AML's main loop. It will execute one full turn and return True to continue or False to stop.
+                should_continue = await agent_loop.run_main_loop(overall_goal, max_agent_loops)
 
-                # Validate structure of turn_data_for_llm (must be dict with required keys)
-                required_keys = ["prompt_messages", "tool_schemas", "force_structured_output", "force_tool_choice", "ums_tool_schemas"]
-                if not isinstance(turn_data_for_llm, dict):
-                    log.error(f"MCPC: CRITICAL - AgentMasterLoop.run_main_loop returned non-dict: {type(turn_data_for_llm)}")
-                    self.agent_status = "failed"
-                    self.agent_last_message = "Internal error: Agent data preparation failed - invalid data type."
-                    if agent_loop and not agent_loop._shutdown_event.is_set():
-                        await agent_loop.shutdown()
-                    break
-
-                missing_keys = [key for key in required_keys if key not in turn_data_for_llm]
-                if missing_keys:
-                    log.error(
-                        f"MCPC: CRITICAL - AgentMasterLoop.run_main_loop returned dict missing required keys: {missing_keys}. "
-                        f"Available keys: {list(turn_data_for_llm.keys())}"
-                    )
-                    self.agent_status = "failed"
-                    self.agent_last_message = "Internal error: Agent data structure missing required keys."
-                    if agent_loop and not agent_loop._shutdown_event.is_set():
-                        await agent_loop.shutdown()
-                    break
-
-                # Extract values from turn_data_for_llm
-                prompt_messages = turn_data_for_llm.get("prompt_messages")
-                tool_schemas = turn_data_for_llm.get("tool_schemas")
-                force_structured_output = turn_data_for_llm.get("force_structured_output")
-                force_tool_choice = turn_data_for_llm.get("force_tool_choice")
-                ums_tool_schemas_for_llm = turn_data_for_llm.get("ums_tool_schemas")
-
-                # Additional validation for critical values
-                if prompt_messages is None or tool_schemas is None:
-                    log.error(
-                        f"MCPC: CRITICAL - 'prompt_messages' or 'tool_schemas' is None. "
-                        f"PM type: {type(prompt_messages)}, TS type: {type(tool_schemas)}"
-                    )
-                    self.agent_status = "failed"
-                    self.agent_last_message = "Internal error: Agent data structure malformed."
-                    if agent_loop and not agent_loop._shutdown_event.is_set():
-                        await agent_loop.shutdown()
-                    break
-
-            except asyncio.CancelledError:
-                self.safe_print("MCPC: Agent data preparation was cancelled. Stopping agent.")
-                log.info("MCPC: AgentMasterLoop.run_main_loop was cancelled.")
-                if agent_loop and not agent_loop._shutdown_event.is_set():
-                    await agent_loop.shutdown()
-                self.agent_status = "stopped"
-                self.agent_last_message = "Agent preparation cancelled."
-                break
-            except Exception as prep_err:
-                self.safe_print(f"[bold red]MCPC: Error during agent data preparation: {str(prep_err)[:200]}[/]")
-                log.error(f"MCPC: Critical error in agent_loop.run_main_loop: {prep_err}", exc_info=True)
-                self.agent_status = "failed"
-                self.agent_last_message = f"Preparation error: {str(prep_err)[:100]}"
-                if agent_loop and not agent_loop._shutdown_event.is_set():
-                    await agent_loop.shutdown()
-                break
-
-            # 2. MCPClient makes the LLM call using process_agent_llm_turn
-            self.safe_print(f"MCPC: Requesting LLM decision (Model: {agent_loop.agent_llm_model})...")
-            self.agent_last_message = f"Requesting LLM decision for turn {current_aml_loop}..."
-
-            try:
-                # Add timeout protection for LLM calls (3 minutes max)
-                llm_decision: Dict = await asyncio.wait_for(
-                    self.process_agent_llm_turn(
-                        prompt_messages=prompt_messages,
-                        tool_schemas=tool_schemas,
-                        model_name=agent_loop.agent_llm_model,
-                        ui_websocket_sender=ui_websocket_sender,
-                        force_structured_output=force_structured_output,
-                        force_tool_choice=force_tool_choice,
-                        ums_tool_schemas=ums_tool_schemas_for_llm,
-                    ),
-                    timeout=180.0  # 3 minutes timeout
-                )
-            except asyncio.TimeoutError:
-                self.safe_print(f"[bold red]MCPC: LLM call timeout (3 minutes) - agent may be stuck or model overloaded[/]")
-                log.error(f"MCPC: LLM call timeout after 180 seconds for turn {loop_num_mcp_managed + 1}")
-                llm_decision = {
-                    "decision": "error",
-                    "message": "LLM call timed out after 3 minutes. Consider using a faster model or simpler prompts.",
-                    "error_type_for_agent": "LLMTimeoutError",
-                }
-                self.agent_status = "failed"
-                self.agent_last_message = "LLM call timed out"
-                if not agent_loop._shutdown_event.is_set():
-                    await agent_loop.shutdown()
-                break
-            except Exception as llm_call_err:
-                self.safe_print(f"[bold red]MCPC: Critical error calling LLM for agent: {str(llm_call_err)[:200]}[/]")
-                log.error(f"MCPC: Unhandled exception in self.process_agent_llm_turn: {llm_call_err}", exc_info=True)
-                llm_decision = {
-                    "decision": "error",
-                    "message": f"MCPClient failed to get LLM decision: {llm_call_err}",
-                    "error_type_for_agent": "MCPClientError",
-                }
-                self.agent_status = "failed"  # Update MCPClient's status
-                self.agent_last_message = f"LLM call error: {str(llm_call_err)[:100]}"
-                if not agent_loop._shutdown_event.is_set():
-                    await agent_loop.shutdown()
-                break
-
-            # 3. Agent executes the LLM decision using execute_llm_decision
-            decision_type_log = llm_decision.get("decision", "unknown")
-            self.safe_print(f"MCPC: Passing LLM decision (type: {decision_type_log}) to agent for execution...")
-            log.debug(f"MCPC: LLM decision for agent: {str(llm_decision)[:300]}")
-            self.agent_last_message = f"Executing LLM decision (type: {decision_type_log}) for turn {current_aml_loop}..."
-            
-            try:
-                # Call execute_llm_decision and get should_continue flag
-                should_continue: bool = await agent_loop.execute_llm_decision(llm_decision)
-
-                # Relay agent's internal action summary if sender available (AFTER execution)
+                # Relay agent's internal action summary if sender available (AFTER full turn execution)
                 if ui_websocket_sender and agent_loop and agent_loop.state.last_action_summary:
                     activity_summary = agent_loop.state.last_action_summary
                     await ui_websocket_sender(
                         "agent_activity_log", {"summary": activity_summary, "timestamp": datetime.now(timezone.utc).isoformat()}
                     )
 
-                # Handle should_continue and other termination conditions
+                # The agent_loop.run_main_loop handles its own budget, turn limits, and goal completion.
+                # We just react to its `should_continue` signal.
                 if not should_continue:
-                    self.safe_print("MCPC: Agent signaled loop termination after executing decision.")
-                    log.info("MCPC: AgentMasterLoop.execute_llm_decision returned False (stop).")
-                    if not agent_loop.state.goal_achieved_flag:
-                        self.agent_status = "stopped"
-                        self.agent_last_message = "Agent decided to stop."
-                    # If goal_achieved_flag is true, status will be set later based on it.
-                    break
+                    self.safe_print("MCPC: Agent signaled loop termination after completing its turn.")
+                    log.info(f"MCPC: AgentMasterLoop.run_main_loop returned False. Stopping orchestration loop.")
+                    break  # Exit the MCPC orchestration loop
+
+                # If agent is still supposed to continue, check MCPC's maximum loops.
+                if current_aml_loop >= max_agent_loops:
+                    self.safe_print(f"MCPC: Max orchestration loops ({max_agent_loops}) reached. Signaling agent to conclude.")
+                    log.info(f"MCPC: Max orchestration loops ({max_agent_loops}) reached. Signaling agent to conclude.")
+                    # Even if `run_main_loop` returned True, we enforce this outer loop limit.
+                    # Signal AML to shut down if it hasn't already.
+                    if not agent_loop._shutdown_event.is_set():
+                        await agent_loop.shutdown()
+                    should_continue = False  # Force stop
+                    break  # Exit the MCPC orchestration loop
+
             except asyncio.CancelledError:
-                self.safe_print("MCPC: Agent decision execution was cancelled. Stopping agent.")
-                log.info("MCPC: AgentMasterLoop.execute_llm_decision was cancelled.")
+                self.safe_print("MCPC: Agent orchestration was cancelled. Stopping agent.")
+                log.info("MCPC: Agent orchestration loop was cancelled.")
+                # Signal AML to shut down if it hasn't already handled cancellation internally.
                 if not agent_loop._shutdown_event.is_set():
                     await agent_loop.shutdown()
                 self.agent_status = "stopped"
-                self.agent_last_message = "Agent execution cancelled."
-                break
-            except Exception as exec_err:
-                self.safe_print(f"[bold red]MCPC: Error during agent decision execution: {str(exec_err)[:200]}[/]")
-                log.error(f"MCPC: Critical error in agent_loop.execute_llm_decision: {exec_err}", exc_info=True)
-                self.agent_status = "failed"
-                self.agent_last_message = f"Execution error: {str(exec_err)[:100]}"
+                self.agent_last_message = "Agent orchestration cancelled."
+                should_continue = False  # Force stop
+                break  # Exit the MCPC orchestration loop
+
+            except Exception as orchestration_err:
+                self.safe_print(f"[bold red]MCPC: Critical error during agent orchestration: {str(orchestration_err)[:200]}[/]")
+                log.error(f"MCPC: Unhandled exception in agent orchestration loop: {orchestration_err}", exc_info=True)
+                # Signal AML to shut down due to critical orchestration error.
                 if not agent_loop._shutdown_event.is_set():
                     await agent_loop.shutdown()
-                break
+                self.agent_status = "failed"
+                self.agent_last_message = f"Orchestration error: {str(orchestration_err)[:100]}"
+                should_continue = False  # Force stop
+                break  # Exit the MCPC orchestration loop
 
-            # Note: AgentMasterLoop.state.loop_count is incremented internally by agent_loop.execute_llm_decision upon success.
-
-            if agent_loop.state.goal_achieved_flag:
-                self.safe_print("MCPC: Agent goal_achieved_flag is now true after decision execution. Stopping.")
-                log.info("MCPC: Agent goal_achieved_flag became true. Loop will terminate.")
-                self.agent_status = "completed"
-                self.agent_last_message = "Agent achieved overall goal."
-                break
-
-            await asyncio.sleep(0.1)
+            # Small delay between turns for readability/resource management, unless explicitly stopped.
+            if should_continue:
+                await asyncio.sleep(0.1)
 
         # --- Loop End ---
-        final_aml_loop_count = agent_loop.state.loop_count if agent_loop else 0
-        self.agent_current_loop = final_aml_loop_count  # Ensure final sync for agentStatus API
-
-        # Update final status based on how the loop exited
-        if self.agent_status == "running":  # If loop finished due to max_agent_loops
+        # Update final MCPC status based on how the agent_loop finished
+        if agent_loop.state.goal_achieved_flag:
+            self.agent_status = "completed"
+            self.agent_last_message = "Agent achieved its overall goal."
+        elif agent_loop._shutdown_event.is_set():  # AML shut down internally
+            self.agent_status = "stopped"
+            self.agent_last_message = "Agent shut down gracefully by AML."
+        elif current_aml_loop >= max_agent_loops:  # Reached max outer loops
             self.agent_status = "max_loops_reached"
             self.agent_last_message = f"Agent reached max MCPC-driven loops ({max_agent_loops})."
+        else:  # Any other exit reason from the AML loop that wasn't already handled by AML's status updates
+            self.agent_status = "stopped"  # Default stop if not a specific completion/failure
+            self.agent_last_message = "Agent stopped by AML."
 
-        # Print final summary message
+        self.agent_current_loop = current_aml_loop  # Final sync for agentStatus API
+
+        # Print final summary message based on the determined status
         if self.agent_status == "completed":
             self.safe_print(
-                f"[bold green]{EMOJI_MAP.get('party_popper', '🎉')} Agent achieved its overall goal after {final_aml_loop_count} internal loops![/]"
+                f"[bold green]{EMOJI_MAP.get('party_popper', '🎉')} Agent achieved its overall goal after {current_aml_loop} internal loops![/]"
             )
-            log.info(f"MCPC: Agent run finished - goal achieved after {final_aml_loop_count} internal loops.")
-        elif self.agent_status == "stopped":
-            self.safe_print(f"[yellow]{EMOJI_MAP.get('cancel', '🛑')} Agent task stopped/cancelled after {final_aml_loop_count} internal loops.[/]")
-            log.info(f"MCPC: Agent run finished - stopped/cancelled after {final_aml_loop_count} internal loops.")
-        elif self.agent_status == "failed":
-            self.safe_print(f"[bold red]{EMOJI_MAP.get('collision', '💥')} Agent task failed after {final_aml_loop_count} internal loops.[/]")
-            log.info(f"MCPC: Agent run finished - failed after {final_aml_loop_count} internal loops.")
-        else:  # Max loops reached or other states
+            log.info(f"MCPC: Agent run finished - goal achieved after {current_aml_loop} internal loops.")
+        elif self.agent_status == "failed" or self.agent_status == "failed_to_stop":
             self.safe_print(
-                f"[yellow]{EMOJI_MAP.get('warning', '⚠️')} Agent run concluded after {final_aml_loop_count} internal loops. Final status: {self.agent_status}[/]"
+                f"[bold red]{EMOJI_MAP.get('collision', '💥')} Agent task failed after {current_aml_loop} internal loops. Reason: {self.agent_last_message}[/]"
             )
-            log.info(f"MCPC: Agent run finished - {final_aml_loop_count} internal loops. Status: {self.agent_status}")
+            log.info(f"MCPC: Agent run finished - failed after {current_aml_loop} internal loops. Reason: {self.agent_last_message}")
+        else:  # Stopped, max_loops_reached, etc.
+            self.safe_print(
+                f"[yellow]{EMOJI_MAP.get('warning', '⚠️')} Agent run concluded after {current_aml_loop} internal loops. Final status: {self.agent_status}[/]"
+            )
+            log.info(f"MCPC: Agent run finished - {current_aml_loop} internal loops. Status: {self.agent_status}")
 
+        # Final check: Ensure AML is shut down after the entire orchestration concludes.
         if agent_loop and not agent_loop._shutdown_event.is_set():
             self.safe_print("MCPC: Ensuring final agent shutdown process...")
             await agent_loop.shutdown()
         elif not agent_loop:
             log.warning("MCPC: Agent loop instance was None at end of run_self_driving_agent.")
-        else:
-            self.safe_print("MCPC: Agent already processing shutdown.")
 
         self.safe_print(f"[bold cyan]{EMOJI_MAP.get('robot', '🤖')} Self-Driving Agent Orchestration Concluded by MCPC.[/]")
 
@@ -13388,7 +13320,7 @@ class MCPClient:
                                 last_text_update_time = current_time  # Initialize time
 
                                 # Directly iterate over the wrapped generator stream
-                                async for chunk_type, chunk_data in self._stream_wrapper(self.process_streaming_query(query)):
+                                async for chunk_type, chunk_data in self._stream_wrapper(query):
                                     current_time = time.time()
                                     needs_render_update = False  # Reset flag for this chunk
 
@@ -13635,6 +13567,19 @@ class MCPClient:
             padding=(0, 1),  # Less vertical padding
         )
         target_console.print(final_stats_panel)
+
+    async def _display_server_status(self, server_name: str, server_config: ServerConfig) -> Dict[str, Any]:
+        """Helper function for displaying individual server status in progress."""
+        metrics = server_config.metrics
+        is_connected = server_name in self.server_manager.active_sessions
+        health_score = 0
+        if is_connected and metrics.request_count > 0:
+            # A simple heuristic for health scoring
+            health_penalty = (metrics.error_rate * 100) + max(0, (metrics.avg_response_time - 1.0) * 10)
+            health_score = max(0, min(100, int(100 - health_penalty)))
+
+        tools_count = sum(1 for t in self.server_manager.tools.values() if t.server_name == server_name)
+        return {"health": health_score, "tools": tools_count}  # Used by _run_with_progress if use_health_scores=True
 
     async def close(self):
         """Gracefully shut down the client and release resources."""
@@ -14884,10 +14829,14 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     nonlocal active_query_task  # Allow modification of outer scope variable
                     try:
                         # Iterate over the standardized events yielded by the stream wrapper
-                        # Call process_streaming_query without model - it uses mcp_client.current_model
-                        async for chunk_type, chunk_data in mcp_client._stream_wrapper(mcp_client.process_streaming_query(query_text)):
+                        # Call _stream_wrapper directly, passing query_text and the websocket sender
+                        async for chunk_type, chunk_data in mcp_client._stream_wrapper(
+                            query=query_text,
+                            ui_websocket_sender=send_ws_message,  # Pass the WebSocket sender function
+                            # model, max_tokens, temperature will use mcp_client defaults
+                        ):
                             # Forward relevant events to the WebSocket client
-                            if chunk_type == "text":
+                            if chunk_type == "text_chunk":  # Note: _stream_wrapper standardizes to text_chunk
                                 await send_ws_message("text_chunk", chunk_data)
                             elif chunk_type == "status":
                                 # Convert potentially marked-up string to plain text for basic WS status
@@ -14895,21 +14844,21 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                 await send_ws_message("status", plain_status_text)
                             elif chunk_type == "error":
                                 await send_ws_message("error", {"message": str(chunk_data)})
-                            elif chunk_type == "final_stats":
+                            elif chunk_type == "final_usage":  # Renamed from final_stats for clarity
                                 # Send final usage and completion status after stream completes
-                                # Use the get_token_usage function to get current session stats
-                                usage_data = await get_token_usage(mcp_client)
-                                await send_ws_message("token_usage", usage_data)
-                                await send_ws_message("query_complete", {"stop_reason": chunk_data.get("stop_reason", "unknown")})
+                                # The payload structure of final_usage from _stream_wrapper needs to be compatible
+                                # with what get_token_usage would return or adjusted.
+                                # For simplicity, let's assume it yields the necessary components.
+                                await send_ws_message("token_usage", chunk_data)  # chunk_data is the dict from final_usage
+                            elif chunk_type == "stop_reason":
+                                await send_ws_message("query_complete", {"stop_reason": str(chunk_data)})
                             elif chunk_type == "tool_call_start":
-                                # Forward tool start event if UI needs it
                                 await send_ws_message("tool_call_start", chunk_data)
                             elif chunk_type == "tool_call_input_chunk":
-                                # Forward input chunks if UI needs them
                                 await send_ws_message("tool_call_input_chunk", chunk_data)
                             elif chunk_type == "tool_call_end":
-                                # Forward tool end event if UI needs it
                                 await send_ws_message("tool_call_end", chunk_data)
+                            # ... (handle any other event types yielded by _stream_wrapper)
 
                     except asyncio.CancelledError:
                         log.info(f"WS-{connection_id}: Query task cancelled.")
