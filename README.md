@@ -38,7 +38,7 @@ The Model Context Protocol (MCP) standardizes how AI models interact with extern
     -   **CLI:** Feature-rich interactive shell (`/commands`, autocompletion, **Rich** Markdown rendering) and batch-mode operation via **Typer**. Includes a live **Textual User Interface (TUI) dashboard** for monitoring.
 
 -   **Robust Server Connectivity & Management**
-    -   Supports `stdio` and `sse` (HTTP Server-Sent Events) MCP servers.
+    -   Supports `stdio`, `sse` (HTTP Server-Sent Events), and `streaming-http` MCP servers.
     -   **Advanced STDIO Handling (Key Engineering Effort):** Features a custom `RobustStdioSession` designed to gracefully handle potentially noisy or non-compliant `stdio` servers. It includes:
         -   *Noise Filtering:* Ignores non-JSON-RPC output that could corrupt the protocol.
         -   *Direct Future Resolution:* Avoids complex queueing for faster response handling.
@@ -46,10 +46,17 @@ The Model Context Protocol (MCP) standardizes how AI models interact with extern
         -   **Critical STDIO Safety:** A multi-layered system (`StdioProtectionWrapper`, `safe_stdout` context manager, `get_safe_console()` function) prevents accidental writes to `sys.stdout` from corrupting the `stdio` channel, ensuring safe coexistence of multiple `stdio` servers and user output (redirected to `stderr` when necessary). This was crucial for stability.
     -   **Resilience:** Automatic connection retries with exponential backoff and circuit breakers for failing servers (`@retry_with_circuit_breaker`). Background health monitoring (`ServerMonitor`) checks server responsiveness.
 
+-   **Modern Transport Support**
+    -   **Streaming-HTTP:** Native support for the modern `streaming-http` transport protocol via the FastMCP library. This transport provides efficient bidirectional communication over HTTP with built-in streaming capabilities, making it ideal for modern MCP server deployments.
+    -   **Intelligent Transport Detection:** Automatically detects and suggests the appropriate transport type based on server URLs and discovery information:
+        -   Local file paths → `stdio`
+        -   URLs with `/sse` or `/events` paths → `sse`
+        -   General HTTP/HTTPS URLs → `streaming-http` (default for modern servers)
+
 -   **Intelligent Server Discovery**
     -   Auto-discovers local `stdio` servers (Python/JS scripts) in configured filesystem paths.
     -   **mDNS Discovery (Zeroconf):** Real-time discovery and notification of MCP servers (`_mcp._tcp.local.`) on the local network. Interactive commands (`/discover list`, `/discover connect`, etc.) for managing LAN servers.
-    -   **Local Port Scanning:** Actively scans a configurable range of local ports (e.g., 8000-9000) for MCP servers by attempting an `initialize` handshake. Useful for servers not advertising via mDNS. Configurable via `/config port-scan ...` commands.
+    -   **Local Port Scanning:** Actively scans a configurable range of local ports (e.g., 8000-9000) for MCP servers by attempting an `initialize` handshake. Supports detection of all transport types (`stdio`, `sse`, `streaming-http`). Configurable via `/config port-scan ...` commands.
     -   **Registry Integration:** Connects to remote MCP registries (specified in config) to find and add shared servers.
     -   **Claude Desktop Import:** Automatically detects `claude_desktop_config.json` in the project root. **Intelligently adapts configurations:**
         -   Remaps `wsl.exe ... bash -c "cmd"` calls to direct Linux shell execution (`/bin/bash -c "cmd"`).
@@ -242,7 +249,7 @@ The web UI (`mcpclient run --webui`) provides a modern, user-friendly interface 
 -   **Real-time Chat:** Streamed responses from Claude via WebSockets, rich Markdown rendering (via `Marked.js`), code block syntax highlighting (via `highlight.js`) with copy buttons, and clear display of system messages and status updates.
 -   **Tool Interaction:** Visual separation and display of tool calls (arguments) and their results (success or error) directly within the chat flow. A modal allows direct execution of any available tool with custom JSON parameters for testing and debugging.
 -   **Server Management:** A dedicated sidebar tab lists configured servers. Users can:
-    -   Add new servers (STDIO/SSE) via a modal form.
+    -   Add new servers (STDIO/SSE/Streaming-HTTP) via a modal form.
     -   Connect/disconnect from servers with status indicators (loading, connected, disconnected, error).
     -   Enable/disable servers (automatically disconnects if disabled).
     -   Remove server configurations.
@@ -266,7 +273,7 @@ GET    /api/status                     - Client overview (model, servers, tools,
 GET    /api/config                     - Get current (non-sensitive) configuration
 PUT    /api/config                     - Update configuration settings (e.g., { "temperature": 0.8 })
 GET    /api/servers                    - List all configured servers with status, health, tools
-POST   /api/servers                    - Add a new server configuration (Requires ServerAddRequest model)
+POST   /api/servers                    - Add a new server configuration (Supports stdio/sse/streaming-http transports)
 DELETE /api/servers/{server_name}    - Remove a server configuration
 POST   /api/servers/{server_name}/connect    - Connect to a specific server
 POST   /api/servers/{server_name}/disconnect - Disconnect from a specific server
@@ -330,7 +337,7 @@ This client employs several techniques to provide a robust and feature-rich expe
 -   **Asynchronous Core:** Built entirely on Python's `asyncio` for efficient handling of network I/O (HTTP, WebSockets, SSE), subprocess communication (`stdio`), filesystem operations (`aiofiles`), and concurrent background tasks (monitoring, discovery, port scanning).
 -   **Component-Based Design:** While packaged primarily as a single script for ease of use, it internally separates concerns into distinct classes:
     -   `MCPClient`: The main application class, orchestrating UI loops, command handling, and core logic.
-    -   `ServerManager`: Handles server configuration, lifecycle (connecting, disconnecting, restarting), discovery mechanisms, capability aggregation (tools, resources, prompts), and manages server processes/sessions. Uses `AsyncExitStack` for reliable resource cleanup.
+    -   `ServerManager`: Handles server configuration, lifecycle (connecting, disconnecting, restarting), discovery mechanisms, capability aggregation (tools, resources, prompts), and manages server processes/sessions. Uses `AsyncExitStack` for reliable resource cleanup. Supports all transport types including the modern `streaming-http` protocol via FastMCP integration.
     -   **`RobustStdioSession` (Key Engineering Effort):** A custom implementation of the `mcp.ClientSession` tailored specifically for `stdio` servers. It includes logic to:
         -   Filter non-JSON-RPC output from the server's `stdout` to prevent protocol errors.
         -   Handle responses by directly resolving `asyncio.Future` objects associated with request IDs, offering a potentially more performant alternative to queue-based approaches.
@@ -396,7 +403,7 @@ This client offers multiple ways to find and integrate MCP servers:
         -   `/discover auto [on|off]`: Toggle continuous background mDNS scanning (requires `enable_local_discovery: true` in config).
   -   **Local Port Scanning:**
       -   If enabled (`enable_port_scanning: true` in `config.yaml` or via `/config port-scan enable true`), actively scans a range of ports on specified local IP addresses during startup discovery.
-      -   Attempts a basic MCP `initialize` handshake on each port to detect responsive MCP servers (primarily SSE).
+      -   Attempts a basic MCP `initialize` handshake on each port to detect responsive MCP servers. Supports automatic detection of `sse` and `streaming-http` transport types based on server responses and HTTP headers.
       -   Useful for finding servers that don't use mDNS advertisement.
       -   The range, target IPs, concurrency, and timeout are configurable via `config.yaml` or the `/config port-scan ...` commands.
       -   Found servers are presented alongside other discovered servers for optional addition to the configuration.
@@ -445,7 +452,7 @@ mcpclient config --edit
 -   **Core:** Python 3.13+, `asyncio`
 -   **CLI:** `Typer`, `Rich`
 -   **Web:** `FastAPI`, `Uvicorn`, `WebSockets`, `Alpine.js`, `Tailwind CSS`, `DaisyUI`
--   **MCP:** `mcp` SDK (`mcp>=1.0.0`)
+-   **MCP:** `mcp` SDK (`mcp>=1.0.0`), `fastmcp` (for streaming-http transport)
 -   **AI:** `anthropic` SDK (`anthropic>=0.15.0`)
 -   **Observability:** `opentelemetry-sdk`, `opentelemetry-api`, `opentelemetry-instrumentation`
 -   **Utilities:** `httpx`, `PyYAML`, `python-dotenv`, `psutil`, `aiofiles`, `diskcache`, `tiktoken`, `zeroconf`, `colorama`
