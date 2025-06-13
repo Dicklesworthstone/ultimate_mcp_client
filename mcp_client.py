@@ -4038,7 +4038,11 @@ class ServerManager:
                 log.info(f"[{server_name}] Loading tools...")
                 try:
                     list_tools_result = await asyncio.wait_for(session.list_tools(), timeout=capability_timeout)
-                    if list_tools_result and hasattr(list_tools_result, 'tools'):
+                    # Handle both SSE/STDIO transport (object with .tools attribute) and FastMCP streaming-http (direct list)
+                    if isinstance(list_tools_result, list):
+                        tools_list = list_tools_result  # FastMCP returns list directly
+                        self._process_list_result(server_name, tools_list, self.tools, MCPTool, "tool")
+                    elif list_tools_result and hasattr(list_tools_result, 'tools'):
                         self._process_list_result(server_name, list_tools_result.tools, self.tools, MCPTool, "tool")
                     else: log.warning(f"[{server_name}] Invalid ListToolsResult.")
                 except asyncio.TimeoutError: log.error(f"[{server_name}] Timeout loading tools.")
@@ -4051,7 +4055,11 @@ class ServerManager:
                 log.info(f"[{server_name}] Loading resources...")
                 try:
                     list_resources_result = await asyncio.wait_for(session.list_resources(), timeout=capability_timeout)
-                    if list_resources_result and hasattr(list_resources_result, 'resources'):
+                    # Handle both SSE/STDIO transport (object with .resources attribute) and FastMCP streaming-http (direct list)
+                    if isinstance(list_resources_result, list):
+                        resources_list = list_resources_result  # FastMCP returns list directly
+                        self._process_list_result(server_name, resources_list, self.resources, MCPResource, "resource")
+                    elif list_resources_result and hasattr(list_resources_result, 'resources'):
                         self._process_list_result(server_name, list_resources_result.resources, self.resources, MCPResource, "resource")
                     else: log.warning(f"[{server_name}] Invalid ListResourcesResult.")
                 except asyncio.TimeoutError: log.error(f"[{server_name}] Timeout loading resources.")
@@ -4064,7 +4072,11 @@ class ServerManager:
                 log.info(f"[{server_name}] Loading prompts...")
                 try:
                     list_prompts_result = await asyncio.wait_for(session.list_prompts(), timeout=capability_timeout)
-                    if list_prompts_result and hasattr(list_prompts_result, 'prompts'):
+                    # Handle both SSE/STDIO transport (object with .prompts attribute) and FastMCP streaming-http (direct list)
+                    if isinstance(list_prompts_result, list):
+                        prompts_list = list_prompts_result  # FastMCP returns list directly
+                        self._process_list_result(server_name, prompts_list, self.prompts, MCPPrompt, "prompt")
+                    elif list_prompts_result and hasattr(list_prompts_result, 'prompts'):
                          self._process_list_result(server_name, list_prompts_result.prompts, self.prompts, MCPPrompt, "prompt")
                     else: log.warning(f"[{server_name}] Invalid ListPromptsResult.")
                 except asyncio.TimeoutError: log.error(f"[{server_name}] Timeout loading prompts.")

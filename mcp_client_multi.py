@@ -211,8 +211,9 @@ from dotenv import dotenv_values, find_dotenv, load_dotenv, set_key
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastmcp import Client as FastMCPClient
+from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 from mcp import ClientSession
-from mcp.client.sse import sse_client
 from mcp.shared.exceptions import McpError
 from mcp.types import (
     CallToolResult,
@@ -846,11 +847,12 @@ class SetModelRequest(BaseModel):
 class ServerType(Enum):
     STDIO = "stdio"
     SSE = "sse"
+    STREAMABLE_HTTP = "streamable-http"
 
 
 class ServerAddRequest(BaseModel):
     name: str
-    type: ServerType
+    type: Optional[ServerType] = None  # Now optional - will use transport inference if not provided
     path: str
     argsString: Optional[str] = ""
 
@@ -3562,90 +3564,64 @@ class ServerManager:
 
     async def _probe_port(self, ip_address: str, port: int, probe_timeout: float, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         """
-        Attempts to detect an MCP SSE server on a given IP:Port.
-        Returns server details dict if MCP pattern detected, None otherwise.
+        Attempts to detect an MCP server on a given IP:Port by checking for a
+        standard MCP discovery endpoint at the root URL.
+        Returns server details dict if an MCP server is detected, None otherwise.
         """
-        tcp_check_timeout = 0.25  # Slightly longer TCP timeout
+        # Quick TCP check remains the same and is good practice.
+        tcp_check_timeout = 0.25
         try:
             reader, writer = await asyncio.wait_for(asyncio.open_connection(ip_address, port), timeout=tcp_check_timeout)
             writer.close()
             await writer.wait_closed()
-            if USE_VERBOSE_SESSION_LOGGING:
-                log.debug(f"TCP Port open: {ip_address}:{port}. Proceeding.")
-            await asyncio.sleep(0.05)
         except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
-            return None
-        except Exception as e:
-            log.warning(f"TCP pre-check error {ip_address}:{port}: {e}")
-            return None
+            return None  # Port is not open
 
-        base_url = f"http://{ip_address}:{port}"
-        sse_url = f"{base_url}/sse"
-        mcp_server_found = False
-        server_details = None
-
-        # --- Attempt GET /sse (Streaming Check) ---
+        # --- NEW, SIMPLIFIED PROBE LOGIC ---
+        probe_url = f"http://{ip_address}:{port}/"
         try:
             if USE_VERBOSE_SESSION_LOGGING:
-                log.debug(f"Probing GET {sse_url} (timeout={probe_timeout}s)...")
-            async with client.stream("GET", sse_url, timeout=probe_timeout) as response:
-                if response.status_code == 200 and response.headers.get("content-type", "").lower().startswith("text/event-stream"):
-                    log.info(f"MCP SSE detected via GET /sse at {sse_url}")
-                    server_name = f"mcp-scan-{ip_address}-{port}-sse"
-                    server_details = {
-                        "name": server_name,
-                        "path": sse_url,
-                        "type": ServerType.SSE,
-                        "args": [],
-                        "description": f"SSE server (GET /sse) on {ip_address}:{port}",
-                        "source": "portscan",
-                    }
-                    mcp_server_found = True  # Found it, no need for POST
-                elif USE_VERBOSE_SESSION_LOGGING:
-                    log.debug(f"GET {sse_url} failed: Status={response.status_code}, Type={response.headers.get('content-type')}")
-        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError, asyncio.TimeoutError) as http_err:
+                log.debug(f"Probing for MCP server at: GET {probe_url} (timeout={probe_timeout}s)...")
+
+            response = await client.get(probe_url, timeout=probe_timeout)
+
+            # Check for the MCP discovery header
+            if response.status_code == 200 and response.headers.get("x-mcp-server", "").lower() == "true":
+                # Server has identified itself as an MCP server. Now get details.
+                transport_type_str = response.headers.get("x-mcp-transport", "streamable-http")
+                endpoint_path = ""
+                try:
+                    # The body might contain the endpoint path
+                    data = response.json()
+                    endpoint_path = data.get("endpoint", "")
+                except json.JSONDecodeError:
+                    # Fallback if body is not JSON
+                    if transport_type_str == "sse":
+                        endpoint_path = "/sse"
+                    else:  # Default to streamable-http
+                        endpoint_path = "/mcp"
+
+                # Construct the full path for the client to use
+                full_path = f"{probe_url.strip('/')}{endpoint_path}"
+
+                log.info(f"MCP server detected at {probe_url}. Type: {transport_type_str}, Endpoint: {full_path}")
+
+                return {
+                    "name": f"mcp-scan-{ip_address}-{port}",
+                    "path": full_path,
+                    "type": ServerType(transport_type_str),
+                    "args": [],
+                    "description": f"Discovered {transport_type_str} server on {ip_address}:{port}",
+                    "source": "portscan",
+                }
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RequestError, asyncio.TimeoutError):
+            # These are expected for non-responsive ports, no need to log verbosely unless debugging.
             if USE_VERBOSE_SESSION_LOGGING:
-                log.debug(f"GET {sse_url} error: {type(http_err).__name__}")
+                log.debug(f"Probe failed for {probe_url}: Connection/Timeout error.")
         except Exception as e:
-            log.warning(f"Unexpected error GET {sse_url}: {e}")
+            log.warning(f"Unexpected error probing {probe_url}: {e}")
 
-        # --- Attempt POST / initialize ---
-        if not mcp_server_found:
-            initialize_payload = {"jsonrpc": "2.0", "method": "initialize", "params": {"protocolVersion": "2025-03-25"}, "id": str(uuid.uuid4())}
-            try:
-                if USE_VERBOSE_SESSION_LOGGING:
-                    log.debug(f"Probing POST {base_url} (timeout={probe_timeout}s)...")
-                response = await client.post(base_url, json=initialize_payload, timeout=probe_timeout)
-                if response.status_code == 200:
-                    try:
-                        response_data = response.json()
-                        if isinstance(response_data, dict) and response_data.get("jsonrpc") == "2.0":
-                            log.info(f"MCP detected via POST initialize at {base_url}")
-                            server_name = f"mcp-scan-{ip_address}-{port}-post"
-                            server_details = {
-                                "name": server_name,
-                                "path": base_url,
-                                "type": ServerType.SSE,
-                                "args": [],
-                                "description": f"SSE server (POST /) on {ip_address}:{port}",
-                                "source": "portscan",
-                            }
-                        elif USE_VERBOSE_SESSION_LOGGING:
-                            log.debug(f"Non-MCP JSON from POST {base_url}: {str(response_data)[:100]}...")
-                    except json.JSONDecodeError:
-                        if USE_VERBOSE_SESSION_LOGGING:
-                            log.debug(f"Non-JSON response at POST {base_url}")
-                elif USE_VERBOSE_SESSION_LOGGING:
-                    log.debug(f"POST {base_url} failed: Status={response.status_code}")
-            except (httpx.TimeoutException, httpx.RequestError, asyncio.TimeoutError) as http_err:
-                if USE_VERBOSE_SESSION_LOGGING:
-                    log.debug(f"POST {base_url} error: {type(http_err).__name__}")
-            except Exception as e:
-                log.warning(f"Unexpected error POST {base_url}: {e}")
-
-        if server_details is None and USE_VERBOSE_SESSION_LOGGING:
-            log.debug(f"TCP Port {ip_address}:{port} open, but no MCP pattern detected.")
-        return server_details
+        return None
 
     async def _discover_port_scan(self):
         """Scan configured local IP addresses and port ranges for MCP SSE servers."""
@@ -3674,9 +3650,14 @@ class ServerManager:
 
         discovered_servers_to_add = []
         semaphore = asyncio.Semaphore(concurrency)
-        # Use a shared client for efficiency
-        client_timeout = httpx.Timeout(probe_timeout + 0.5, connect=probe_timeout)  # Slightly larger overall timeout
-        self._port_scan_client = httpx.AsyncClient(verify=False, timeout=client_timeout, limits=httpx.Limits(max_connections=concurrency + 10))
+        # Use a shared client for efficiency, NOW WITH REDIRECTS ENABLED
+        client_timeout = httpx.Timeout(probe_timeout + 0.5, connect=probe_timeout)
+        self._port_scan_client = httpx.AsyncClient(
+            verify=False,
+            timeout=client_timeout,
+            limits=httpx.Limits(max_connections=concurrency + 10),
+            follow_redirects=True,  # <<< THIS IS THE KEY FIX
+        )
 
         try:
             total_ports_to_scan = (end_port - start_port + 1) * len(targets)
@@ -3710,14 +3691,25 @@ class ServerManager:
                 server_path = result.get("path")
                 if server_path and server_path not in configured_urls:
                     if not any(d[1] == server_path for d in discovered_servers_to_add):
+                        # Use enhanced transport detection with intelligent fallbacks
+                        server_type_from_probe = result.get("type", ServerType.STREAMABLE_HTTP)
+                        if isinstance(server_type_from_probe, Enum):
+                            server_type_from_probe = server_type_from_probe.value
+                        else:
+                            # Double-check inference for discovered servers
+                            inferred_type = self._infer_transport_type(server_path)
+                            if inferred_type != ServerType.STREAMABLE_HTTP:  # Only log if different from default
+                                log.debug(f"Port scan transport inference: {server_path} -> {inferred_type.value}")
+                                server_type_from_probe = inferred_type.value
+
                         discovered_servers_to_add.append(
                             (
                                 result.get("name", "Unknown"),
                                 server_path,
-                                ServerType.SSE.value,  # Type is always SSE from probe
+                                server_type_from_probe,
                                 None,
                                 [],
-                                result.get("description", ""),  # No version/categories from scan
+                                result.get("description", ""),
                             )
                         )
                         log.debug(f"Adding port scan result: {result.get('name')} ({server_path})")
@@ -3982,7 +3974,19 @@ class ServerManager:
             log.warning(f"Server name conflict for '{original_name}', renaming to '{name}'.")
 
         try:
-            server_type = ServerType(type_str.lower())
+            # Use improved transport inference for better user experience
+            if type_str:
+                try:
+                    server_type = ServerType(type_str.lower())
+                except ValueError:
+                    # Fallback to inference if type_str is invalid
+                    log.warning(f"Invalid server type '{type_str}', using transport inference for {path_or_url}")
+                    server_type = self._infer_transport_type(path_or_url)
+            else:
+                # Use transport inference when no type is specified
+                server_type = self._suggest_transport_from_discovery(server_info)
+                log.info(f"Inferred transport type '{server_type.value}' for server '{name}' at {path_or_url}")
+
             version_obj = None
             if server_info.get("version"):
                 version_obj = ServerVersion.from_string(server_info["version"])  # type: ignore
@@ -4047,6 +4051,59 @@ class ServerManager:
             connect_success,
             f"Server '{final_added_name}' added and connected." if connect_success else f"Server '{final_added_name}' added but failed to connect.",
         )
+
+    # --- Transport Inference ---
+
+    def _infer_transport_type(self, path_or_url: str) -> ServerType:
+        """
+        Infer the transport type from the path/URL using modern FastMCP patterns.
+        This improves the user experience by reducing manual transport selection.
+
+        Args:
+            path_or_url: The server path or URL
+
+        Returns:
+            ServerType: Inferred transport type
+        """
+        if not path_or_url:
+            return ServerType.STDIO  # Default fallback
+
+        # Local file paths are always STDIO
+        if not path_or_url.startswith(("http://", "https://")):
+            return ServerType.STDIO
+
+        # URL-based inference
+        parsed = urlparse(path_or_url)
+        path = parsed.path.lower()
+
+        # SSE-specific patterns
+        if "/sse" in path or path.endswith("/events"):
+            return ServerType.SSE
+
+        # For HTTP URLs without specific SSE indicators, default to streamable-http
+        # This aligns with FastMCP's modern approach
+        return ServerType.STREAMABLE_HTTP
+
+    def _suggest_transport_from_discovery(self, discovered_info: Dict[str, Any]) -> ServerType:
+        """
+        Suggest transport type from discovery information, with intelligent fallbacks.
+
+        Args:
+            discovered_info: Discovery result containing server information
+
+        Returns:
+            ServerType: Suggested transport type
+        """
+        # Use explicit type from discovery if available
+        if "type" in discovered_info:
+            try:
+                return ServerType(discovered_info["type"].lower())
+            except ValueError:
+                pass  # Fall through to inference
+
+        # Use URL-based inference
+        path_or_url = discovered_info.get("path_or_url", discovered_info.get("path", ""))
+        return self._infer_transport_type(path_or_url)
 
     # --- Connection Logic ---
 
@@ -4207,6 +4264,7 @@ class ServerManager:
             # Process termination handled by outer loop's exit stack if process_this_attempt was set
             raise setup_err
 
+
     async def _load_server_capabilities(
         self, server_name: str, session: ClientSession, initialize_result: Optional[Union[MCPInitializeResult, Dict[str, Any]]]
     ):
@@ -4216,7 +4274,6 @@ class ServerManager:
         Correctly handles both dict (STDIO) and ServerCapabilities object (MCPInitializeResult) types.
         """
         log.info(f"[{server_name}] Loading capabilities using anyio...")
-        capability_timeout = 30.0  # Timeout for individual capability list calls
 
         # Determine if capabilities are advertised
         has_tools = False
@@ -4227,30 +4284,24 @@ class ServerManager:
         if isinstance(initialize_result, dict):  # From STDIO direct response
             caps_data = initialize_result.get("capabilities")
             if isinstance(caps_data, dict):
-                # If STDIO returns a dict, we might need to map its keys
-                # Assuming simple boolean flags for now based on previous code
                 has_tools = bool(caps_data.get("tools"))
                 has_resources = bool(caps_data.get("resources"))
                 has_prompts = bool(caps_data.get("prompts"))
         elif isinstance(initialize_result, MCPInitializeResult):  # From standard ClientSession result object
-            # Access the capabilities attribute directly from the MCPInitializeResult object
-            server_caps_obj = initialize_result.capabilities  # This is the ServerCapabilities object
+            server_caps_obj = initialize_result.capabilities
 
-        # Check the ServerCapabilities object if obtained from MCPInitializeResult
         if server_caps_obj and hasattr(server_caps_obj, "tools") and hasattr(server_caps_obj, "resources") and hasattr(server_caps_obj, "prompts"):
             has_tools = bool(server_caps_obj.tools)
             has_resources = bool(server_caps_obj.resources)
             has_prompts = bool(server_caps_obj.prompts)
         elif server_caps_obj:
-            # Log if capabilities object exists but lacks expected fields
             log.warning(
                 f"[{server_name}] InitializeResult.capabilities object present but lacks expected fields (tools, resources, prompts). Type: {type(server_caps_obj)}"
             )
-        else:  # Add an else to catch the case where initialize_result was neither dict nor MCPInitializeResult
+        elif not isinstance(initialize_result, dict):
             log.warning(f"[{server_name}] Unexpected initialize_result type ({type(initialize_result)}), cannot determine capabilities.")
 
         log.debug(f"[{server_name}] Determined capabilities: tools={has_tools}, resources={has_resources}, prompts={has_prompts}")
-        # Store determined capabilities in the config
         if server_name in self.config.servers:
             self.config.servers[server_name].capabilities = {
                 "tools": has_tools,
@@ -4258,79 +4309,79 @@ class ServerManager:
                 "prompts": has_prompts,
             }
 
-        # --- Define async functions for loading each capability type ---
         async def load_tools_task():
-            if has_tools and hasattr(session, "list_tools"):
-                log.info(f"[{server_name}] Loading tools...")
+            if has_tools:
                 try:
-                    res = await asyncio.wait_for(session.list_tools(), timeout=capability_timeout)
-                    # Use helper to process results, handle potential None or incorrect type
-                    self._process_list_result(server_name, getattr(res, "tools", None), self.tools, MCPTool, "tool")
-                except asyncio.TimeoutError:
-                    log.error(f"[{server_name}] Timeout loading tools.")
-                except McpError as e:  # Catch specific MCP errors
-                    log.error(f"[{server_name}] MCP Error loading tools: {e}")
+                    log.info(f"[{server_name}] Calling tools/list to fetch tools...")
+                    list_tools_result = await session.list_tools()
+                    # Handle both STDIO transport (object with .tools attribute) and FastMCP streaming-http (direct list)
+                    if isinstance(list_tools_result, list):
+                        tools_list = list_tools_result  # FastMCP returns list directly
+                    elif hasattr(list_tools_result, 'tools'):
+                        tools_list = list_tools_result.tools  # STDIO returns object with .tools attribute
+                    else:
+                        log.warning(f"[{server_name}] Unexpected tools result type: {type(list_tools_result)}")
+                        tools_list = []
+                    self._process_list_result(server_name, tools_list, self.tools, MCPTool, "tool")
                 except Exception as e:
-                    log.error(f"[{server_name}] Unexpected error loading tools: {e}", exc_info=True)
-                    raise  # Re-raise other errors to potentially cancel the group
+                    log.error(f"[{server_name}] Failed to list tools: {e}", exc_info=True)
             else:
-                log.info(f"[{server_name}] Skipping tools (not supported or method unavailable).")
+                log.info(f"[{server_name}] Skipping tools (not supported by server).")
 
         async def load_resources_task():
-            if has_resources and hasattr(session, "list_resources"):
-                log.info(f"[{server_name}] Loading resources...")
+            if has_resources:
                 try:
-                    res = await asyncio.wait_for(session.list_resources(), timeout=capability_timeout)
-                    self._process_list_result(server_name, getattr(res, "resources", None), self.resources, MCPResource, "resource")
-                except asyncio.TimeoutError:
-                    log.error(f"[{server_name}] Timeout loading resources.")
-                except McpError as e:
-                    log.error(f"[{server_name}] MCP Error loading resources: {e}")
+                    log.info(f"[{server_name}] Calling resources/list to fetch resources...")
+                    list_resources_result = await session.list_resources()
+                    # Handle both STDIO transport (object with .resources attribute) and FastMCP streaming-http (direct list)
+                    if isinstance(list_resources_result, list):
+                        resources_list = list_resources_result  # FastMCP returns list directly
+                    elif hasattr(list_resources_result, 'resources'):
+                        resources_list = list_resources_result.resources  # STDIO returns object with .resources attribute
+                    else:
+                        log.warning(f"[{server_name}] Unexpected resources result type: {type(list_resources_result)}")
+                        resources_list = []
+                    self._process_list_result(server_name, resources_list, self.resources, MCPResource, "resource")
                 except Exception as e:
-                    log.error(f"[{server_name}] Unexpected error loading resources: {e}", exc_info=True)
-                    raise  # Re-raise other errors
+                    log.error(f"[{server_name}] Failed to list resources: {e}", exc_info=True)
             else:
-                log.info(f"[{server_name}] Skipping resources (not supported or method unavailable).")
+                log.info(f"[{server_name}] Skipping resources (not supported by server).")
 
         async def load_prompts_task():
-            if has_prompts and hasattr(session, "list_prompts"):
-                log.info(f"[{server_name}] Loading prompts...")
+            if has_prompts:
                 try:
-                    res = await asyncio.wait_for(session.list_prompts(), timeout=capability_timeout)
-                    self._process_list_result(server_name, getattr(res, "prompts", None), self.prompts, MCPPrompt, "prompt")
-                except asyncio.TimeoutError:
-                    log.error(f"[{server_name}] Timeout loading prompts.")
-                except McpError as e:
-                    log.error(f"[{server_name}] MCP Error loading prompts: {e}")
+                    log.info(f"[{server_name}] Calling prompts/list to fetch prompts...")
+                    list_prompts_result = await session.list_prompts()
+                    # Handle both STDIO transport (object with .prompts attribute) and FastMCP streaming-http (direct list)
+                    if isinstance(list_prompts_result, list):
+                        prompts_list = list_prompts_result  # FastMCP returns list directly
+                    elif hasattr(list_prompts_result, 'prompts'):
+                        prompts_list = list_prompts_result.prompts  # STDIO returns object with .prompts attribute
+                    else:
+                        log.warning(f"[{server_name}] Unexpected prompts result type: {type(list_prompts_result)}")
+                        prompts_list = []
+                    self._process_list_result(server_name, prompts_list, self.prompts, MCPPrompt, "prompt")
                 except Exception as e:
-                    log.error(f"[{server_name}] Unexpected error loading prompts: {e}", exc_info=True)
-                    raise  # Re-raise other errors
+                    log.error(f"[{server_name}] Failed to list prompts: {e}", exc_info=True)
             else:
-                log.info(f"[{server_name}] Skipping prompts (not supported or method unavailable).")
+                log.info(f"[{server_name}] Skipping prompts (not supported by server).")
 
-        # --- End definition of loading tasks ---
-
-        # --- Use anyio.create_task_group for structured concurrency ---
         try:
             async with anyio.create_task_group() as tg:
                 tg.start_soon(load_tools_task)
                 tg.start_soon(load_resources_task)
                 tg.start_soon(load_prompts_task)
-            # No results are explicitly returned by the tasks, they modify self state directly
         except Exception as e:
-            # Log errors that caused the task group to cancel (e.g., re-raised exceptions from tasks)
-            # Or other TaskGroup errors. anyio might raise an ExceptionGroup.
-            if isinstance(e, BaseExceptionGroup):  # Handle potential ExceptionGroup from anyio
+            if isinstance(e, BaseExceptionGroup):
                 log.error(f"[{server_name}] Multiple errors during concurrent capability loading:")
                 for i, sub_exc in enumerate(e.exceptions):
-                    log.error(f"  Error {i + 1}: {type(sub_exc).__name__} - {sub_exc}", exc_info=False)  # Log basic info
-                    log.debug(f"  Traceback {i + 1}:", exc_info=sub_exc)  # Log full traceback at debug
+                    log.error(f"  Error {i + 1}: {type(sub_exc).__name__} - {sub_exc}", exc_info=False)
+                    log.debug(f"  Traceback {i + 1}:", exc_info=sub_exc)
             else:
-                # Log single exception
                 log.error(f"[{server_name}] Error during concurrent capability loading task group: {e}", exc_info=True)
-        # --- End anyio usage ---
 
         log.info(f"[{server_name}] Capability loading attempt finished.")
+
 
     def _process_list_result(
         self, server_name: str, result_list: Optional[List[Any]], target_dict: Dict[str, Any], item_class: type, item_type_name: str
@@ -4403,7 +4454,6 @@ class ServerManager:
         config_updated_by_rename = False
         max_retries = current_server_config.retry_policy.get("max_attempts", 3)
         backoff_factor = current_server_config.retry_policy.get("backoff_factor", 0.5)
-        timeout_increment = current_server_config.retry_policy.get("timeout_increment", 5.0)
         process_to_use: Optional[asyncio.subprocess.Process] = self.processes.get(current_server_name)
 
         # Span for the entire connection process (including retries) for this server
@@ -4465,38 +4515,40 @@ class ServerManager:
                             if session:
                                 await attempt_exit_stack.enter_async_context(session)
 
-                        elif current_server_config.type == ServerType.SSE:
-                            connect_url = current_server_config.path
-                            parsed_connect_url = urlparse(connect_url)
-                            if not parsed_connect_url.scheme:
-                                connect_url = f"http://{connect_url}"
+                        elif current_server_config.type in [ServerType.STREAMABLE_HTTP, ServerType.SSE]:
+                            # This is the correct, documented way to pass complex connection info.
+                            log.info(f"[{current_server_name}] Building MCPConfig for connection...")
+                            url_with_slash = current_server_config.path
+                            if not url_with_slash.endswith('/'):
+                                url_with_slash += '/'
 
-                            connect_timeout = current_server_config.timeout + (retry_count * timeout_increment)
-                            # Use a very long read timeout for persistent SSE streams
-                            persistent_read_timeout_secs = timedelta(days=1).total_seconds()  # Effectively infinite
-                            handshake_timeout = connect_timeout + 15.0  # Allow extra time for handshake
+                            # 1. Define the server configuration within the MCPConfig structure.
+                            mcp_config_dict = {
+                                "mcpServers": {
+                                    current_server_name: {
+                                        "url": url_with_slash,
+                                        "transport": current_server_config.type.value,
+                                    }
+                                },
+                                # 2. Define the client information at the top level of the config.
+                                #    The client will apply this to all server connections it makes.
+                                "clientInfo": {
+                                    "name": "mcp-client-multi",
+                                    "version": "2.0.0" # This is the field the server requires.
+                                }
+                            }
 
-                            log.info(f"[{current_server_name}] Creating persistent SSE context for {connect_url}...")
-                            sse_ctx = sse_client(
-                                url=connect_url, headers=None, timeout=connect_timeout, sse_read_timeout=persistent_read_timeout_secs
-                            )
-                            # Manage SSE streams within the attempt stack first
-                            read_stream, write_stream = await attempt_exit_stack.enter_async_context(sse_ctx)
-                            log.debug(f"[{current_server_name}] SSE streams obtained.")
+                            # 3. Instantiate the FastMCPClient with the configuration dictionary.
+                            #    The client will parse this and handle all internal setup correctly.
+                            client_for_this_server = FastMCPClient(mcp_config_dict)
 
-                            # Use standard ClientSession, also managed by attempt stack initially
-                            session_read_timeout = timedelta(seconds=persistent_read_timeout_secs + 10.0)
-                            session = ClientSession(read_stream=read_stream, write_stream=write_stream, read_timeout_seconds=session_read_timeout)
-                            await attempt_exit_stack.enter_async_context(session)
-                            log.info(f"[{current_server_name}] Persistent SSE ClientSession created.")
-
-                            # Perform handshake
-                            log.info(f"[{current_server_name}] Performing MCP handshake (initialize) via SSE...")
-                            initialize_result_obj = await asyncio.wait_for(session.initialize(), timeout=handshake_timeout)
+                            # The rest of the logic for managing the session lifecycle remains the same.
+                            session = await attempt_exit_stack.enter_async_context(client_for_this_server)
+                            initialize_result_obj = session.initialize_result
                             log.info(
-                                f"[{current_server_name}] Initialize successful (SSE). Server reported: {getattr(initialize_result_obj, 'serverInfo', 'N/A')}"
+                                f"[{current_server_name}] Initialize successful ({current_server_config.type.value}). Server reported: {getattr(initialize_result_obj, 'serverInfo', 'N/A')}"
                             )
-                            process_this_attempt = None  # No process for SSE
+                            process_this_attempt = None  # No process for HTTP transports
 
                         else:
                             raise RuntimeError(f"Unknown server type: {current_server_config.type}")
@@ -4614,8 +4666,6 @@ class ServerManager:
                         )
                         self._safe_printer(f"[green]{EMOJI_MAP['success']} Connected & loaded: {current_server_name} ({tools_loaded_count} tools)[/]")
 
-                        # *** Success: Adopt resources into main exit stack ***
-                        # This moves session, and potentially sse_client context manager
                         await self.exit_stack.enter_async_context(attempt_exit_stack.pop_all())
                         # Add session to active list *after* adopting to main stack
                         self.active_sessions[current_server_name] = session
@@ -4656,9 +4706,8 @@ class ServerManager:
                         error_type_name = type(e).__name__
                         log.warning(
                             f"[{initial_server_name}] Connection attempt {retry_count + 1} failed (current name '{current_server_name}'): {error_type_name} - {e}",
-                            exc_info=False,
-                        )  # Log less verbosely initially
-                        log.debug(f"Traceback for {initial_server_name} connection error:", exc_info=True)  # Full traceback at debug level
+                            exc_info=True,
+                        )  # Show full traceback to help debug issues
                         if span_for_server_connection_process:
                             span_for_server_connection_process.add_event(
                                 f"connect_attempt_failed",
@@ -4978,8 +5027,6 @@ class ServerManager:
         log.debug(f"Removed tools/resources/prompts for {server_name}.")
 
         # --- Close Session ---
-        # The session and its associated resources (like sse_client context)
-        # are managed by the main exit_stack. We need to find and pop them.
         session_to_close = self.active_sessions.pop(server_name, None)
         if session_to_close:
             # Attempt to gracefully close the session itself
@@ -4988,12 +5035,6 @@ class ServerManager:
                 log.debug(f"Gracefully closed ClientSession for {server_name}.")
             except Exception as e:
                 log.warning(f"Error during explicit session close for {server_name}: {e}")
-            # Note: Closing the session *might* trigger cleanup in the underlying
-            # streams managed by the exit_stack, but explicitly popping from
-            # the stack is safer if possible (requires identifying the context).
-            # For simplicity now, we rely on the session's aclose and the main
-            # exit_stack's cleanup on overall client shutdown. A more granular
-            # exit_stack per session might be needed for immediate resource release.
 
         # --- Terminate STDIO Process ---
         process = self.processes.pop(server_name, None)
@@ -5039,20 +5080,19 @@ class ServerManager:
         current_server_name = server_config.name
         max_retries = server_config.retry_policy.get("max_attempts", 1)
         backoff_factor = server_config.retry_policy.get("backoff_factor", 0.2)
-        timeout_increment = server_config.retry_policy.get("timeout_increment", 2.0)
+        timeout_increment = server_config.retry_policy.get("timeout_increment", 2.0)  # This is now conceptual, not passed directly
         test_exit_stack = AsyncExitStack()  # Local stack for test resources
 
         log.debug(f"[Test:{current_server_name}] Starting connection test...")
         for retry_count in range(max_retries + 1):
+            # NOTE: session variable is only used by STDIO logic now
             session: Optional[ClientSession] = None
             process_this_attempt: Optional[asyncio.subprocess.Process] = None
-            log_file_handle = None
             last_error = None
             is_connected = False
 
             try:
                 log.debug(f"[Test:{current_server_name}] Attempt {retry_count + 1}/{max_retries + 1}")
-                current_timeout = server_config.timeout + (retry_count * timeout_increment)
 
                 if server_config.type == ServerType.STDIO:
                     log_file_path = (CONFIG_DIR / f"{current_server_name}_test_stderr.log").resolve()
@@ -5076,23 +5116,16 @@ class ServerManager:
 
                     session = RobustStdioSession(process_this_attempt, f"test-{current_server_name}")
                     await test_exit_stack.enter_async_context(session)
+                    current_timeout = server_config.timeout + (retry_count * timeout_increment)
                     await asyncio.wait_for(session.initialize(response_timeout=current_timeout), timeout=current_timeout + 5.0)
                     await session.send_initialized_notification()
 
-                elif server_config.type == ServerType.SSE:
-                    connect_url = server_config.path
-                    if not urlparse(connect_url).scheme:
-                        connect_url = f"http://{connect_url}"
-                    sse_ctx = sse_client(url=connect_url, timeout=current_timeout)
-                    read_stream, write_stream = await test_exit_stack.enter_async_context(sse_ctx)
-                    session = ClientSession(
-                        read_stream=read_stream, write_stream=write_stream, read_timeout_seconds=timedelta(seconds=current_timeout + 15.0)
-                    )
-                    await test_exit_stack.enter_async_context(session)
-                    await asyncio.wait_for(session.initialize(), timeout=current_timeout + 10.0)
+                elif server_config.type in [ServerType.SSE, ServerType.STREAMABLE_HTTP]:
+                    log.debug(f"[Test:{current_server_name}] Testing HTTP connection to {server_config.path}")
+                    http_client = FastMCPClient(server_config.path)
+                    await test_exit_stack.enter_async_context(http_client)
                 else:
                     raise RuntimeError(f"Unknown server type: {server_config.type}")
-
                 log.debug(f"[Test:{current_server_name}] Handshake successful.")
                 is_connected = True
                 return True  # Success
@@ -5107,6 +5140,7 @@ class ServerManager:
                 FileNotFoundError,
                 asyncio.TimeoutError,
                 BaseExceptionGroup,
+                TypeError,  # Catch the original TypeError as well
             ) as e:
                 last_error = e
                 log_level = logging.DEBUG if isinstance(e, (httpx.ConnectError, asyncio.TimeoutError, ConnectionRefusedError)) else logging.WARNING
@@ -5118,14 +5152,12 @@ class ServerManager:
             except Exception as e:
                 last_error = e
                 log.error(f"[Test:{current_server_name}] Unexpected error: {e}", exc_info=True)
-                # Close stack and return False immediately on unexpected error
                 await test_exit_stack.aclose()
                 return False
             finally:
-                # Clean up resources for *this specific attempt* if it didn't succeed immediately
                 if not is_connected:
                     await test_exit_stack.aclose()
-                    test_exit_stack = AsyncExitStack()  # Reset for next potential retry
+                    test_exit_stack = AsyncExitStack()
 
             # --- Retry Logic ---
             if retry_count < max_retries:
@@ -5136,9 +5168,8 @@ class ServerManager:
                 log.warning(
                     f"[Test:{current_server_name}] Final connection test failed after {max_retries + 1} attempts. Last error: {type(last_error).__name__}"
                 )
-                return False  # Failed after all retries
+                return False
 
-        # Should not be reached normally
         return False
 
     # --- Zeroconf Registration ---
@@ -6420,6 +6451,7 @@ class MCPClient:
         parts = args.split(maxsplit=2)  # Split into name, type, rest
         if len(parts) < 3:
             safe_console.print("[yellow]Usage: /servers add NAME <stdio|sse> PATH [ARGS...][/]")
+            safe_console.print("Example (http):  /servers add remote-http streamable-http http://host:port/mcp")
             safe_console.print("Example (stdio): /servers add mypy stdio /usr/bin/python /path/to/mypy_server.py --port 8080")
             safe_console.print("Example (sse):   /servers add remote-tools sse https://my-mcp.example.com")
             return
@@ -8775,25 +8807,66 @@ The array must have exactly {len(tools_for_llm_prompt_in_chunk)} scores.
 
         return details
 
+    async def reload_single_server(self, server_name: str, session: ClientSession) -> bool:
+        """
+        Sends a new initialize request to a single server and reloads its capabilities.
+        This is a helper for the main reload_servers method.
+
+        Returns:
+            bool: True if reload was successful, False otherwise.
+        """
+        log.info(f"[{server_name}] Sending re-initialize request to refresh capabilities...")
+        try:
+            # Re-run the initialize handshake. This is the correct way to get a fresh
+            # capability list from a modern MCP server over a persistent connection.
+            new_initialize_result = await session.initialize()
+
+            if not new_initialize_result:
+                log.error(f"[{server_name}] Re-initialize returned no result. Cannot refresh capabilities.")
+                return False
+
+            log.info(f"[{server_name}] Received fresh capabilities. Updating tool lists.")
+            # We can now reuse the ServerManager's method to populate the lists from the new result.
+            await self.server_manager._load_server_capabilities(server_name, session, new_initialize_result)
+            log.info(f"[{server_name}] Successfully reloaded capabilities.")
+            return True
+
+        except (McpError, RuntimeError, httpx.RequestError, asyncio.TimeoutError) as e:
+            log.error(f"[{server_name}] Failed to reload capabilities: {type(e).__name__} - {e}")
+            # Optionally, you could mark the server as degraded here.
+            server_config = self.config.servers.get(server_name)
+            if server_config:
+                server_config.metrics.error_count += 1
+                server_config.metrics.update_status()
+            return False
+        except Exception as e:
+            log.error(f"[{server_name}] Unexpected error during capability reload: {e}", exc_info=True)
+            return False
+
     async def reload_servers(self):
-        """Disconnects all MCP servers, reloads config (YAML part), and reconnects."""
-        log.info("Reloading servers via API request...")
-        # Close existing connections first
-        if self.server_manager:
-            await self.server_manager.close()
+        """
+        Reloads capabilities from all active MCP servers by sending a new 'initialize'
+        request over the existing connection.
+        """
+        log.info("Reloading capabilities from active servers...")
+        if not self.server_manager or not self.server_manager.active_sessions:
+            log.warning("No active servers to reload.")
+            self.safe_print("[yellow]No active servers to reload.[/yellow]")
+            return
 
-        # Re-load the YAML parts of the config
-        self.config.load_from_yaml()
-        # Re-apply env overrides to ensure they take precedence over newly loaded YAML
-        self.config._apply_env_overrides()
+        active_sessions_copy = self.server_manager.active_sessions.copy()
+        log.info(f"Found {len(active_sessions_copy)} active session(s) to reload.")
 
-        # Re-create server manager with the reloaded config
-        # Tool cache can persist
-        self.server_manager = ServerManager(self.config, tool_cache=self.tool_cache, safe_printer=self.safe_print)
+        # Create and run reload tasks concurrently using the new helper method
+        reload_tasks = [self.reload_single_server(name, sess) for name, sess in active_sessions_copy.items()]
+        results = await asyncio.gather(*reload_tasks, return_exceptions=True)
 
-        # Reconnect to enabled servers based on the reloaded config
-        await self.server_manager.connect_to_servers()
-        log.info("Server reload complete.")
+        successful_reloads = sum(1 for r in results if r is True)
+        failed_reloads = len(results) - successful_reloads
+
+        log.info(f"Reload complete. Success: {successful_reloads}, Failed: {failed_reloads}.")
+        if failed_reloads > 0:
+            self.safe_print(f"[yellow]Warning: Failed to reload capabilities for {failed_reloads} server(s). Check logs for details.[/yellow]")
 
     async def apply_prompt_to_conversation(self, prompt_name: str) -> bool:
         """Applies a prompt template as a system message to the current conversation."""
@@ -13957,19 +14030,27 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
 
             @app.post("/api/servers", status_code=201)
             async def add_server_api(req: ServerAddRequest, mcp_client: MCPClient = Depends(get_mcp_client)):
-                """Adds a new server configuration."""
+                """Adds a new server configuration with intelligent transport inference."""
                 if req.name in mcp_client.config.servers:
                     raise HTTPException(status_code=409, detail=f"Server name '{req.name}' already exists")
+
+                # Use transport inference if type not provided
+                if req.type is None:
+                    inferred_type = mcp_client.server_manager._infer_transport_type(req.path)
+                    log.info(f"API: Inferred transport type '{inferred_type.value}' for server '{req.name}' at {req.path}")
+                    server_type = inferred_type
+                else:
+                    server_type = req.type
 
                 args_list = req.argsString.split() if req.argsString else []
                 new_server_config = ServerConfig(
                     name=req.name,
-                    type=req.type,
+                    type=server_type,
                     path=req.path,
                     args=args_list,
                     enabled=True,
                     auto_start=False,
-                    description=f"Added via Web UI ({req.type.value})",
+                    description=f"Added via Web UI ({server_type.value})",
                 )
                 mcp_client.config.servers[req.name] = new_server_config
                 await mcp_client.config.save_async()  # Save YAML
