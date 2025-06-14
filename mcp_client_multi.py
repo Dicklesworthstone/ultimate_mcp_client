@@ -212,7 +212,6 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, 
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import Client as FastMCPClient
-from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 from mcp import ClientSession
 from mcp.shared.exceptions import McpError
 from mcp.types import (
@@ -4264,7 +4263,6 @@ class ServerManager:
             # Process termination handled by outer loop's exit stack if process_this_attempt was set
             raise setup_err
 
-
     async def _load_server_capabilities(
         self, server_name: str, session: ClientSession, initialize_result: Optional[Union[MCPInitializeResult, Dict[str, Any]]]
     ):
@@ -4317,7 +4315,7 @@ class ServerManager:
                     # Handle both STDIO transport (object with .tools attribute) and FastMCP streaming-http (direct list)
                     if isinstance(list_tools_result, list):
                         tools_list = list_tools_result  # FastMCP returns list directly
-                    elif hasattr(list_tools_result, 'tools'):
+                    elif hasattr(list_tools_result, "tools"):
                         tools_list = list_tools_result.tools  # STDIO returns object with .tools attribute
                     else:
                         log.warning(f"[{server_name}] Unexpected tools result type: {type(list_tools_result)}")
@@ -4336,7 +4334,7 @@ class ServerManager:
                     # Handle both STDIO transport (object with .resources attribute) and FastMCP streaming-http (direct list)
                     if isinstance(list_resources_result, list):
                         resources_list = list_resources_result  # FastMCP returns list directly
-                    elif hasattr(list_resources_result, 'resources'):
+                    elif hasattr(list_resources_result, "resources"):
                         resources_list = list_resources_result.resources  # STDIO returns object with .resources attribute
                     else:
                         log.warning(f"[{server_name}] Unexpected resources result type: {type(list_resources_result)}")
@@ -4355,7 +4353,7 @@ class ServerManager:
                     # Handle both STDIO transport (object with .prompts attribute) and FastMCP streaming-http (direct list)
                     if isinstance(list_prompts_result, list):
                         prompts_list = list_prompts_result  # FastMCP returns list directly
-                    elif hasattr(list_prompts_result, 'prompts'):
+                    elif hasattr(list_prompts_result, "prompts"):
                         prompts_list = list_prompts_result.prompts  # STDIO returns object with .prompts attribute
                     else:
                         log.warning(f"[{server_name}] Unexpected prompts result type: {type(list_prompts_result)}")
@@ -4381,7 +4379,6 @@ class ServerManager:
                 log.error(f"[{server_name}] Error during concurrent capability loading task group: {e}", exc_info=True)
 
         log.info(f"[{server_name}] Capability loading attempt finished.")
-
 
     def _process_list_result(
         self, server_name: str, result_list: Optional[List[Any]], target_dict: Dict[str, Any], item_class: type, item_type_name: str
@@ -4519,8 +4516,8 @@ class ServerManager:
                             # This is the correct, documented way to pass complex connection info.
                             log.info(f"[{current_server_name}] Building MCPConfig for connection...")
                             url_with_slash = current_server_config.path
-                            if not url_with_slash.endswith('/'):
-                                url_with_slash += '/'
+                            if not url_with_slash.endswith("/"):
+                                url_with_slash += "/"
 
                             # 1. Define the server configuration within the MCPConfig structure.
                             mcp_config_dict = {
@@ -4534,8 +4531,8 @@ class ServerManager:
                                 #    The client will apply this to all server connections it makes.
                                 "clientInfo": {
                                     "name": "mcp-client-multi",
-                                    "version": "2.0.0" # This is the field the server requires.
-                                }
+                                    "version": "2.0.0",  # This is the field the server requires.
+                                },
                             }
 
                             # 3. Instantiate the FastMCPClient with the configuration dictionary.
@@ -4544,6 +4541,8 @@ class ServerManager:
 
                             # The rest of the logic for managing the session lifecycle remains the same.
                             session = await attempt_exit_stack.enter_async_context(client_for_this_server)
+                            # Store the FastMCP client for direct tool calls (needed for FastMCP Context)
+                            session._fastmcp_client = client_for_this_server
                             initialize_result_obj = session.initialize_result
                             log.info(
                                 f"[{current_server_name}] Initialize successful ({current_server_config.type.value}). Server reported: {getattr(initialize_result_obj, 'serverInfo', 'N/A')}"
@@ -8112,11 +8111,36 @@ The array must have exactly {len(tools_for_llm_prompt_in_chunk)} scores.
         try:
             with safe_stdout():
                 async with self.tool_execution_context(tool_name, tool_args, server_name):
-                    # *** REMOVE response_timeout argument from the call ***
-                    result = await session.call_tool(
-                        tool.original_tool.name,  # Use the name from the original Tool object
-                        tool_args,
-                    )
+                    # Check if this is a FastMCP client (streaming-http) - use client directly for Context support
+                    log.debug(f"execute_tool: server_name={server_name}, session type={type(session)}, has _fastmcp_client={hasattr(session, '_fastmcp_client')}")
+                    if hasattr(session, '_fastmcp_client'):
+                        # Use FastMCP client's call_tool method directly (provides FastMCP Context)
+                        fastmcp_client = session._fastmcp_client
+                        log.info(f"Using FastMCP client directly for tool {tool.original_tool.name} on {server_name}")
+                        if tool.original_tool.name == "list_available_tools":
+                            _tools = await fastmcp_client.list_tools()
+                            payload = {
+                                "success": True,
+                                "total_count": len(_tools),
+                                "tools": [t.model_dump(mode="json") if hasattr(t, "model_dump") else t.__dict__ for t in _tools],
+                            }
+                            result_content = [TextContent(type="text", text=json.dumps(payload, indent=2))]
+                        elif tool.original_tool.name == "list_registered_apis":
+                            _apis = await fastmcp_client.list_registered_apis()
+                            payload = {"success": True, "total_count": len(_apis), "apis": _apis}
+                            result_content = [TextContent(type="text", text=json.dumps(payload, indent=2))]
+                        else:
+                            # Normal tool – just call it
+                            result_content = await fastmcp_client.call_tool(tool.original_tool.name, tool_args)
+                        result = CallToolResult(content=result_content, isError=False)
+                        log.info(f"FastMCP client call succeeded for {tool.original_tool.name}")
+                    else:
+                        # Standard MCP session (stdio/sse) - use session's call_tool method
+                        log.info(f"Using standard MCP session for tool {tool.original_tool.name} on {server_name}")
+                        result = await session.call_tool(
+                            tool.original_tool.name,  # Use the name from the original Tool object
+                            tool_args,
+                        )
 
                     # Dependency check (unchanged)
                     if self.tool_cache:
@@ -11696,20 +11720,30 @@ The array must have exactly {len(tools_for_llm_prompt_in_chunk)} scores.
                                     if cached_tool_result is not None and is_cached_result_an_error:
                                         log.info(f"MCPClient: Ignoring cached error for {original_mcp_tool_name_to_execute}.")
                                     try:
-                                        mcp_call_tool_result_object: CallToolResult = await self.execute_tool(
+                                        mcp_call_tool_result_object = await self.execute_tool(
                                             server_name_for_tool_exec, original_mcp_tool_name_to_execute, tool_args_for_execution
                                         )
-                                        raw_content_from_mcp_call = mcp_call_tool_result_object.content
+                                        
+                                        # Handle both CallToolResult (stdio/sse) and direct list (streaming-http) responses
+                                        if hasattr(mcp_call_tool_result_object, 'content'):
+                                            # Standard CallToolResult object (stdio/sse)
+                                            raw_content_from_mcp_call = mcp_call_tool_result_object.content
+                                            tool_result_is_error = getattr(mcp_call_tool_result_object, 'isError', False)
+                                        else:
+                                            # Direct response (streaming-http/FastMCP)
+                                            raw_content_from_mcp_call = mcp_call_tool_result_object
+                                            tool_result_is_error = False  # FastMCP doesn't use isError flag
+                                        
                                         log.debug(
-                                            f"MCPC: Raw content from CallToolResult for '{original_mcp_tool_name_to_execute}': Type {type(raw_content_from_mcp_call)}, Preview: {str(raw_content_from_mcp_call)[:200]}"
+                                            f"MCPC: Raw content from tool result for '{original_mcp_tool_name_to_execute}': Type {type(raw_content_from_mcp_call)}, Preview: {str(raw_content_from_mcp_call)[:200]}"
                                         )
 
                                         # Use the integrated robust_parse_mcp_tool_content
                                         parsed_ums_payload_dict = robust_parse_mcp_tool_content(raw_content_from_mcp_call)
                                         tool_execution_output_content = parsed_ums_payload_dict  # This is the UMS dict or error dict
 
-                                        # Determine error flag based on parsed_ums_payload_dict and mcp_call_tool_result_object.isError
-                                        if mcp_call_tool_result_object.isError:
+                                        # Determine error flag based on parsed_ums_payload_dict and tool_result_is_error
+                                        if tool_result_is_error:
                                             tool_execution_is_error_flag = True
                                             if isinstance(tool_execution_output_content, dict) and tool_execution_output_content.get("success", True):
                                                 tool_execution_output_content.setdefault(
@@ -15551,7 +15585,7 @@ def run(
     verbose_logging: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose session logging.")] = False,
     webui_flag: Annotated[bool, typer.Option("--webui", "-w", help="Launch the Web UI instead of CLI.")] = False,
     webui_host: Annotated[str, typer.Option("--host", "-h", help="Host for the Web UI server.")] = "127.0.0.1",
-    webui_port: Annotated[int, typer.Option("--port", "-p", help="Port for the Web UI server.")] = 8880,
+            webui_port: Annotated[int, typer.Option("--port", "-p", help="Port for the Web UI server.")] = 8017,
     serve_ui_file: Annotated[bool, typer.Option("--serve-ui", help="Serve the default HTML UI file from the current directory.")] = True,
     cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers on startup.")] = False,
     agent_mode: Annotated[bool, typer.Option("--agent", "-a", help="Run in self-driving agent mode.")] = False,
