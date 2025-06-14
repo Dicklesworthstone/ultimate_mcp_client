@@ -8112,11 +8112,9 @@ The array must have exactly {len(tools_for_llm_prompt_in_chunk)} scores.
             with safe_stdout():
                 async with self.tool_execution_context(tool_name, tool_args, server_name):
                     # Check if this is a FastMCP client (streaming-http) - use client directly for Context support
-                    log.debug(f"execute_tool: server_name={server_name}, session type={type(session)}, has _fastmcp_client={hasattr(session, '_fastmcp_client')}")
                     if hasattr(session, '_fastmcp_client'):
                         # Use FastMCP client's call_tool method directly (provides FastMCP Context)
                         fastmcp_client = session._fastmcp_client
-                        log.info(f"Using FastMCP client directly for tool {tool.original_tool.name} on {server_name}")
                         if tool.original_tool.name == "list_available_tools":
                             _tools = await fastmcp_client.list_tools()
                             payload = {
@@ -8133,10 +8131,8 @@ The array must have exactly {len(tools_for_llm_prompt_in_chunk)} scores.
                             # Normal tool – just call it
                             result_content = await fastmcp_client.call_tool(tool.original_tool.name, tool_args)
                         result = CallToolResult(content=result_content, isError=False)
-                        log.info(f"FastMCP client call succeeded for {tool.original_tool.name}")
                     else:
                         # Standard MCP session (stdio/sse) - use session's call_tool method
-                        log.info(f"Using standard MCP session for tool {tool.original_tool.name} on {server_name}")
                         result = await session.call_tool(
                             tool.original_tool.name,  # Use the name from the original Tool object
                             tool_args,
