@@ -4027,8 +4027,8 @@
         <span class="loading loading-ring loading-lg text-primary"></span>
     </div>
     <script>
-        const API_BASE_URL = 'http://localhost:8880/api'; // Adjust port as needed
-        const WS_URL = 'ws://localhost:8880/ws/chat'; // Adjust hostname/port to match backend
+                        const API_BASE_URL = 'http://localhost:8017/api'; // Adjust port as needed
+                const WS_URL = 'ws://localhost:8017/ws/chat'; // Adjust hostname/port to match backend
 
         // ContrastOptimizer Class (as provided previously)
         class ContrastOptimizer {
@@ -7658,6 +7658,14 @@
                         }
                         this.$nextTick(() => this.initTippy());
                         break;
+                    // == Streaming tool input events (currently ignored, avoid console warnings) ==
+                    case 'tool_call_start':
+                    case 'tool_call_input_chunk':
+                    case 'tool_call_end':
+                        // These events indicate the assistant is streaming the *input* it plans to send to a tool.
+                        // The UI doesn\'t render this yet, so we simply acknowledge them to prevent the
+                        // default "unknown message type" warning.
+                        break;
                     default:
                         console.warn('WS: Received unknown message type:', message.type, message);
                 }
@@ -8602,8 +8610,69 @@
                 </div>
                 ${(metricTokens || metricCost || metricTime) ? `<div class="tool-model-metrics"> ${metricTokens} ${metricCost} ${metricTime} </div>` : ''}
                 </div>`;
-                } 
+                }, // End renderModelResult
 
+                // Render comparison table
+                renderComparisonTable(models, title = 'Model Comparison') {
+                    if (!models || models.length === 0) return '';
+                    const headers = ['Provider', 'Model', 'Cost', 'Time', 'Tokens'];
+                    const headerRow = `<thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>`;
+                    const bodyRows = models.map(model => {
+                        const cost = model.cost !== undefined ? this.formatValue(model.cost, 'cost') : 'N/A';
+                        const time = model.processing_time !== undefined ? this.formatValue(model.processing_time, 'time') : 'N/A';
+                        const tokens = model.tokens ? (typeof model.tokens === 'object' ? this.formatValue(model.tokens.total || 0, 'number') : this.formatValue(model.tokens, 'number')) : 'N/A';
+                        const provider = DOMPurify.sanitize(model.provider || 'Unknown');
+                        const modelName = DOMPurify.sanitize(model.model || 'Unknown');
+                        return `<tr><td>${provider}</td><td>${modelName}</td><td>${cost}</td><td>${time}</td><td>${tokens}</td></tr>`;
+                    }).join('');
+                    return `<div class="tool-comparison">
+    <div class="tool-comparison-header"><h3 class="tool-comparison-title">
+        <i class="fas fa-balance-scale"></i> ${DOMPurify.sanitize(title)}</h3>
+    </div>
+    <div class="tool-comparison-table-wrapper">
+        <table class="tool-comparison-table bg-base-300/15">${headerRow}
+            <tbody class="bg-base-200/20">${bodyRows}</tbody>
+        </table>
+    </div>
+</div>`;
+                }, // End renderComparisonTable
+
+                // Render stats dashboard
+                renderStatsDashboard(stats, title = 'Statistics') {
+                    if (!stats || typeof stats !== 'object') return '';
+                    const metrics = [
+                        { key: 'total_cost', label: 'Total Cost', type: 'cost', icon: 'fas fa-dollar-sign' },
+                        { key: 'total_time', label: 'Total Time', type: 'time', icon: 'fas fa-clock' },
+                        { key: 'total_tokens', label: 'Total Tokens', type: 'number', icon: 'fas fa-hashtag' },
+                        { key: 'avg_cost', label: 'Avg Cost', type: 'cost', icon: 'fas fa-chart-line' },
+                        { key: 'avg_time', label: 'Avg Time', type: 'time', icon: 'fas fa-tachometer-alt' },
+                        { key: 'success_rate', label: 'Success Rate', type: 'percentage', icon: 'fas fa-check-circle' }
+                    ];
+                    const gridContent = metrics.map(metric => {
+                        const value = stats[metric.key];
+                        if (value === undefined || value === null) return '';
+                        let formattedValue;
+                        if (metric.type === 'percentage') {
+                            formattedValue = `${(parseFloat(value) * 100).toFixed(1)}%`;
+                        } else {
+                            formattedValue = this.formatValue(value, metric.type);
+                        }
+                        return `<div class="tool-stats-card">
+                            <div class="tool-stats-icon"><i class="${metric.icon}"></i></div>
+                            <div class="tool-stats-content">
+                                <div class="tool-stats-value">${formattedValue}</div>
+                                <div class="tool-stats-label">${metric.label}</div>
+                            </div>
+                        </div>`;
+                    }).filter(Boolean).join('');
+                    if (!gridContent) return '';
+                    return `<div class="tool-stats-dashboard">
+                        <div class="tool-stats-header">
+                            <h3 class="tool-stats-title"><i class="fas fa-chart-line"></i> ${DOMPurify.sanitize(title)}</h3>
+                        </div>
+                        <div class="tool-stats-grid">${gridContent}</div>
+                    </div>`;
+                } // End renderStatsDashboard
 
                 }, // End visualRenderer
                 renderUserProvidedToolResult(block, message) {

@@ -15178,7 +15178,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
 
             # --- Static File Serving ---
             if serve_ui_file:
-                ui_file = Path(__file__).parent / "mcp_client_ui.html"  # Look relative to script
+                ui_file = Path(__file__).parent / "mcp_client_multi_ui.html"  # Look relative to script
                 if ui_file.exists():
                     log.info(f"Serving static UI file from {ui_file.resolve()}")
 

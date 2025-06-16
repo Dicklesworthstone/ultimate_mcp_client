@@ -886,7 +886,7 @@ class MetacognitionEngine:
             goal_envelope = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
                 self._get_ums_tool_name("get_goal_details"),
-                {"workflow_id": self.state.workflow_id, "goal_id": self.state.current_leaf_goal_id}
+                {"goal_id": self.state.current_leaf_goal_id}
             )
             
             try:
@@ -1054,7 +1054,7 @@ class MetacognitionEngine:
             goal_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
                 self._get_ums_tool_name("get_goal_details"),
-                {"workflow_id": self.state.workflow_id, "goal_id": goal_id}
+                {"goal_id": goal_id}
             )
             
             try:
@@ -1821,7 +1821,7 @@ class LLMOrchestrator:
                     "description": "Content for THOUGHT_PROCESS or DONE decisions"
                 }
             },
-            "required": ["decision_type"],
+            "required": ["decision_type", "tool_name", "tool_args", "tool_calls", "content"],
             "additionalProperties": False
         }
         
@@ -2151,7 +2151,6 @@ class AgentMasterLoop:
                     UMS_SERVER_NAME,
                     self._get_ums_tool_name("get_goal_details"),
                     {
-                        "workflow_id": self.state.workflow_id,
                         "goal_id": self.state.root_goal_id
                     }
                 )
@@ -2643,8 +2642,7 @@ class AgentMasterLoop:
                 UMS_SERVER_NAME,
                 self._get_ums_tool_name("get_working_memory"),
                 {
-                    "context_id": self.state.context_id,
-                    "limit": 20
+                    "context_id": self.state.context_id
                 }
             )
             
@@ -3085,7 +3083,7 @@ class AgentMasterLoop:
                         "working_memory_ids": created_memory_ids,
                         "focus_area_ids": [created_memory_ids[1]] if len(created_memory_ids) > 1 else created_memory_ids[:1],
                         "context_action_ids": [],
-                        "current_goal_thought_ids": []
+                        "current_goals": []
                     }
                 )
                 
@@ -3104,8 +3102,7 @@ class AgentMasterLoop:
                     {
                         "context_id": self.state.context_id,
                         "include_content": False,
-                        "update_access": False,
-                        "limit": 20
+                        "update_access": False
                     }
                 )
                 
@@ -3165,7 +3162,6 @@ class AgentMasterLoop:
                     UMS_SERVER_NAME,
                     self._get_ums_tool_name("get_goal_details"),
                     {
-                        "workflow_id": self.state.workflow_id,
                         "goal_id": self.state.root_goal_id
                     }
                 )
@@ -3932,7 +3928,7 @@ Avoid circular reasoning. Each action should move closer to the goal."""
             goal_res = await self.mcp_client._execute_tool_and_parse_for_agent(
                 UMS_SERVER_NAME,
                 self._get_ums_tool_name("get_goal_details"),
-                {"workflow_id": self.state.workflow_id, "goal_id": self.state.current_leaf_goal_id}
+                {"goal_id": self.state.current_leaf_goal_id}
             )
             try:
                 goal_data = await self._get_valid_ums_data_payload(goal_res, "get_goal_details_current_description")
