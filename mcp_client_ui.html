@@ -3902,10 +3902,17 @@
 
     <script>
         // Dynamically determine URLs based on current page location
+        // Handle both direct access (with port) and reverse proxy (without port)
         const currentHost = window.location.hostname || '127.0.0.1';
-        const currentPort = window.location.port || '8017';
-        const API_BASE_URL = `http://${currentHost}:${currentPort}/api`;
-        const WS_URL = `ws://${currentHost}:${currentPort}/ws/chat`;
+        const currentPort = window.location.port;
+        // Only append port if explicitly present; if empty (reverse proxy on 80/443), omit it
+        // Fallback to 8017 only when hostname is also missing (file:// access)
+        const portSuffix = currentPort ? `:${currentPort}` : (window.location.hostname ? '' : ':8017');
+        // Use correct protocol (https/wss for secure, http/ws for insecure)
+        const httpProtocol = window.location.protocol === 'https:' ? 'https' : 'http';
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const API_BASE_URL = `${httpProtocol}://${currentHost}${portSuffix}/api`;
+        const WS_URL = `${wsProtocol}://${currentHost}${portSuffix}/ws/chat`;
 
 
 
