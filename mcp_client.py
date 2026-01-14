@@ -175,7 +175,7 @@ import traceback
 import uuid
 from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, redirect_stdout, suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -9552,7 +9552,10 @@ async def main_async(query, model, server, dashboard, interactive, verbose_loggi
                  await mcp_client.config.save_async()
                  log.info(f"Added server '{req.name}' via API.")
                  # Return the added server config (or just success)
-                 return {"message": f"Server '{req.name}' added.", "server": new_server_config.model_dump(exclude={'metrics'})} # Exclude metrics
+                 # ServerConfig is a dataclass, not Pydantic, so use asdict instead of model_dump
+                 server_dict = asdict(new_server_config)
+                 server_dict.pop('metrics', None)  # Exclude metrics
+                 return {"message": f"Server '{req.name}' added.", "server": server_dict}
 
             @app.delete("/api/servers/{server_name}")
             async def remove_server_api(server_name: str, mcp_client: MCPClient = Depends(get_mcp_client)):

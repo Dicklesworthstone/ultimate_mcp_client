@@ -3901,8 +3901,11 @@
     </div>
 
     <script>
-        const API_BASE_URL = 'http://127.0.0.1:8017/api'; // Adjust if needed
-        const WS_URL = 'ws://127.0.0.1:8017/ws/chat';   // Adjust if needed
+        // Dynamically determine URLs based on current page location
+        const currentHost = window.location.hostname || '127.0.0.1';
+        const currentPort = window.location.port || '8017';
+        const API_BASE_URL = `http://${currentHost}:${currentPort}/api`;
+        const WS_URL = `ws://${currentHost}:${currentPort}/ws/chat`;
 
 
 
