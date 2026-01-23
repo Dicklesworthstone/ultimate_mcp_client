@@ -14,10 +14,13 @@ BUFFER_LIMIT = 2**18  # 256 KiB
 # Use orjson if available, fallback to standard json
 try:
     import orjson as json_parser
+
     print("[INFO] Using orjson for JSON operations.")
 except ImportError:
     import json as json_parser
+
     print("[INFO] Using standard json library.")
+
 
 async def read_output(stream, name, output_list):
     """Read lines from stdout/stderr and print/store them."""
@@ -27,7 +30,7 @@ async def read_output(stream, name, output_list):
             if not line_bytes:
                 print(f"[{name}] ### EOF ###", flush=True)
                 break
-            line_str_raw = line_bytes.decode('utf-8', errors='replace')
+            line_str_raw = line_bytes.decode("utf-8", errors="replace")
             print(f"[{name}] <<< {repr(line_str_raw)}", flush=True)  # Log raw line with repr
             line_str_stripped = line_str_raw.strip()
             if line_str_stripped:  # Only add non-empty lines to list
@@ -41,6 +44,7 @@ async def read_output(stream, name, output_list):
         except Exception as e:
             print(f"[{name}] !!! Error reading stream: {e}", flush=True)
             break
+
 
 async def write_to_stdin(proc, data_bytes):
     """Write bytes to stdin and drain."""
@@ -59,22 +63,24 @@ async def write_to_stdin(proc, data_bytes):
         print(f"[CLIENT] !!! Stdin write failed (Other Error): {e}", flush=True)
         return False
 
+
 async def send_jsonrpc(proc, message_dict):
     """Serialize dict to JSON, add newline, encode, and send."""
     try:
         # Use orjson dumps if available (returns bytes), else standard json + encode
-        if json_parser.__name__ == 'orjson':
-            json_bytes = json_parser.dumps(message_dict) + b'\n'
+        if json_parser.__name__ == "orjson":
+            json_bytes = json_parser.dumps(message_dict) + b"\n"
         else:
-            json_str = json_parser.dumps(message_dict) + '\n'
-            json_bytes = json_str.encode('utf-8')
+            json_str = json_parser.dumps(message_dict) + "\n"
+            json_bytes = json_str.encode("utf-8")
 
-        method_or_id = message_dict.get('method', message_dict.get('id', 'N/A'))
+        method_or_id = message_dict.get("method", message_dict.get("id", "N/A"))
         print(f"[CLIENT] >>> Sending JSON ({method_or_id})...", flush=True)
         return await write_to_stdin(proc, json_bytes)
     except Exception as e:
         print(f"[CLIENT] !!! Error serializing/sending JSON: {e}", flush=True)
         return False
+
 
 async def wait_for_response(request_id, stdout_lines, mcp_timeout):
     """Wait for a specific JSON-RPC response ID in the output lines."""
@@ -103,9 +109,10 @@ async def wait_for_response(request_id, stdout_lines, mcp_timeout):
     print(f"[CLIENT] !!! Timeout waiting for response ID {request_id}.", flush=True)
     return None
 
+
 async def main():
     print("[CLIENT] Starting server process via bash shell...")
-    
+
     try:
         proc = await asyncio.create_subprocess_shell(
             SHELL_COMMAND,
@@ -114,7 +121,7 @@ async def main():
             stderr=asyncio.subprocess.PIPE,
             limit=BUFFER_LIMIT,  # Apply the defined buffer limit
             env=os.environ.copy(),  # Inherit environment
-            executable='/bin/bash'  # Explicitly specify bash
+            executable="/bin/bash",  # Explicitly specify bash
         )
         print(f"[CLIENT] Server process started with PID: {proc.pid}")
 
@@ -128,19 +135,15 @@ async def main():
         # Give server more time to start up before sending any messages
         print("[CLIENT] Waiting 3 seconds for server startup...")
         await asyncio.sleep(3.0)
-        
+
         # 1. Send Initialize
         print("[CLIENT] Sending initialize request...")
         init_id = 1
         init_req = {
             "jsonrpc": "2.0",
             "method": "initialize",
-            "params": {
-                "capabilities": {},
-                "clientInfo": {"name": "llm-gateway-test", "version": "1.0.0"},
-                "protocolVersion": PROTOCOL_VERSION
-            },
-            "id": init_id
+            "params": {"capabilities": {}, "clientInfo": {"name": "llm-gateway-test", "version": "1.0.0"}, "protocolVersion": PROTOCOL_VERSION},
+            "id": init_id,
         }
         if not await send_jsonrpc(proc, init_req):
             print("[CLIENT] Failed to send initialize request")
@@ -160,11 +163,7 @@ async def main():
 
         # 2. Send Initialized Notification
         print("[CLIENT] Sending initialized notification...")
-        init_notif = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {}
-        }
+        init_notif = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
         if not await send_jsonrpc(proc, init_notif):
             print("[CLIENT] Failed to send initialized notification")
             return
@@ -173,12 +172,7 @@ async def main():
         # 3. Send List Tools
         print("[CLIENT] Sending list_tools request...")
         list_tools_id = 2
-        list_tools_req = {
-            "jsonrpc": "2.0",
-            "method": "tools/list",
-            "params": {},
-            "id": list_tools_id
-        }
+        list_tools_req = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": list_tools_id}
         if not await send_jsonrpc(proc, list_tools_req):
             print("[CLIENT] Failed to send list_tools request")
             return
@@ -211,18 +205,18 @@ async def main():
         print("[CLIENT] Cleaning up...")
         try:
             # Cancel readers
-            if 'stdout_reader' in locals():
+            if "stdout_reader" in locals():
                 stdout_reader.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await stdout_reader
-            
-            if 'stderr_reader' in locals():
+
+            if "stderr_reader" in locals():
                 stderr_reader.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await stderr_reader
 
             # Terminate server process
-            if 'proc' in locals() and proc.returncode is None:
+            if "proc" in locals() and proc.returncode is None:
                 print("[CLIENT] Terminating server process...")
                 try:
                     proc.terminate()
@@ -240,11 +234,12 @@ async def main():
                     print(f"[CLIENT] Server process terminated with code {proc.returncode}.")
                 else:
                     print("[CLIENT] Server process might still be running after kill attempt.")
-            elif 'proc' in locals():
+            elif "proc" in locals():
                 print(f"[CLIENT] Server process already exited with code {proc.returncode}.")
         except Exception as cleanup_err:
             print(f"[CLIENT] Error during cleanup: {cleanup_err}")
             traceback.print_exc()
+
 
 if __name__ == "__main__":
     try:

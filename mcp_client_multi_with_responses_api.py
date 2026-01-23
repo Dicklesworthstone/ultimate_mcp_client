@@ -354,7 +354,7 @@ DEFAULT_MODELS = {
     Provider.CEREBRAS: "llama-4-scout-17b-16e-instruct",
 }
 
-OPENAI_MAX_TOOL_COUNT = 128 # Maximum tools to send to OpenAI-compatible APIs
+OPENAI_MAX_TOOL_COUNT = 128  # Maximum tools to send to OpenAI-compatible APIs
 
 # Emoji mapping
 EMOJI_MAP = {
@@ -2515,7 +2515,7 @@ class ServerMonitor:
                 # Just check if we can send a basic request - using ping-like mechanism
                 # Since most MCP implementations don't have a ping, we'll just verify the session is responsive
                 # by checking internal state rather than making network calls
-                if hasattr(session, '_is_active') and not getattr(session, '_is_active', True):
+                if hasattr(session, "_is_active") and not getattr(session, "_is_active", True):
                     raise ConnectionAbortedError(f"Session {server_name} is not active")
                 log.debug(f"[{server_name}] Lightweight health check passed")
             except Exception as e:
@@ -4660,7 +4660,7 @@ class MCPClient:
 
         # --- Initialize Provider Clients to None ---
         self.anthropic: Optional[AsyncAnthropic] = None
-        self.openai_client: Optional[AsyncOpenAI] = None # ** This will be used for BOTH OpenAI Responses and other compatible APIs **
+        self.openai_client: Optional[AsyncOpenAI] = None  # ** This will be used for BOTH OpenAI Responses and other compatible APIs **
         self.gemini_client: Optional[AsyncOpenAI] = None
         self.grok_client: Optional[AsyncOpenAI] = None
         self.deepseek_client: Optional[AsyncOpenAI] = None
@@ -7908,7 +7908,7 @@ class MCPClient:
                 # Build parameters dictionary dynamically
                 anthropic_params = {
                     "model": model,
-                    "messages": formatted_messages, # Excludes system message
+                    "messages": formatted_messages,  # Excludes system message
                     "max_tokens": max_tokens_to_use,
                     "temperature": temperature_to_use,
                 }
@@ -7917,7 +7917,7 @@ class MCPClient:
                     anthropic_params["system"] = system_prompt
 
                 response = await cast("AsyncAnthropic", provider_client).messages.create(**anthropic_params)
-                
+
                 # Extract text content (Anthropic usually returns content blocks)
                 if response.content and isinstance(response.content, list):
                     text_parts = [block.text for block in response.content if block.type == "text"]
@@ -8033,7 +8033,7 @@ class MCPClient:
         self,
         messages: InternalMessageList,
         provider: str,
-        model_name: str, # Keep model_name for potential future provider-specific logic
+        model_name: str,  # Keep model_name for potential future provider-specific logic
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Formats internal message list into the specific structure required by the provider.
@@ -8046,7 +8046,7 @@ class MCPClient:
         """
         formatted_messages: List[Dict[str, Any]] = []
         system_prompt_extracted: Optional[str] = None
-        messages_to_process: InternalMessageList = [] # Messages excluding the system prompt for Anthropic
+        messages_to_process: InternalMessageList = []  # Messages excluding the system prompt for Anthropic
 
         first_system_message_found = False
         for msg in messages:
@@ -8070,7 +8070,9 @@ class MCPClient:
                 # Add all other messages (including system for non-Anthropic, or subsequent system for Anthropic)
                 messages_to_process.append(msg)
 
-        log.debug(f"Formatting {len(messages_to_process)} messages for provider '{provider}'. System prompt extracted for Anthropic: {bool(system_prompt_extracted)}")
+        log.debug(
+            f"Formatting {len(messages_to_process)} messages for provider '{provider}'. System prompt extracted for Anthropic: {bool(system_prompt_extracted)}"
+        )
 
         # --- Anthropic Formatting (Uses messages_to_process) ---
         if provider == Provider.ANTHROPIC.value:
@@ -8082,7 +8084,7 @@ class MCPClient:
                     log.warning("Skipping subsequent system message found when formatting for Anthropic.")
                     continue
 
-                api_role = role # user or assistant
+                api_role = role  # user or assistant
                 api_content_list: List[Dict[str, Any]]
 
                 if isinstance(content, str):
@@ -8110,10 +8112,10 @@ class MCPClient:
                             stringified_content = self._stringify_content(result_content)
                             result_content_api: List[Dict] = []
                             # Anthropic content for tool_result can be list of blocks or string. Be flexible.
-                            if isinstance(result_content, list): # If original content was blocks, try to keep? Simpler to stringify.
-                                 result_content_api = [{"type": "text", "text": stringified_content}]
+                            if isinstance(result_content, list):  # If original content was blocks, try to keep? Simpler to stringify.
+                                result_content_api = [{"type": "text", "text": stringified_content}]
                             else:
-                                 result_content_api = [{"type": "text", "text": stringified_content}]
+                                result_content_api = [{"type": "text", "text": stringified_content}]
 
                             result_block_api = {"type": "tool_result", "tool_use_id": block.get("tool_use_id", ""), "content": result_content_api}
                             if block.get("is_error") is True:
@@ -8123,7 +8125,7 @@ class MCPClient:
                             log.warning(f"Skipping unknown block type during Anthropic formatting: {block_type}")
                     api_content_list = processed_blocks
                 elif content is None:
-                    api_content_list = [] # Empty content list for Anthropic? Or skip message? Let's use empty list.
+                    api_content_list = []  # Empty content list for Anthropic? Or skip message? Let's use empty list.
                     log.debug("Anthropic message content was None, sending empty content list.")
                 else:
                     log.warning(f"Unexpected content type for Anthropic: {type(content)}. Converting to string block.")
@@ -8131,26 +8133,32 @@ class MCPClient:
 
                 # Only add message if content list is not empty (Anthropic requires content)
                 if api_content_list:
-                     formatted_messages.append({"role": api_role, "content": api_content_list})
+                    formatted_messages.append({"role": api_role, "content": api_content_list})
                 else:
-                     log.warning(f"Skipping Anthropic message with empty content list (Role: {api_role})")
-
+                    log.warning(f"Skipping Anthropic message with empty content list (Role: {api_role})")
 
             return formatted_messages, system_prompt_extracted
 
         # --- OpenAI-Compatible (INCLUDING Responses API) Formatting ---
         # Uses messages_to_process, which *includes* system messages for these providers
         elif provider in [
-            Provider.OPENAI.value, Provider.GROK.value, Provider.DEEPSEEK.value,
-            Provider.GROQ.value, Provider.GEMINI.value, Provider.MISTRAL.value,
-            Provider.CEREBRAS.value, Provider.OPENROUTER.value
+            Provider.OPENAI.value,
+            Provider.GROK.value,
+            Provider.DEEPSEEK.value,
+            Provider.GROQ.value,
+            Provider.GEMINI.value,
+            Provider.MISTRAL.value,
+            Provider.CEREBRAS.value,
+            Provider.OPENROUTER.value,
         ]:
             for msg in messages_to_process:
                 # Basic validation again inside the loop
-                if not isinstance(msg, dict): continue
+                if not isinstance(msg, dict):
+                    continue
                 role = msg.get("role")
                 content = msg.get("content")
-                if not role: continue
+                if not role:
+                    continue
                 openai_role = role
 
                 # Handle System, User, Assistant Roles directly
@@ -8168,40 +8176,47 @@ class MCPClient:
                         # We need to extract text AND tool_calls separately.
                         text_parts = []
                         for block in content:
-                             if not isinstance(block, dict): continue
-                             block_type = block.get("type")
-                             if block_type == "text":
-                                 text_parts.append(block.get("text", ""))
-                             elif block_type == "tool_use" and openai_role == 'assistant':
-                                 original_tool_name = block.get("name", "unknown_tool")
-                                 tool_call_id = block.get("id", "")
-                                 tool_input = block.get("input", {})
-                                 sanitized_name = next(
-                                     (s_name for s_name, o_name in self.server_manager.sanitized_to_original.items() if o_name == original_tool_name),
-                                     original_tool_name,
-                                 )
-                                 try:
-                                     arguments_str = json.dumps(tool_input)
-                                 except TypeError:
-                                     log.error(f"Could not JSON-stringify tool input for '{sanitized_name}'. Sending empty args.")
-                                     arguments_str = "{}"
-                                 tool_calls_for_api.append(
-                                     {"id": tool_call_id, "type": "function", "function": {"name": sanitized_name, "arguments": arguments_str}}
-                                 )
+                            if not isinstance(block, dict):
+                                continue
+                            block_type = block.get("type")
+                            if block_type == "text":
+                                text_parts.append(block.get("text", ""))
+                            elif block_type == "tool_use" and openai_role == "assistant":
+                                original_tool_name = block.get("name", "unknown_tool")
+                                tool_call_id = block.get("id", "")
+                                tool_input = block.get("input", {})
+                                sanitized_name = next(
+                                    (s_name for s_name, o_name in self.server_manager.sanitized_to_original.items() if o_name == original_tool_name),
+                                    original_tool_name,
+                                )
+                                try:
+                                    arguments_str = json.dumps(tool_input)
+                                except TypeError:
+                                    log.error(f"Could not JSON-stringify tool input for '{sanitized_name}'. Sending empty args.")
+                                    arguments_str = "{}"
+                                tool_calls_for_api.append(
+                                    {"id": tool_call_id, "type": "function", "function": {"name": sanitized_name, "arguments": arguments_str}}
+                                )
                         # Combine extracted text parts; use None if no text but tool calls exist
                         extracted_text = "\n".join(text_parts).strip()
                         message_content = extracted_text if extracted_text else None
 
-                    elif content is None and openai_role == 'assistant':
-                        message_content = None # Assistant can have null content if using tools
+                    elif content is None and openai_role == "assistant":
+                        message_content = None  # Assistant can have null content if using tools
                     elif content is None:
-                        message_content = "" # For user/system, null content becomes empty string
-                    else: # Fallback for unexpected types
+                        message_content = ""  # For user/system, null content becomes empty string
+                    else:  # Fallback for unexpected types
                         log.warning(f"Unexpected content type for {provider}: {type(content)}. Converting to string.")
                         message_content = str(content)
 
                     # Handle Tool Results (convert internal 'user' role tool result to 'tool' role message)
-                    if openai_role == "user" and isinstance(content, list) and content and isinstance(content[0], dict) and content[0].get("type") == "tool_result":
+                    if (
+                        openai_role == "user"
+                        and isinstance(content, list)
+                        and content
+                        and isinstance(content[0], dict)
+                        and content[0].get("type") == "tool_result"
+                    ):
                         tool_call_id = content[0].get("tool_use_id")
                         tool_result_content = content[0].get("content")
                         tool_is_error = content[0].get("is_error", False)
@@ -8212,29 +8227,28 @@ class MCPClient:
                             formatted_messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": final_tool_content})
                         else:
                             log.warning("Internal tool result missing 'tool_use_id'. Skipping.")
-                        continue # Skip adding the original 'user' message
+                        continue  # Skip adding the original 'user' message
 
                     # Assemble final message payload for system/user/assistant
                     # Set 'content' only if it's not None
                     if message_content is not None:
-                         message_payload["content"] = message_content
-                    if tool_calls_for_api and openai_role == 'assistant':
+                        message_payload["content"] = message_content
+                    if tool_calls_for_api and openai_role == "assistant":
                         message_payload["tool_calls"] = tool_calls_for_api
 
                     # Add the message if it has 'content' or 'tool_calls'
                     if "content" in message_payload or "tool_calls" in message_payload:
-                         formatted_messages.append(message_payload)
+                        formatted_messages.append(message_payload)
                     else:
-                         log.warning(f"Skipping message with no content or tool calls (Role: {openai_role})")
-
+                        log.warning(f"Skipping message with no content or tool calls (Role: {openai_role})")
 
             # Return messages *with* system prompt, and None for extracted prompt
-            return formatted_messages, None # No separate system prompt needed
+            return formatted_messages, None  # No separate system prompt needed
 
         # --- Unknown Provider ---
         else:
             log.error(f"Message formatting failed: Provider '{provider}' is not supported.")
-            return [], None # Indicate failure
+            return [], None  # Indicate failure
 
     async def _handle_anthropic_stream(self, stream: AsyncMessageStream) -> AsyncGenerator[Tuple[str, Any], None]:
         """Process Anthropic stream and emit standardized events."""
@@ -8322,7 +8336,7 @@ class MCPClient:
         stop_reason = "stop"  # Default stop reason
         error_message: Optional[str] = None
         response_id: Optional[str] = None
-        tools_were_used_or_requested = False # Flag to track tool activity
+        tools_were_used_or_requested = False  # Flag to track tool activity
 
         try:
             # Iterate through the Server-Sent Events from the stream
@@ -8330,34 +8344,34 @@ class MCPClient:
                 # Gracefully handle potential missing attributes in event/data
                 # Note: The actual event objects are typed (e.g., ResponseCreatedEvent)
                 # but we use getattr for robustness against potential future changes or None values
-                event_type = getattr(event, 'event', None)
-                event_data = getattr(event, 'data', None) # The 'data' attribute usually holds the specific event object
+                event_type = getattr(event, "event", None)
+                event_data = getattr(event, "data", None)  # The 'data' attribute usually holds the specific event object
 
                 if not event_type or not event_data:
                     log.warning(f"Received unexpected event structure (missing type or data): {event}")
-                    continue # Skip malformed events
+                    continue  # Skip malformed events
 
                 log.debug(f"Received OpenAI Responses Stream Event: {event_type}")
 
                 # --- Event Processing ---
-                if event_type == 'response.created':
-                    response_id = getattr(event_data, 'id', None)
+                if event_type == "response.created":
+                    response_id = getattr(event_data, "id", None)
                     log.debug(f"Response Stream Started (ID: {response_id})")
                     # Optionally yield info: yield "response_created", {"response_id": response_id}
 
-                elif event_type == 'response.in_progress':
+                elif event_type == "response.in_progress":
                     # Typically indicates the response generation process is active
                     log.debug("Response stream in progress...")
                     # Optionally yield status: yield "status", "Processing..."
 
-                elif event_type == 'response.output_item.added':
-                    item = getattr(event_data, 'item', None)
+                elif event_type == "response.output_item.added":
+                    item = getattr(event_data, "item", None)
                     # Check if a tool call item was added
-                    if item and getattr(item, 'type', None) == 'tool_call':
-                        tools_were_used_or_requested = True # Mark tool activity
-                        tool_call_id = getattr(item, 'id', None)
-                        tool_func = getattr(item, 'function', None) # Function tools are nested under 'function'
-                        tool_name_sanitized = getattr(tool_func, 'name', 'unknown_function_tool') if tool_func else 'non_function_tool'
+                    if item and getattr(item, "type", None) == "tool_call":
+                        tools_were_used_or_requested = True  # Mark tool activity
+                        tool_call_id = getattr(item, "id", None)
+                        tool_func = getattr(item, "function", None)  # Function tools are nested under 'function'
+                        tool_name_sanitized = getattr(tool_func, "name", "unknown_function_tool") if tool_func else "non_function_tool"
                         # Map sanitized name back to original MCP name
                         original_tool_name = self.server_manager.sanitized_to_original.get(tool_name_sanitized, tool_name_sanitized)
                         if tool_call_id:
@@ -8369,14 +8383,14 @@ class MCPClient:
                     # elif item and getattr(item, 'type', None) == 'message':
                     #    log.debug(f"Message item added: {getattr(item, 'id', 'N/A')}")
 
-                elif event_type == 'response.output_text.delta':
-                    text_delta = getattr(event_data, 'delta', None)
+                elif event_type == "response.output_text.delta":
+                    text_delta = getattr(event_data, "delta", None)
                     if text_delta:
                         yield ("text_chunk", text_delta)
 
-                elif event_type == 'response.function_call_arguments.delta':
-                    tool_call_id = getattr(event_data, 'item_id', None)
-                    args_chunk = getattr(event_data, 'delta', None)
+                elif event_type == "response.function_call_arguments.delta":
+                    tool_call_id = getattr(event_data, "item_id", None)
+                    args_chunk = getattr(event_data, "delta", None)
                     if tool_call_id and args_chunk and tool_call_id in current_tool_calls:
                         current_tool_calls[tool_call_id]["args_acc"] += args_chunk
                         yield ("tool_call_input_chunk", {"id": tool_call_id, "json_chunk": args_chunk})
@@ -8384,23 +8398,23 @@ class MCPClient:
                         # This might happen if output_item.added was missed or malformed
                         log.warning(f"Responses stream: Args chunk for unknown/missing tool call ID: {tool_call_id}")
 
-                elif event_type == 'response.output_text.annotation.added':
-                    annotation_item = getattr(event_data, 'annotation', None)
+                elif event_type == "response.output_text.annotation.added":
+                    annotation_item = getattr(event_data, "annotation", None)
                     if annotation_item:
-                         try:
-                             # Use model_dump for Pydantic v2 compatibility
-                             annotation_dict = annotation_item.model_dump()
-                             yield ("annotation", annotation_dict)
-                         except AttributeError: # Fallback if model_dump isn't available
-                             log.warning(f"Could not serialize annotation object: {annotation_item}, sending as string.")
-                             yield ("annotation", {"raw_annotation": str(annotation_item)})
+                        try:
+                            # Use model_dump for Pydantic v2 compatibility
+                            annotation_dict = annotation_item.model_dump()
+                            yield ("annotation", annotation_dict)
+                        except AttributeError:  # Fallback if model_dump isn't available
+                            log.warning(f"Could not serialize annotation object: {annotation_item}, sending as string.")
+                            yield ("annotation", {"raw_annotation": str(annotation_item)})
 
-                elif event_type == 'response.output_item.done':
-                    item = getattr(event_data, 'item', None)
+                elif event_type == "response.output_item.done":
+                    item = getattr(event_data, "item", None)
                     # Finalize tool call parsing when its item is done
-                    if item and getattr(item, 'type', None) == 'tool_call':
-                        tools_were_used_or_requested = True # Mark tool activity finished
-                        tool_call_id = getattr(item, 'id', None)
+                    if item and getattr(item, "type", None) == "tool_call":
+                        tools_were_used_or_requested = True  # Mark tool activity finished
+                        tool_call_id = getattr(item, "id", None)
                         if tool_call_id and tool_call_id in current_tool_calls:
                             tool_info = current_tool_calls.pop(tool_call_id)
                             accumulated_args = tool_info["args_acc"]
@@ -8411,9 +8425,11 @@ class MCPClient:
                                     parsed_input = json.loads(accumulated_args)
                                 else:
                                     log.debug(f"Tool call {tool_call_id} ({tool_info['name']}) finished with empty arguments.")
-                                    parsed_input = {} # Represent no args as empty dict
+                                    parsed_input = {}  # Represent no args as empty dict
                             except json.JSONDecodeError as e:
-                                log.error(f"OpenAI Responses JSON parse failed for tool {tool_info['name']} (ID: {tool_call_id}): {e}. Raw: '{accumulated_args}'")
+                                log.error(
+                                    f"OpenAI Responses JSON parse failed for tool {tool_info['name']} (ID: {tool_call_id}): {e}. Raw: '{accumulated_args}'"
+                                )
                                 parsed_input = {"_tool_input_parse_error": f"JSON parse failed: {e}", "raw_args": accumulated_args}
                             yield ("tool_call_end", {"id": tool_call_id, "parsed_input": parsed_input})
                         elif tool_call_id:
@@ -8424,69 +8440,72 @@ class MCPClient:
                     #     log.debug(f"Message item done: {getattr(item, 'id', 'N/A')}")
 
                 # --- Terminal Events ---
-                elif event_type == 'response.completed':
-                    final_response = getattr(event_data, 'response', None)
+                elif event_type == "response.completed":
+                    final_response = getattr(event_data, "response", None)
                     if final_response:
-                        stop_reason = "stop" # Default success reason
-                        usage = getattr(final_response, 'usage', None)
+                        stop_reason = "stop"  # Default success reason
+                        usage = getattr(final_response, "usage", None)
                         if usage:
-                            input_tokens = getattr(usage, 'input_tokens', 0)
-                            output_tokens = getattr(usage, 'output_tokens', 0)
-                            output_details = getattr(usage, 'output_tokens_details', None)
-                            reasoning_tokens = getattr(output_details, 'reasoning_tokens', 0) if output_details else 0
-                            input_details = getattr(usage, 'input_tokens_details', None)
-                            cached_tokens = getattr(input_details, 'cached_tokens', 0) if input_details else 0
-                            log.debug(f"Responses final usage (Completed): In={input_tokens}, Out={output_tokens}, Reasoning={reasoning_tokens}, Cached={cached_tokens}")
-                    break # Terminal state
+                            input_tokens = getattr(usage, "input_tokens", 0)
+                            output_tokens = getattr(usage, "output_tokens", 0)
+                            output_details = getattr(usage, "output_tokens_details", None)
+                            reasoning_tokens = getattr(output_details, "reasoning_tokens", 0) if output_details else 0
+                            input_details = getattr(usage, "input_tokens_details", None)
+                            cached_tokens = getattr(input_details, "cached_tokens", 0) if input_details else 0
+                            log.debug(
+                                f"Responses final usage (Completed): In={input_tokens}, Out={output_tokens}, Reasoning={reasoning_tokens}, Cached={cached_tokens}"
+                            )
+                    break  # Terminal state
 
-                elif event_type == 'response.incomplete':
-                    final_response = getattr(event_data, 'response', None)
+                elif event_type == "response.incomplete":
+                    final_response = getattr(event_data, "response", None)
                     if final_response:
-                        details = getattr(final_response, 'incomplete_details', None)
-                        stop_reason = getattr(details, 'reason', 'incomplete') if details else 'incomplete'
+                        details = getattr(final_response, "incomplete_details", None)
+                        stop_reason = getattr(details, "reason", "incomplete") if details else "incomplete"
                         log.warning(f"Responses stream incomplete. Reason: {stop_reason}")
                         # Attempt to extract partial usage if available (might be null)
-                        usage = getattr(final_response, 'usage', None)
+                        usage = getattr(final_response, "usage", None)
                         if usage:
-                            input_tokens = getattr(usage, 'input_tokens', 0)
-                            output_tokens = getattr(usage, 'output_tokens', 0)
-                            output_details = getattr(usage, 'output_tokens_details', None)
-                            reasoning_tokens = getattr(output_details, 'reasoning_tokens', 0) if output_details else 0
-                            input_details = getattr(usage, 'input_tokens_details', None)
-                            cached_tokens = getattr(input_details, 'cached_tokens', 0) if input_details else 0
-                            log.debug(f"Responses partial usage (Incomplete): In={input_tokens}, Out={output_tokens}, Reasoning={reasoning_tokens}, Cached={cached_tokens}")
-                    break # Terminal state
+                            input_tokens = getattr(usage, "input_tokens", 0)
+                            output_tokens = getattr(usage, "output_tokens", 0)
+                            output_details = getattr(usage, "output_tokens_details", None)
+                            reasoning_tokens = getattr(output_details, "reasoning_tokens", 0) if output_details else 0
+                            input_details = getattr(usage, "input_tokens_details", None)
+                            cached_tokens = getattr(input_details, "cached_tokens", 0) if input_details else 0
+                            log.debug(
+                                f"Responses partial usage (Incomplete): In={input_tokens}, Out={output_tokens}, Reasoning={reasoning_tokens}, Cached={cached_tokens}"
+                            )
+                    break  # Terminal state
 
-                elif event_type == 'response.failed':
-                    final_response = getattr(event_data, 'response', None)
+                elif event_type == "response.failed":
+                    final_response = getattr(event_data, "response", None)
                     if final_response:
-                        error_obj = getattr(final_response, 'error', None)
+                        error_obj = getattr(final_response, "error", None)
                         if error_obj:
-                             error_message = getattr(error_obj, 'message', 'Unknown failure')
-                             error_code = getattr(error_obj, 'code', 'N/A')
-                             log.error(f"Responses stream failed: {error_message} (Code: {error_code})")
-                             yield ("error", f"API Failure ({error_code}): {error_message}")
+                            error_message = getattr(error_obj, "message", "Unknown failure")
+                            error_code = getattr(error_obj, "code", "N/A")
+                            log.error(f"Responses stream failed: {error_message} (Code: {error_code})")
+                            yield ("error", f"API Failure ({error_code}): {error_message}")
                         else:
-                             yield ("error", "API Failure: Unknown error object in failed response.")
+                            yield ("error", "API Failure: Unknown error object in failed response.")
                     else:
                         yield ("error", "API Failure: Unknown reason (no response object in failed event).")
                     stop_reason = "error"
-                    break # Terminal state
+                    break  # Terminal state
 
-                elif event_type == 'error':
-                     # This is an error event directly from the stream (e.g., connection issues)
-                     error_obj = event_data
-                     error_message = getattr(error_obj, 'message', 'Unknown stream error')
-                     error_code = getattr(error_obj, 'code', 'N/A')
-                     log.error(f"Responses stream explicit error event: {error_message} (Code: {error_code})")
-                     yield ("error", f"Stream Error ({error_code}): {error_message}")
-                     stop_reason = "error"
-                     break # Terminal state
+                elif event_type == "error":
+                    # This is an error event directly from the stream (e.g., connection issues)
+                    error_obj = event_data
+                    error_message = getattr(error_obj, "message", "Unknown stream error")
+                    error_code = getattr(error_obj, "code", "N/A")
+                    log.error(f"Responses stream explicit error event: {error_message} (Code: {error_code})")
+                    yield ("error", f"Stream Error ({error_code}): {error_message}")
+                    stop_reason = "error"
+                    break  # Terminal state
 
                 else:
                     # Catch-all for any other event types defined by the API
                     log.warning(f"Unhandled OpenAI Responses stream event type: {event_type}")
-
 
         # --- Handle API/Connection Errors During Iteration ---
         except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e:
@@ -8511,26 +8530,21 @@ class MCPClient:
             # --- Final Yields ---
             # Standardize stop reason if tools were the last action before a normal stop
             if stop_reason == "stop" and tools_were_used_or_requested:
-                 final_stop_reason = "tool_use"
+                final_stop_reason = "tool_use"
             else:
-                 final_stop_reason = stop_reason or "unknown" # Ensure stop_reason has a value
+                final_stop_reason = stop_reason or "unknown"  # Ensure stop_reason has a value
 
             log.debug(f"OpenAI Responses stream handler finishing. Final Stop Reason: {final_stop_reason}")
 
             # Yield final usage details collected
             yield (
                 "final_usage",
-                {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "reasoning_tokens": reasoning_tokens,
-                    "cached_tokens": cached_tokens
-                 }
+                {"input_tokens": input_tokens, "output_tokens": output_tokens, "reasoning_tokens": reasoning_tokens, "cached_tokens": cached_tokens},
             )
             # Yield the determined stop reason
             yield ("stop_reason", final_stop_reason)
             log.debug("OpenAI Responses stream handler yielded final usage and stop reason.")
-            
+
     async def _handle_openai_compatible_stream(
         self, stream: AsyncStream[ChatCompletionChunk], provider_name: str
     ) -> AsyncGenerator[Tuple[str, Any], None]:
@@ -8568,12 +8582,12 @@ class MCPClient:
                             else:
                                 log.warning(f"Args chunk for unknown tool index {idx} from {provider_name}")
                 if provider_name == Provider.GROQ.value and hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
-                     usage = chunk.x_groq.usage
-                     if usage:
-                         input_tokens = getattr(usage, "prompt_tokens", input_tokens)
-                         current_chunk_output = getattr(usage, "completion_tokens", 0)
-                         output_tokens = max(output_tokens, current_chunk_output)
-                         log.debug(f"Groq chunk usage: In={input_tokens}, Out={output_tokens} (Chunk Out={current_chunk_output})")
+                    usage = chunk.x_groq.usage
+                    if usage:
+                        input_tokens = getattr(usage, "prompt_tokens", input_tokens)
+                        current_chunk_output = getattr(usage, "completion_tokens", 0)
+                        output_tokens = max(output_tokens, current_chunk_output)
+                        log.debug(f"Groq chunk usage: In={input_tokens}, Out={output_tokens} (Chunk Out={current_chunk_output})")
 
             for idx, tool_data in current_tool_calls.items():
                 accumulated_args = tool_data["args_acc"]
@@ -8582,7 +8596,9 @@ class MCPClient:
                     if accumulated_args:
                         parsed_input = json.loads(accumulated_args)
                 except json.JSONDecodeError as e:
-                    log.error(f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'")
+                    log.error(
+                        f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'"
+                    )
                     parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
                 yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
 
@@ -9027,16 +9043,19 @@ class MCPClient:
             for tool in sorted(mcp_tools, key=lambda t: t.name):
                 original_name = tool.name
                 sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_name)[:64]
-                if not sanitized_name: continue # Skip invalid
+                if not sanitized_name:
+                    continue  # Skip invalid
                 self.server_manager.sanitized_to_original[sanitized_name] = original_name
                 input_schema = tool.input_schema
                 if not isinstance(input_schema, dict):
                     input_schema = {"type": "object", "properties": {}, "required": []}
-                formatted_tools.append({
-                    "name": sanitized_name,
-                    "description": tool.description or "No description provided.",
-                    "input_schema": input_schema, # Anthropic uses 'input_schema'
-                })
+                formatted_tools.append(
+                    {
+                        "name": sanitized_name,
+                        "description": tool.description or "No description provided.",
+                        "input_schema": input_schema,  # Anthropic uses 'input_schema'
+                    }
+                )
 
         # --- OpenAI Responses API Formatting (FLAT structure - different keys) ---
         elif provider_enum_val == Provider.OPENAI.value:
@@ -9045,7 +9064,8 @@ class MCPClient:
             for tool in sorted(mcp_tools, key=lambda t: t.name):
                 original_name = tool.name
                 sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_name)[:64]
-                if not sanitized_name: continue # Skip invalid
+                if not sanitized_name:
+                    continue  # Skip invalid
                 self.server_manager.sanitized_to_original[sanitized_name] = original_name
 
                 input_schema = tool.input_schema
@@ -9057,80 +9077,107 @@ class MCPClient:
                         "required": input_schema.get("required", []),
                     }
                     # Basic validation
-                    if not isinstance(validated_schema.get("properties"), dict): validated_schema["properties"] = {}
-                    if not isinstance(validated_schema.get("required"), list): validated_schema["required"] = []
+                    if not isinstance(validated_schema.get("properties"), dict):
+                        validated_schema["properties"] = {}
+                    if not isinstance(validated_schema.get("required"), list):
+                        validated_schema["required"] = []
                 else:
                     validated_schema = {"type": "object", "properties": {}, "required": []}
 
                 # *** FLAT STRUCTURE FOR RESPONSES API ***
-                initially_formatted_tools.append({
-                    "type": "function",
-                    "name": sanitized_name,                   # FLAT
-                    "description": tool.description or "No description provided.", # FLAT
-                    "parameters": validated_schema,            # FLAT (key name matches ChatCompletions)
-                })
+                initially_formatted_tools.append(
+                    {
+                        "type": "function",
+                        "name": sanitized_name,  # FLAT
+                        "description": tool.description or "No description provided.",  # FLAT
+                        "parameters": validated_schema,  # FLAT (key name matches ChatCompletions)
+                    }
+                )
 
             # Truncation logic (checks top-level 'name')
             if len(initially_formatted_tools) > OPENAI_MAX_TOOL_COUNT:
-                 original_count = len(initially_formatted_tools)
-                 formatted_tools = initially_formatted_tools[:OPENAI_MAX_TOOL_COUNT]
-                 truncated_sanitized_names = {t['name'] for t in formatted_tools} # Access top-level name
-                 excluded_original_names = [self.server_manager.sanitized_to_original.get(t['name'], t['name'])
-                                             for t in initially_formatted_tools if t['name'] not in truncated_sanitized_names]
-                 log.warning(f"Tool list for OpenAI ({original_count}) exceeds limit ({OPENAI_MAX_TOOL_COUNT}). Truncated. Excluded: {', '.join(sorted(excluded_original_names))}")
+                original_count = len(initially_formatted_tools)
+                formatted_tools = initially_formatted_tools[:OPENAI_MAX_TOOL_COUNT]
+                truncated_sanitized_names = {t["name"] for t in formatted_tools}  # Access top-level name
+                excluded_original_names = [
+                    self.server_manager.sanitized_to_original.get(t["name"], t["name"])
+                    for t in initially_formatted_tools
+                    if t["name"] not in truncated_sanitized_names
+                ]
+                log.warning(
+                    f"Tool list for OpenAI ({original_count}) exceeds limit ({OPENAI_MAX_TOOL_COUNT}). Truncated. Excluded: {', '.join(sorted(excluded_original_names))}"
+                )
             else:
-                 formatted_tools = initially_formatted_tools
+                formatted_tools = initially_formatted_tools
 
         # --- Other OpenAI-Compatible (Chat Completions API - NESTED structure) ---
         elif provider_enum_val in [
-            Provider.GROK.value, Provider.DEEPSEEK.value, Provider.GROQ.value,
-            Provider.MISTRAL.value, Provider.CEREBRAS.value, Provider.GEMINI.value,
-            Provider.OPENROUTER.value
+            Provider.GROK.value,
+            Provider.DEEPSEEK.value,
+            Provider.GROQ.value,
+            Provider.MISTRAL.value,
+            Provider.CEREBRAS.value,
+            Provider.GEMINI.value,
+            Provider.OPENROUTER.value,
         ]:
             log.debug(f"Formatting tools for OpenAI-compatible provider: {provider_enum_val} (Chat Completions - NESTED structure).")
             initially_formatted_tools: List[Dict[str, Any]] = []
             for tool in sorted(mcp_tools, key=lambda t: t.name):
                 original_name = tool.name
                 sanitized_name = re.sub(r"[^a-zA-Z0-9_-]", "_", original_name)[:64]
-                if not sanitized_name: continue # Skip invalid
+                if not sanitized_name:
+                    continue  # Skip invalid
                 self.server_manager.sanitized_to_original[sanitized_name] = original_name
 
                 input_schema = tool.input_schema
                 validated_schema: Dict[str, Any]
                 if isinstance(input_schema, dict) and input_schema.get("type") == "object":
-                     validated_schema = {"type": "object", "properties": input_schema.get("properties", {}), "required": input_schema.get("required", [])}
-                     if not isinstance(validated_schema.get("properties"), dict): validated_schema["properties"] = {}
-                     if not isinstance(validated_schema.get("required"), list): validated_schema["required"] = []
+                    validated_schema = {
+                        "type": "object",
+                        "properties": input_schema.get("properties", {}),
+                        "required": input_schema.get("required", []),
+                    }
+                    if not isinstance(validated_schema.get("properties"), dict):
+                        validated_schema["properties"] = {}
+                    if not isinstance(validated_schema.get("required"), list):
+                        validated_schema["required"] = []
                 else:
-                     validated_schema = {"type": "object", "properties": {}, "required": []}
+                    validated_schema = {"type": "object", "properties": {}, "required": []}
 
                 # *** NESTED STRUCTURE FOR CHAT COMPLETIONS API ***
-                initially_formatted_tools.append({
-                    "type": "function",
-                    "function": { # Nested
-                        "name": sanitized_name,
-                        "description": tool.description or "No description provided.",
-                        "parameters": validated_schema,
-                    },
-                })
+                initially_formatted_tools.append(
+                    {
+                        "type": "function",
+                        "function": {  # Nested
+                            "name": sanitized_name,
+                            "description": tool.description or "No description provided.",
+                            "parameters": validated_schema,
+                        },
+                    }
+                )
 
             # Apply truncation logic (checks nested 'function.name')
             if len(initially_formatted_tools) > OPENAI_MAX_TOOL_COUNT:
-                 original_count = len(initially_formatted_tools)
-                 formatted_tools = initially_formatted_tools[:OPENAI_MAX_TOOL_COUNT]
-                 truncated_sanitized_names = {t['function']['name'] for t in formatted_tools} # Access nested name
-                 excluded_original_names = [self.server_manager.sanitized_to_original.get(t['function']['name'], t['function']['name'])
-                                             for t in initially_formatted_tools if t['function']['name'] not in truncated_sanitized_names]
-                 log.warning(f"Tool list for {provider_enum_val} ({original_count}) exceeds limit ({OPENAI_MAX_TOOL_COUNT}). Truncated. Excluded: {', '.join(sorted(excluded_original_names))}")
+                original_count = len(initially_formatted_tools)
+                formatted_tools = initially_formatted_tools[:OPENAI_MAX_TOOL_COUNT]
+                truncated_sanitized_names = {t["function"]["name"] for t in formatted_tools}  # Access nested name
+                excluded_original_names = [
+                    self.server_manager.sanitized_to_original.get(t["function"]["name"], t["function"]["name"])
+                    for t in initially_formatted_tools
+                    if t["function"]["name"] not in truncated_sanitized_names
+                ]
+                log.warning(
+                    f"Tool list for {provider_enum_val} ({original_count}) exceeds limit ({OPENAI_MAX_TOOL_COUNT}). Truncated. Excluded: {', '.join(sorted(excluded_original_names))}"
+                )
             else:
-                 formatted_tools = initially_formatted_tools
+                formatted_tools = initially_formatted_tools
         else:
             log.warning(f"Tool formatting not implemented or provider '{provider}' unknown. Returning no tools.")
             return None
 
         log.info(f"Formatted {len(formatted_tools)} tools for provider '{provider}'.")
         return formatted_tools if formatted_tools else None
-    
+
     # --- Streaming Handlers (_handle_*_stream) ---
     async def _handle_anthropic_stream(self, stream: AsyncMessageStream) -> AsyncGenerator[Tuple[str, Any], None]:
         """Process Anthropic stream and emit standardized events. (Enhanced Error Handling)"""
@@ -9231,124 +9278,125 @@ class MCPClient:
             yield ("stop_reason", stop_reason)
 
     async def _handle_openai_compatible_stream(
-            self, stream: AsyncStream[ChatCompletionChunk], provider_name: str
-        ) -> AsyncGenerator[Tuple[str, Any], None]:
-            """Process OpenAI/Grok/DeepSeek/etc. stream and emit standardized events."""
-            current_tool_calls: Dict[int, Dict] = {}  # {index: {'id':..., 'name':..., 'args_acc':...}}
-            input_tokens = 0  # Often not available until the end
-            output_tokens = 0 # Often not available until the end
-            stop_reason = "stop"  # Default
-            finish_reason = None
-            final_usage_obj = None # To store usage from get_final_usage()
+        self, stream: AsyncStream[ChatCompletionChunk], provider_name: str
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
+        """Process OpenAI/Grok/DeepSeek/etc. stream and emit standardized events."""
+        current_tool_calls: Dict[int, Dict] = {}  # {index: {'id':..., 'name':..., 'args_acc':...}}
+        input_tokens = 0  # Often not available until the end
+        output_tokens = 0  # Often not available until the end
+        stop_reason = "stop"  # Default
+        finish_reason = None
+        final_usage_obj = None  # To store usage from get_final_usage()
 
-            try:
-                async for chunk in stream:
-                    # --- Process Chunk Data (Text, Tools) ---
-                    choice = chunk.choices[0] if chunk.choices else None
-                    if not choice:
-                        continue
+        try:
+            async for chunk in stream:
+                # --- Process Chunk Data (Text, Tools) ---
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    continue
 
-                    delta = choice.delta
-                    finish_reason = choice.finish_reason # Store the latest finish_reason
+                delta = choice.delta
+                finish_reason = choice.finish_reason  # Store the latest finish_reason
 
-                    # 1. Text Chunks
-                    if delta and delta.content:
-                        yield ("text_chunk", delta.content)
+                # 1. Text Chunks
+                if delta and delta.content:
+                    yield ("text_chunk", delta.content)
 
-                    # 2. Tool Calls (Parsing logic remains the same)
-                    if delta and delta.tool_calls:
-                        for tc_chunk in delta.tool_calls:
-                            idx = tc_chunk.index
-                            # Start of a new tool call
-                            if tc_chunk.id and tc_chunk.function and tc_chunk.function.name:
-                                tool_id = tc_chunk.id
-                                sanitized_name = tc_chunk.function.name
-                                # --- Get Original Name ---
-                                original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
-                                # -------------------------
-                                current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
-                                yield ("tool_call_start", {"id": tool_id, "name": original_name})
+                # 2. Tool Calls (Parsing logic remains the same)
+                if delta and delta.tool_calls:
+                    for tc_chunk in delta.tool_calls:
+                        idx = tc_chunk.index
+                        # Start of a new tool call
+                        if tc_chunk.id and tc_chunk.function and tc_chunk.function.name:
+                            tool_id = tc_chunk.id
+                            sanitized_name = tc_chunk.function.name
+                            # --- Get Original Name ---
+                            original_name = self.server_manager.sanitized_to_original.get(sanitized_name, sanitized_name)
+                            # -------------------------
+                            current_tool_calls[idx] = {"id": tool_id, "name": original_name, "args_acc": ""}
+                            yield ("tool_call_start", {"id": tool_id, "name": original_name})
 
-                            # Argument chunks for an existing tool call
-                            if tc_chunk.function and tc_chunk.function.arguments:
-                                args_chunk = tc_chunk.function.arguments
-                                if idx in current_tool_calls:
-                                    current_tool_calls[idx]["args_acc"] += args_chunk
-                                    # Yield incremental input chunk
-                                    yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
-                                else:
-                                    log.warning(f"Args chunk for unknown tool index {idx} from {provider_name}")
+                        # Argument chunks for an existing tool call
+                        if tc_chunk.function and tc_chunk.function.arguments:
+                            args_chunk = tc_chunk.function.arguments
+                            if idx in current_tool_calls:
+                                current_tool_calls[idx]["args_acc"] += args_chunk
+                                # Yield incremental input chunk
+                                yield ("tool_call_input_chunk", {"id": current_tool_calls[idx]["id"], "json_chunk": args_chunk})
+                            else:
+                                log.warning(f"Args chunk for unknown tool index {idx} from {provider_name}")
 
-                    # --- Provider-Specific Stream Data (e.g., Groq Usage) ---
-                    if provider_name == Provider.GROQ.value and hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
-                        usage = chunk.x_groq.usage
-                        if usage:
-                            # Groq provides usage per-chunk, update totals
-                            input_tokens = getattr(usage, "prompt_tokens", input_tokens) # Prompt tokens usually fixed
-                            current_chunk_output = getattr(usage, "completion_tokens", 0)
-                            # Use max as completion_tokens seems cumulative in Groq's per-chunk usage
-                            output_tokens = max(output_tokens, current_chunk_output)
-                            log.debug(f"Groq chunk usage: In={input_tokens}, Out={output_tokens} (Chunk Out={current_chunk_output})")
+                # --- Provider-Specific Stream Data (e.g., Groq Usage) ---
+                if provider_name == Provider.GROQ.value and hasattr(chunk, "x_groq") and chunk.x_groq and hasattr(chunk.x_groq, "usage"):
+                    usage = chunk.x_groq.usage
+                    if usage:
+                        # Groq provides usage per-chunk, update totals
+                        input_tokens = getattr(usage, "prompt_tokens", input_tokens)  # Prompt tokens usually fixed
+                        current_chunk_output = getattr(usage, "completion_tokens", 0)
+                        # Use max as completion_tokens seems cumulative in Groq's per-chunk usage
+                        output_tokens = max(output_tokens, current_chunk_output)
+                        log.debug(f"Groq chunk usage: In={input_tokens}, Out={output_tokens} (Chunk Out={current_chunk_output})")
 
+            # --- After Stream Ends: Finalize Tool Calls ---
+            for idx, tool_data in current_tool_calls.items():
+                accumulated_args = tool_data["args_acc"]
+                parsed_input = {}
+                try:
+                    if accumulated_args:  # Only parse if not empty
+                        parsed_input = json.loads(accumulated_args)
+                except json.JSONDecodeError as e:
+                    log.error(
+                        f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'"
+                    )
+                    parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
+                yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
 
-                # --- After Stream Ends: Finalize Tool Calls ---
-                for idx, tool_data in current_tool_calls.items():
-                    accumulated_args = tool_data["args_acc"]
-                    parsed_input = {}
-                    try:
-                        if accumulated_args: # Only parse if not empty
-                            parsed_input = json.loads(accumulated_args)
-                    except json.JSONDecodeError as e:
-                        log.error(f"{provider_name} JSON parse failed for tool {tool_data['name']} (ID: {tool_data['id']}): {e}. Raw: '{accumulated_args}'")
-                        parsed_input = {"_tool_input_parse_error": f"Failed: {e}"}
-                    yield ("tool_call_end", {"id": tool_data["id"], "parsed_input": parsed_input})
+            # Determine final stop reason
+            stop_reason = finish_reason if finish_reason else "stop"
+            if stop_reason == "tool_calls":
+                stop_reason = "tool_use"  # Standardize
 
-                # Determine final stop reason
-                stop_reason = finish_reason if finish_reason else "stop"
-                if stop_reason == "tool_calls":
-                    stop_reason = "tool_use" # Standardize
+        # --- Error Handling ---
+        except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e:
+            log.error(f"{provider_name} stream API error: {e}")
+            yield ("error", f"{provider_name} API Error: {e}")
+            stop_reason = "error"
+        except Exception as e:
+            log.error(f"Unexpected error in {provider_name} stream handler: {e}", exc_info=True)
+            yield ("error", f"Unexpected stream processing error: {e}")
+            stop_reason = "error"
+        # --- End Main Try/Except ---
+        finally:
+            # --- Get Final Usage (Correct Method) ---
+            # Do this *after* the stream loop finishes, but *before* yielding final usage
+            # Skip for Groq, as we accumulated it during the stream
+            if provider_name != Provider.GROQ.value:
+                try:
+                    # Call get_final_usage() on the stream object AFTER iteration
+                    final_usage_obj = stream.get_final_usage()
+                    if final_usage_obj:
+                        input_tokens = getattr(final_usage_obj, "prompt_tokens", 0)
+                        output_tokens = getattr(final_usage_obj, "completion_tokens", 0)
+                        log.debug(f"Retrieved final usage via get_final_usage() for {provider_name}: In={input_tokens}, Out={output_tokens}")
+                    else:
+                        log.warning(f"stream.get_final_usage() returned None for {provider_name}. Usage may be inaccurate.")
+                except AttributeError:
+                    # Handle cases where get_final_usage might not exist (though it should for OpenAI v1+)
+                    log.warning(f"Stream object for {provider_name} does not have get_final_usage(). Usage will be 0.")
+                except Exception as e:
+                    # Catch any other error during the final usage call
+                    log.warning(f"Error calling get_final_usage() for {provider_name}: {e}. Usage may be inaccurate.")
 
-            # --- Error Handling ---
-            except (OpenAIAPIError, OpenAIAPIConnectionError, OpenAIAuthenticationError) as e:
-                log.error(f"{provider_name} stream API error: {e}")
-                yield ("error", f"{provider_name} API Error: {e}")
-                stop_reason = "error"
-            except Exception as e:
-                log.error(f"Unexpected error in {provider_name} stream handler: {e}", exc_info=True)
-                yield ("error", f"Unexpected stream processing error: {e}")
-                stop_reason = "error"
-            # --- End Main Try/Except ---
-            finally:
-                # --- Get Final Usage (Correct Method) ---
-                # Do this *after* the stream loop finishes, but *before* yielding final usage
-                # Skip for Groq, as we accumulated it during the stream
-                if provider_name != Provider.GROQ.value:
-                    try:
-                        # Call get_final_usage() on the stream object AFTER iteration
-                        final_usage_obj = stream.get_final_usage()
-                        if final_usage_obj:
-                            input_tokens = getattr(final_usage_obj, "prompt_tokens", 0)
-                            output_tokens = getattr(final_usage_obj, "completion_tokens", 0)
-                            log.debug(f"Retrieved final usage via get_final_usage() for {provider_name}: In={input_tokens}, Out={output_tokens}")
-                        else:
-                            log.warning(f"stream.get_final_usage() returned None for {provider_name}. Usage may be inaccurate.")
-                    except AttributeError:
-                        # Handle cases where get_final_usage might not exist (though it should for OpenAI v1+)
-                        log.warning(f"Stream object for {provider_name} does not have get_final_usage(). Usage will be 0.")
-                    except Exception as e:
-                        # Catch any other error during the final usage call
-                        log.warning(f"Error calling get_final_usage() for {provider_name}: {e}. Usage may be inaccurate.")
+            # --- Log and Yield Final Events ---
+            if input_tokens == 0 or output_tokens == 0:
+                # Adjust warning based on whether usage was expected vs unavailable
+                if final_usage_obj or provider_name == Provider.GROQ.value:  # If we got an object but values are 0
+                    log.warning(f"{provider_name} usage details reported as zero (Input: {input_tokens}, Output: {output_tokens}).")
+                else:  # If we couldn't get the usage object at all
+                    log.warning(f"{provider_name} usage details unavailable. Cannot calculate cost accurately.")
 
-                # --- Log and Yield Final Events ---
-                if input_tokens == 0 or output_tokens == 0:
-                    # Adjust warning based on whether usage was expected vs unavailable
-                    if final_usage_obj or provider_name == Provider.GROQ.value: # If we got an object but values are 0
-                        log.warning(f"{provider_name} usage details reported as zero (Input: {input_tokens}, Output: {output_tokens}).")
-                    else: # If we couldn't get the usage object at all
-                        log.warning(f"{provider_name} usage details unavailable. Cannot calculate cost accurately.")
-
-                yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
-                yield ("stop_reason", stop_reason)
+            yield ("final_usage", {"input_tokens": input_tokens, "output_tokens": output_tokens})
+            yield ("stop_reason", stop_reason)
 
     def _filter_faulty_client_tool_results(self, messages_in: InternalMessageList) -> InternalMessageList:
         """
@@ -9484,7 +9532,7 @@ class MCPClient:
         """
         span: Optional[trace.Span] = None
         span_context_manager = None
-        current_task = asyncio.current_task() # Get task for cancellation check
+        current_task = asyncio.current_task()  # Get task for cancellation check
         stop_reason: Optional[str] = "processing"
         error_occurred = False
 
@@ -9495,7 +9543,7 @@ class MCPClient:
         self.cache_hit_count = 0
         self.tokens_saved_by_cache = 0
 
-        with safe_stdout(): # Ensure stdout protection if needed
+        with safe_stdout():  # Ensure stdout protection if needed
             start_time = time.time()
             # --- Determine Model and Provider ---
             if not model:
@@ -9512,7 +9560,7 @@ class MCPClient:
             # --- Get Provider Client ---
             provider_client = getattr(self, f"{provider_name}_client", None)
             if not provider_client and provider_name == Provider.ANTHROPIC.value:
-                provider_client = self.anthropic # Special case
+                provider_client = self.anthropic  # Special case
             if not provider_client:
                 error_msg = f"API key/client for provider '{provider_name}' not configured or initialized."
                 log.error(error_msg)
@@ -9560,8 +9608,8 @@ class MCPClient:
                 completed_tool_calls: List[Dict] = []
                 turn_input_tokens: int = 0
                 turn_output_tokens: int = 0
-                reasoning_tokens = 0 # Specific to Responses API
-                cached_tokens = 0    # Specific to Responses API
+                reasoning_tokens = 0  # Specific to Responses API
+                cached_tokens = 0  # Specific to Responses API
                 turn_cost: float = 0.0
                 turn_stop_reason: Optional[str] = None
                 turn_api_error: Optional[str] = None
@@ -9574,16 +9622,15 @@ class MCPClient:
                 tools_len_str = str(len(formatted_tools)) if formatted_tools else "0"
                 log.debug(f"[{provider_name}] Turn Start: Msgs={len(formatted_messages)}, Tools={tools_len_str}")
                 if formatted_tools and provider_name == Provider.OPENAI.value:
-                     log.debug(f"First OpenAI tool structure being sent (Flat for Responses API): {json.dumps(formatted_tools[0], indent=2)}")
+                    log.debug(f"First OpenAI tool structure being sent (Flat for Responses API): {json.dumps(formatted_tools[0], indent=2)}")
                 elif formatted_tools and provider_name != Provider.ANTHROPIC.value:
-                     log.debug(f"First {provider_name} tool structure being sent (Nested for Chat Comp): {json.dumps(formatted_tools[0], indent=2)}")
-
+                    log.debug(f"First {provider_name} tool structure being sent (Nested for Chat Comp): {json.dumps(formatted_tools[0], indent=2)}")
 
                 stream_start_time = time.time()
-                stream_iterator: Optional[AsyncGenerator] = None # Define before try block
-                api_stream_context = None # For Anthropic's async with
+                stream_iterator: Optional[AsyncGenerator] = None  # Define before try block
+                api_stream_context = None  # For Anthropic's async with
 
-                try: # --- API Call and Stream Initiation ---
+                try:  # --- API Call and Stream Initiation ---
                     log.debug(f"Initiating API call to {provider_name}...")
                     api_client: Any = provider_client
 
@@ -9592,16 +9639,16 @@ class MCPClient:
                         openai_resp_client = cast("AsyncOpenAI", api_client)
                         responses_params: Dict[str, Any] = {
                             "model": model,
-                            "input": formatted_messages, # Expects 'input' key
+                            "input": formatted_messages,  # Expects 'input' key
                             "stream": True,
                             "temperature": self.config.temperature,
-                            "tools": formatted_tools, # Should be FLAT now
-                            "tool_choice": "auto", # Or handle specific choices
+                            "tools": formatted_tools,  # Should be FLAT now
+                            "tool_choice": "auto",  # Or handle specific choices
                             "max_output_tokens": max_tokens_to_use,
                         }
                         # Use 'instructions' for system prompt with Responses API
                         if system_prompt:
-                             responses_params["instructions"] = system_prompt
+                            responses_params["instructions"] = system_prompt
 
                         log.debug(f"Calling OpenAI Responses API with params:")
                         log.debug(f"  Model: {responses_params.get('model')}")
@@ -9612,40 +9659,64 @@ class MCPClient:
                         log.debug(f"  Max Tokens: {responses_params.get('max_output_tokens')}")
                         log.debug(f"  Instructions: {'Present' if 'instructions' in responses_params else 'None'}")
                         try:
-                            tools_json_str = json.dumps(responses_params.get('tools', []), indent=2)
+                            tools_json_str = json.dumps(responses_params.get("tools", []), indent=2)
                             log_limit = 3
-                            if len(responses_params.get('tools', [])) > log_limit:
-                                tools_json_str = json.dumps(responses_params['tools'][:log_limit], indent=2) + f"\n... (and {len(responses_params['tools']) - log_limit} more tools)"
-                            log.debug(f"  Tools ({len(responses_params.get('tools',[]))}): {tools_json_str}")
-                        except Exception as json_err: log.error(f"Could not serialize tools for logging: {json_err}")
+                            if len(responses_params.get("tools", [])) > log_limit:
+                                tools_json_str = (
+                                    json.dumps(responses_params["tools"][:log_limit], indent=2)
+                                    + f"\n... (and {len(responses_params['tools']) - log_limit} more tools)"
+                                )
+                            log.debug(f"  Tools ({len(responses_params.get('tools', []))}): {tools_json_str}")
+                        except Exception as json_err:
+                            log.error(f"Could not serialize tools for logging: {json_err}")
 
                         api_stream = await openai_resp_client.responses.create(**responses_params)
-                        stream_iterator = self._handle_openai_responses_stream(api_stream) # Use the Responses handler
+                        stream_iterator = self._handle_openai_responses_stream(api_stream)  # Use the Responses handler
                         log.debug(f"API call successful for OpenAI Responses. Processing stream...")
 
                     # --- Anthropic ---
                     elif provider_name == Provider.ANTHROPIC.value:
                         anthropic_client = cast("AsyncAnthropic", api_client)
-                        stream_manager_params = { "model": model, "messages": formatted_messages, "tools": formatted_tools, "max_tokens": max_tokens_to_use, "temperature": self.config.temperature }
-                        if system_prompt: stream_manager_params["system"] = system_prompt
+                        stream_manager_params = {
+                            "model": model,
+                            "messages": formatted_messages,
+                            "tools": formatted_tools,
+                            "max_tokens": max_tokens_to_use,
+                            "temperature": self.config.temperature,
+                        }
+                        if system_prompt:
+                            stream_manager_params["system"] = system_prompt
                         # Use 'async with' for Anthropic's stream context manager
                         api_stream_context = anthropic_client.messages.stream(**stream_manager_params)
-                        api_stream = await api_stream_context.__aenter__() # Enter context
+                        api_stream = await api_stream_context.__aenter__()  # Enter context
                         stream_iterator = self._handle_anthropic_stream(api_stream)
                         log.debug(f"API call successful for Anthropic. Processing stream...")
 
                     # --- Other OpenAI-Compatible (Chat Completions) ---
                     elif provider_name in [
-                         Provider.GROK.value, Provider.DEEPSEEK.value, Provider.GROQ.value,
-                         Provider.GEMINI.value, Provider.MISTRAL.value, Provider.CEREBRAS.value,
-                         Provider.OPENROUTER.value
+                        Provider.GROK.value,
+                        Provider.DEEPSEEK.value,
+                        Provider.GROQ.value,
+                        Provider.GEMINI.value,
+                        Provider.MISTRAL.value,
+                        Provider.CEREBRAS.value,
+                        Provider.OPENROUTER.value,
                     ]:
                         openai_comp_client = cast("AsyncOpenAI", api_client)
                         # Chat Completions expects 'messages' key and NESTED tools
-                        completion_params = { "model": model, "messages": formatted_messages, "tools": formatted_tools, "max_tokens": max_tokens_to_use, "temperature": self.config.temperature, "stream": True }
-                        log.debug(f"Calling OpenAI Compatible API ({provider_name}) with params: { {k: v for k, v in completion_params.items() if k != 'messages'} } Input Msgs: {len(completion_params['messages'])}")
+                        completion_params = {
+                            "model": model,
+                            "messages": formatted_messages,
+                            "tools": formatted_tools,
+                            "max_tokens": max_tokens_to_use,
+                            "temperature": self.config.temperature,
+                            "stream": True,
+                        }
+                        log.debug(
+                            f"Calling OpenAI Compatible API ({provider_name}) with params: { {k: v for k, v in completion_params.items() if k != 'messages'} } Input Msgs: {len(completion_params['messages'])}"
+                        )
                         api_stream = await openai_comp_client.chat.completions.create(**completion_params)
-                        stream_iterator = self._handle_openai_compatible_stream(api_stream, provider_name) # Use Chat Comp handler
+                        stream_iterator = self._handle_openai_compatible_stream(api_stream, provider_name)  # Use Chat Comp handler
                         log.debug(f"API call successful for {provider_name}. Processing stream...")
                     else:
                         raise NotImplementedError(f"Streaming API call not implemented for provider: {provider_name}")
@@ -9663,24 +9734,28 @@ class MCPClient:
                                     log.error(f"Stream error event from {provider_name} handler: {turn_api_error}")
                                     yield "status", f"[bold red]Stream Error ({provider_name}): {turn_api_error}[/]"
                                     turn_stop_reason = "error"
-                                    break # Exit inner loop on error
+                                    break  # Exit inner loop on error
                                 elif std_event_type == "text_chunk":
                                     if isinstance(std_event_data, str):
                                         accumulated_text_this_turn += std_event_data
                                         yield "text_chunk", std_event_data
-                                elif std_event_type == "annotation": # Pass annotations through (from Responses API)
+                                elif std_event_type == "annotation":  # Pass annotations through (from Responses API)
                                     yield "annotation", std_event_data
                                 elif std_event_type == "tool_call_start":
                                     tool_id = std_event_data.get("id", str(uuid.uuid4()))
                                     original_tool_name = std_event_data.get("name", "unknown_tool")
                                     tool_calls_in_progress[tool_id] = {"name": original_tool_name, "args_acc": ""}
-                                    yield "status", f"{EMOJI_MAP['tool']} Preparing tool: [bold]{original_tool_name.split(':')[-1]}[/] (ID: {tool_id[:8]})..."
+                                    yield (
+                                        "status",
+                                        f"{EMOJI_MAP['tool']} Preparing tool: [bold]{original_tool_name.split(':')[-1]}[/] (ID: {tool_id[:8]})...",
+                                    )
                                 elif std_event_type == "tool_call_input_chunk":
                                     tool_id = std_event_data.get("id")
                                     json_chunk = std_event_data.get("json_chunk")
                                     if tool_id and json_chunk and tool_id in tool_calls_in_progress:
                                         tool_calls_in_progress[tool_id]["args_acc"] += json_chunk
-                                    elif tool_id: log.warning(f"Input chunk for unknown tool call ID: {tool_id}")
+                                    elif tool_id:
+                                        log.warning(f"Input chunk for unknown tool call ID: {tool_id}")
                                 elif std_event_type == "tool_call_end":
                                     tool_id = std_event_data.get("id")
                                     parsed_input = std_event_data.get("parsed_input", {})
@@ -9688,7 +9763,8 @@ class MCPClient:
                                         tool_info = tool_calls_in_progress.pop(tool_id)
                                         completed_tool_calls.append({"id": tool_id, "name": tool_info["name"], "input": parsed_input})
                                         log.debug(f"Completed parsing tool call: ID={tool_id}, Name={tool_info['name']}")
-                                    elif tool_id: log.warning(f"End event for unknown tool call ID: {tool_id}")
+                                    elif tool_id:
+                                        log.warning(f"End event for unknown tool call ID: {tool_id}")
                                 elif std_event_type == "final_usage":
                                     turn_input_tokens = std_event_data.get("input_tokens", 0)
                                     turn_output_tokens = std_event_data.get("output_tokens", 0)
@@ -9701,24 +9777,28 @@ class MCPClient:
                                     self.session_total_cost += turn_cost
                                     # Build usage string dynamically
                                     usage_parts = [f"In={turn_input_tokens:,}", f"Out={turn_output_tokens:,}"]
-                                    if reasoning_tokens > 0: usage_parts.append(f"Reasoning={reasoning_tokens:,}")
-                                    if cached_tokens > 0: usage_parts.append(f"Cached={cached_tokens:,}")
+                                    if reasoning_tokens > 0:
+                                        usage_parts.append(f"Reasoning={reasoning_tokens:,}")
+                                    if cached_tokens > 0:
+                                        usage_parts.append(f"Cached={cached_tokens:,}")
                                     usage_status_msg = f"{EMOJI_MAP['token']} Turn Tokens: {', '.join(usage_parts)} | {EMOJI_MAP['cost']} Turn Cost: ${turn_cost:.4f}"
                                     yield "status", usage_status_msg
                                     if span:
-                                         turn_idx = sum(1 for m in messages if m.get("role") == "assistant")
-                                         span.set_attribute(f"turn_{turn_idx}.input_tokens", turn_input_tokens)
-                                         span.set_attribute(f"turn_{turn_idx}.output_tokens", turn_output_tokens)
-                                         span.set_attribute(f"turn_{turn_idx}.cost", turn_cost)
-                                         if reasoning_tokens > 0: span.set_attribute(f"turn_{turn_idx}.reasoning_tokens", reasoning_tokens)
-                                         if cached_tokens > 0: span.set_attribute(f"turn_{turn_idx}.cached_tokens", cached_tokens)
+                                        turn_idx = sum(1 for m in messages if m.get("role") == "assistant")
+                                        span.set_attribute(f"turn_{turn_idx}.input_tokens", turn_input_tokens)
+                                        span.set_attribute(f"turn_{turn_idx}.output_tokens", turn_output_tokens)
+                                        span.set_attribute(f"turn_{turn_idx}.cost", turn_cost)
+                                        if reasoning_tokens > 0:
+                                            span.set_attribute(f"turn_{turn_idx}.reasoning_tokens", reasoning_tokens)
+                                        if cached_tokens > 0:
+                                            span.set_attribute(f"turn_{turn_idx}.cached_tokens", cached_tokens)
                                 elif std_event_type == "stop_reason":
                                     turn_stop_reason = std_event_data
                                     log.debug(f"Received stop reason: {turn_stop_reason}")
                         except asyncio.CancelledError:
                             log.debug("Stream consumption loop cancelled.")
                             turn_stop_reason = "cancelled"
-                            error_occurred = True # Treat cancellation as an error for outer loop control
+                            error_occurred = True  # Treat cancellation as an error for outer loop control
                         except Exception as consume_err:
                             log.error(f"Error consuming stream wrapper: {consume_err}", exc_info=True)
                             turn_api_error = str(consume_err)
@@ -9726,46 +9806,49 @@ class MCPClient:
                             error_occurred = True
                         finally:
                             # *** Ensure generator is closed ***
-                            if stream_iterator and hasattr(stream_iterator, 'aclose'):
-                                 log.debug(f"Closing raw stream iterator for {provider_name} in finally block...")
-                                 # Use suppress to avoid errors if already closed or during cancellation
-                                 with suppress(Exception):
-                                     await stream_iterator.aclose()
-                                 log.debug(f"Raw stream iterator for {provider_name} closed.")
+                            if stream_iterator and hasattr(stream_iterator, "aclose"):
+                                log.debug(f"Closing raw stream iterator for {provider_name} in finally block...")
+                                # Use suppress to avoid errors if already closed or during cancellation
+                                with suppress(Exception):
+                                    await stream_iterator.aclose()
+                                log.debug(f"Raw stream iterator for {provider_name} closed.")
                             # Also exit Anthropic context manager if applicable
-                            if api_stream_context and hasattr(api_stream_context, '__aexit__'):
+                            if api_stream_context and hasattr(api_stream_context, "__aexit__"):
                                 log.debug("Exiting Anthropic stream context manager...")
                                 with suppress(Exception):
                                     await api_stream_context.__aexit__(None, None, None)
                                 log.debug("Anthropic stream context manager exited.")
 
-                        if turn_stop_reason == "error": break # Exit outer loop if error happened during consumption
+                        if turn_stop_reason == "error":
+                            break  # Exit outer loop if error happened during consumption
 
-                    else: # Handle case where stream_iterator wasn't created
-                         turn_api_error = turn_api_error or f"Stream iterator not created for {provider_name}"
-                         log.error(turn_api_error)
-                         break # Exit outer loop
+                    else:  # Handle case where stream_iterator wasn't created
+                        turn_api_error = turn_api_error or f"Stream iterator not created for {provider_name}"
+                        log.error(turn_api_error)
+                        break  # Exit outer loop
 
                 # --- Catch API Call / Connection Errors ---
                 except asyncio.CancelledError:
                     log.debug(f"API call/stream setup cancelled for {provider_name}")
                     error_occurred = True
                     turn_stop_reason = "cancelled"
-                    break # Exit outer loop
+                    break  # Exit outer loop
                 except (anthropic.APIError, openai.APIError, httpx.RequestError, NotImplementedError, Exception) as api_err:
                     # Consolidate error handling, specific types logged by handler
                     turn_api_error = f"API Error ({type(api_err).__name__}): {api_err}"
                     log.error(f"{provider_name} {turn_api_error}", exc_info=True)
                     error_occurred = True
                     turn_stop_reason = "error"
-                    break # Exit outer loop
+                    break  # Exit outer loop
                 finally:
-                    log.debug(f"Stream processing finished for turn. Duration: {time.time() - stream_start_time:.2f}s. API Error: {turn_api_error}. Stop Reason: {turn_stop_reason}")
+                    log.debug(
+                        f"Stream processing finished for turn. Duration: {time.time() - stream_start_time:.2f}s. API Error: {turn_api_error}. Stop Reason: {turn_stop_reason}"
+                    )
 
                 # --- Post-Stream Processing / Check Stop Reason ---
                 if error_occurred or turn_stop_reason == "error":
-                    stop_reason = "error" # Set overall stop reason
-                    break # Exit the outer while loop
+                    stop_reason = "error"  # Set overall stop reason
+                    break  # Exit the outer while loop
 
                 # Append Assistant Message (Text and/or Tool Calls)
                 assistant_content_blocks: List[Union[TextContentBlock, ToolUseContentBlock]] = []
@@ -9777,23 +9860,23 @@ class MCPClient:
                     assistant_message: InternalMessage = {"role": "assistant", "content": assistant_content_blocks}
                     messages.append(assistant_message)
                     if accumulated_text_this_turn:
-                         final_response_text += accumulated_text_this_turn
+                        final_response_text += accumulated_text_this_turn
 
                 # Check stop reason and decide next action
                 if current_task and current_task.cancelled():
                     raise asyncio.CancelledError("Cancelled before stop reason handling")
-                stop_reason = turn_stop_reason # Update overall stop reason
+                stop_reason = turn_stop_reason  # Update overall stop reason
 
                 if stop_reason == "tool_use":
                     if not completed_tool_calls:
                         log.warning(f"{provider_name} stop reason 'tool_use' but no calls parsed.")
                         yield "status", "[yellow]Warning: Model requested tools, but none were identified.[/]"
-                        break # Exit loop
+                        break  # Exit loop
 
                     tool_results_for_api: List[InternalMessage] = []
                     yield "status", f"{EMOJI_MAP['tool']} Processing {len(completed_tool_calls)} tool call(s)..."
 
-                    try: # --- Tool Execution Loop ---
+                    try:  # --- Tool Execution Loop ---
                         for tool_call in completed_tool_calls:
                             if current_task and current_task.cancelled():
                                 raise asyncio.CancelledError("Cancelled during tool processing")
@@ -9801,7 +9884,7 @@ class MCPClient:
                             tool_use_id = tool_call["id"]
                             original_tool_name = tool_call["name"]
                             tool_args = tool_call["input"]
-                            tool_short_name = original_tool_name.split(':')[-1] if ':' in original_tool_name else original_tool_name
+                            tool_short_name = original_tool_name.split(":")[-1] if ":" in original_tool_name else original_tool_name
                             tool_start_time = time.time()
                             tool_result_content: Union[str, List[Dict], Dict] = "Error: Tool execution failed unexpectedly."
                             log_content_for_history: Any = tool_result_content
@@ -9817,7 +9900,7 @@ class MCPClient:
                                 log_content_for_history = {"error": error_text, "raw_json": raw_json_str}
                                 yield "status", f"{EMOJI_MAP['failure']} Input Error [bold]{tool_short_name}[/]: Client parse failed."
                                 log.error(f"{error_text} Raw: {raw_json_str}")
-                            else: # Proceed with execution if parse OK
+                            else:  # Proceed with execution if parse OK
                                 mcp_tool_obj = self.server_manager.tools.get(original_tool_name)
                                 if not mcp_tool_obj:
                                     error_text = f"Tool '{original_tool_name}' not found by client."
@@ -9831,8 +9914,10 @@ class MCPClient:
                                     cached_result = None
                                     # Cache Check
                                     if self.tool_cache and self.config.enable_caching:
-                                        try: cached_result = self.tool_cache.get(original_tool_name, tool_args)
-                                        except TypeError: cached_result = None
+                                        try:
+                                            cached_result = self.tool_cache.get(original_tool_name, tool_args)
+                                        except TypeError:
+                                            cached_result = None
                                         cache_is_error = isinstance(cached_result, dict) and cached_result.get("error")
                                         if cached_result is not None and not cache_is_error:
                                             tool_result_content = cached_result
@@ -9843,16 +9928,21 @@ class MCPClient:
                                             content_str_tokens = self._stringify_content(cached_result)
                                             cached_tokens_est = self._estimate_string_tokens(content_str_tokens)
                                             self.tokens_saved_by_cache += cached_tokens_est
-                                            yield "status", f"{EMOJI_MAP['cached']} Using cache [bold]{tool_short_name}[/] ({cached_tokens_est:,} tokens)"
+                                            yield (
+                                                "status",
+                                                f"{EMOJI_MAP['cached']} Using cache [bold]{tool_short_name}[/] ({cached_tokens_est:,} tokens)",
+                                            )
                                             log.info(f"Using cached result for {original_tool_name}")
-                                        elif cached_result is not None: log.info(f"Ignoring cached error for {original_tool_name}")
+                                        elif cached_result is not None:
+                                            log.info(f"Ignoring cached error for {original_tool_name}")
 
                                     # Execute if not cached or cache was error
                                     if not cache_used_flag:
                                         yield "status", f"{EMOJI_MAP['server']} Executing [bold]{tool_short_name}[/] via {server_name}..."
                                         log.info(f"Executing tool '{original_tool_name}' via server '{server_name}'...")
                                         try:
-                                            if current_task and current_task.cancelled(): raise asyncio.CancelledError("Cancelled before tool execution")
+                                            if current_task and current_task.cancelled():
+                                                raise asyncio.CancelledError("Cancelled before tool execution")
                                             with safe_stdout():
                                                 exec_params = {"server_name": server_name, "tool_name": original_tool_name, "tool_args": tool_args}
                                                 mcp_result: CallToolResult = await self.execute_tool(**exec_params)
@@ -9861,7 +9951,10 @@ class MCPClient:
                                                 error_detail = str(mcp_result.content) if mcp_result.content else "Unknown server error"
                                                 tool_result_content = f"Error: Tool execution failed: {error_detail}"
                                                 log_content_for_history = {"error": error_detail, "raw_content": mcp_result.content}
-                                                yield "status", f"{EMOJI_MAP['failure']} Error [bold]{tool_short_name}[/] ({tool_latency:.1f}s): {error_detail[:100]}..."
+                                                yield (
+                                                    "status",
+                                                    f"{EMOJI_MAP['failure']} Error [bold]{tool_short_name}[/] ({tool_latency:.1f}s): {error_detail[:100]}...",
+                                                )
                                                 log.warning(f"Tool '{original_tool_name}' failed on '{server_name}': {error_detail}")
                                             else:
                                                 tool_result_content = mcp_result.content if mcp_result.content is not None else ""
@@ -9869,11 +9962,16 @@ class MCPClient:
                                                 is_error_flag = False
                                                 content_str_tokens = self._stringify_content(tool_result_content)
                                                 result_tokens = self._estimate_string_tokens(content_str_tokens)
-                                                yield "status", f"{EMOJI_MAP['success']} Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {tool_latency:.1f}s)"
+                                                yield (
+                                                    "status",
+                                                    f"{EMOJI_MAP['success']} Result [bold]{tool_short_name}[/] ({result_tokens:,} tokens, {tool_latency:.1f}s)",
+                                                )
                                                 log.info(f"Tool '{original_tool_name}' OK ({result_tokens:,} tokens, {tool_latency:.1f}s)")
                                                 if self.tool_cache and self.config.enable_caching and not is_error_flag:
-                                                    try: self.tool_cache.set(original_tool_name, tool_args, tool_result_content)
-                                                    except TypeError: log.warning(f"Failed cache {original_tool_name}: unhashable args")
+                                                    try:
+                                                        self.tool_cache.set(original_tool_name, tool_args, tool_result_content)
+                                                    except TypeError:
+                                                        log.warning(f"Failed cache {original_tool_name}: unhashable args")
                                         except asyncio.CancelledError:
                                             log.debug(f"Tool execution cancelled: {original_tool_name}")
                                             tool_result_content = "Error: Tool execution cancelled by user."
@@ -9887,53 +9985,73 @@ class MCPClient:
                                             error_text = f"Client error: {str(exec_err)}"
                                             tool_result_content = f"Error: {error_text}"
                                             log_content_for_history = {"error": error_text}
-                                            yield "status", f"{EMOJI_MAP['failure']} Client Error [bold]{tool_short_name}[/] ({tool_latency:.2f}s): {str(exec_err)}"
+                                            yield (
+                                                "status",
+                                                f"{EMOJI_MAP['failure']} Client Error [bold]{tool_short_name}[/] ({tool_latency:.2f}s): {str(exec_err)}",
+                                            )
 
                             # Append result to message list for *next* turn
-                            tool_result_block: ToolResultContentBlock = {"type": "tool_result", "tool_use_id": tool_use_id, "content": tool_result_content, "is_error": is_error_flag, "_is_tool_result": True}
+                            tool_result_block: ToolResultContentBlock = {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": tool_result_content,
+                                "is_error": is_error_flag,
+                                "_is_tool_result": True,
+                            }
                             tool_result_message: InternalMessage = {"role": "user", "content": [tool_result_block]}
                             tool_results_for_api.append(tool_result_message)
-                            tool_results_for_history.append({"tool_name": original_tool_name, "tool_use_id": tool_use_id, "content": log_content_for_history, "is_error": is_error_flag, "cache_used": cache_used_flag})
-                            await asyncio.sleep(0.01) # Yield control
+                            tool_results_for_history.append(
+                                {
+                                    "tool_name": original_tool_name,
+                                    "tool_use_id": tool_use_id,
+                                    "content": log_content_for_history,
+                                    "is_error": is_error_flag,
+                                    "cache_used": cache_used_flag,
+                                }
+                            )
+                            await asyncio.sleep(0.01)  # Yield control
 
-                    except asyncio.CancelledError: raise
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as tool_loop_err:
                         log.error(f"Unexpected error during tool execution loop: {tool_loop_err}", exc_info=True)
                         yield "error", f"Error during tool processing: {tool_loop_err}"
                         error_occurred = True
                         stop_reason = "error"
-                        break # Break outer loop
+                        break  # Break outer loop
 
                     # If tool loop completed without error/cancellation
                     messages.extend(tool_results_for_api)
                     self.cache_hit_count += cache_hits_during_query
                     log.info(f"Added {len(tool_results_for_api)} tool results. Continuing interaction loop.")
                     await asyncio.sleep(0.01)
-                    continue # Continue main loop for next API call
+                    continue  # Continue main loop for next API call
 
                 elif stop_reason == "error":
-                     log.error(f"Exiting interaction loop due to error during turn for {provider_name}.")
-                     yield "status", "[bold red]Exiting due to turn error.[/]"
-                     error_occurred = True
-                     break
-                else: # Normal finish
-                     log.info(f"LLM interaction finished normally. Stop reason: {stop_reason}")
-                     break # Exit the main loop
+                    log.error(f"Exiting interaction loop due to error during turn for {provider_name}.")
+                    yield "status", "[bold red]Exiting due to turn error.[/]"
+                    error_occurred = True
+                    break
+                else:  # Normal finish
+                    log.info(f"LLM interaction finished normally. Stop reason: {stop_reason}")
+                    break  # Exit the main loop
             # --- End Main Interaction Loop ---
 
         # --- Outer Loop Exception Handling ---
         except asyncio.CancelledError:
-             log.info("Query processing was cancelled (outer loop).")
-             yield "status", "[yellow]Request cancelled by user.[/]"
-             if span: span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
-             stop_reason = "cancelled"
-             error_occurred = True
+            log.info("Query processing was cancelled (outer loop).")
+            yield "status", "[yellow]Request cancelled by user.[/]"
+            if span:
+                span.set_status(trace.StatusCode.ERROR, description="Query cancelled by user")
+            stop_reason = "cancelled"
+            error_occurred = True
         except Exception as e:
             error_msg = f"Unexpected error during query processing loop: {str(e)}"
             log.error(error_msg, exc_info=True)
             if span:
                 span.set_status(trace.StatusCode.ERROR, description=error_msg)
-                if hasattr(span, "record_exception"): span.record_exception(e)
+                if hasattr(span, "record_exception"):
+                    span.record_exception(e)
             yield "error", f"Unexpected Error: {error_msg}"
             stop_reason = "error"
             error_occurred = True
@@ -9961,13 +10079,14 @@ class MCPClient:
                 span.add_event("query_processing_ended", attributes=span_final_event_payload)
 
             if span_context_manager and hasattr(span_context_manager, "__exit__"):
-                with suppress(Exception): span_context_manager.__exit__(*sys.exc_info())
+                with suppress(Exception):
+                    span_context_manager.__exit__(*sys.exc_info())
 
             # Update Graph and History *only if not error/cancelled*
             if not error_occurred and not (current_task and current_task.cancelled()):
                 try:
-                    self.conversation_graph.current_node.messages = messages # Save final message list
-                    self.conversation_graph.current_node.model = model # Record model used
+                    self.conversation_graph.current_node.messages = messages  # Save final message list
+                    self.conversation_graph.current_node.model = model  # Record model used
                     await self.conversation_graph.save(str(self.conversation_graph_file))
 
                     end_time = time.time()
@@ -9976,15 +10095,22 @@ class MCPClient:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     if hasattr(self, "history") and hasattr(self.history, "add_async"):
                         history_entry_data = {
-                            "query": query, "response": final_response_text, "model": model,
-                            "timestamp": timestamp, "server_names": list(servers_used),
-                            "tools_used": tools_used, "conversation_id": self.conversation_graph.current_node.id,
-                            "latency_ms": latency_ms, "tokens_used": tokens_used_hist,
-                            "streamed": True, "cached": (cache_hits_during_query > 0),
+                            "query": query,
+                            "response": final_response_text,
+                            "model": model,
+                            "timestamp": timestamp,
+                            "server_names": list(servers_used),
+                            "tools_used": tools_used,
+                            "conversation_id": self.conversation_graph.current_node.id,
+                            "latency_ms": latency_ms,
+                            "tokens_used": tokens_used_hist,
+                            "streamed": True,
+                            "cached": (cache_hits_during_query > 0),
                         }
                         history_entry = ChatHistory(**history_entry_data)
                         await self.history.add_async(history_entry)
-                    else: log.warning("History object/method not found, cannot save history.")
+                    else:
+                        log.warning("History object/method not found, cannot save history.")
                 except Exception as final_update_err:
                     log.error(f"Error during final graph/history update: {final_update_err}", exc_info=True)
                     yield "error", f"Failed to save history: {final_update_err}"
@@ -9996,14 +10122,14 @@ class MCPClient:
                 "total_cost": self.session_total_cost,
                 "cache_hits": cache_hits_during_query,
                 "tokens_saved": self.tokens_saved_by_cache,
-                "reasoning_tokens": reasoning_tokens, # Include these if available
-                "cached_tokens": cached_tokens,       # Include these if available
+                "reasoning_tokens": reasoning_tokens,  # Include these if available
+                "cached_tokens": cached_tokens,  # Include these if available
             }
             yield "final_usage", final_usage_payload
             yield "stop_reason", stop_reason or "unknown"
 
         log.info(f"Streaming query finished. Final Stop Reason: {stop_reason}. Total Latency: {(time.time() - start_time) * 1000:.0f}ms")
-        
+
     async def _stream_wrapper(self, stream_generator: AsyncGenerator[Any, None]) -> AsyncGenerator[Tuple[str, Any], None]:
         """Wraps the query generator to extract specific event types and final stats."""
         final_stats = {}
@@ -10068,7 +10194,7 @@ class MCPClient:
 
     async def interactive_loop(self):
         """Runs the main interactive command loop with direct stream handling."""
-        interactive_console = get_safe_console() # Get console instance once
+        interactive_console = get_safe_console()  # Get console instance once
 
         self.safe_print("\n[bold green]MCP Client Interactive Mode[/]")
         self.safe_print(f"Default Model: [cyan]{self.current_model}[/]. Type '/help' for commands.")
@@ -10076,22 +10202,22 @@ class MCPClient:
 
         # Define fixed layout dimensions
         RESPONSE_PANEL_HEIGHT = 55
-        STATUS_PANEL_HEIGHT = 10 # Reduced status height
+        STATUS_PANEL_HEIGHT = 10  # Reduced status height
         # --- Throttling Config ---
-        TEXT_UPDATE_INTERVAL = 0.2 # Update Markdown max ~5 times/sec
+        TEXT_UPDATE_INTERVAL = 0.2  # Update Markdown max ~5 times/sec
 
         @contextmanager
         def suppress_logs_during_live():
             """Temporarily suppress logging below WARNING during Live display."""
-            logger_instance = logging.getLogger("mcpclient_multi") # Get specific logger
+            logger_instance = logging.getLogger("mcpclient_multi")  # Get specific logger
             original_level = logger_instance.level
             # Suppress INFO and DEBUG during live updates
             if original_level < logging.WARNING:
-                 logger_instance.setLevel(logging.WARNING)
+                logger_instance.setLevel(logging.WARNING)
             try:
                 yield
             finally:
-                 logger_instance.setLevel(original_level) # Restore original level
+                logger_instance.setLevel(original_level)  # Restore original level
 
         while True:
             # --- Reset state for this iteration ---
@@ -10102,7 +10228,7 @@ class MCPClient:
             query_error: Optional[Exception] = None
             query_cancelled = False
             final_stats_to_print = {}
-            last_text_update_time = 0.0 # For throttling
+            last_text_update_time = 0.0  # For throttling
 
             try:
                 user_input = await asyncio.to_thread(Prompt.ask, "\n[bold blue]>>> [/]", console=interactive_console, default="")
@@ -10117,13 +10243,15 @@ class MCPClient:
                     if hasattr(self, "_active_live_display") and self._active_live_display:
                         log.warning("Attempting to run command while Live display might be active. Stopping display.")
                         if live_display and live_display.is_started:
-                            with suppress(Exception): live_display.stop()
+                            with suppress(Exception):
+                                live_display.stop()
                         self._active_live_display = None
                         live_display = None
 
                     try:
                         cmd_parts = shlex.split(user_input[1:])
-                        if not cmd_parts: continue
+                        if not cmd_parts:
+                            continue
                         cmd = cmd_parts[0].lower()
                         args = shlex.join(cmd_parts[1:]) if len(cmd_parts) > 1 else ""
                     except ValueError as e:
@@ -10142,17 +10270,19 @@ class MCPClient:
                     query = user_input
                     status_lines = deque(maxlen=STATUS_PANEL_HEIGHT)
                     abort_message = Text("Press Ctrl+C once to abort...", style="dim yellow")
-                    current_response_text = "" # Text accumulated *during* the live update
-                    needs_render_update = False # Flag to trigger render
+                    current_response_text = ""  # Text accumulated *during* the live update
+                    needs_render_update = False  # Flag to trigger render
 
                     # --- Setup Live Display Placeholders ---
                     response_panel = Panel(Text("Waiting...", style="dim"), title="Response", height=RESPONSE_PANEL_HEIGHT, border_style="dim blue")
-                    status_panel = Panel(Group(*[Text("")]*STATUS_PANEL_HEIGHT), title="Status", height=STATUS_PANEL_HEIGHT+2, border_style="dim blue")
+                    status_panel = Panel(
+                        Group(*[Text("")] * STATUS_PANEL_HEIGHT), title="Status", height=STATUS_PANEL_HEIGHT + 2, border_style="dim blue"
+                    )
                     abort_panel = Panel(abort_message, height=3, border_style="none")
                     main_group = Group(response_panel, status_panel, abort_panel)
                     live_panel = Panel(main_group, title=f"Querying {self.current_model}...", border_style="dim green")
 
-                    self._active_live_display = True # Set flag
+                    self._active_live_display = True  # Set flag
                     consuming_task = asyncio.current_task()
                     self.current_query_task = consuming_task
 
@@ -10162,12 +10292,12 @@ class MCPClient:
                             live_display = live
                             try:
                                 current_time = time.time()
-                                last_text_update_time = current_time # Initialize time
+                                last_text_update_time = current_time  # Initialize time
 
                                 # Directly iterate over the wrapped generator stream
                                 async for chunk_type, chunk_data in self._stream_wrapper(self.process_streaming_query(query)):
                                     current_time = time.time()
-                                    needs_render_update = False # Reset flag for this chunk
+                                    needs_render_update = False  # Reset flag for this chunk
 
                                     if consuming_task.cancelled():
                                         query_cancelled = True
@@ -10180,7 +10310,7 @@ class MCPClient:
                                         # --- Throttle Markdown Update ---
                                         if current_time - last_text_update_time >= TEXT_UPDATE_INTERVAL:
                                             response_panel.renderable = Markdown(current_response_text, code_theme="monokai")
-                                            response_panel.border_style = "blue" # Update style as text comes in
+                                            response_panel.border_style = "blue"  # Update style as text comes in
                                             live_panel.border_style = "green"
                                             last_text_update_time = current_time
                                             needs_render_update = True
@@ -10194,7 +10324,7 @@ class MCPClient:
                                             display_status = padding + display_status
                                         status_panel.renderable = Group(*display_status)
                                         status_panel.border_style = "blue"
-                                        needs_render_update = True # Update immediately for status
+                                        needs_render_update = True  # Update immediately for status
                                     elif chunk_type == "error":
                                         query_error = RuntimeError(chunk_data)
                                         status_lines.append(Text.from_markup(f"[bold red]Error: {chunk_data}[/bold red]"))
@@ -10204,13 +10334,15 @@ class MCPClient:
                                             display_status = padding + display_status
                                         status_panel.renderable = Group(*display_status)
                                         status_panel.border_style = "red"
-                                        needs_render_update = True # Update immediately for error
+                                        needs_render_update = True  # Update immediately for error
                                     elif chunk_type == "final_stats":
                                         final_stats_to_print = chunk_data
 
                                     # Update abort message visibility & title
                                     abort_panel.renderable = abort_message if not consuming_task.done() else Text("")
-                                    live_panel.title = f"Querying {self.current_model}..." if not consuming_task.done() else f"Result ({self.current_model})"
+                                    live_panel.title = (
+                                        f"Querying {self.current_model}..." if not consuming_task.done() else f"Result ({self.current_model})"
+                                    )
                                     # Always need to update if title/abort message changes
                                     needs_render_update = True
 
@@ -10221,17 +10353,23 @@ class MCPClient:
                                 # --- Perform one final update after the loop ---
                                 # Ensure the last text chunk is rendered
                                 response_panel.renderable = Markdown(current_response_text, code_theme="monokai")
-                                response_panel.border_style = "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                response_panel.border_style = (
+                                    "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                )
                                 # Update final status state
                                 display_status_final = list(status_lines)[-STATUS_PANEL_HEIGHT:]
                                 if len(display_status_final) < STATUS_PANEL_HEIGHT:
-                                     padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
-                                     display_status_final = padding + display_status_final
+                                    padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
+                                    display_status_final = padding + display_status_final
                                 status_panel.renderable = Group(*display_status_final)
-                                status_panel.border_style = "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                status_panel.border_style = (
+                                    "blue" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
+                                )
                                 # Update final title/abort message
                                 abort_panel.renderable = Text("")
-                                live_panel.title = f"Result ({self.current_model})" + (" - Cancelled" if query_cancelled else (" - Error" if query_error else ""))
+                                live_panel.title = f"Result ({self.current_model})" + (
+                                    " - Cancelled" if query_cancelled else (" - Error" if query_error else "")
+                                )
                                 live_panel.border_style = "green" if not query_error and not query_cancelled else ("red" if query_error else "yellow")
                                 # Trigger final refresh
                                 live.update(live_panel)
@@ -10284,8 +10422,8 @@ class MCPClient:
                     # Rebuild final status renderable using the final state of status_lines
                     display_status_final = list(status_lines)[-STATUS_PANEL_HEIGHT:]
                     if len(display_status_final) < STATUS_PANEL_HEIGHT:
-                         padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
-                         display_status_final = padding + display_status_final
+                        padding = [Text("")] * (STATUS_PANEL_HEIGHT - len(display_status_final))
+                        display_status_final = padding + display_status_final
                     final_status_renderable = Group(*display_status_final)
 
                     # Build final panels
@@ -10307,7 +10445,8 @@ class MCPClient:
             except KeyboardInterrupt:
                 self.safe_print("\n[yellow]Input interrupted. Type /exit or Ctrl+C again to quit.[/yellow]")
                 if live_display and live_display.is_started:
-                    with suppress(Exception): live_display.stop()
+                    with suppress(Exception):
+                        live_display.stop()
                     self._active_live_display = None
                     live_display = None
                 continue
@@ -10318,14 +10457,16 @@ class MCPClient:
                 self.safe_print(f"\n[bold red]Unexpected Error in interactive loop:[/] {loop_err}")
                 log.error("Unexpected error in interactive loop", exc_info=True)
                 if live_display and live_display.is_started:
-                    with suppress(Exception): live_display.stop()
+                    with suppress(Exception):
+                        live_display.stop()
                     self._active_live_display = None
                     live_display = None
                 await asyncio.sleep(1)
 
             finally:
                 if live_display and live_display.is_started:
-                    with suppress(Exception): live_display.stop()
+                    with suppress(Exception):
+                        live_display.stop()
                 self._active_live_display = None
                 if self.current_query_task == asyncio.current_task():
                     self.current_query_task = None
@@ -10459,6 +10600,7 @@ class MCPClient:
         """Manage client configuration (view, edit YAML, reset to defaults)."""
         # Run the config management function
         asyncio.run(config_async(show, edit, reset))
+
 
 async def main_async(query, model, server, dashboard, interactive, webui_flag, webui_host, webui_port, serve_ui_file, cleanup_servers):
     """Main async entry point - Handles CLI, Interactive, Dashboard, and Web UI modes."""
@@ -11496,7 +11638,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     try:
                         # Use model_dump() for Pydantic v2 compatibility
                         await websocket.send_json(WebSocketMessage(type=msg_type, payload=payload).model_dump())
-                    except (WebSocketDisconnect, RuntimeError) as send_err: # More specific exceptions
+                    except (WebSocketDisconnect, RuntimeError) as send_err:  # More specific exceptions
                         # Ignore errors if the socket is already closing/closed
                         log.debug(f"WS-{connection_id}: Failed send (Type: {msg_type}) - likely disconnected: {send_err}")
                     except Exception as send_err:
@@ -11521,7 +11663,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                 # --- Consumer coroutine for processing the query stream ---
                 async def _consume_query_stream(query_text: str):
                     """Consumes the query stream and sends updates over WebSocket."""
-                    nonlocal active_query_task # Allow modification of outer scope variable
+                    nonlocal active_query_task  # Allow modification of outer scope variable
                     try:
                         # Iterate over the standardized events yielded by the stream wrapper
                         async for chunk_type, chunk_data in mcp_client._stream_wrapper(mcp_client.process_streaming_query(query_text)):
@@ -11534,7 +11676,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                 await send_ws_message("error", {"message": str(chunk_data)})
                             elif chunk_type == "final_stats":
                                 # Send final usage and completion status after stream completes
-                                usage_data = await get_token_usage(mcp_client) # Recalculate based on final client state
+                                usage_data = await get_token_usage(mcp_client)  # Recalculate based on final client state
                                 await send_ws_message("token_usage", usage_data)
                                 await send_ws_message("query_complete", {"stop_reason": chunk_data.get("stop_reason", "unknown")})
                             # Add handlers for other event types if needed (e.g., tool calls for UI)
@@ -11550,8 +11692,8 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                         await send_ws_message("error", {"message": error_msg})
                     finally:
                         # --- Cleanup specific to this query task ---
-                        task_being_cleaned = active_query_task # Capture current task locally
-                        active_query_task = None # Clear task reference for this WS connection
+                        task_being_cleaned = active_query_task  # Capture current task locally
+                        active_query_task = None  # Clear task reference for this WS connection
 
                         # Clear global task reference ONLY if it was THIS task
                         # Check the task object itself for safety before clearing
@@ -11574,7 +11716,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                             if message.type == "query":
                                 query_text = str(message.payload or "").strip()
                                 if not query_text:
-                                    continue # Ignore empty queries
+                                    continue  # Ignore empty queries
                                 if active_query_task and not active_query_task.done():
                                     await send_error_response("Previous query still running.")
                                     continue
@@ -11605,11 +11747,12 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                     try:
                                         # Use shlex to handle potential quoting in args
                                         parts = shlex.split(command_str[1:])
-                                        if not parts: continue # Ignore empty command
+                                        if not parts:
+                                            continue  # Ignore empty command
                                         cmd = parts[0].lower()
                                         args = shlex.join(parts[1:]) if len(parts) > 1 else ""
                                     except ValueError as e:
-                                        await send_error_response(f"Error parsing command: {e}", cmd=command_str[:10]) # Pass partial command
+                                        await send_error_response(f"Error parsing command: {e}", cmd=command_str[:10])  # Pass partial command
                                         continue
 
                                     log.info(f"WS-{connection_id} processing command: /{cmd} {args}")
@@ -11620,7 +11763,9 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                             # Optionally switch back to root, or stay on cleared node
                                             # mcp_client.conversation_graph.set_current_node("root")
                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                            await send_command_response(True, "Conversation branch cleared.", {"messages": []}) # Send cleared messages
+                                            await send_command_response(
+                                                True, "Conversation branch cleared.", {"messages": []}
+                                            )  # Send cleared messages
                                         elif cmd == "model":
                                             if args:
                                                 # Optional: Add validation if model is known
@@ -11630,27 +11775,39 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                                 asyncio.create_task(mcp_client.config.save_async())
                                                 await send_command_response(True, f"Model set to: {args}", {"currentModel": args})
                                             else:
-                                                await send_command_response(True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model})
+                                                await send_command_response(
+                                                    True, f"Current model: {mcp_client.current_model}", {"currentModel": mcp_client.current_model}
+                                                )
                                         elif cmd == "fork":
                                             new_node = mcp_client.conversation_graph.create_fork(name=args if args else None)
                                             mcp_client.conversation_graph.set_current_node(new_node.id)
                                             await mcp_client.conversation_graph.save(str(mcp_client.conversation_graph_file))
-                                            await send_command_response(True, f"Created and switched to branch: {new_node.name}", {"newNodeId": new_node.id, "newNodeName": new_node.name, "messages": new_node.messages})
+                                            await send_command_response(
+                                                True,
+                                                f"Created and switched to branch: {new_node.name}",
+                                                {"newNodeId": new_node.id, "newNodeName": new_node.name, "messages": new_node.messages},
+                                            )
                                         elif cmd == "checkout":
                                             if not args:
                                                 await send_error_response("Usage: /checkout NODE_ID_or_Prefix", cmd)
                                                 continue
                                             node_id_prefix = args
                                             node_to_checkout = None
-                                            matches = [n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id_prefix)]
+                                            matches = [
+                                                n for n_id, n in mcp_client.conversation_graph.nodes.items() if n_id.startswith(node_id_prefix)
+                                            ]
                                             if len(matches) == 1:
                                                 node_to_checkout = matches[0]
                                             elif len(matches) > 1:
-                                                 await send_error_response(f"Ambiguous node ID prefix '{node_id_prefix}'", cmd)
-                                                 continue
+                                                await send_error_response(f"Ambiguous node ID prefix '{node_id_prefix}'", cmd)
+                                                continue
 
                                             if node_to_checkout and mcp_client.conversation_graph.set_current_node(node_to_checkout.id):
-                                                await send_command_response(True, f"Switched to branch: {node_to_checkout.name}", {"currentNodeId": node_to_checkout.id, "messages": node_to_checkout.messages})
+                                                await send_command_response(
+                                                    True,
+                                                    f"Switched to branch: {node_to_checkout.name}",
+                                                    {"currentNodeId": node_to_checkout.id, "messages": node_to_checkout.messages},
+                                                )
                                             else:
                                                 await send_error_response(f"Node ID prefix '{node_id_prefix}' not found.", cmd)
                                         elif cmd == "apply_prompt":
@@ -11659,14 +11816,16 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                                                 continue
                                             success = await mcp_client.apply_prompt_to_conversation(args)
                                             if success:
-                                                await send_command_response(True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages})
+                                                await send_command_response(
+                                                    True, f"Applied prompt: {args}", {"messages": mcp_client.conversation_graph.current_node.messages}
+                                                )
                                             else:
                                                 await send_error_response(f"Prompt not found: {args}", cmd)
                                         elif cmd == "abort":
                                             log.info(f"WS-{connection_id} received abort command.")
-                                            task_to_cancel = active_query_task # Target the task specific to this connection
+                                            task_to_cancel = active_query_task  # Target the task specific to this connection
                                             if task_to_cancel and not task_to_cancel.done():
-                                                was_cancelled = task_to_cancel.cancel() # Request cancellation
+                                                was_cancelled = task_to_cancel.cancel()  # Request cancellation
                                                 if was_cancelled:
                                                     await send_command_response(True, "Abort signal sent to running query.")
                                                 else:
@@ -11690,7 +11849,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                             log.warning(f"WS-{connection_id} invalid message: {raw_data[:100]}... Error: {e}")
                             await send_ws_message("error", {"message": "Invalid message format."})
                         except WebSocketDisconnect:
-                            raise # Re-raise to be caught by the outer handler
+                            raise  # Re-raise to be caught by the outer handler
                         except Exception as e:
                             log.error(f"WS-{connection_id} error processing message: {e}", exc_info=True)
                             # Use suppress correctly when sending error back
@@ -11704,7 +11863,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     log.error(f"WS-{connection_id} unexpected handler error: {e}", exc_info=True)
                     # Use suppress correctly when trying to close the socket on error
                     with suppress(Exception):
-                       await websocket.close(code=1011)
+                        await websocket.close(code=1011)
                 finally:
                     # --- Final Cleanup for this WebSocket Connection ---
                     log.debug(f"WS-{connection_id}: Cleaning up WebSocket handler resources.")
@@ -11731,11 +11890,7 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                     @app.get("/", response_class=FileResponse, include_in_schema=False)
                     async def serve_html():
                         # Added cache control headers to encourage browser reloading for development
-                        headers = {
-                            "Cache-Control": "no-cache, no-store, must-revalidate",
-                            "Pragma": "no-cache",
-                            "Expires": "0"
-                        }
+                        headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
                         return FileResponse(str(ui_file.resolve()), headers=headers)
                 else:
                     log.warning(f"UI file {ui_file} not found. Cannot serve.")
@@ -11748,19 +11903,19 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
                 await server_instance.serve()
                 log.info("Web UI server shut down normally.")
             except OSError as e:
-                if e.errno == 98: # Address already in use
+                if e.errno == 98:  # Address already in use
                     safe_console.print(f"[bold red]ERROR: Could not start Web UI. Port {webui_port} is already in use.[/]")
                     safe_console.print(f"[yellow]Please stop the other process using port {webui_port} or choose a different port using --port.[/]")
-                    sys.exit(1) # Exit directly
+                    sys.exit(1)  # Exit directly
                 else:
                     log.error(f"Uvicorn server failed with OS error: {e}", exc_info=True)
                     safe_console.print(f"[bold red]Web UI server failed to start (OS Error): {e}[/]")
-                    sys.exit(1) # Exit on other OS errors too
-            except Exception as e: # Catch other potential server errors during serve()
+                    sys.exit(1)  # Exit on other OS errors too
+            except Exception as e:  # Catch other potential server errors during serve()
                 log.error(f"Uvicorn server failed: {e}", exc_info=True)
                 safe_console.print(f"[bold red]Web UI server failed to start: {e}[/]")
-                sys.exit(1) # Exit on other startup errors
-                
+                sys.exit(1)  # Exit on other startup errors
+
             log.info("Web UI server shut down.")
             # NOTE: Cleanup for webui is handled by lifespan, so return here
         elif dashboard:
@@ -11871,14 +12026,14 @@ async def main_async(query, model, server, dashboard, interactive, webui_flag, w
             sys.exit(1)  # Exit with error code
     finally:
         # Ensure cleanup doesn't run if webui failed early OR if lifespan is handling it
-        should_cleanup_main = not webui_flag # Default: cleanup if not webui
+        should_cleanup_main = not webui_flag  # Default: cleanup if not webui
         # If webui mode, assume lifespan handles cleanup *unless* we explicitly
         # exited early (e.g., due to OSError above, which calls sys.exit).
         # If sys.exit was called, this finally block might not execute fully anyway.
         # The goal is to avoid double cleanup if lifespan is responsible.
         if webui_flag:
-             should_cleanup_main = False # Lifespan is responsible in normal webui operation/shutdown
-             log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan or exited early).")
+            should_cleanup_main = False  # Lifespan is responsible in normal webui operation/shutdown
+            log.info("Web UI mode: Skipping final client cleanup in main_async (handled by lifespan or exited early).")
 
         if should_cleanup_main and client and hasattr(client, "close"):
             log.info("Performing final cleanup...")

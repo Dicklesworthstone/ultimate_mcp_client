@@ -88,6 +88,10 @@ patterns = ["screenshots/*", "debug_scripts/*", "tests/*", "docs/*", ".mcpclient
 
 [tool.ruff]
 line-length = 150
+# Specify the target Python version for ruff
+target-version = "py313"
+
+[tool.ruff.lint]
 select = [
     "E", "W", "F", "I", "C4", "B", "A", "ASYNC", "TCH", # Added more useful checks
 ]
@@ -102,8 +106,6 @@ ignore = [
     "E702",
     "F541",
 ]
-# Specify the target Python version for ruff
-target-version = "py313"
 
 [tool.ruff.format]
 quote-style = "double"

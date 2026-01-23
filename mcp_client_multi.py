@@ -8112,7 +8112,7 @@ The array must have exactly {len(tools_for_llm_prompt_in_chunk)} scores.
             with safe_stdout():
                 async with self.tool_execution_context(tool_name, tool_args, server_name):
                     # Check if this is a FastMCP client (streaming-http) - use client directly for Context support
-                    if hasattr(session, '_fastmcp_client'):
+                    if hasattr(session, "_fastmcp_client"):
                         # Use FastMCP client's call_tool method directly (provides FastMCP Context)
                         fastmcp_client = session._fastmcp_client
                         if tool.original_tool.name == "list_available_tools":
@@ -11719,17 +11719,17 @@ The array must have exactly {len(tools_for_llm_prompt_in_chunk)} scores.
                                         mcp_call_tool_result_object = await self.execute_tool(
                                             server_name_for_tool_exec, original_mcp_tool_name_to_execute, tool_args_for_execution
                                         )
-                                        
+
                                         # Handle both CallToolResult (stdio/sse) and direct list (streaming-http) responses
-                                        if hasattr(mcp_call_tool_result_object, 'content'):
+                                        if hasattr(mcp_call_tool_result_object, "content"):
                                             # Standard CallToolResult object (stdio/sse)
                                             raw_content_from_mcp_call = mcp_call_tool_result_object.content
-                                            tool_result_is_error = getattr(mcp_call_tool_result_object, 'isError', False)
+                                            tool_result_is_error = getattr(mcp_call_tool_result_object, "isError", False)
                                         else:
                                             # Direct response (streaming-http/FastMCP)
                                             raw_content_from_mcp_call = mcp_call_tool_result_object
                                             tool_result_is_error = False  # FastMCP doesn't use isError flag
-                                        
+
                                         log.debug(
                                             f"MCPC: Raw content from tool result for '{original_mcp_tool_name_to_execute}': Type {type(raw_content_from_mcp_call)}, Preview: {str(raw_content_from_mcp_call)[:200]}"
                                         )
@@ -15581,7 +15581,7 @@ def run(
     verbose_logging: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose session logging.")] = False,
     webui_flag: Annotated[bool, typer.Option("--webui", "-w", help="Launch the Web UI instead of CLI.")] = False,
     webui_host: Annotated[str, typer.Option("--host", "-h", help="Host for the Web UI server.")] = "127.0.0.1",
-            webui_port: Annotated[int, typer.Option("--port", "-p", help="Port for the Web UI server.")] = 8017,
+    webui_port: Annotated[int, typer.Option("--port", "-p", help="Port for the Web UI server.")] = 8017,
     serve_ui_file: Annotated[bool, typer.Option("--serve-ui", help="Serve the default HTML UI file from the current directory.")] = True,
     cleanup_servers: Annotated[bool, typer.Option("--cleanup-servers", help="Test and remove unreachable servers on startup.")] = False,
     agent_mode: Annotated[bool, typer.Option("--agent", "-a", help="Run in self-driving agent mode.")] = False,
