@@ -430,6 +430,33 @@ This client offers multiple ways to find and integrate MCP servers:
 -   **Interactive CLI:** The `/config` command allows viewing and modifying settings like `api-key`, `model`, `max-tokens`, `discovery-path`, port scanning parameters, etc. Changes are saved back to `config.yaml`.
 -   **Web UI Settings:** The "Settings" tab in the Web UI provides controls for common configuration options. Changes made here are sent via the API and saved to `config.yaml`.
 
+**Guard Local STDIO Servers:**
+
+When importing Claude-style `mcpServers` entries or adding local STDIO servers,
+you can wrap a server with [Armorer Guard](https://github.com/ArmorerLabs/Armorer-Guard)
+to inspect tool-call arguments before they reach the underlying server:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "armorer-guard",
+      "args": [
+        "mcp-proxy",
+        "--",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/tmp"
+      ]
+    }
+  }
+}
+```
+
+The proxy runs locally and forwards safe MCP calls unchanged while blocking
+prompt injection, credential leakage, exfiltration risk, and dangerous actions.
+
 **View Current Config:**
 
 ```bash
